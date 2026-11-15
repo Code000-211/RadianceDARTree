@@ -87,6 +87,9 @@ struct SchedReq {
     void drafter_reset() {
         n_draft      = 0;
         draft_next   = 0;
+        chain_next   = false;
+        draft_lead   = -1;
+        dyn          = DynTree{};
         conv_cursor  = 0;
         draft_filled = 0;
         draft_lo     = 0;
@@ -112,6 +115,22 @@ struct SchedReq {
      * drafts the drafter issued for it, which that step verifies. */
     int32_t  entry_next = -1;
     int32_t  draft_next = 0;
+    /* Dynamic rows (DESIGN-dynrows.md): what the last two GROWN trees of this sequence looked like,
+     * newest first (note_grown): active nodes, the leading run of nodes that form a chain, and
+     * whether the tree was a pure chain. `n` how many are valid. With --draft-tree-rows / -chain
+     * they predict the next tree's shape for the step issued ahead. */
+    struct DynTree {
+        int n = 0;
+        int act[2] = {};
+        int lead[2] = {};
+        bool pure[2] = {};
+    } dyn;
+    /* expect_draft's decision for the step issued ahead: its verify is the chain of the first
+     * `draft_next` nodes. */
+    bool     chain_next = false;
+    /* The leading run of the tree set_draft published for the step issued ahead that really is a
+     * chain (Request::draft_chain); -1 when the proposal is not predicted as one. */
+    int32_t  draft_lead = -1;
 
     /* Cancelled while a step in flight or a drafter snapshot still names it; its blocks are
      * released once nothing does. Freed earlier, a kernel still writing a block would put one
@@ -407,6 +426,22 @@ public:
     /* The deepest of a tree's first `n` nodes (parents null: a chain). Public for the engine's
      * cross-check of a serial tree. */
     static int tree_depth(const int32_t* parents, int n);
+    /* The active nodes of a tree's first `n` (confidence pruning, abi/rad_mtp_tree.h): the pruned
+     * slots are inert duplicates of node 1 under the root (advance_impl.h, ADV_BTAKE / ADV_TAKE),
+     * which no acceptance walk takes. Node 1 is always active; a chain (parents null) all of them. */
+    static int tree_active(const int32_t* tokens, const int32_t* parents, int n);
+    /* The index of the last active node of a tree's first `n` (0 for n <= 0): the prefix that holds
+     * every real node, which a verify may cut to (the inert tail is a suffix). */
+    static int tree_last_active(const int32_t* tokens, const int32_t* parents, int n);
+    /* The longest run of nodes 1..m that is a chain (node j under j - 1), none of them inert. */
+    static int tree_lead(const int32_t* tokens, const int32_t* parents, int n);
+    /* After a step: sequence `id`'s freshly GROWN tree (all `n` nodes the head made, whatever the
+     * next verify will carry), for the prediction of the following steps. No-op without
+     * --draft-tree-rows / --draft-tree-chain. */
+    void note_grown(uint64_t id, const int32_t* tokens, const int32_t* parents, int n);
+    /* Whether the next step's form follows the prediction (the engine's tree_compact asks the
+     * last build instead). */
+    bool dyn_enabled() const { return serial_tree_ && (cfg_.draft_tree_rows >= 0 || cfg_.draft_tree_chain > 0); }
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
      * round 0 carries it. Call serial_end() once the step has committed. */

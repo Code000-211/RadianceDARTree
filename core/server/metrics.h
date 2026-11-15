@@ -155,6 +155,12 @@ private:
     /* Exact totals behind the rate gauges; see render(). */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
     Counter c_draft_refills_, c_draft_refill_tokens_;
+    /* A serial head's tree: cumulative counts the scheduler keeps (sample()), rendered as two
+     * histograms (active nodes a verify, accepted depth) and counters. */
+    Counter c_tree_verifies_, c_tree_nodes_budget_, c_tree_nodes_active_;
+    Counter c_tree_chain_steps_, c_tree_rows_cut_, c_tree_active_cut_;
+    Gauge   g_tree_active_[MAX_DRAFT_POS + 1];
+    Gauge   g_tree_accdepth_[MAX_DRAFT_POS + 1];
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_queries_;

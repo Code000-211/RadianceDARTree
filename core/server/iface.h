@@ -128,6 +128,16 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     double  draft_depth_adaptive = 0.0;
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
+    /* A serial head's tree (core/sched/metrics.h): verifies, budget and active nodes, histograms
+     * by active nodes and by accepted depth. */
+    int64_t tree_verifies = 0;
+    int64_t tree_nodes_budget = 0;
+    int64_t tree_nodes_active = 0;
+    int64_t tree_chain_steps = 0;     /* dynamic rows: steps issued in the chain's form */
+    int64_t tree_rows_cut = 0;        /* nodes the issued count dropped from the budget */
+    int64_t tree_active_cut = 0;      /* of those, real ones (acceptance the prediction cost) */
+    int64_t tree_active_hist [MAX_DRAFT_POS + 1] = {};
+    int64_t tree_accdepth_hist[MAX_DRAFT_POS + 1] = {};
     int64_t preemptions = 0;
     int64_t preempt_forced = 0;       /* --preempt-wait-ms fallback victims */
     int64_t total_requests = 0;

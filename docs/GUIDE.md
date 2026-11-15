@@ -1620,17 +1620,63 @@ move into place. A tree changes no token, only how many drafts land a step; the 
 `draft trees` row says when it is on. Under a tree `num-speculative-tokens` counts the tree's
 nodes, grown over the block the drafter was trained at. A request with a grammar (`response_format`,
 tools) speculates on a tree too: each row is masked against the grammar after its own ancestors.
-`draft-coupling: on` samples one path, so a coupled drafter proposes the chain.
+`draft-coupling: on` samples one path, so a coupled block drafter (DFlash2) proposes the chain; a serial
+head's tree (below) is coupled by recursive rejection sampling.
 
 A serial draft head (the MTP of Qwen3.8-Flash-Next) takes a tree too, where its plugin states one
-(`draft-tree`, `draft-tree-leaves`, `draft-tree-nodes`, `draft-tree-width`). With a serial head
+(`draft-tree`, `draft-tree-leaves`, `draft-tree-nodes`, `draft-tree-width`, `draft-tree-prune`,
+`draft-tree-prune-rel`). With a serial head
 `num-speculative-tokens` counts the head's rounds, as for a chain; the verify carries that chain
 plus up to `draft-tree-leaves` runner-up candidates of the first round as siblings of the chain's first
 token, so a step lands a token whenever the target agrees with the chain or with one of them. The
 text is unchanged. The core refuses a serial tree on a model whose recurrent state does not follow
-the accepted path, and with `draft-coupling: on`; `draft-window: adaptive` stays fixed under one. The
+the accepted path; `draft-window: adaptive` stays fixed under one. With `draft-coupling: on` the tree's
+siblings are not the head's top ranks but are drawn without replacement from its own law (the trunk
+token and `draft-tree-leaves` leaves at the root, each grown node's children in stage 2) and the target's
+verify walks them by recursive rejection sampling, which keeps the committed text exactly the target's
+law at the request's temperature (a greedy request keeps the greedy tree). The
 metrics count a tree's acceptance by depth: `radiance:draft_tokens_total` counts every node (each is
 a verify row), the per-position acceptance the depths.
+
+**Pruned trees: `draft-tree-prune`, `draft-tree-prune-rel`.** A tree always fills its node budget, so
+every verify pays for all its rows although the head is sure of its first token most of the time. With
+`draft-tree-prune: P` a candidate becomes a node only if its cumulative probability (the product of the
+head's probabilities along its path, over the head's top eight) is at least P, and with
+`draft-tree-prune-rel: R` only if its probability is at least R times that of the best candidate of its
+parent; both zero (the default) is the unpruned tree, bit for bit. The best candidate of every node, the
+trunk, is never pruned, so a tree pruned hard enough is the plain chain. The same rule prunes stage 1's
+depth-1 leaves and stage 2's whole tree. A pruned slot is not removed from the verify (its shape is
+fixed, issued ahead) but is **inert**: a duplicate of the first node, which computes exactly what that node
+computes (so it routes to the experts that node already needs), is never accepted (the acceptance takes the
+lowest-numbered matching child, and the first node is lower) and writes only K/V that a rejected node would.
+With `draft-coupling: on` the same two thresholds prune by the **q-rank** of a slot instead of the drawn
+token's probability: a node's children are drawn without replacement, and the thresholds drop a suffix of that
+draft order, judged by the j-th largest probability of the head's law (and the parent's cumulative score), never
+by the token that happened to be drawn into the slot. That is what keeps the coupled verify exact: a cut that
+read the drawn token's own probability would favour the tokens it keeps and bias the output (the test
+suite shows the statistic that catches it).
+**Paying only for the real nodes: `draft-tree-rows`, `draft-tree-chain`.** Pruned slots verify as inert
+duplicates, and a tree step costs 3 to 8 ms more than a chain step of the same rows. Two switches (both off by
+default, which is today's step bit for bit) recover that:
+`draft-tree-rows: M` verifies a **prefix** of the grown tree, as many nodes as the larger real-node count of the
+sequence's last two trees plus M (the nodes are numbered in creation order, a suffix of a tree is a tree, and with
+`draft-coupling` the cut drops only the last children of a node's draft order, which the coupled verify keeps
+exact); when the step is built after the commit the tree is known and the inert tail is simply not verified.
+`draft-tree-chain: H` issues the step **in the chain's form** when the last H trees of every sequence in it were
+pure chains: no `spec_parent`, and no `spec_path` when the step before it verified no tree, so the plugin issues a
+chain deployment's operands (the fused delta-net op, the plain attention, no tree compaction) -- the first
+chain-form step after a tree verify still closes that verify's path. The step issued ahead is a prediction
+(the tree it verifies is still being grown), so a surprise costs acceptance, never correctness: the nodes beyond
+the prediction are dropped and counted (`radiance:spec_tree_rows_cut_total`, `..._active_cut_total` for the real
+ones, `..._chain_steps_total`). Design and the cost model: `DESIGN-dynrows.md`.
+Every draft is verified, so the thresholds change how many drafts land a step and what a step costs, not
+what the model says (up to the last-bit differences any change of the verify batch's rows can make to the
+target's logits, as between a chain and a tree).
+`/metrics` reports, per tree verify, how many nodes were real (not pruned) and how deep the accepted path
+went, so a sweep can read the trade (the histograms' `_sum / _count` are the means):
+`radiance:spec_tree_active_nodes` and `radiance:spec_tree_accepted_depth` (histograms, one bucket a whole
+number), `radiance:spec_tree_verifies_total`, `radiance:spec_tree_nodes_budget_total`,
+`radiance:spec_tree_nodes_active_total`. `radiance:draft_tokens_total` still counts every row.
 
 **A shorter block under load: `draft-short-from: N`.** A block drafter's block is paid for by
 every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
@@ -2383,7 +2429,11 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `draft-tree-leaves: L` | 3 | a serial head's tree (Qwen3.8-Flash-Next's MTP): runner-up siblings of the chain's first token, 0 to 7 |
 | `draft-tree-nodes: N` | auto | a serial head's tree: the most nodes one verify carries (default: the larger of the plugin's budget and `num-speculative-tokens` + `draft-tree-leaves`, `num-speculative-tokens` counting the head's rounds, clamped to what the plugin's verify can carry: 15 on Qwen3.8-Flash-Next, whose delta net walks 16 rows; more rounds than that is refused by name) |
 | `draft-tree-width: W` | 1 | a serial head's tree: frontier rows the plugin's head grows a round; 1 is the chain with its leaves, more asks the plugin for a deeper tree |
-| `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
+| `draft-tree-prune: P` | 0 | a serial head's tree: a candidate becomes a node only if its cumulative probability is at least P (0 to 1; 0 off). The best candidate of every node is always kept, so a high P gives the chain (§4.6, "pruned trees") |
+| `draft-tree-prune-rel: R` | 0 | a serial head's tree: a candidate becomes a node only if its probability is at least R times its parent's best candidate's (0 to 1; 0 off); with both set it needs both |
+| `draft-tree-rows: M` | off | a serial head's tree: verify only the first (the larger active-node count of the sequence's last two trees) + M nodes, a prefix of the tree (0 to 64, or off: every verify issues the whole node budget); with `draft-tree-prune` the inert tail stops costing rows |
+| `draft-tree-chain: H` | 0 | a serial head's tree: issue a step as a plain chain verify (no tree operands, the fused delta-net op, the plain attention) when the last H (1 or 2) trees of every sequence of the step were pure chains; 0 off |
+| `draft-coupling: MODE` | off | `on`: an MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. With a draft tree (`draft-tree on`, stage 1 or 2) the siblings of a node are sampled without replacement from the head's law and verified by recursive rejection sampling (`DESIGN-coupling.md`): the same lossless guarantee. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**
@@ -4160,6 +4210,7 @@ always 1 and carries the cache's settings as labels: `cache_dtype`, `block_size`
 | `decode_tokens_per_second`, `prefill_tokens_per_second` | |
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
 | `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
+| `spec_tree_active_nodes`, `spec_tree_accepted_depth` (histograms), `spec_tree_verifies_total`, `spec_tree_nodes_budget_total`, `spec_tree_nodes_active_total` | a serial head's tree, per verify: nodes that were real (not pruned by `draft-tree-prune`) and drafts accepted; present once a tree verify ran |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
 | `lookup_proposals_total`, `lookup_held_total`, `lookup_held_drafts_total`, `lookup_held_hits_total` | prompt lookup as the only drafter: proposals made, proposals held back as not paying for their verify rows and their drafts, and of the held ones scored against the text that followed, the drafts that came true (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted |

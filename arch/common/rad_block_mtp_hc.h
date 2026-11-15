@@ -74,6 +74,7 @@
 #include "rad_block_moe_fp8.h"
 #include "rad_block_mtp_fp8.h"     /* mtp_draft_head_q2(): one reading of the 2-bit head */
 #include "rad_spechub.h"           /* RAD_MTP_COUPLE_*: the coupling wire */
+#include "rad_mtp_rrs.h"           /* RAD_MTP_RRS_MAX_WIDTH */
 #include "rad_qsa.h"
 #include "rad_block_vit.h"
 
@@ -183,6 +184,13 @@ struct MtpHcBlock {
     /* --draft-coupling: one op a round. The ABI freezes `round` as a parameter, so a round
      * cannot be an operand and each gets its own declared op. */
     rad_op op_couple[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    /* A stage-1 draft tree (--draft-coupling): round 1's propose op also draws this many sibling
+     * leaves beside the trunk token (abi/rad_mtp_rrs.h). A stage-2 tree (tree_rounds) declares no
+     * propose op: its grower draws and writes the states. */
+    int couple_leaves = 0;
+    /* Stage 1's confidence pruning under coupling (round 1's propose op, with `leaves`): the same
+     * two thresholds as the grower's, decided by the slot priorities (the j-th largest q) only. */
+    double couple_prune_abs = 0.0, couple_prune_rel = 0.0;
 
     /* rad_arch.h's vocab-head rule, asked through the block by whoever sizes `dlog` and the pair
      * planes. */
@@ -480,14 +488,31 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
          * whose column 0 is the proposal. Linear chains only: x is a token, while a tree reads
          * column 0 as a parent index. The engine refuses other drafters; this check keeps a
          * mismatched declaration from writing tokens into a tree plane. */
-        if (w.couple_draws || w.couple_state) {
+        if ((w.couple_draws || w.couple_state) && !tree_rounds) {
             if (!w.couple_draws || !w.couple_state || depth < 1 ||
                 depth > RAD_MTP_COUPLE_MAX_ROUNDS || !op_drerank || (g.world > 1 && !op_dmerge))
                 return RAD_E_UNSUPPORTED;
             for (int round = 1; round <= depth; ++round) {
-                op_couple[round - 1] = rw(b, RAD_OP(b, "mtp_couple_propose",
-                    /* The whole vocabulary: `row_topk` reports global ids and the merge keeps
-                     * them, while `g.n_vocab` is this rank's shard. */
+                /* The whole vocabulary: `row_topk` reports global ids and the merge keeps them,
+                 * while `g.n_vocab` is this rank's shard. */
+                const bool cprune = couple_prune_abs > 0.0 || couple_prune_rel > 0.0;
+                op_couple[round - 1] = round == 1 && couple_leaves > 0 && cprune
+                    ? rw(b, RAD_OP(b, "mtp_couple_propose",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
+                                   RAD_INT("round", round), RAD_INT("max_rounds", depth),
+                                   RAD_INT("leaves", couple_leaves),
+                                   RAD_F64("prune_abs", couple_prune_abs),
+                                   RAD_F64("prune_rel", couple_prune_rel)),
+                        RAD_NOWEIGHTS),
+                        { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state })
+                : round == 1 && couple_leaves > 0
+                    ? rw(b, RAD_OP(b, "mtp_couple_propose",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
+                                   RAD_INT("round", round), RAD_INT("max_rounds", depth),
+                                   RAD_INT("leaves", couple_leaves)),
+                        RAD_NOWEIGHTS),
+                        { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state })
+                    : rw(b, RAD_OP(b, "mtp_couple_propose",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
                                RAD_INT("round", round), RAD_INT("max_rounds", depth)),
                     RAD_NOWEIGHTS),

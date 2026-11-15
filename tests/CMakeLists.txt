@@ -132,6 +132,7 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 
 # Binaries that need more CPU than the default budget, and what costs it. Lower an entry when its
 # cost comes down, so the tripwire stays tight.
+set(RAD_TEST_CPU_BUDGET_mtp_rrs_test 50)  # chi-square over 3e5 seeds a tree kind: coupling ~31 s, coupling + pruning ~12 s more
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
@@ -349,6 +350,12 @@ if(TARGET spechub)
     target_compile_definitions(spechub_wiring_test PRIVATE RAD_SPECHUB_WITH_DEVICE=1)
   endif()
   add_dependencies(spechub_wiring_test spechub)
+  # spechub_device_test runs the plugin's device rows of the draft tree's coupled ops against its
+  # host rows on a card (skips without one); it needs the same library path.
+  target_link_libraries(spechub_device_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(spechub_device_test PRIVATE
+    RAD_SPECHUB_LIB="${RAD_PLUGIN_OUT}/kernels/spechub.so")
+  add_dependencies(spechub_device_test spechub)
   # sample_test's coupling case declares a Sampler with draft_coupling set and needs the verify
   # op the spechub plugin carries (its host row); it skips when the library is absent.
   add_dependencies(sample_test spechub)

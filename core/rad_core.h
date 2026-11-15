@@ -739,6 +739,12 @@ struct Request {
     /* A tree drafter's parents for `draft` (StepEntry::draft_parent): draft[j]'s parent node,
      * 0 the bonus token. Null for a chain. The sampler reads each row's ancestors from it. */
     const int32_t*       draft_parent = nullptr;
+    /* A step issued ahead in the chain's form (--draft-tree-chain) verifies the first n drafted
+     * tokens as a chain whatever the arriving tree's parents are: only the leading `draft_chain`
+     * of them really are one. Row k may take its coupled state only while k + 1 <= draft_chain (the
+     * next token is then the row's own child, not a sibling that happens to carry the same id);
+     * every other row keeps the ordinary pick, which is exact. -1: the proposal is a chain. */
+    int32_t              draft_chain = -1;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -1030,6 +1036,24 @@ struct Config {
     int         draft_tree_leaves = 3;
     int         draft_tree_nodes = 0;
     int         draft_tree_width = 1;
+    /* --draft-tree-prune / --draft-tree-prune-rel: confidence pruning of a serial head's tree. A
+     * candidate becomes a node only if its cumulative probability is >= draft_tree_prune and its
+     * probability >= draft_tree_prune_rel times its parent's best candidate's; the best candidate
+     * of every parent (the trunk) is never pruned, so a hard-pruned tree is the plain chain. 0 =
+     * off (the tree always fills its node budget). Pruned slots verify as inert duplicates of the
+     * first node, which no acceptance walk takes. */
+    double      draft_tree_prune = 0.0;
+    double      draft_tree_prune_rel = 0.0;
+    /* --draft-tree-rows M / --draft-tree-chain H: what a pruned tree's verify does not pay for
+     * (DESIGN-dynrows.md). rows: -1 off (every verify issues the full node budget); M >= 0 issues
+     * the first max(active nodes of the last two grown trees) + M nodes of a tree (a suffix is
+     * dropped, which is always a valid tree and, with coupling, a suffix of each node's draft
+     * order). chain: 0 off; H >= 1 issues a step in the chain's form (no tree operands, the fused
+     * delta-net op) when the last H grown trees of every sequence of the step were pure chains,
+     * verifying the chain prefix of the next tree. Both lossless; a wrong guess costs acceptance
+     * only. */
+    int         draft_tree_rows = -1;
+    int         draft_tree_chain = 0;
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify

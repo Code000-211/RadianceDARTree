@@ -2996,7 +2996,9 @@ std::string Engine::engine_info() const {
         sp["depth"]   = drafter_.depth;
         if (serial_tree_) {
             sp["tree"] = { { "nodes", cfg_.n_spec }, { "leaves", tree_leaves_ },
-                           { "width", tree_width_ } };
+                           { "width", tree_width_ },
+                           { "prune", cfg_.draft_tree_prune },
+                           { "prune_rel", cfg_.draft_tree_prune_rel } };
         }
     }
     e["speculation"] = std::move(sp);

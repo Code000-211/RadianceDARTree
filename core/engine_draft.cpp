@@ -11,6 +11,7 @@
 #include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
 #include "device/device.h"
+#include "rad_mtp_tree.h"
 
 #include <algorithm>
 #include <chrono>
@@ -95,12 +96,19 @@ int Engine::step_state_init() {
             return RAD_E_STATE;
         }
         couple_rows_ = sd.shape[1];
+        couple_planes_ = sd.shape[0];
+        if (couple_planes_ > RAD_MTP_COUPLE_MAX_ROWS) {
+            RAD_ERR("--draft-coupling: 'mtp_couple_state' has %lld rounds, the coupling binds %d at "
+                    "most", (long long)couple_planes_, RAD_MTP_COUPLE_MAX_ROWS);
+            return RAD_E_STATE;
+        }
         /* One entry per card slot, indexed by StepEntry::card as slots_host_ is. */
         couple_by_card_.assign((size_t)n_slot, RadMtpCoupleDraw{});
         couple_draw_stage_ = static_cast<RadMtpCoupleDraw*>(
             rad_dev_alloc(n_slot * (int64_t)sizeof(RadMtpCoupleDraw), RAD_MEM_HOST_PINNED));
         couple_readback_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
-            (int64_t)drafter_.depth * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
+            std::max<int64_t>(drafter_.depth, couple_planes_) * couple_rows_ *
+                (int64_t)sizeof(RadMtpCoupleState),
             RAD_MEM_HOST_PINNED));
         if (!couple_draw_stage_ || !couple_readback_) return RAD_E_NOMEM;
         if (drafter_.kind == RAD_DRAFT_BLOCK)
@@ -185,6 +193,18 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
             a.vocab      = (int32_t)meta_.n_vocab;
             a.width      = tree_width_;
             a.depth      = draft_rounds_;
+            /* Stage 1's confidence pruning of the depth-1 leaves: the plugin's candidate logits
+             * beside the ids, and the grower's rule (abi/rad_mtp_tree.h), whose thresholds are
+             * the same two numbers the plugin's grower op got. */
+            if (tree_width_ == 1 && tree_prune_ && drafter_.proposal_score) {
+                RadMtpTreeCfg pc{};
+                rad_mtp_tree_set_prune(&pc, cfg_.draft_tree_prune, cfg_.draft_tree_prune_rel);
+                a.prune = pc.prune;
+                a.prune_log_abs = pc.log_abs;
+                a.prune_log_rel = pc.log_rel;
+                if (from_proposal)
+                    a.src_val = static_cast<const float*>(rk.ctx.buf_ptr(drafter_.proposal_score));
+            }
         }
         if (from_proposal) {
             a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
@@ -215,6 +235,9 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 /* ADV_COMPACT on every rank, against the scheduler's latest build (the tree step just accepted):
  * the accepted paths' K and V into place in every paged group. Each rank's pools are its own. */
 int Engine::tree_compact(int rows) {
+    /* A step issued in the chain's form verified no tree, so its accepted path is the first rows:
+     * nothing to move (the kernel would find every node in place). */
+    if (sched_.advance_args(0).parent_off < 0) return RAD_OK;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
         AdvanceArgs a = sched_.advance_args((int)i);
@@ -373,8 +396,11 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         const void* state = r0.ctx.buf_ptr(couple_state_buf_);
         if (!state || serial_done_ > (int)drafter_.depth) return RAD_E_STATE;
         const int64_t pitch = couple_rows_ * (int64_t)sizeof(RadMtpCoupleState);
+        /* A stage-2 tree's states are one row a node, not a round: all of them. */
+        const int64_t planes = serial_tree_ && tree_width_ > 1 ? couple_planes_ : serial_done_;
+        if (planes > couple_planes_) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_2d_async(couple_readback_, pitch, state, pitch,
-                                    (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), serial_done_,
+                                    (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), planes,
                                     r0.ctx.stream()));
     }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
@@ -460,6 +486,9 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
         const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)pitch], nodes,
                                         serial_tree_ ? S.par : nullptr);
+        /* The whole grown tree, whatever the next verify carries: the predictor of the following
+         * steps' row count and form (--draft-tree-rows, --draft-tree-chain). */
+        if (serial_tree_) sched_.note_grown(seq, &draft_out_[(size_t)i * (size_t)pitch], S.par, nodes);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
@@ -484,10 +513,22 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
                  "coupling", (unsigned long long)seq);
     int n_bound = 0, n_malformed = 0;
     std::string why;
-    const int bs = mtp_couple_bind_rounds(bp, couple_draw_stage_[(size_t)i],
-                                          &couple_readback_[(size_t)i], (int)couple_rows_, done,
-                                          slots_host_[card], meta_.n_vocab, couple_bound_,
-                                          &n_bound, &why, &n_malformed);
+    int bs;
+    if (serial_tree_) {
+        /* A draft tree: one state per verify row that drafted children (stage 1: the rounds of
+         * the chain; stage 2: every node the grower gave children to). */
+        const int nodes = serial_nodes(done);
+        const int rows = tree_width_ > 1 ? std::min<int>(nodes, (int)couple_planes_)
+                                         : std::min<int>(done, (int)couple_planes_);
+        bs = mtp_couple_bind_tree(bp, couple_draw_stage_[(size_t)i], &couple_readback_[(size_t)i],
+                                  (int)couple_rows_, rows, slots_host_[card], nodes, meta_.n_vocab,
+                                  couple_bound_, &n_bound, &why, &n_malformed);
+    } else {
+        bs = mtp_couple_bind_rounds(bp, couple_draw_stage_[(size_t)i],
+                                    &couple_readback_[(size_t)i], (int)couple_rows_, done,
+                                    slots_host_[card], meta_.n_vocab, couple_bound_,
+                                    &n_bound, &why, &n_malformed);
+    }
     if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
     if (n_malformed > 0 && !couple_malformed_note_) {
         couple_malformed_note_ = true;
@@ -497,7 +538,7 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
                  (unsigned long long)seq, n_malformed);
     }
     for (auto& rk : ranks_) {
-        const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, drafted ? n_bound : 0);
+        const int st = rk->sampler.set_mtp_couple(seq, couple_bound_, drafted ? n_bound : 0, serial_tree_);
         if (st < 0 && st != RAD_E_NOTFOUND) return st;
     }
     return RAD_OK;

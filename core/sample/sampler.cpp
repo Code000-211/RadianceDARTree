@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "gbnf.h"
 #include "../sched/draft.h"   /* RAD_SCHED_MAX_SPEC */
+#include "rad_mtp_rrs.h"       /* a draft tree's coupled siblings */
 #include "../util/simd.h"
 
 #include <algorithm>
@@ -666,12 +667,20 @@ bool Sampler::speculation_fixed(uint64_t req_id) const {
 
 /* Every state must name this request and its own round: one from another request or round would
  * couple against a Q this step never drew. */
-int Sampler::set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n) {
-    if (!couple_ || n < 0 || n > RAD_MTP_COUPLE_MAX_ROUNDS || (n && !states)) return RAD_E_STATE;
+int Sampler::set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n, bool tree) {
+    if (!couple_ || n < 0 || n > (tree ? RAD_MTP_COUPLE_MAX_ROWS : RAD_MTP_COUPLE_MAX_ROUNDS) ||
+        (n && !states))
+        return RAD_E_STATE;
     const auto it = seqs_.find(req_id);
     if (it == seqs_.end()) return RAD_E_NOTFOUND;
-    for (int i = 0; i < n; ++i)
-        if (states[i].draw.seq != req_id || states[i].round != i + 1) return RAD_E_STATE;
+    /* A chain's state i is round i + 1. A tree's is its verify row's: round = the row's depth + 1,
+     * so at most i + 1, and a row with no drafted children is an all-zero (unbound) state. */
+    for (int i = 0; i < n; ++i) {
+        if (tree && states[i].status == 0) continue;
+        if (states[i].draw.seq != req_id ||
+            (tree ? (states[i].round < 1 || states[i].round > i + 1) : states[i].round != i + 1))
+            return RAD_E_STATE;
+    }
     SeqState& s = it->second;
     for (int i = 0; i < n; ++i) s.couple[i] = states[i];
     s.couple_n = n;
@@ -828,14 +837,36 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             if (couple_) {
                 couple_stage_[row] = RadMtpCoupleState{};
                 const auto sit = seqs_.find(r->id);
-                if (sit != seqs_.end() && !sp.greedy() && r->draft && k + 1 < n_pos &&
+                /* The row's drafted children, in node order and without repeats: a chain row's one
+                 * draft, a tree row's children (the first is the coupled proposal; a window cut
+                 * may have dropped the last ones). */
+                int32_t kid[RAD_SCHED_MAX_SPEC];
+                int     nk = 0;
+                if (tpar) {
+                    for (int32_t j = k + 1; j < n_pos && nk < RAD_SCHED_MAX_SPEC; ++j) {
+                        int32_t pj = tpar[j - 1];
+                        pj = (pj < 0 || pj >= j) ? j - 1 : pj;
+                        bool dup = false;
+                        for (int t = 0; t < nk; ++t) dup = dup || kid[t] == r->draft[j - 1];
+                        if (pj == k && !dup) kid[nk++] = r->draft[j - 1];
+                    }
+                } else if (k + 1 < n_pos && r->draft &&
+                           (r->draft_chain < 0 || k + 1 <= r->draft_chain)) {
+                    kid[nk++] = r->draft[k];
+                }
+                if (sit != seqs_.end() && !sp.greedy() && r->draft && nk > 0 &&
                     k < sit->second.couple_n) {
                     const RadMtpCoupleState& c = sit->second.couple[k];
-                    /* Same request and seed, this row's round, position and proposed token
-                     * (rad_mtp_couple_binds); anything else is a stale state from another step. */
-                    if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k, r->draft[k],
+                    /* Same request and seed, this row's round (its depth + 1), position and
+                     * proposed token (rad_mtp_couple_binds); anything else is a stale state from
+                     * another step. A tree row keeps the prefix of its drafted children that the
+                     * verify still carries. */
+                    const int kept = rad_mtp_rrs_prefix(c, kid, nk);
+                    if (kept > 0 &&
+                        rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, dk, kid[0],
                                              cfg_.n_vocab)) {
                         couple_stage_[row] = c;
+                        if (c.nkids >= 2) couple_stage_[row].nkids = kept;
                         any_couple_ = true;
                         ++couple_build_.rows;
                         auto& q = couple_build_.seqs;

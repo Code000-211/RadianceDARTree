@@ -2113,6 +2113,17 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             nm, (unsigned)d->proposal);
         return RAD_E_INVAL;
     }
+    if (d->proposal_score != RAD_NULL_HANDLE) {
+        if (!serial_tree || d->tree_width > 1 || d->proposal == RAD_NULL_HANDLE ||
+            (size_t)d->proposal_score >= prog_.buffers.size() ||
+            prog_.buffers[d->proposal_score].decl.dtype != RAD_F32) {
+            err(RAD_E_INVAL, "declare_drafter '%s': proposal_score %u. The candidates' logits are "
+                             "an f32 buffer of a stage-1 serial tree (tree_nodes > 0, width <= 1) "
+                             "with a proposal buffer, at the proposal's pitch.",
+                nm, (unsigned)d->proposal_score);
+            return RAD_E_INVAL;
+        }
+    }
     if (d->proposal_pitch < 0) {
         err(RAD_E_INVAL, "declare_drafter '%s': proposal_pitch %lld", nm,
             (long long)d->proposal_pitch);

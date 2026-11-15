@@ -90,6 +90,14 @@ struct StepPlan {
     int     tok_shift = 0;
     int     n_spec = 0;               /* the batch-wide speculative window */
     bool    spec_is_tree = false;     /* a tree drafter fills spec_parent; a chain leaves it null */
+    /* Dynamic rows (DESIGN-dynrows.md): every verify of the step is a chain (or has no drafts), so
+     * the step is issued in the chain's form, spec_parent null (spec_is_tree false). `no_path`:
+     * also no spec_path, because no sequence of the step follows a tree verify's accepted path, so
+     * the plugin's operand lists are exactly a chain deployment's. `tree_verify`: the step verifies
+     * at least one tree (spec_is_tree with drafts), so the step after it must heal its path. */
+    bool    chain_fast = false;
+    bool    no_path = false;
+    bool    tree_verify = false;
     /* Decode/prefill split, for a block that issues each half separately. Entries are sorted so
      * decode rows are sequences [0, n_seq_decode) and prefill chunks follow. */
     int64_t n_seq_decode = 0;
@@ -100,7 +108,8 @@ struct StepPlan {
     void reset() {
         e.clear();
         n_tok = 0; phase = RAD_PHASE_DECODE; draft_pass = 0; tok_shift = 0; n_spec = 0;
-        spec_is_tree = false; max_q_len = 0; max_ctx_len = 0; n_seq_decode = 0; n_tok_decode = 0;
+        spec_is_tree = false; chain_fast = false; no_path = false; tree_verify = false;
+        max_q_len = 0; max_ctx_len = 0; n_seq_decode = 0; n_tok_decode = 0;
     }
 };
 
@@ -345,6 +354,7 @@ private:
     void forget_tables();
     int64_t last_n_seq_ = 0;
     bool    last_tree_  = false;   /* the last build staged spec_parent (advance_args' parent_off) */
+    bool    last_nopath_ = false;  /* the last build handed no spec_path (advance_args' path_off) */
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;

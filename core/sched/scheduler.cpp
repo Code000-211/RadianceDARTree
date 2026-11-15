@@ -507,6 +507,51 @@ int Scheduler::tree_depth(const int32_t* parents, int n) {
     return best;
 }
 
+int Scheduler::tree_active(const int32_t* tokens, const int32_t* parents, int n) {
+    if (n <= 0) return 0;
+    if (!parents || !tokens) return n;
+    int active = n;
+    for (int j = 2; j <= n; ++j)
+        if (parents[j - 1] == 0 && tokens[j - 1] == tokens[0]) --active;
+    return active;
+}
+
+/* A node of a tree's first `n` is inert when it is a duplicate of node 1 under the root (the
+ * pruned slot, tree_active). */
+static inline bool tree_inert(const int32_t* tokens, const int32_t* parents, int j) {
+    return parents && tokens && j >= 2 && parents[j - 1] == 0 && tokens[j - 1] == tokens[0];
+}
+
+int Scheduler::tree_last_active(const int32_t* tokens, const int32_t* parents, int n) {
+    if (n <= 0) return 0;
+    for (int j = n; j >= 2; --j)
+        if (!tree_inert(tokens, parents, j)) return j;
+    return 1;
+}
+
+int Scheduler::tree_lead(const int32_t* tokens, const int32_t* parents, int n) {
+    int m = 0;
+    for (int j = 1; j <= n; ++j) {
+        const int p = parents ? parents[j - 1] : j - 1;
+        if (p != j - 1 || tree_inert(tokens, parents, j)) break;
+        m = j;
+    }
+    return m;
+}
+
+void Scheduler::note_grown(uint64_t id, const int32_t* tokens, const int32_t* parents, int n) {
+    if (!dyn_enabled()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = by_id_.find(id);
+    if (it == by_id_.end()) return;
+    SchedReq::DynTree& d = reqs_[(size_t)it->second]->dyn;
+    d.act[1] = d.act[0]; d.lead[1] = d.lead[0]; d.pure[1] = d.pure[0];
+    d.act[0] = tree_active(tokens, parents, n);
+    d.lead[0] = tree_lead(tokens, parents, n);
+    d.pure[0] = d.lead[0] > 0 && d.lead[0] == tree_last_active(tokens, parents, n);
+    if (d.n < 2) ++d.n;
+}
+
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
@@ -519,6 +564,8 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
     if (parents)
         for (int i = 0; i < n && i < RAD_SCHED_MAX_SPEC; ++i) s.draft_par[i] = parents[i];
     s.req->draft_parent = parents ? s.draft_par : nullptr;
+    s.req->draft_chain = -1;
+    s.draft_lead = -1;
 
     /* The step issued ahead already verifies these: it was planned with the drafter's count and
      * the card has the tokens. The host copy is what its commit emits accepted tokens from, so it
@@ -526,7 +573,15 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
      * sequence and expect_draft() cut this one's count to its window, so a longer proposal is cut
      * to the planned count (the window may have moved at the commit since). */
     if (next_open_ && s.entry_next >= 0) {
-        if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
+        if ((draft_.adaptive() || dyn_enabled()) && n > s.draft_next) {
+            /* What the predictor cut (expect_draft): the active nodes it lost, for the sweep. */
+            if (dyn_enabled() && parents && s.draft_next < n) {
+                m_.tree_rows_cut += n - s.draft_next;
+                m_.tree_active_cut += tree_active(tokens, parents, n) -
+                                      tree_active(tokens, parents, s.draft_next);
+            }
+            n = s.draft_next;
+        }
         if (n != s.draft_next) {
             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
                     (unsigned long long)id, n, s.draft_next);
@@ -536,6 +591,9 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
         s.n_draft = n;
         s.req->n_draft = n;
         s.req->draft = n ? s.draft : nullptr;
+        /* A step predicted to be a chain verifies these n tokens as one. Only the leading run of the
+         * arriving tree is a chain: the coupled sampler binds no row beyond it (Request::draft_chain). */
+        if (dyn_enabled() && s.chain_next) s.draft_lead = parents ? tree_lead(tokens, parents, n) : n;
         return RAD_OK;
     }
 
@@ -550,6 +608,14 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
     int cap = draft_cap(s);
     if (n > cap) n = cap;
     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
+    /* The step is built after this commit, so the tree is known: verify up to its last real node.
+     * The inert tail is a suffix of duplicates no acceptance takes, so this changes no outcome
+     * (with coupling it drops only repeats, which the sampler's child list ignores). */
+    if (dyn_enabled() && parents && n > 1) {
+        const int la = tree_last_active(tokens, parents, n);
+        m_.tree_rows_cut += n - la;
+        n = la;
+    }
     for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];
     s.n_draft = n;
     s.req->n_draft = n;
@@ -2404,6 +2470,33 @@ const RadBatch* Scheduler::step() {
         lost_restore = true;
     }
 
+    /* The chain's form, decided exactly: the drafts are known (DESIGN-dynrows.md). Every verify of
+     * the step is a chain (a head's tree whose nodes hang off their predecessors, prompt lookup's
+     * proposal) and at least one verifies something. No spec_path either when no sequence still
+     * owes the accepted path of an earlier tree verify. */
+    if (tree_ && serial_tree_ && cfg_.draft_tree_chain > 0) {
+        bool chain = true, any = false, owes = false;
+        for (const StepEntry& e : plan_.e) {
+            if (e.n_last_path > 0) owes = true;
+            if (e.is_prefill || e.n_spec <= 0) continue;
+            any = true;
+            if (e.draft_parent) {
+                for (int32_t j = 1; j <= e.n_spec && chain; ++j) chain = e.draft_parent[j - 1] == j - 1;
+            }
+        }
+        if (chain && any) {
+            plan_.spec_is_tree = false;
+            plan_.chain_fast = true;
+            plan_.no_path = !owes;
+            for (StepEntry& e : plan_.e) {
+                e.draft_parent = nullptr;
+                SchedReq& sr = *reqs_[(size_t)e.slot];
+                if (sr.req) { sr.req->draft_parent = nullptr; sr.req->draft_chain = -1; }
+            }
+            ++m_.tree_chain_steps;
+        }
+    }
+    plan_.tree_verify = plan_.spec_is_tree && plan_.n_spec > 0;
     step_start_ = std::chrono::steady_clock::now();
     const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
     if (!b) {
@@ -2509,6 +2602,25 @@ void Scheduler::expect_draft(uint64_t id, int n) {
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
+    s.chain_next = false;
+    /* Dynamic rows: the shape of the tree this step will verify is not known yet (it is being grown
+     * behind the step in flight), so it is predicted from the last two grown trees. Either guess is
+     * lossless: a node beyond the count is dropped, a suffix of a tree being a tree, and the
+     * chain's form verifies the first nodes as the chain they are (DESIGN-dynrows.md). */
+    if (dyn_enabled() && n > 1 && s.dyn.n > 0) {
+        const SchedReq::DynTree& d = s.dyn;
+        int lead = d.lead[0], act = d.act[0];
+        if (d.n > 1) { lead = std::max(lead, d.lead[1]); act = std::max(act, d.act[1]); }
+        const int hold = cfg_.draft_tree_chain;
+        bool pure = hold > 0 && d.n >= hold && lead > 0;
+        for (int h = 0; pure && h < hold && h < 2; ++h) pure = d.pure[h];
+        if (pure) {
+            s.chain_next = true;
+            n = std::min(n, lead);
+        } else if (cfg_.draft_tree_rows >= 0) {
+            n = std::min(n, std::max(act + cfg_.draft_tree_rows, std::max(lead, 1)));
+        }
+    }
     s.draft_next = n > 0 ? n : 0;
 }
 
@@ -2517,8 +2629,10 @@ const RadBatch* Scheduler::step_next() {
     const RadBatch* b = step_next_locked();
     if (!b)
         for (const StepEntry& e : plan_.e)
-            if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot])
+            if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot]) {
                 reqs_[(size_t)e.slot]->draft_next = 0;
+                reqs_[(size_t)e.slot]->chain_next = false;
+            }
     return b;
 }
 
@@ -2567,6 +2681,23 @@ const RadBatch* Scheduler::step_next_locked() {
 
     plan_next_.reset();
     plan_next_.spec_is_tree = tree_;
+    /* The chain's form (DESIGN-dynrows.md): every row of the step is predicted to verify a chain
+     * (expect_draft), so the step carries no tree operands. The previous step's accepted path
+     * still has to be applied unless that step verified no tree. */
+    bool fast = dyn_enabled() && cfg_.draft_tree_chain > 0;
+    bool any_draft = false;
+    for (const StepEntry& e : plan_.e) {
+        if (!fast) break;
+        if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) { fast = false; break; }
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (s.draft_next > 0) { any_draft = true; fast = fast && s.chain_next; }
+    }
+    fast = fast && any_draft;
+    if (fast) {
+        plan_next_.spec_is_tree = false;
+        plan_next_.chain_fast = true;
+        plan_next_.no_path = !plan_.tree_verify;
+    }
     for (const StepEntry& e : plan_.e) {
         if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) return nullptr;
         SchedReq& s = *reqs_[(size_t)e.slot];
@@ -2605,7 +2736,7 @@ const RadBatch* Scheduler::step_next_locked() {
         n.conv_cursor    = s.conv_cursor;
         n.draft          = s.draft;    /* published before this step commits (set_draft) */
         /* And the tree drafter's parents, which the card verifies by (ADV_BTAKE took them). */
-        n.draft_parent   = tree_ ? s.draft_par : nullptr;
+        n.draft_parent   = tree_ && !fast ? s.draft_par : nullptr;
         n.n_draft        = d;
         n.is_prefill     = false;
         n.produces_token = true;
@@ -2614,6 +2745,7 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
+    plan_next_.tree_verify  = plan_next_.spec_is_tree && plan_next_.n_spec > 0;
     plan_next_.phase        = RAD_PHASE_DECODE;
     plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
     plan_next_.n_tok_decode = plan_next_.n_tok;
@@ -2655,9 +2787,13 @@ void Scheduler::promote_next() {
         if (s.req) {
             s.req->n_draft = plan_.e[i].n_spec;
             s.req->draft = s.draft;
-            s.req->draft_parent = tree_ && plan_.e[i].n_spec ? s.draft_par : nullptr;
+            s.req->draft_parent = plan_.spec_is_tree && plan_.e[i].n_spec ? s.draft_par : nullptr;
         }
+        if (s.req) s.req->draft_chain = plan_.chain_fast && s.chain_next ? s.draft_lead : -1;
+        s.chain_next = false;
+        s.draft_lead = -1;
     }
+    if (plan_.chain_fast) ++m_.tree_chain_steps;
     ++m_.steps_decode;
     /* A step issued ahead during a hold is one of its decode-only steps. */
     if (interleave_left_ > 0) {
@@ -2874,6 +3010,17 @@ int Scheduler::commit(StepResult& res) {
                                   (unsigned long long)r.id, now, was, draft_.yield(s.adapt, was),
                                   draft_.yield(s.adapt, now), est);
                     }
+                }
+                /* A serial head's tree: how many of its nodes were real (not pruned) and how deep
+                 * the accepted path went, for a sweep of --draft-tree-prune. */
+                if (serial_tree_ && !e.ngram) {
+                    const int act = tree_active(e.draft, e.draft_parent, e.n_spec);
+                    const int mx = (int)(sizeof m_.tree_active_hist / sizeof m_.tree_active_hist[0]) - 1;
+                    ++m_.tree_verifies;
+                    m_.tree_nodes_budget += e.n_spec;
+                    m_.tree_nodes_active += act;
+                    ++m_.tree_active_hist[act < mx ? act : mx];
+                    ++m_.tree_accdepth_hist[a < mx ? a : mx];
                 }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;

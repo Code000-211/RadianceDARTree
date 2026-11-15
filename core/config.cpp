@@ -216,11 +216,26 @@ static const Flag g_flags[] = {
     { "--draft-tree-width",   "N",      "a serial head's tree: frontier rows its head grows a round\n"
                                         "(default 1: the chain and its leaves); more asks the plugin\n"
                                         "for a deeper tree" },
+    { "--draft-tree-prune",   "P",      "a serial head's tree: grow a node only where its cumulative\n"
+                                        "probability is at least P (0..1, default 0 = off); the best\n"
+                                        "candidate of every node (the trunk) is always kept" },
+    { "--draft-tree-prune-rel", "R",    "a serial head's tree: grow a node only where its probability\n"
+                                        "is at least R times its parent's best candidate's (0..1,\n"
+                                        "default 0 = off); with both set a candidate needs both" },
+    { "--draft-tree-rows",    "M",      "a serial head's tree: verify only the first (largest active\n"
+                                        "count of the last two trees) + M nodes of a tree (default off:\n"
+                                        "every verify issues the whole node budget); pairs with\n"
+                                        "--draft-tree-prune" },
+    { "--draft-tree-chain",   "H",      "a serial head's tree: issue a step as a plain chain verify\n"
+                                        "(no tree operands, the fused delta-net op) when the last H\n"
+                                        "trees of every sequence were pure chains (default 0 = off)" },
     { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
     "                                    samples each proposal from its own shortlist and the sampler\n"
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
     "                                    requests, the same output law, other tokens than off for a fixed\n"
-    "                                    seed" },
+    "                                    seed. With a draft tree the siblings are drawn without\n"
+    "                                    replacement from the head's law and verified by recursive\n"
+    "                                    rejection sampling" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -872,6 +887,24 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--draft-tree-leaves"))     { if (!num(0, 7, &c->draft_tree_leaves)) return RAD_E_INVAL; }
         else if (S("--draft-tree-nodes"))      { if (!num(0, 64, &c->draft_tree_nodes)) return RAD_E_INVAL; }
         else if (S("--draft-tree-width"))      { if (!num(1, 64, &c->draft_tree_width)) return RAD_E_INVAL; }
+        else if (S("--draft-tree-prune") || S("--draft-tree-prune-rel")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("%s must be a probability in [0, 1], not '%s'", a.c_str(), v);
+                return RAD_E_INVAL;
+            }
+            (S("--draft-tree-prune") ? c->draft_tree_prune : c->draft_tree_prune_rel) = d;
+        }
+        else if (S("--draft-tree-rows")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!std::strcmp(v, "off")) c->draft_tree_rows = -1;
+            else if (!parse_int(a.c_str(), v, 0, 64, &n)) return RAD_E_INVAL;
+            else c->draft_tree_rows = (int)n;
+        }
+        else if (S("--draft-tree-chain"))      { if (!num(0, 2, &c->draft_tree_chain)) return RAD_E_INVAL; }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -1463,6 +1496,14 @@ const ShowRow kShow[] = {
     { "--draft-tree-nodes",   [](const Config& c) {
           return c.draft_tree_nodes > 0 ? num(c.draft_tree_nodes) : std::string("auto"); } },
     { "--draft-tree-width",   [](const Config& c) { return num(c.draft_tree_width); } },
+    { "--draft-tree-prune",   [](const Config& c) {
+          return c.draft_tree_prune > 0 ? fnum(c.draft_tree_prune) : std::string("off"); } },
+    { "--draft-tree-prune-rel", [](const Config& c) {
+          return c.draft_tree_prune_rel > 0 ? fnum(c.draft_tree_prune_rel) : std::string("off"); } },
+    { "--draft-tree-rows",    [](const Config& c) {
+          return c.draft_tree_rows >= 0 ? num(c.draft_tree_rows) : std::string("off"); } },
+    { "--draft-tree-chain",   [](const Config& c) {
+          return c.draft_tree_chain > 0 ? num(c.draft_tree_chain) : std::string("off"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },

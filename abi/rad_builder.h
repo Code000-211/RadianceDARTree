@@ -293,6 +293,13 @@ typedef struct RadBuildCtx {
     int      draft_rounds;
     int      draft_tree_leaves;
     int      draft_tree_width;
+    /* ---- appended (confidence-pruned serial trees). --draft-tree-prune / --draft-tree-prune-rel:
+     * a candidate becomes a tree node only if its cumulative probability >= prune_abs and its
+     * probability >= prune_rel * the probability of its parent's best candidate (0 = off, the
+     * trunk is never pruned). The plugin hands them to its head's tree grower; the core applies
+     * the same rule to stage 1's leaves. See abi/rad_mtp_tree.h. */
+    float    draft_tree_prune_abs;
+    float    draft_tree_prune_rel;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
@@ -809,6 +816,11 @@ typedef struct RadDrafterDecl {
     int32_t     tree_nodes;
     int32_t     tree_leaves;
     int32_t     tree_width;
+    /* SERIAL tree, stage 1 with confidence pruning (RadBuildCtx::draft_tree_prune_*) only: an f32
+     * plane at the proposal's pitch holding the logits of the proposal's candidate columns (the
+     * head's reranked top-8), still intact when the core captures the first round's leaves. 0:
+     * the leaves are not pruned. */
+    rad_buf     proposal_score;
 } RadDrafterDecl;
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);

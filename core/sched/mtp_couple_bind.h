@@ -70,3 +70,67 @@ inline int mtp_couple_bind_rounds(const MtpCoupleBindPoint& p, const RadMtpCoupl
 }
 
 }  // namespace rad
+
+namespace rad {
+
+/* The tree counterpart of mtp_couple_bind_rounds (--draft-coupling with a draft tree, abi/rad_mtp_rrs.h).
+ *
+ * The readback plane holds one state per verify ROW that drafted children: stage 1 the head's rounds
+ * (round r's state at row r - 1, the chain node's), stage 2 the grower's node states (row f). `rows`
+ * of them are read; out[k] is row k's state bound to its verify position n_out + depth(k), or an
+ * all-zero state (status 0, which the sampler leaves to the ordinary pick) for a row with no
+ * children, for a malformed shortlist and for every row of a greedy request. A state that is not the
+ * draw's, not the round of its node's depth, or whose first child is not the tree's first child of
+ * that node is a defect: RAD_E_STATE with `why`, as in the chain's bind. Fills out[0, rows) and sets
+ * *n_bound = rows (0 when the request is not live or is greedy). The card's tree is S: node j's
+ * parent S.par[j - 1], token S.tok[j]. */
+inline int mtp_couple_bind_tree(const MtpCoupleBindPoint& p, const RadMtpCoupleDraw& d,
+                                const RadMtpCoupleState* rb, int rb_stride, int rows,
+                                const StepSlot& S, int nodes, int64_t vocab,
+                                RadMtpCoupleState* out, int* n_bound, std::string* why,
+                                int* n_malformed = nullptr) {
+    *n_bound = 0;
+    if (n_malformed) *n_malformed = 0;
+    if (!p.live || d.mode != 1) return RAD_OK;
+    if (rows < 0 || rows > RAD_MTP_COUPLE_MAX_ROWS || nodes < 0 || nodes > RAD_SCHED_MAX_SPEC) {
+        *why = "MTP coupled: a draft tree of " + std::to_string(nodes) + " node(s) and " +
+               std::to_string(rows) + " coupled row(s) exceeds the planes";
+        return RAD_E_STATE;
+    }
+    int depth[1 + RAD_SCHED_MAX_SPEC];
+    depth[0] = 0;
+    for (int j = 1; j <= nodes; ++j) {
+        const int pj = S.par[j - 1];
+        depth[j] = (pj >= 0 && pj < j ? depth[pj] : j - 1) + 1;
+    }
+    for (int k = 0; k < rows; ++k) {
+        out[k] = RadMtpCoupleState{};
+        int first = -1;
+        for (int j = k + 1; j <= nodes && first < 0; ++j)
+            if (S.par[j - 1] == k) first = j;
+        if (first < 0) continue;   /* no children: nothing was drafted from this row */
+        const RadMtpCoupleState& st = rb[(size_t)k * (size_t)rb_stride];
+        if (std::memcmp(&st.draw, &d, sizeof d) || (st.status != 1 && st.status != -1)) {
+            *why = "MTP coupled: sequence " + std::to_string(d.seq) + " tree row " +
+                   std::to_string(k) + " returned status " + std::to_string(st.status) +
+                   " (draw " + (std::memcmp(&st.draw, &d, sizeof d) ? "stale" : "current") +
+                   "); refusing the step";
+            return RAD_E_STATE;
+        }
+        if (st.status == -1) { if (n_malformed) ++*n_malformed; continue; }
+        if (st.round != depth[k] + 1 || st.x != S.tok[first] ||
+            !rad_mtp_couple_state_valid(st, vocab)) {
+            *why = "MTP coupled: sequence " + std::to_string(d.seq) + " tree row " +
+                   std::to_string(k) + " (depth " + std::to_string(depth[k]) + ") returned round " +
+                   std::to_string(st.round) + " x " + std::to_string(st.x) + " for first child " +
+                   std::to_string(S.tok[first]) + "; refusing the step";
+            return RAD_E_STATE;
+        }
+        out[k] = st;
+        out[k].pos = rad_mtp_couple_verify_pos(p.n_out, depth[k] + 1);
+    }
+    *n_bound = rows;
+    return RAD_OK;
+}
+
+}  // namespace rad

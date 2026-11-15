@@ -2956,6 +2956,78 @@ TEST(the_committed_bind_point_outlives_a_reap) {
     CHECK_EQ(n_bound, 0);
 }
 
+/* The tree's bind (--draft-coupling with a draft tree): one state a verify row that drafted
+ * children, bound at the row's depth, and every inconsistency a refusal. */
+TEST(the_tree_bind_reads_one_state_per_row_with_children) {
+    const int64_t vocab = 64;
+    StepSlot S{};
+    const int32_t tok[6] = { 5, 21, 22, 23, 31, 32 };
+    const int32_t par[5] = { 0, 1, 2, 0, 0 };
+    for (int j = 0; j <= 5; ++j) S.tok[j] = tok[j];
+    for (int j = 0; j < 5; ++j) S.par[j] = par[j];
+    S.ntree = 5;
+    RadMtpCoupleDraw d{};
+    d.seed = 5; d.base = 40; d.seq = 9; d.card = 0; d.mode = 1;
+    RadMtpCoupleState rb[3]{};
+    for (int k = 0; k < 3; ++k) {
+        RadMtpCoupleState& c = rb[k];
+        c.draw = d; c.status = 1; c.round = k + 1; c.count = 4; c.x = tok[k + 1];
+        c.ids[0] = tok[k + 1]; c.ids[1] = 40; c.ids[2] = 41; c.ids[3] = 42;
+        c.q[0] = c.q[1] = c.q[2] = c.q[3] = 0.25;
+        for (int i = 4; i < 8; ++i) c.ids[i] = -1;
+    }
+    rb[0].ids[1] = 31; rb[0].ids[2] = 32; rb[0].nkids = 3;
+    MtpCoupleBindPoint p;
+    p.found = true; p.live = true; p.n_out = 44;
+    RadMtpCoupleState out[RAD_MTP_COUPLE_MAX_ROWS]{};
+    int n_bound = -1;
+    std::string why;
+    CHECK_EQ(mtp_couple_bind_tree(p, d, rb, 1, 3, S, 5, vocab, out, &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 3);
+    for (int k = 0; k < 3; ++k) {
+        CHECK_EQ(out[k].pos, (uint64_t)(44 + k));          /* the row's depth */
+        CHECK_EQ(out[k].round, k + 1);
+    }
+    CHECK_EQ(out[0].nkids, 3);
+    /* a row with no child is no state, whatever the plane holds there */
+    CHECK_EQ(mtp_couple_bind_tree(p, d, rb, 1, 6 > 3 ? 3 : 3, S, 3, vocab, out, &n_bound, &why),
+             RAD_OK);
+    /* stage 2: a node under a deeper parent binds at its depth */
+    StepSlot S2 = S;
+    S2.par[1] = 0;                                         /* node 2 is a second child of the root */
+    RadMtpCoupleState rb2[3] = { rb[0], rb[1], rb[2] };
+    rb2[1].round = 2;                                      /* row 1 (node 1) still has no child... */
+    S2.par[2] = 1;                                         /* ... until node 3 hangs under node 1 */
+    S2.par[3] = 1; S2.par[4] = 0;
+    rb2[1].x = S2.tok[3];
+    rb2[1].ids[0] = S2.tok[3];
+    CHECK_EQ(mtp_couple_bind_tree(p, d, rb2, 1, 3, S2, 5, vocab, out, &n_bound, &why), RAD_OK);
+    CHECK_EQ(out[1].pos, (uint64_t)45);
+    /* refusals: a stale draw, a round that is not the depth + 1, a first child that is not x */
+    RadMtpCoupleState bad[3] = { rb[0], rb[1], rb[2] };
+    bad[1].draw.base = 41;
+    CHECK_EQ(mtp_couple_bind_tree(p, d, bad, 1, 3, S, 5, vocab, out, &n_bound, &why), RAD_E_STATE);
+    bad[1] = rb[1]; bad[1].round = 3;
+    CHECK_EQ(mtp_couple_bind_tree(p, d, bad, 1, 3, S, 5, vocab, out, &n_bound, &why), RAD_E_STATE);
+    bad[1] = rb[1]; bad[0].x = 99; bad[0].ids[0] = 99;
+    CHECK_EQ(mtp_couple_bind_tree(p, d, bad, 1, 3, S, 5, vocab, out, &n_bound, &why), RAD_E_STATE);
+    /* a malformed shortlist keeps the ordinary verify; a greedy draw and a dead request bind nothing */
+    RadMtpCoupleState mal[3] = { rb[0], rb[1], rb[2] };
+    mal[2].status = -1;
+    int n_mal = 0;
+    CHECK_EQ(mtp_couple_bind_tree(p, d, mal, 1, 3, S, 5, vocab, out, &n_bound, &why, &n_mal), RAD_OK);
+    CHECK_EQ(n_mal, 1);
+    CHECK_EQ(out[2].status, 0);
+    RadMtpCoupleDraw g = d;
+    g.mode = 0;
+    CHECK_EQ(mtp_couple_bind_tree(p, g, rb, 1, 3, S, 5, vocab, out, &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
+    MtpCoupleBindPoint dead = p;
+    dead.live = false;
+    CHECK_EQ(mtp_couple_bind_tree(dead, d, rb, 1, 3, S, 5, vocab, out, &n_bound, &why), RAD_OK);
+    CHECK_EQ(n_bound, 0);
+}
+
 /* A decode benchmark needs the request to last as long as asked, not as long as the model
  * chooses. EOS still stops an ordinary request, and max_tokens still stops one ignoring EOS. */
 TEST(ignore_eos_runs_to_max_tokens_and_nothing_else_changes) {
@@ -7951,6 +8023,359 @@ TEST(a_serial_trees_acceptance_is_counted_by_depth) {
     CHECK_EQ(m.draft_depth_seen, 3);
 }
 
+/* Confidence pruning: the slots a pruned tree leaves inert are duplicates of node 1 under the root
+ * (advance_impl.h), which the host counts as not active; node 1 itself always is. A chain, and a
+ * tree with no duplicates, are all active. */
+TEST(a_pruned_trees_active_nodes_are_counted_without_its_inert_duplicates) {
+    const int32_t tok[6] = { 21, 22, 23, 31, 21, 21 };
+    const int32_t par[6] = { 0, 1, 2, 0, 0, 0 };
+    CHECK_EQ(Scheduler::tree_active(tok, par, 6), 4);
+    CHECK_EQ(Scheduler::tree_active(tok, par, 5), 4);
+    CHECK_EQ(Scheduler::tree_active(tok, par, 4), 4);
+    CHECK_EQ(Scheduler::tree_active(tok, par, 1), 1);
+    CHECK_EQ(Scheduler::tree_active(tok, par, 0), 0);
+    CHECK_EQ(Scheduler::tree_active(tok, nullptr, 6), 6);          /* a chain */
+    /* a duplicate of node 1's token that hangs off a deeper node is a real (if redundant) node */
+    const int32_t par2[6] = { 0, 1, 2, 0, 1, 0 };
+    CHECK_EQ(Scheduler::tree_active(tok, par2, 6), 5);
+    CHECK_EQ(Scheduler::tree_active(kTreeDraft, kTreePar, 6), 6);  /* unpruned: every node */
+}
+
+/* The metrics a sweep reads: per tree verify the active node count and the accepted depth. */
+TEST(a_serial_trees_verifies_are_counted_by_active_nodes_and_accepted_depth) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    /* two inert duplicates of node 1 (21) after the chain 21 22 23 and one leaf 31 */
+    const int32_t draft[6] = { 21, 22, 23, 31, 21, 21 };
+    CHECK_OK(f.sch.set_draft(a, draft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    int32_t path[RAD_SCHED_MAX_SPEC] = { 1, 2 };
+    int32_t acc_n = 2, tok = 77;
+    uint8_t eos = 0;
+    Scheduler::StepResult res;
+    res.n_seq = 1;
+    res.n_accepted = &acc_n;
+    res.token = &tok;
+    res.eos = &eos;
+    res.path = path;
+    CHECK_OK(f.sch.commit(res));
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.tree_verifies, (int64_t)1);
+    CHECK_EQ(m.tree_nodes_budget, (int64_t)6);
+    CHECK_EQ(m.tree_nodes_active, (int64_t)4);
+    CHECK_EQ(m.tree_active_hist[4], (int64_t)1);
+    CHECK_EQ(m.tree_active_hist[6], (int64_t)0);
+    CHECK_EQ(m.tree_accdepth_hist[2], (int64_t)1);
+    /* the depth statistics are unchanged by the inert slots: depth 3 of the chain */
+    CHECK_EQ(m.draft_tokens, (int64_t)6);
+    CHECK_EQ(m.draft_pos_reached[0], (int64_t)1);
+}
+
+/* ================================================================== dynamic rows (DESIGN-dynrows.md) */
+
+namespace {
+/* A pruned tree of N = 6 whose active nodes are the chain 21 22 23: the rest are inert duplicates
+ * of node 1 under the root. And one with two real leaves behind the chain. */
+const int32_t kChainDraft[6] = { 21, 22, 23, 21, 21, 21 };
+const int32_t kLeafDraft[6]  = { 21, 22, 23, 31, 32, 21 };
+
+void commit_one(Fixture& f, int32_t acc, int32_t tok, const int32_t* path = nullptr, int n_path = 0) {
+    int32_t pp[RAD_SCHED_MAX_SPEC] = {};
+    for (int t = 0; t < n_path; ++t) pp[t] = path[t];
+    int32_t acc_n = acc, tk = tok;
+    uint8_t eos = 0;
+    Scheduler::StepResult res;
+    res.n_seq = (int)f.sch.plan().e.size();
+    res.n_accepted = &acc_n;
+    res.token = &tk;
+    res.eos = &eos;
+    res.path = n_path ? pp : nullptr;
+    CHECK_OK(f.sch.commit(res));
+}
+}  // namespace
+
+TEST(the_tree_helpers_find_the_last_real_node_and_the_leading_chain) {
+    CHECK_EQ(Scheduler::tree_last_active(kChainDraft, kTreePar, 6), 3);
+    CHECK_EQ(Scheduler::tree_last_active(kLeafDraft, kTreePar, 6), 5);
+    CHECK_EQ(Scheduler::tree_last_active(kTreeDraft, kTreePar, 6), 6);
+    CHECK_EQ(Scheduler::tree_last_active(kTreeDraft, kTreePar, 1), 1);
+    CHECK_EQ(Scheduler::tree_last_active(kTreeDraft, kTreePar, 0), 0);
+    CHECK_EQ(Scheduler::tree_last_active(kTreeDraft, nullptr, 6), 6);
+    CHECK_EQ(Scheduler::tree_lead(kChainDraft, kTreePar, 6), 3);
+    CHECK_EQ(Scheduler::tree_lead(kLeafDraft, kTreePar, 6), 3);
+    CHECK_EQ(Scheduler::tree_lead(kTreeDraft, nullptr, 6), 6);
+    const int32_t sib[4] = { 1, 2, 3, 4 }, sp[4] = { 0, 0, 1, 2 };   /* node 2 is node 1's sibling */
+    CHECK_EQ(Scheduler::tree_lead(sib, sp, 4), 1);
+}
+
+/* Off by default: a pruned tree that is only a chain is still issued as a tree, its inert tail
+ * included, exactly as before. */
+TEST(a_chain_shaped_tree_is_a_tree_step_unless_the_chain_form_is_asked_for) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 6);
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK(b->spec_parent != nullptr);
+    CHECK(b->spec_path != nullptr);
+    CHECK_EQ(f.sch.metrics().tree_chain_steps, (int64_t)0);
+}
+
+/* A host-built step knows the tree: with --draft-tree-rows the inert tail is not verified (it is a
+ * suffix of duplicates nothing accepts), and what remains is a chain, so with --draft-tree-chain
+ * the step is issued as one -- no spec_parent, no spec_path, the plan's entries without parents --
+ * and the host's acceptance is the chain's. */
+TEST(a_host_built_step_of_a_chain_shaped_tree_is_issued_as_a_chain) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_tree_rows = 0;
+    f.cfg.draft_tree_chain = 1;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 3);
+    CHECK_EQ(b->n_tok, 4);
+    CHECK(!f.sch.plan().spec_is_tree);
+    CHECK(f.sch.plan().chain_fast);
+    CHECK(b->spec_parent == nullptr);
+    CHECK(b->spec_path == nullptr);
+    CHECK_EQ(b->spec_path_pitch, 0);
+    CHECK(f.sch.plan().e[0].draft_parent == nullptr);
+    CHECK_EQ(f.sch.advance_args(0).parent_off, (int64_t)-1);
+    CHECK_EQ(f.sch.advance_args(0).path_off, (int64_t)-1);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(b->positions[j], 160 + j);
+    commit_one(f, 3, 77);                     /* the chain accepted whole */
+    CHECK_EQ(f.sch.metrics().tree_chain_steps, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().tree_verifies, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().tree_nodes_budget, (int64_t)3);
+    CHECK_EQ(f.sch.metrics().tree_nodes_active, (int64_t)3);
+    CHECK_EQ(f.sch.metrics().tree_rows_cut, (int64_t)3);
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq->output.size() >= 4);
+    CHECK_EQ(rq->output[rq->output.size() - 4], 21);
+    CHECK_EQ(rq->output[rq->output.size() - 1], 77);
+
+    /* a real leaf makes it a tree again, trimmed to the last real node (5 of 6) */
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 5);
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK(b->spec_parent != nullptr);
+    CHECK(b->spec_path != nullptr);
+    CHECK(f.sch.plan().e[0].draft_parent != nullptr);
+    CHECK(f.sch.advance_args(0).parent_off >= 0);
+}
+
+/* The step after a tree verify still owes that verify's accepted path (the delta net's replay, the
+ * windows, the QSA tail): a chain-form step keeps spec_path then, and drops it once nothing owes. */
+TEST(a_chain_form_step_after_a_tree_verify_keeps_the_path_plane_it_owes) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_tree_rows = 0;
+    f.cfg.draft_tree_chain = 1;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.plan().spec_is_tree);
+    const int32_t path5[1] = { 5 };
+    commit_one(f, 1, 905, path5, 1);          /* a leaf: the path is not the identity */
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(f.sch.plan().chain_fast);
+    CHECK(b->spec_parent == nullptr);
+    REQUIRE(b->spec_path != nullptr);
+    const int32_t want[4] = { 0, 5, 2, 3 };
+    for (int t = 0; t < 4; ++t) CHECK_EQ(b->spec_path[t], want[t]);
+    commit_one(f, 3, 78);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(f.sch.plan().chain_fast);
+    CHECK(b->spec_path == nullptr);           /* the previous verify was a chain: nothing owed */
+}
+
+/* The step issued ahead is shaped by what the last grown trees were: a prediction. Its count is
+ * the active nodes of the last two trees + the margin (a suffix cut); when every one of the last H
+ * was a pure chain, the chain's form with the chain's length. The cut is lossless: the proposal that
+ * arrives is cut to the plan (set_draft), and what it dropped is counted. */
+TEST(a_step_issued_ahead_is_a_chain_when_the_last_grown_trees_were_chains) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_tree_rows = 1;
+    f.cfg.draft_tree_chain = 2;
+    CHECK_OK(f.start());
+    auto r = f.request(160, 64);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));     /* a full tree: tree form */
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(f.sch.plan().spec_is_tree);
+
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    auto grow = [&](const int32_t* tok) {
+        StepSlot& S = slots[(size_t)f.sch.plan().e[0].card];
+        S.ntree = 6;
+        for (int j = 0; j < 6; ++j) { S.tok[1 + j] = tok[j]; S.par[j] = kTreePar[j]; }
+    };
+    auto accept_none = [&]() {
+        std::vector<int32_t> y(16, -1);
+        const StepEntry& e0 = f.sch.plan().e[0];
+        for (int j = 0; j <= 6; ++j) y[(size_t)(e0.dev_out + j)] = 900 + j;
+        AdvanceArgs acc = f.sch.advance_args(0);
+        acc.mode = ADV_ACCEPT;
+        acc.st = slots.data();
+        acc.src = y.data();
+        for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+    };
+
+    /* No grown tree seen yet: the full budget, tree form. */
+    accept_none();
+    grow(kTreeDraft);
+    f.sch.expect_draft(a, 6);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 6);
+    CHECK(nb->spec_parent != nullptr);
+    commit_one(f, 0, 900);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    f.sch.note_grown(a, kLeafDraft, kTreePar, 6);              /* 5 active, chain 3, not pure */
+    f.sch.promote_next();
+    CHECK(f.sch.plan().spec_is_tree);
+
+    /* One grown tree with leaves: rows = active + 1 = 6 of 6. */
+    accept_none();
+    grow(kLeafDraft);
+    f.sch.note_grown(a, kLeafDraft, kTreePar, 6);
+    f.sch.expect_draft(a, 6);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 6);
+    CHECK(nb->spec_parent != nullptr);
+    AdvanceArgs tr = f.sch.advance_args(0);
+    tr.mode = ADV_TRUNK; tr.st = slots.data();
+    for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+    commit_one(f, 0, 901);
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    f.sch.promote_next();
+
+    /* Two pure chains in a row: the chain's form, the chain's three nodes. The step now in flight
+     * was a tree verify, so the successor still carries the path plane. */
+    f.sch.note_grown(a, kChainDraft, kTreePar, 6);
+    f.sch.note_grown(a, kChainDraft, kTreePar, 6);
+    accept_none();
+    grow(kChainDraft);
+    f.sch.expect_draft(a, 6);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 3);
+    CHECK(nb->spec_parent == nullptr);
+    CHECK(nb->spec_path != nullptr);
+    tr = f.sch.advance_args(0);
+    tr.mode = ADV_TRUNK; tr.st = slots.data();
+    CHECK_EQ(tr.parent_off, (int64_t)-1);
+    for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(nb->token_ids[j], j == 0 ? 900 : kChainDraft[j - 1]);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(nb->positions[j], nb->positions[0] + j);
+    commit_one(f, 0, 902);
+    /* the proposal that arrives is the whole grown tree; the step verified its chain */
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    CHECK_EQ(f.sch.metrics().tree_rows_cut, (int64_t)3);
+    CHECK_EQ(f.sch.metrics().tree_active_cut, (int64_t)2);     /* the two leaves a chain step drops */
+    f.sch.promote_next();
+    CHECK(!f.sch.plan().spec_is_tree);
+    CHECK(f.sch.plan().chain_fast);
+    CHECK(f.sch.plan().e[0].draft_parent == nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 3);
+    CHECK_EQ(f.sch.metrics().tree_chain_steps, (int64_t)1);
+
+    /* The next one, behind a chain step: still a chain, and now nothing is owed, so no spec_path
+     * either -- the plugin's operand lists are a chain deployment's. */
+    accept_none();
+    grow(kChainDraft);
+    f.sch.note_grown(a, kChainDraft, kTreePar, 6);
+    f.sch.expect_draft(a, 6);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 3);
+    CHECK(nb->spec_parent == nullptr);
+    CHECK(nb->spec_path == nullptr);
+    CHECK_EQ(f.sch.advance_args(0).path_off, (int64_t)-1);
+    commit_one(f, 0, 903);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    f.sch.promote_next();
+
+    /* A tree grown again breaks the run: the next prediction is the tree form, rows = active + 1,
+     * with a path plane again. */
+    f.sch.note_grown(a, kLeafDraft, kTreePar, 6);
+    accept_none();
+    grow(kLeafDraft);
+    f.sch.expect_draft(a, 6);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 6);
+    CHECK(nb->spec_parent != nullptr);
+    CHECK(nb->spec_path != nullptr);
+}
+
+/* With the chain's form off, --draft-tree-rows alone: a prediction shorter than the budget cuts a
+ * suffix of the tree. */
+TEST(the_predicted_row_count_is_the_recent_active_maximum_plus_the_margin) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_tree_rows = 1;
+    CHECK_OK(f.start());
+    auto r = f.request(160, 64);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.note_grown(a, kChainDraft, kTreePar, 6);              /* 3 active */
+    f.sch.expect_draft(a, 6);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 4);                                    /* 3 + 1 */
+    CHECK(nb->spec_parent != nullptr);                          /* the chain form is off */
+    /* the tree that arrives is cut to the plan, and the real nodes it lost are counted */
+    commit_one(f, 0, 900);
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    CHECK_EQ(f.sch.metrics().tree_rows_cut, (int64_t)2);
+    CHECK_EQ(f.sch.metrics().tree_active_cut, (int64_t)1);      /* leaf 32 of the five real ones */
+    f.sch.promote_next();
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+    CHECK_EQ(f.sch.plan().e[0].draft_parent[3], 0);
+    /* a bigger recent maximum wins over the newest, and the budget caps it */
+    f.sch.note_grown(a, kTreeDraft, kTreePar, 6);
+    f.sch.note_grown(a, kChainDraft, kTreePar, 6);
+    f.sch.expect_draft(a, 6);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 6);
+}
+
 RAD_TEST_MAIN()
 
 /* ================================================================== the plan without a span */
@@ -8262,4 +8687,50 @@ TEST(sim_burst_of_long_prompts) {
                 (double)pf_tok / std::max(t_pf, 1e-9),
                 (double)N * (double)L / tt.back(), pct(0.5), pct(0.95), tt.back(),
                 dec_s > 0 ? (double)dec_tok / dec_s : 0.0, t);
+}
+
+/* A step issued ahead in the chain's form verifies the first n tokens of whatever tree arrives as a
+ * chain. Only the tree's leading run really is one, and the coupled sampler binds a row only inside
+ * it (Request::draft_chain): a sibling that carries the id of a node's first child must not take that
+ * node's state (tests/mtp_rrs_test.cpp, the chain form over a tree that is not a chain). */
+TEST(a_chain_form_step_issued_ahead_tells_the_sampler_how_much_of_the_arriving_tree_is_a_chain) {
+    for (int arriving = 0; arriving < 3; ++arriving) {
+        Fixture f;
+        serial_tree_setup(f);
+        f.cfg.draft_tree_rows = 0;
+        f.cfg.draft_tree_chain = 1;
+        CHECK_OK(f.start());
+        auto r = f.request(160, 64);
+        r->speculation_fixed = true;
+        const uint64_t a = f.add(std::move(r));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK(f.sch.plan().spec_is_tree);
+        CHECK_EQ(f.sch.find(a)->draft_chain, -1);
+
+        f.sch.note_grown(a, kChainDraft, kTreePar, 6);           /* the last grown tree: a pure chain */
+        f.sch.expect_draft(a, 6);
+        const RadBatch* nb = f.sch.step_next();
+        REQUIRE(nb != nullptr);
+        CHECK_EQ(nb->n_spec, 3);
+        CHECK(nb->spec_parent == nullptr);
+        commit_one(f, 0, 900);
+        /* arriving: 0 the predicted chain, 1 its first two nodes then a sibling of node 1, 2 a root
+         * sibling right after node 1 */
+        static const int32_t par_chain[6] = { 0, 1, 2, 0, 0, 0 };
+        static const int32_t par_two[6]   = { 0, 1, 0, 0, 0, 0 };
+        static const int32_t par_one[6]   = { 0, 0, 1, 0, 0, 0 };
+        const int32_t* par = arriving == 0 ? par_chain : arriving == 1 ? par_two : par_one;
+        CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, par));
+        f.sch.promote_next();
+        CHECK(f.sch.plan().chain_fast);
+        CHECK(f.sch.plan().e[0].draft_parent == nullptr);
+        const Request* rq = f.sch.find(a);
+        REQUIRE(rq != nullptr);
+        CHECK(rq->draft_parent == nullptr);
+        CHECK_EQ(rq->n_draft, 3);
+        CHECK_EQ(rq->draft_chain, arriving == 0 ? 3 : arriving == 1 ? 2 : 1);
+    }
 }

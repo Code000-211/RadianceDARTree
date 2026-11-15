@@ -6,6 +6,7 @@
  */
 #pragma once
 #include "advance.h"
+#include "rad_mtp_tree.h"   /* the stage-1 leaves' pruning rule: the grower's, one function */
 
 #if defined(__HIPCC__)
 #define RAD_ADV_FN __host__ __device__ inline
@@ -136,13 +137,27 @@ RAD_ADV_FN int32_t adv_path_node(const StepSlot& S, int32_t t) {
  * overwrites them. Column 0 is the greedy pick (chain node 1), so a leaf equal to it is no
  * sibling; an id out of range would index the embedding out of bounds; a repeat adds nothing.
  * Filtered here so every rank, which holds the same row, keeps the same list. */
-RAD_ADV_FN void adv_capture(const AdvanceArgs& a, StepSlot& S, const int32_t* row) {
+RAD_ADV_FN void adv_capture(const AdvanceArgs& a, StepSlot& S, const int32_t* row,
+                            const float* val) {
     S.nalt = 0;
     if (a.leaves <= 0) return;
     const int32_t pick = row[0];
+    /* Confidence pruning (abi/rad_mtp_tree.h's rule, the grower's arithmetic): a leaf the row's
+     * distribution does not back is no leaf. The row's best candidate is never pruned. */
+    const bool prune = a.prune != 0 && val != nullptr && a.src_pitch >= RAD_MTP_TREE_K;
+    float lp[RAD_MTP_TREE_K], mx = 0.0f, lse = 0.0f;
+    int best = -1;
+    RadMtpTreeCfg pc{};
+    if (prune) {
+        pc.prune = 1; pc.log_abs = a.prune_log_abs; pc.log_rel = a.prune_log_rel;
+        best = rad_mtp_tree_row_logp(row, val, lp, &mx, &lse);
+    }
     for (int64_t c = 1; c < a.src_pitch && S.nalt < a.leaves && S.nalt < kAdvMaxLeaves; ++c) {
         const int32_t id = row[c];
         if (id < 0 || (a.vocab > 0 && id >= a.vocab) || id == pick) continue;
+        if (prune && (best < 0 || c >= RAD_MTP_TREE_K || !(lp[c] == lp[c]) ||
+                      !rad_mtp_tree_keep(&pc, (int)c, best, 0.0f, lp[c], val[c], mx)))
+            continue;
         bool dup = false;
         for (int32_t q = 0; q < S.nalt; ++q) dup = dup || S.alt[q] == id;
         if (!dup) S.alt[S.nalt++] = id;
@@ -341,7 +356,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         S.tok[a.round - 1] = t;
         /* A serial tree's leaves: round 1's candidates are in the proposal row right now, and this
          * round's pass overwrites them. */
-        if (a.round == 2 && a.tree_nodes > 0) adv_capture(a, S, a.src + (int64_t)i * a.src_pitch);
+        if (a.round == 2 && a.tree_nodes > 0)
+            adv_capture(a, S, a.src + (int64_t)i * a.src_pitch,
+                        a.src_val ? a.src_val + (int64_t)i * a.src_pitch : nullptr);
         tok[k] = t;
         adv_pos(a, pos, k, a.shared_kv ? base + a.rot_shift : base);
         ctx[i] = base;
@@ -403,7 +420,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         if (a.tree_nodes > 0) {
             /* A serial head with one round: its candidates are still in the row (ADV_ROUND would
              * have taken them at round 2). */
-            if (a.round == 1) adv_capture(a, S, a.src + (int64_t)i * a.src_pitch);
+            if (a.round == 1)
+                adv_capture(a, S, a.src + (int64_t)i * a.src_pitch,
+                            a.src_val ? a.src_val + (int64_t)i * a.src_pitch : nullptr);
             /* The chain, node j + 1 under node j, then up to `leaves` siblings of node 1 under the
              * bonus token. The count is fixed by the budget alone (a short list is padded with
              * node 1's token, a sibling the walk never takes: the lowest-index child wins), since
@@ -440,6 +459,17 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
             S.tok[1 + j] = a.src[(int64_t)i * a.src_pitch + j];
         if (a.par) {
             for (int32_t j = 0; j < a.round; ++j) S.par[j] = a.par[(int64_t)i * a.src_pitch + j];
+            /* A pruned grower's inert entries (token < 0, or past the vocabulary): a duplicate of
+             * node 1 under the root. That is a row the verify computes exactly as node 1's (same
+             * token, same parent, so the same experts), and the acceptance walk, which takes the
+             * lowest-index child that matches, always meets node 1 first: it is never accepted. */
+            if (a.tree_nodes > 0)
+                for (int32_t j = 0; j < a.round; ++j) {
+                    const int32_t t = S.tok[1 + j];
+                    if (t >= 0 && (a.vocab <= 0 || t < a.vocab)) continue;
+                    S.tok[1 + j] = j > 0 ? S.tok[1] : 0;
+                    S.par[j] = 0;
+                }
             S.ntree = a.round;
             /* A serial tree the plugin grew: the host reserved K/V and history rows for depth
              * <= R, so anything else becomes the chain prefix (nodes 1..R, then siblings of node

@@ -992,6 +992,8 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
         bc.draft_rounds      = draft_rounds_;
         bc.draft_tree_leaves = tree_leaves_;
         bc.draft_tree_width  = tree_width_;
+        bc.draft_tree_prune_abs = (float)cfg_.draft_tree_prune;
+        bc.draft_tree_prune_rel = (float)cfg_.draft_tree_prune_rel;
     }
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
@@ -1320,6 +1322,7 @@ int Engine::declare() {
             draft_rounds_  = rounds;
             tree_leaves_   = std::min(cfg_.draft_tree_leaves, nodes - rounds);
             tree_width_    = std::max(1, std::min(cfg_.draft_tree_width, nodes));
+            tree_prune_    = cfg_.draft_tree_prune > 0.0 || cfg_.draft_tree_prune_rel > 0.0;
             cfg_.n_spec    = nodes;
             RAD_INFO("draft trees: a serial head -- %d round(s) of greedy chain, %d runner-up "
                      "leaf(s), width %d, up to %d node(s) a verify", rounds, tree_leaves_,
@@ -1579,6 +1582,7 @@ int Engine::declare() {
         draft_rounds_ = drafter_.depth;
         tree_leaves_  = std::min<int>(drafter_.tree_leaves, drafter_.tree_nodes - drafter_.depth);
         tree_width_   = std::max<int>(1, drafter_.tree_width);
+        tree_prune_   = cfg_.draft_tree_prune > 0.0 || cfg_.draft_tree_prune_rel > 0.0;
         /* Every node is a row a verify carries, so the budget the plugin declared must be the
          * max_spec this engine staged its planes for. */
         if (drafter_.tree_nodes != cfg_.n_spec) {
@@ -1586,14 +1590,28 @@ int Engine::declare() {
                     "(max_spec)", drafter_.name, drafter_.tree_nodes, cfg_.n_spec);
             return RAD_E_STATE;
         }
-        if (cfg_.draft_coupling) {
-            RAD_ERR("--draft-coupling on with a serial head's tree: coupling is defined on a "
-                    "linear chain of draws (one per round); serve it with --draft-tree off");
-            return RAD_E_UNSUPPORTED;
-        }
+        /* --draft-coupling with a serial head's tree: the head draws each node's children without
+         * replacement and the sampler verifies them by recursive rejection sampling
+         * (abi/rad_mtp_rrs.h). The plugin refuses the shapes it cannot couple. */
     } else if (cfg_.draft_tree > 0 && cfg_.n_spec > 0 && !tree_ && draft_tree_) {
         RAD_WARN("--draft-tree on: '%s' declared no tree, so it proposes a chain",
                  drafter_.name ? drafter_.name : "(none)");
+    }
+    /* Confidence pruning applies to a serial head's tree only; say so rather than ignore it. */
+    if (cfg_.draft_tree_prune > 0.0 || cfg_.draft_tree_prune_rel > 0.0) {
+        if (serial_tree_)
+            RAD_INFO("draft trees: confidence pruning -- a candidate needs a cumulative probability "
+                     ">= %g and a probability >= %g of its parent's best; the best candidate of every "
+                     "node is always kept%s", cfg_.draft_tree_prune, cfg_.draft_tree_prune_rel,
+                     tree_width_ == 1 && !cfg_.draft_coupling && !drafter_.proposal_score
+                         ? " (this plugin's head hands the core no candidate logits: the depth-1 "
+                           "leaves are not pruned)"
+                     : cfg_.draft_coupling
+                         ? " (with --draft-coupling a node's cut children are decided by q-rank, "
+                           "not by the drawn token's probability)" : "");
+        else
+            RAD_WARN("--draft-tree-prune / --draft-tree-prune-rel: no serial draft tree is served "
+                     "here, so they do nothing");
     }
     /* A tree's acceptance by path against state that cannot follow a path is silent corruption:
      * recurrent and rolling-window state would absorb the rows in row order and replay a prefix of

@@ -449,104 +449,13 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   after a tree the window and tail compactions and QSA's heal. Stage 2 (`--draft-tree-width` > 1) adds
   the `mtp_tree_grow` op a round (`docs/OPS.md`, "Serial draft tree growth") and the head's tree
   rounds, whose attention reads the operands the grower leaves for each frontier row.
-- **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
-  expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
-  GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`
-  and owning-model checks (Unlimited-OCR's by its `model_type`). A vision model with another
-  pipeline needs a core change.
-  Audio goes through one of two feature extractors, Gemma 4's and Qwen3-ASR's (Whisper's), chosen
-  by `audio_config.model_type`.
-- **A speech model says how it hears**, through the optional
-  `const RadAudioFormat* rad_arch_audio_format(const RadModelMeta*)` (`RAD_ARCH_AUDIO_FORMAT`): the
-  tokens around a clip when its config names none, the turn a transcription is asked in, how a
-  language is forced and named, and where the transcript starts in the reply. That is all
-  `/v1/audio/transcriptions` knows about a model, so a new speech model is a plugin, not a server
-  change. Like `rad_arch_chat_format`, the struct grows only at its end, behind its `struct_size`.
+  *Chain-form steps* (`--draft-tree-chain`, DESIGN-dynrows.md). A tree deployment's decode step may arrive with
+  `spec_parent` null and, when no earlier tree verify's path is owed, `spec_path` null and `spec_path_pitch` 0: the
+  core found every verify of the step to be a chain (or predicted so, and cut the verify to its chain prefix). The
+  plugin must then issue exactly what a chain deployment issues. `spec_path` non-null with `spec_parent` null is the
+  step after a tree verify whose own verify is a chain: close the path (the delta net's replay, the windows, the QSA
+  tail), attend as a chain. The two planes are independent; the arch helpers `tree_verify_step` and `tree_path_step`
+  already treat them so. A tree plugin that branches on `spec_parent` alone for "this deployment drafts trees" is
+  wrong on such a step.
 
----
-
-## 12. Quantiser plugins
-
-A quantiser turns a weight, handed to it in f32, into the planes of an **encoding**
-(`abi/rad_encoding.h`): the numbers in one canonical row-major arrangement, which a kernel library
-lays out its own way at load. The contract is `abi/rad_quant.h`:
-
-```c
-int                     rad_quant_count(void);
-const RadQuantizerInfo* rad_quant_at(int i);   /* name, doc, options, encoding, row_block, quantize, decode */
-```
-
-`rad_plugin_info` reports `RAD_PLUGIN_QUANT`. `rad-convert` drives quantisers through a
-**recipe**: ordered rules from a weight's logical name to a quantiser and its options.
-
-```
-# PATTERN                    QUANTISER  OPTIONS
-blk.*.ffn_*_exps.*.weight    myquant    bits=3 group=64
-*                            rtn        codes=i8 group=128 scale=bf16 clamp=sym
-```
-
-`rad-convert --list-quantizers` prints every loaded quantiser and its options. A recipe option the
-quantiser does not declare is refused before anything is quantised. Two plugins naming the same
-quantiser are refused, both named.
-
-A quantiser that can use a card exports `int rad_quant_devices(const int* ids, int n)`
-(`RadQuantDevicesFn`). `rad-convert --gpus 0,1` calls it once, before the first weight; without
-the flag the plugin runs on the host. Which device a weight ran on is not recorded anywhere, so the
-planes must be the host's byte for byte: libquant's trellis GPTQ keeps the host's operations and
-their order on the card (`tests/quant_tcq_gpu_test.cpp` compares the two). Return
-`RAD_E_UNSUPPORTED` from a build with no device path.
-
-The core decodes the `plain` and `affine` schemes. Your own scheme is decoded by your `decode`
-hook, which the oracle, `rad-kbench` and `rad-convert`'s error report use; return
-`RAD_E_UNSUPPORTED` for a scheme you did not write. Serving a new encoding also needs a kernel
-library whose `layout` hook accepts it and an architecture that declares the weight at it. The
-in-tree architectures declare only the encodings their blocks were written for, so another format
-needs its own kernel library and architecture plugin.
-
----
-
-## 13. Building, installing and the search path
-
-```cmake
-cmake_minimum_required(VERSION 3.21)
-project(mykernels LANGUAGES CXX HIP)   # CXX alone for a host-only plugin
-find_package(radiance REQUIRED)
-rad_plugin_defaults()                  # C++20, an optimising build type unless one was asked for
-rad_add_plugin(mykernels kernels SOURCES rows.cpp HIP_SOURCES kernels.hip)
-```
-
-The kind is `kernels`, `architectures` or `quantizers`, the directory the engine loads it from.
-Only `HIP_SOURCES` are compiled as HIP: for `RAD_GPU_TARGETS` (§10) or a `GPU_TARGETS` list,
-optimised with `-DNDEBUG` outside Debug, uncompressed, against the HIP runtime the installed
-radiance found. radiance builds its own plugins with the same `rad_add_plugin`, and every plugin
-directory in the tree opens with these lines guarded by `if(NOT COMMAND rad_add_plugin)`, so each
-builds inside the tree or on its own.
-
-`find_package` also sets `RADIANCE_ABI_VERSION` (to refuse at configure time rather than at
-`dlopen`), `RADIANCE_HOME`, `RADIANCE_KERNELS_DIR`, `RADIANCE_ARCHITECTURES_DIR` and
-`RADIANCE_QUANTIZERS_DIR`. `cmake --install` puts the plugin under the home of the radiance you
-built against; `RAD_PLUGIN_INSTALL_HOME` overrides that. Before installing, the build tree's
-`radiance_home/` is a working home for the plugin alone.
-
-**`$RADIANCE_HOME` is a search path**: homes separated by `:`, the first winning. Each may hold
-`kernels/`, `architectures/` and `quantizers/`, and a plugin file in an earlier home shadows one of
-the same name later. Your plugins go ahead of an installation without copying it:
-
-```sh
-RADIANCE_HOME=$HOME/radiance-plugins:/opt/radiance/share/radiance radiance --config radiance.yaml
-```
-
-The same path can be set as `server.radiance-home` in the YAML file instead.
-
-The container image takes one the same way, mounted:
-`-v /my/plugins:/plugins -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance`.
-
-**The kernel hierarchy** is `server.kernels` in the server's YAML file, `--kernels` on a tool (or
-`$RADIANCE_KERNELS` for both), an ordered list of the kernel libraries to use:
-`kernels: mykernels,libr4d` puts yours before libr4d. An entry matches a
-plugin's name or its file (`libr4d`, `r4d`, `libr4d.so` and a path to it are one library); an entry
-matching nothing is warned about by name. Separate entries with commas or colons
-(`mykernels:libr4d` is the same list); the engine's `kernels` key, every tool's `--kernels` and
-`$RADIANCE_KERNELS` follow this one rule, and an empty `$RADIANCE_KERNELS` counts as unset. A kernel library the list does not
-name is not loaded, so name every library you want, including the host library (`libavx`) and the
-reference (`libref`). With no list every library found loads, a reference library (§1) last.
+  

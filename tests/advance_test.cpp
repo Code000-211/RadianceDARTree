@@ -1130,4 +1130,291 @@ TEST(a_tree_round_roots_a_parent_made_in_the_same_pass) {
     CHECK_EQ(S.par[4], 0);
 }
 
+/* ================================================================== confidence pruning
+ * abi/rad_mtp_tree.h's rule on stage 1's depth-1 leaves, and the inert slot a pruned tree leaves
+ * behind: a duplicate of node 1 under the root, which the acceptance walk (lowest-index child that
+ * matches) always meets node 1 first and so never takes. */
+namespace {
+
+/* ADV_TAKE of a one-round serial tree over one proposal row with the candidates' logits beside it,
+ * thresholds as probabilities (0 = off). Returns the StepSlot. */
+StepSlot prune_take(const int32_t (&ids)[8], const float (&val)[8], double pabs, double prel,
+                    int leaves = 3, int nodes = 4, bool with_val = true) {
+    Slab s(ADV_TAKE);
+    s.a.round = 1; s.a.src_pitch = 8;
+    s.a.tree_nodes = nodes; s.a.leaves = leaves; s.a.vocab = 1000;
+    RadMtpTreeCfg pc{};
+    rad_mtp_tree_set_prune(&pc, pabs, prel);
+    s.a.prune = pc.prune; s.a.prune_log_abs = pc.log_abs; s.a.prune_log_rel = pc.log_rel;
+    float v[8];
+    std::memcpy(v, val, sizeof v);
+    if (with_val) s.a.src_val = v;
+    std::memset(&s.st[0], 0, sizeof s.st[0]);
+    s.row(0, true, 0, 1, 0, 0, 0, 0, 0);
+    std::memcpy(s.src, ids, sizeof ids);
+    s.run();
+    return s.st[0];
+}
+
+}  /* namespace */
+
+/* Logits 5 4 3 0 -1 -2 -3 -4: probabilities .66 .243 .0895 .0045 ... (ratio to the best .368, .135,
+ * .007); a leaf is a column past the pick. Thresholds off: all three leaves, as before. */
+TEST(a_pruned_serial_tree_keeps_only_the_leaves_the_distribution_backs) {
+    const int32_t ids[8] = { 500, 601, 602, 603, 604, 605, 606, 607 };
+    const float   val[8] = { 5, 4, 3, 0, -1, -2, -3, -4 };
+    {
+        const StepSlot a = prune_take(ids, val, 0.0, 0.0);
+        CHECK_EQ(a.ntree, 4);
+        CHECK_EQ(a.nalt, 3);
+        CHECK_EQ(a.tok[2], 601); CHECK_EQ(a.tok[3], 602); CHECK_EQ(a.tok[4], 603);
+    }
+    {   /* no value plane: pruning cannot apply, the capture is the old one */
+        const StepSlot a = prune_take(ids, val, 0.5, 0.0, 3, 4, /*with_val=*/false);
+        CHECK_EQ(a.nalt, 3);
+    }
+    {   /* abs .1: only .243 passes; the others are pruned and the list is padded with node 1's
+         * token (the inert slot) */
+        const StepSlot a = prune_take(ids, val, 0.1, 0.0);
+        CHECK_EQ(a.ntree, 4);
+        CHECK_EQ(a.nalt, 1);
+        CHECK_EQ(a.tok[2], 601); CHECK_EQ(a.tok[3], 500); CHECK_EQ(a.tok[4], 500);
+        for (int j = 1; j < 4; ++j) CHECK_EQ(a.par[j], 0);
+    }
+    {   /* rel .3: ratios .368 stays, .135 goes */
+        const StepSlot a = prune_take(ids, val, 0.0, 0.3);
+        CHECK_EQ(a.nalt, 1);
+        CHECK_EQ(a.tok[2], 601);
+    }
+    {   /* both: abs .05 (keeps the first two) and rel .3 (keeps the first): one */
+        const StepSlot a = prune_take(ids, val, 0.05, 0.3);
+        CHECK_EQ(a.nalt, 1);
+    }
+    {   /* abs .25 drops .243 too: no leaf, the chain with three inert slots */
+        const StepSlot a = prune_take(ids, val, 0.25, 0.0);
+        CHECK_EQ(a.nalt, 0);
+        CHECK_EQ(a.ntree, 4);
+        for (int j = 2; j <= 4; ++j) CHECK_EQ(a.tok[j], 500);
+    }
+}
+
+TEST(a_pruned_serial_tree_never_prunes_the_rows_best_candidate_and_drops_invalid_ones) {
+    const int32_t ids[8] = { 500, 601, 602, 603, 604, 605, 606, 607 };
+    /* the largest logit is column 2, not the pick's column 0: it is the row's best, so a leaf the
+     * hardest thresholds keep; column 1 is pruned */
+    const float val[8] = { 1, 0, 9, 0, 0, 0, 0, 0 };
+    const StepSlot a = prune_take(ids, val, 0.999, 1.0);
+    CHECK_EQ(a.nalt, 1);
+    CHECK_EQ(a.tok[2], 602);
+    /* a candidate whose logit is not a number (or -inf) is no leaf once pruning is on, but is
+     * still taken with the thresholds off (the old capture ignores values) */
+    const float bad[8] = { 5, -INFINITY, 4, NAN, 3, 2, 1, 0 };
+    const StepSlot b = prune_take(ids, bad, 0.001, 0.0);
+    CHECK_EQ(b.tok[2], 602); CHECK_EQ(b.tok[3], 604); CHECK_EQ(b.tok[4], 605);
+    const StepSlot c = prune_take(ids, bad, 0.0, 0.0);
+    CHECK_EQ(c.tok[2], 601); CHECK_EQ(c.tok[3], 602); CHECK_EQ(c.tok[4], 603);
+}
+
+/* Round 2 of a longer head captures the same way (the proposal row of round 1 is intact then). */
+TEST(a_pruned_serial_tree_captures_in_round_two_with_the_same_rule) {
+    const int32_t ids[8] = { 500, 601, 602, 603, 604, 605, 606, 607 };
+    const float   val[8] = { 5, 4, 3, 0, -1, -2, -3, -4 };
+    Slab s(ADV_ROUND);
+    s.a.round = 2; s.a.src_pitch = 8;
+    s.a.tree_nodes = 6; s.a.leaves = 3; s.a.vocab = 1000;
+    RadMtpTreeCfg pc{};
+    rad_mtp_tree_set_prune(&pc, 0.1, 0.0);
+    s.a.prune = pc.prune; s.a.prune_log_abs = pc.log_abs; s.a.prune_log_rel = pc.log_rel;
+    float v[8];
+    std::memcpy(v, val, sizeof v);
+    s.a.src_val = v;
+    std::memset(&s.st[0], 0, sizeof s.st[0]);
+    s.row(0, true, 0, 1, 0, 0, 0, 0, 0);
+    std::memcpy(s.src, ids, sizeof ids);
+    s.run();
+    CHECK_EQ(s.st[0].nalt, 1);
+    CHECK_EQ(s.st[0].alt[0], 601);
+}
+
+/* ADV_BTAKE of a pruned grower's final tree: an inert entry (token -1, or past the vocabulary)
+ * becomes a duplicate of node 1 under the root; a plugin's valid tree is taken as it was. */
+TEST(a_btake_of_a_pruned_tree_turns_inert_entries_into_duplicates_of_node_one) {
+    Slab s(ADV_BTAKE);
+    s.a.round = 5; s.a.src_pitch = 5;
+    s.a.tree_nodes = 5; s.a.depth = 3; s.a.vocab = 1000;
+    int32_t par[5] = { 0, 0, 1, 0, 0 };
+    s.a.par = par;
+    s.row(0, true, 0, 6, 0, 0, 0, -1, 5);
+    const int32_t tok[5] = { 70, 71, 72, -1, 1000 };
+    for (int j = 0; j < 5; ++j) s.src[j] = tok[j];
+    s.run();
+    const StepSlot& S = s.st[0];
+    CHECK_EQ(S.ntree, 5);
+    const int32_t want_t[5] = { 70, 71, 72, 70, 70 }, want_p[5] = { 0, 0, 1, 0, 0 };
+    for (int j = 0; j < 5; ++j) { CHECK_EQ(S.tok[1 + j], want_t[j]); CHECK_EQ(S.par[j], want_p[j]); }
+    CHECK(adv_tree_valid(S.par, S.ntree, 3));
+    /* the tree's first node itself inert (a grower that made nothing): token 0 under the root */
+    Slab u(ADV_BTAKE);
+    u.a.round = 3; u.a.src_pitch = 3;
+    u.a.tree_nodes = 3; u.a.depth = 2; u.a.vocab = 1000;
+    int32_t par2[3] = { 0, 0, 0 };
+    u.a.par = par2;
+    u.row(0, true, 0, 4, 0, 0, 0, -1, 3);
+    for (int j = 0; j < 3; ++j) u.src[j] = -1;
+    u.run();
+    for (int j = 0; j < 3; ++j) { CHECK_EQ(u.st[0].tok[1 + j], 0); CHECK_EQ(u.st[0].par[j], 0); }
+    /* a block drafter (no tree_nodes) keeps whatever it wrote */
+    Slab b(ADV_BTAKE);
+    b.a.round = 2; b.a.src_pitch = 2;
+    int32_t par3[2] = { 0, 1 };
+    b.a.par = par3;
+    b.row(0, true, 0, 3, 0, 0, 0, -1, 2);
+    b.src[0] = -1; b.src[1] = 5;
+    b.run();
+    CHECK_EQ(b.st[0].tok[1], -1);
+}
+
+/* An inert node is never accepted: over random trees whose active nodes are a prefix 1..k and
+ * whose remaining nodes are the pruned duplicates (node 1's token, parent the root), whatever the
+ * target picks (including the duplicated token), the accepted path lies in the active prefix and
+ * is the path the tree without them gives. */
+TEST(an_inert_node_is_never_accepted_whatever_the_target_picks) {
+    uint32_t rng = 0x1ae27u;
+    int inert_token_picked = 0, deep = 0;
+    for (int c = 0; c < 6000; ++c) {
+        Slab s(ADV_ACCEPT);
+        s.a.parent_off = Slab::PAR * 4;
+        for (int t = 0; t < Slab::kTok; ++t) s.w[Slab::PAR + t] = -2;
+        const int n_spec = 2 + (int)(lcg(rng) % 7);       /* 2..8 */
+        const int k = 1 + (int)(lcg(rng) % (uint32_t)n_spec);       /* active nodes 1..k */
+        s.row(0, true, 0, 1 + n_spec, (int)(lcg(rng) % 1000), 0, 0, 0, n_spec);
+        int32_t draft[8] = {}, parent[8] = {}, target[9] = {};
+        s.w[Slab::TOK] = 50;
+        s.w[Slab::PAR] = -1;
+        for (int j = 1; j <= n_spec; ++j) {
+            if (j <= k) {
+                parent[j - 1] = j == 1 ? 0 : (int32_t)(lcg(rng) % (uint32_t)j);
+                draft[j - 1] = 1 + (int32_t)(lcg(rng) % 4);
+                if (j > 1 && parent[j - 1] == 0 && draft[j - 1] == draft[0]) draft[j - 1] = 5;
+            } else {
+                parent[j - 1] = 0;          /* inert: node 1's token under the root */
+                draft[j - 1] = draft[0];
+            }
+            s.w[Slab::TOK + j] = draft[j - 1];
+            s.w[Slab::PAR + j] = parent[j - 1];
+        }
+        for (int r = 0; r <= n_spec; ++r) {
+            /* bias toward node 1's token so the duplicates are tempting */
+            target[r] = lcg(rng) % 3 == 0 ? draft[0] : 1 + (int32_t)(lcg(rng) % 5);
+            s.src[r] = target[r];
+        }
+        inert_token_picked += target[0] == draft[0] && k < n_spec;
+        int32_t out[9] = {}, path[8] = {}, acc = -1, outk[9] = {}, pathk[8] = {}, acck = -1;
+        CHECK_OK(accept_tree(draft, parent, n_spec, target, out, path, &acc));
+        CHECK_OK(accept_tree(draft, parent, k, target, outk, pathk, &acck));
+        s.run();
+        const StepSlot& S = s.st[0];
+        CHECK_EQ(S.acc, acc);
+        CHECK_EQ(S.acc, acck);
+        for (int t = 0; t < S.acc; ++t) {
+            CHECK(S.path[t] >= 1 && S.path[t] <= k);          /* never an inert node */
+            CHECK_EQ(S.path[t], pathk[t]);
+        }
+        deep += S.acc >= 2;
+    }
+    CHECK(inert_token_picked > 200);
+    CHECK(deep > 200);
+}
+
 RAD_TEST_MAIN()
+
+/* ================================================================== dynamic rows (DESIGN-dynrows.md) */
+
+/* A step issued in the chain's form (no spec_parent, no spec_path) over a tree the head grew: the
+ * card verifies the first `d` nodes in node order as the chain they are -- stage 1 puts the chain
+ * first -- at depth == flat position, writes nothing into the parent or path planes (there are
+ * none), and its acceptance is the chain rule with npath 0, so everything after it (history pass,
+ * compaction, the next step's path) reads the identity. The leaves a prediction cut are dropped,
+ * which for a suffix is always valid. */
+TEST(a_chain_form_verify_of_a_grown_tree_takes_its_first_nodes_as_the_chain) {
+    SerialRun r;
+    const int32_t c0[8] = { 500, 500, 601, 602, 603, 604, 605, 606 };
+    std::memcpy(r.rows[1][0], c0, sizeof c0);
+    r.rows[2][0][0] = 520; r.rows[3][0][0] = 530;
+    r.go(3, 3, 6, 1000, 1);
+    StepSlot st = r.st[0];
+    st.tok[0] = 9;
+    st.ctx = 100; st.n_acc = 1; st.npath = 0;
+
+    Slab v(ADV_TRUNK);             /* parent_off and path_off stay -1: the build staged neither */
+    for (int j = 0; j < Slab::kTok; ++j) v.w[Slab::PAR + j] = -7;
+    for (int j = 0; j < Slab::kSeq * Slab::kPathPitch; ++j) v.w[Slab::PATH + j] = -7;
+    v.st[0] = st;
+    v.row(0, true, 0, 4, 100, 0, 0, 0, 3);       /* d = 3: the chain, not the three leaves */
+    v.run();
+    const int32_t want[4] = { 9, 500, 520, 530 };
+    for (int j = 0; j < 4; ++j) {
+        CHECK_EQ(v.w[Slab::TOK + j], want[j]);
+        CHECK_EQ(v.w[Slab::POS + j], 100 + j);
+        CHECK_EQ(v.slot(0, j), 100 + j);
+    }
+    CHECK_EQ(v.w[Slab::ACC], 1);
+    for (int j = 0; j < Slab::kTok; ++j) CHECK_EQ(v.w[Slab::PAR + j], -7);
+    for (int j = 0; j < Slab::kSeq * Slab::kPathPitch; ++j) CHECK_EQ(v.w[Slab::PATH + j], -7);
+
+    /* Acceptance: the target agrees with the first two drafts and picks 777 after them. */
+    Slab acc(ADV_ACCEPT);
+    for (int j = 0; j < 4; ++j) acc.w[Slab::TOK + j] = v.w[Slab::TOK + j];
+    acc.st[0] = st;
+    acc.row(0, true, 0, 4, 100, 0, 0, 0, 3);
+    const int32_t y[4] = { 500, 520, 777, 1 };
+    for (int j = 0; j < 4; ++j) acc.src[j] = y[j];
+    acc.run();
+    CHECK_EQ(acc.st[0].acc, 2);
+    CHECK_EQ(acc.st[0].npath, 0);
+    CHECK_EQ(acc.st[0].tok[0], 777);
+    CHECK_EQ(acc.st[0].head, 102);
+    CHECK_EQ(acc.st[0].hrow, 2);
+
+    /* The next step is a tree verify again: its path plane is the identity, as after any chain. */
+    Slab nx(ADV_TRUNK);
+    nx.a.parent_off = Slab::PAR * 4;
+    nx.a.path_off = Slab::PATH * 4; nx.a.path_pitch = Slab::kPathPitch;
+    nx.st[0] = acc.st[0];
+    nx.st[0].ntree = 0;
+    nx.row(0, true, 0, 3, 102, 0, 0, 0, 2);
+    nx.run();
+    for (int t = 0; t < Slab::kPathPitch; ++t) CHECK_EQ(nx.w[Slab::PATH + t], t);
+}
+
+/* The same cut on a tree-form step: a prefix of the grown tree is the tree the verify carries, the
+ * leaves past the count are dropped, and what is kept is exactly what a full verify holds for those
+ * rows (tokens, parents, depth positions, flat slots). */
+TEST(a_tree_form_verify_of_a_prefix_keeps_those_rows_exactly_as_the_full_verify_has_them) {
+    SerialRun r;
+    const int32_t c0[8] = { 500, 500, 601, 602, 603, 604, 605, 606 };
+    std::memcpy(r.rows[1][0], c0, sizeof c0);
+    r.rows[2][0][0] = 520; r.rows[3][0][0] = 530;
+    r.go(3, 3, 6, 1000, 1);
+    StepSlot st = r.st[0];
+    st.tok[0] = 9; st.ctx = 100; st.n_acc = 1; st.npath = 0;
+    auto run = [&](int n) {
+        auto v = std::make_unique<Slab>(ADV_TRUNK);
+        v->a.parent_off = Slab::PAR * 4;
+        v->a.path_off = Slab::PATH * 4; v->a.path_pitch = Slab::kPathPitch;
+        v->st[0] = st;
+        v->row(0, true, 0, n, 100, 0, 0, 0, n - 1);
+        v->run();
+        return v;
+    };
+    const auto full = run(7);
+    for (int n : { 2, 4, 5, 6 }) {
+        const auto cut = run(n);
+        for (int j = 0; j < n; ++j) {
+            CHECK_EQ(cut->w[Slab::TOK + j], full->w[Slab::TOK + j]);
+            CHECK_EQ(cut->w[Slab::PAR + j], full->w[Slab::PAR + j]);
+            CHECK_EQ(cut->w[Slab::POS + j], full->w[Slab::POS + j]);
+            CHECK_EQ(cut->slot(0, j), full->slot(0, j));
+        }
+    }
+}

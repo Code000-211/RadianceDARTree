@@ -13008,10 +13008,74 @@ TEST(flashnext_declares_a_draft_tree_only_when_the_engine_asks_for_one) {
         CHECK(count_op(b, "attn_paged_tree_sel") > 0);
     }
 
-    /* A tree does not combine with the coupled draft. */
+    /* A tree combines with the coupled draft (recursive rejection sampling over the siblings,
+     * abi/rad_mtp_rrs.h). Stage 1: one propose op a round, round 1's with the leaves it draws; the
+     * state plane has a row a round. Stage 2: no propose op; the grower writes a state row a node. */
     {
         RadBuilder b;
         RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 3, 1);
+        ctx.draft_coupling = 1;
+        REQUIRE_EQ(declared(ctx, b), RAD_OK);
+        int props = 0, with_leaves = 0;
+        for (const RecOp& o : b.ops)
+            if (o.op == "mtp_couple_propose") {
+                ++props;
+                if (pint(&o, "leaves") == 3) { ++with_leaves; CHECK_EQ(pint(&o, "round"), 1); }
+                else CHECK(param(&o, "leaves") == nullptr);
+                CHECK_EQ(pint(&o, "max_rounds"), R);
+            }
+        CHECK_EQ(props, R);
+        CHECK_EQ(with_leaves, 1);
+        const RecBuf* st = find_b(b, "mtp_couple_state");
+        REQUIRE(st != nullptr);
+        CHECK_EQ(st->d.shape[0], (int64_t)R);
+        CHECK_EQ(count_op(b, "mtp_tree_grow"), 0);
+    }
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 0, 3);
+        ctx.draft_coupling = 1;
+        REQUIRE_EQ(declared(ctx, b), RAD_OK);
+        CHECK_EQ(count_op(b, "mtp_couple_propose"), 0);
+        CHECK_EQ(count_op(b, "mtp_tree_grow"), R);
+        for (const RecOp& o : b.ops)
+            if (o.op == "mtp_tree_grow") CHECK(param(&o, "n_vocab") != nullptr);
+        const RecBuf* st = find_b(b, "mtp_couple_state");
+        REQUIRE(st != nullptr);
+        CHECK_EQ(st->d.shape[0], (int64_t)N);
+    }
+    /* Coupling with confidence pruning: the thresholds go to round 1's propose op (stage 1) and to
+     * the grower (stage 2), which decide by slot priorities (DESIGN-coupling.md 3.5). The core's
+     * logit-based leaf pruning is not armed (no proposal_score): a leaf's own logit would make the
+     * count of children depend on the drawn value. */
+    for (int W : { 1, 3 }) {
+        RadBuilder b0, b1;
+        RadBuildCtx c0 = q4_tree_ctx(0, 1, N, R, W == 1 ? 3 : 0, W);
+        c0.draft_coupling = 1;
+        RadBuildCtx c1 = c0;
+        c1.draft_tree_prune_abs = 0.1f;
+        c1.draft_tree_prune_rel = 0.3f;
+        REQUIRE_EQ(declared(c0, b0), RAD_OK);
+        REQUIRE_EQ(declared(c1, b1), RAD_OK);
+        CHECK_EQ(b0.ops.size(), b1.ops.size());
+        CHECK_EQ(b1.drafter.proposal_score, (rad_buf)0);
+        int carriers = 0;
+        for (size_t i = 0; i < b1.ops.size() && i < b0.ops.size(); ++i) {
+            const bool carrier = W == 1 ? (b1.ops[i].op == "mtp_couple_propose" && pint(&b1.ops[i], "leaves") == 3)
+                                        : b1.ops[i].op == "mtp_tree_grow";
+            CHECK_EQ(b1.ops[i].p.size(), b0.ops[i].p.size() + (carrier ? 2 : 0));
+            if (!carrier) continue;
+            ++carriers;
+            CHECK(std::fabs(pflt(&b1.ops[i], "prune_abs") - 0.1) < 1e-6);
+            CHECK(std::fabs(pflt(&b1.ops[i], "prune_rel") - 0.3) < 1e-6);
+            CHECK(param(&b0.ops[i], "prune_abs") == nullptr);
+        }
+        CHECK_EQ(carriers, W == 1 ? 1 : R);
+    }
+    /* More head rounds than the coupling's states: refused with a message, not clamped. */
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = q4_tree_ctx(0, 1, 15, 9, 3, 1);
         ctx.draft_coupling = 1;
         CHECK(declared(ctx, b) != RAD_OK);
     }
@@ -13064,6 +13128,79 @@ TEST(the_tree_attention_ops_declare_the_same_max_seqs_at_the_sizing_max_tok) {
         }
         CHECK(tree_ops > 0);
     }
+}
+
+/* The engine's arena levels run the plugin's declare again at smaller max_tok values with
+ * RadBuildCtx::shape_probe, and core (the sizing declare in core/build/rad_builder.cpp) refuses
+ * the whole probe unless it declares the same op at every position and every fixed parameter
+ * unchanged (a RAD_PROLE_CAPACITY one may shrink). A tree deployment must pass: stage 1 and
+ * stage 2, one and two ranks, at several real and probe sizes. `capacity` mirrors the libr4d
+ * schemas' RAD_PROLE_CAPACITY parameters (libr4d/r4d_rows.cpp). */
+TEST(a_tree_deployments_sizing_declare_is_the_real_graph_at_every_step_size) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    auto capacity = [](const std::string& op, const std::string& key) {
+        if (op == "qsa_work" && key == "work") return true;
+        if (op == "attn_paged_gate_quant" && key == "max_seqs") return true;
+        if (op == "qsa_score" && key == "seqs") return true;   /* the sequence count is cu's */
+        return false;
+    };
+    for (const int W : { 1, 3 })
+        for (const int world : { 1, 2 })
+            for (const int64_t real : { 2048, 4096 })
+                for (const int64_t probe : { 256, 1024 }) {
+                    RadBuildCtx c = q4_tree_ctx(0, world, W > 1 ? 10 : 7, 3, 3, W);
+                    c.max_tok = real;
+                    RadBuilder full;
+                    full.encs = { { "draft_head", u2_head() } };
+                    REQUIRE_EQ(qwen4exp_fp8::declare(&full, &meta, &c), RAD_OK);
+                    RadBuildCtx p = c;
+                    p.max_tok = probe;
+                    p.shape_probe = 1;
+                    RadBuilder small;
+                    small.encs = { { "draft_head", u2_head() } };
+                    REQUIRE_EQ(qwen4exp_fp8::declare(&small, &meta, &p), RAD_OK);
+                    const std::string tag = "W" + std::to_string(W) + " world " +
+                                            std::to_string(world) + " " + std::to_string(real) +
+                                            "->" + std::to_string(probe);
+                    if (small.ops.size() != full.ops.size())
+                        fprintf(stderr, "    %s: %zu ops at the probe, %zu at the real size\n",
+                                tag.c_str(), small.ops.size(), full.ops.size());
+                    REQUIRE_EQ(small.ops.size(), full.ops.size());
+                    int bad = 0;
+                    for (size_t i = 0; i < full.ops.size(); ++i) {
+                        if (small.ops[i].op != full.ops[i].op) {
+                            if (bad++ < 3)
+                                fprintf(stderr, "    %s: op %zu is '%s' at the probe, '%s' at the "
+                                                "real size\n", tag.c_str(), i,
+                                        small.ops[i].op.c_str(), full.ops[i].op.c_str());
+                            continue;
+                        }
+                        if (small.ops[i].p.size() != full.ops[i].p.size()) { ++bad; continue; }
+                        for (size_t k = 0; k < full.ops[i].p.size(); ++k) {
+                            const RecParam& a = full.ops[i].p[k];
+                            const RecParam& q = small.ops[i].p[k];
+                            if (a.kind == RAD_P_RANGE) continue;
+                            if (capacity(full.ops[i].op, a.key) && q.ival <= a.ival) continue;
+                            if (a.ival != q.ival || a.sval != q.sval || a.dval != q.dval) {
+                                if (bad++ < 3)
+                                    fprintf(stderr, "    %s: op %zu '%s' changes '%s' (%lld vs "
+                                                    "%lld)\n", tag.c_str(), i,
+                                            full.ops[i].op.c_str(), a.key.c_str(), q.ival, a.ival);
+                            }
+                        }
+                    }
+                    CHECK_EQ(bad, 0);
+                    REQUIRE_EQ(small.bufs.size(), full.bufs.size());
+                    for (size_t i = 0; i < full.bufs.size(); ++i) {
+                        const RadBufDecl& f = full.bufs[i].d;
+                        const RadBufDecl& q = small.bufs[i].d;
+                        CHECK_EQ(small.bufs[i].name, full.bufs[i].name);
+                        CHECK_EQ(q.rank, f.rank);
+                        for (uint32_t d = 1; d < f.rank; ++d) CHECK_EQ(q.shape[d], f.shape[d]);
+                        CHECK(q.shape[0] <= f.shape[0]);
+                    }
+                }
 }
 
 TEST(flashnext_tree_steps_route_the_decode_half_through_the_tree_ops) {
@@ -13192,6 +13329,80 @@ TEST(flashnext_tree_steps_route_the_decode_half_through_the_tree_ops) {
     }
 }
 
+/* Dynamic rows (DESIGN-dynrows.md): a step whose tree is a pure chain is issued by the core in the
+ * chain's form -- spec_parent null and, when no earlier tree verify's path is owed, spec_path null
+ * -- and a tree deployment's plugin then issues exactly what a chain deployment's does: the same ops
+ * the same number of times, the fused delta-net op, the classic attention, none of the tree ops. The
+ * operand lists carry no tree plane either. */
+TEST(flashnext_a_chain_form_step_of_a_tree_deployment_issues_the_chain_ops) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3;
+    /* One plugin instance keeps its handles per slot, so a second declare on slot 0 replaces the
+     * first's: each deployment is declared right before its steps run. */
+    auto pattern = [](const RadBuilder& b, const RadCtx& c) {
+        std::map<std::string, size_t> m;
+        for (const auto& i : c.issues)
+            if (const RecOp* o = b.op_of(i.op)) ++m[o->op];
+        return m;
+    };
+    auto declare_tree = [&](RadBuilder& bt) {
+        bt.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ct = q4_tree_ctx(0, 1, N, R, 4, 1);
+        REQUIRE_EQ(qwen4exp_fp8::declare(&bt, &meta, &ct), RAD_OK);
+    };
+
+    RadBuilder bc;
+    bc.encs = { { "draft_head", u2_head() } };
+    RadBuildCtx cc = q4_ctx(0, 1, 4);
+    cc.max_spec = R;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&bc, &meta, &cc), RAD_OK);
+    const auto kc = kit(bc, { R + 1, R + 1, R + 1, R + 1 }, {});
+    const auto vc = run_passes(bc, qwen4exp_fp8::step, { kc.get() });
+    CHECK_PASSES(bc, vc);
+    const auto pc = pattern(bc, *vc[0]);
+    auto seq = [](const RadBuilder& b, const RadCtx& c) {
+        std::vector<std::string> v;
+        for (const auto& i : c.issues) if (const RecOp* o = b.op_of(i.op)) v.push_back(o->op);
+        return v;
+    };
+    const auto sc = seq(bc, *vc[0]);
+
+    RadBuilder bt;
+    declare_tree(bt);
+    const auto kt = kit(bt, { R + 1, R + 1, R + 1, R + 1 }, {});   /* chain rows, no planes */
+    CHECK(kt->b.spec_parent == nullptr && kt->b.spec_path == nullptr);
+    const auto vt = run_passes(bt, qwen4exp_fp8::step, { kt.get() });
+    CHECK_PASSES(bt, vt);
+    const auto pt = pattern(bt, *vt[0]);
+    CHECK(!pt.empty());
+    CHECK(pt == pc);
+    CHECK(seq(bt, *vt[0]) == sc);   /* the same ops in the same order */
+    CHECK(pt.count("gdn_conv_recurrent_update") + pt.count("gdn_conv_recurrent_update_had") > 0);
+    for (const char* op : { "qsa_tail_compact", "attn_paged_tree_sel", "attn_paged_tree_sel_gate_quant",
+                            "attn_paged_tree_sel_gate_had_quant", "int_affine", "kv_window_compact",
+                            "gdn_conv_update", "gdn_recurrent_update" })
+        CHECK_EQ(pt.count(op), (size_t)0);
+
+    /* The same step behind a tree verify (path plane only) is the heal form: separate delta-net
+     * ops with the path, the QSA tail compaction -- what the chain form must not drop when a path
+     * is owed (the scheduler keeps spec_path then). */
+    RadBuilder bo;
+    declare_tree(bo);
+    const TreeKit tk = tree_kit(bo, 4, N, R, false, true);
+    auto owed = kit(bo, { R + 1, R + 1, R + 1, R + 1 }, {});
+    owed->b.spec_path = tk.k->b.spec_path;
+    owed->b.spec_path_pitch = N + 1;
+    owed->b.num_accepted = tk.k->b.num_accepted;
+    const auto vo = run_passes(bo, qwen4exp_fp8::step, { owed.get() });
+    CHECK_PASSES(bo, vo);
+    const auto po = pattern(bo, *vo[0]);
+    CHECK(po.count("qsa_tail_compact") > 0);
+    /* The fold takes the path plane itself (its tree form), so the heal form keeps the fused op. */
+    CHECK(po.count("gdn_conv_recurrent_update") + po.count("gdn_conv_recurrent_update_had") > 0);
+    for (const char* op : { "attn_paged_tree_sel", "int_affine" }) CHECK_EQ(po.count(op), (size_t)0);
+}
+
 TEST(flashnext_stage_two_head_rounds_carry_w_frontier_rows_and_grow_the_tree) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();
@@ -13270,4 +13481,78 @@ TEST(flashnext_refuses_a_draft_tree_wider_than_its_node_budget) {
     /* W = 9 > N = 7 */
     RadBuildCtx ctx = q4_tree_ctx(0, 1, 7, 3, 0, 9);
     CHECK(qwen4exp_fp8::declare(&b, &meta, &ctx) != RAD_OK);
+}
+
+/* Confidence pruning (--draft-tree-prune / -rel, RadBuildCtx::draft_tree_prune_*): the thresholds
+ * change no op, buffer or issue of a step: the stage-2 grower carries them as two optional
+ * parameters (only when on, so the unpruned graph is byte for byte the old one) and the stage-1
+ * head hands the core the candidates' logits (RadDrafterDecl::proposal_score) to prune its leaves
+ * by. */
+TEST(flashnext_tree_pruning_changes_no_op_buffer_or_issue_only_adds_parameters) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3, S = 4;
+    for (int W : { 1, 3 }) {
+        RadBuilder off, on, zero;
+        for (RadBuilder* b : { &off, &on, &zero }) b->encs = { { "draft_head", u2_head() } };
+        RadBuildCtx c0 = q4_tree_ctx(0, 1, N, R, W == 1 ? 4 : 0, W);
+        RadBuildCtx c1 = c0;
+        c1.draft_tree_prune_abs = 0.1f;
+        c1.draft_tree_prune_rel = 0.3f;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&off, &meta, &c0), RAD_OK);
+        REQUIRE_EQ(qwen4exp_fp8::declare(&on, &meta, &c1), RAD_OK);
+        RadBuildCtx cz = c0;      /* explicit zeros are off */
+        cz.draft_tree_prune_abs = 0.0f;
+        cz.draft_tree_prune_rel = 0.0f;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&zero, &meta, &cz), RAD_OK);
+
+        CHECK_EQ(off.ops.size(), on.ops.size());
+        CHECK_EQ(off.bufs.size(), on.bufs.size());
+        CHECK_EQ(off.weights.size(), on.weights.size());
+        CHECK_EQ(off.ops.size(), zero.ops.size());
+        for (size_t i = 0; i < off.ops.size(); ++i) {
+            CHECK_EQ(off.ops[i].op, on.ops[i].op);
+            CHECK_EQ(off.ops[i].reads.size(), on.ops[i].reads.size());
+            CHECK_EQ(off.ops[i].writes.size(), on.ops[i].writes.size());
+            /* the one difference: the grower's two parameters, absent when off or zero */
+            const bool grow = off.ops[i].op == "mtp_tree_grow";
+            CHECK_EQ(on.ops[i].p.size(), off.ops[i].p.size() + (grow ? 2 : 0));
+            CHECK_EQ(zero.ops[i].p.size(), off.ops[i].p.size());
+            if (grow) {
+                REQUIRE(param(&on.ops[i], "prune_abs") != nullptr);
+                REQUIRE(param(&on.ops[i], "prune_rel") != nullptr);
+                CHECK(std::fabs(pflt(&on.ops[i], "prune_abs") - 0.1) < 1e-6);
+                CHECK(std::fabs(pflt(&on.ops[i], "prune_rel") - 0.3) < 1e-6);
+                CHECK(param(&off.ops[i], "prune_abs") == nullptr);
+                CHECK(param(&zero.ops[i], "prune_rel") == nullptr);
+            }
+        }
+        /* the drafter: stage 1 names the candidates' logits plane only when pruning, stage 2 never */
+        CHECK_EQ(off.drafter.proposal_score, (rad_buf)0);
+        CHECK_EQ(zero.drafter.proposal_score, (rad_buf)0);
+        if (W == 1) {
+            CHECK(on.drafter.proposal_score != 0);
+            CHECK_EQ(on.bufs[on.drafter.proposal_score - 1].name.find("mtp_dval") != std::string::npos, true);
+            CHECK_EQ((int)on.bufs[on.drafter.proposal_score - 1].d.dtype, (int)RAD_F32);
+        } else {
+            CHECK_EQ(on.drafter.proposal_score, (rad_buf)0);
+            CHECK_EQ(count_op(on, "mtp_tree_grow"), R);
+        }
+
+        /* the issue pattern of a verify step and the history pass, every op by name */
+        const TreeKit tk_off = tree_kit(off, S, N, R, true, false);
+        const TreeKit tk_on  = tree_kit(on, S, N, R, true, false);
+        const auto his_off = history_pass(off, *tk_off.k);
+        const auto his_on  = history_pass(on, *tk_on.k);
+        const auto v_off = run_passes(off, qwen4exp_fp8::step, { tk_off.k.get(), his_off.get() });
+        const auto v_on  = run_passes(on, qwen4exp_fp8::step, { tk_on.k.get(), his_on.get() });
+        CHECK_PASSES(off, v_off);
+        CHECK_PASSES(on, v_on);
+        std::set<std::string> names;
+        for (const RecOp& o : off.ops) names.insert(o.op);
+        for (size_t pass = 0; pass < 2; ++pass)
+            for (const std::string& nm : names)
+                CHECK_EQ(issues_of(off, *v_off[pass], nm.c_str()).size(),
+                         issues_of(on, *v_on[pass], nm.c_str()).size());
+    }
 }

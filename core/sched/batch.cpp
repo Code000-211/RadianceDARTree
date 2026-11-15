@@ -1302,8 +1302,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.num_accepted = cfg_.n_spec > 0 ? on_rank(base, b0, s.d_acc) : nullptr;
         /* Staged above on a tree step: each row's parent row, -2 for an ordinary causal one. */
         B.spec_parent = plan.spec_is_tree ? on_rank(base, b0, s.d_parent) : nullptr;
-        B.spec_path = path_pitch_ ? on_rank(base, b0, s.d_path) : nullptr;
-        B.spec_path_pitch = (int32_t)path_pitch_;
+        B.spec_path = path_pitch_ && !plan.no_path ? on_rank(base, b0, s.d_path) : nullptr;
+        B.spec_path_pitch = plan.no_path ? 0 : (int32_t)path_pitch_;
         /* Pass 1 is a block drafter's query pass (a serial head has no pass 1). */
         B.anchor_rows = plan.draft_pass == 1 ? on_rank(base, b0, s.d_arow) : nullptr;
         B.rope_pos = mm_on_ ? on_rank(base, b0, s.d_rope) : nullptr;
@@ -1355,6 +1355,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     last_n_seq_ = n_seq;
     last_n_tok_ = n_tok;
     last_tree_  = plan.spec_is_tree;
+    last_nopath_ = plan.no_path;
     ring_.head = off + used;
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
@@ -1396,7 +1397,7 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.q_off    = off(s.d_q);
     a.row_off  = off(s.d_rows);
     a.parent_off = last_tree_ ? off(s.d_parent) : -1;
-    if (path_pitch_) {
+    if (path_pitch_ && !last_nopath_) {
         a.path_off   = off(s.d_path);
         a.path_pitch = (int32_t)path_pitch_;
     }

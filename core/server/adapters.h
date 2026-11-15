@@ -143,6 +143,16 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     for (size_t d = 0;
          d < std::size(m.draft_verify_depth) && d < std::size(o.draft_verify_depth); ++d)
         o.draft_verify_depth[d] = m.draft_verify_depth[d];
+    o.tree_verifies = m.tree_verifies;
+    o.tree_nodes_budget = m.tree_nodes_budget;
+    o.tree_nodes_active = m.tree_nodes_active;
+    o.tree_chain_steps = m.tree_chain_steps;
+    o.tree_rows_cut = m.tree_rows_cut;
+    o.tree_active_cut = m.tree_active_cut;
+    for (size_t d = 0; d < std::size(m.tree_active_hist) && d < std::size(o.tree_active_hist); ++d) {
+        o.tree_active_hist[d] = m.tree_active_hist[d];
+        o.tree_accdepth_hist[d] = m.tree_accdepth_hist[d];
+    }
     o.preemptions = m.preemptions;
     o.preempt_forced = m.preempt_forced;
     o.total_requests = m.admitted;

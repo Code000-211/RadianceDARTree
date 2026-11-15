@@ -115,6 +115,12 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
                    s.pos == p.pos && rad_mtp_couple_state_valid(s, c.vocab);
     __syncthreads();
     if (!eligible) return;
+    /* A tree node with several drafted children (abi/rad_mtp_rrs.h): one thread runs the shared
+     * serial helper, which is the host reference itself. Only rows of a draft tree take it. */
+    if (s.nkids >= 2) {
+        if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
+        return;
+    }
     couple_live(ids, val, c.n_cand, c.vocab, lj, &nl, &valid, &top);
     if (!valid || top == -INFINITY) return;
     const int L = nl;
@@ -354,6 +360,8 @@ __global__ __launch_bounds__(kDfThreads) void dflash_couple(
             s.round = (int)l + 1;
             s.status = -1;
             s.count = 0;
+            s.nkids = 0;   /* the walk's position is one draw: the chain's wire */
+            s.pad_ = 0;
             for (int i = 0; i < 8; ++i) { s.ids[i] = -1; s.q[i] = 0; }
             for (int i = 0; i < sn; ++i)
                 if (wq[i] > 0) { s.ids[s.count] = lid[i]; s.q[s.count++] = wq[i]; }

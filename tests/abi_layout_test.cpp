@@ -241,4 +241,14 @@ TEST(the_serial_tree_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_width), (size_t)208);
 }
 
+/* Confidence pruning's appended fields: the build context's two thresholds and the drafter's score
+ * plane, past the tree shape above (RadDrafterDecl keeps its 72 bytes: the plane takes the old tail
+ * padding). */
+TEST(the_tree_pruning_fields_are_appended_past_the_tree_shape) {
+    CHECK_EQ(offsetof(RadBuildCtx, draft_tree_prune_abs), (size_t)212);
+    CHECK_EQ(offsetof(RadBuildCtx, draft_tree_prune_rel), (size_t)216);
+    CHECK_EQ(offsetof(RadDrafterDecl, proposal_score), (size_t)68);
+    CHECK_EQ(sizeof(RadDrafterDecl), (size_t)72);
+}
+
 RAD_TEST_MAIN()

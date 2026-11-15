@@ -47,6 +47,7 @@
 #include "rad_sample.h"
 #include "rad_yarn.h"
 #include "rad_mtp_tree.h"
+#include "rad_mtp_tree_rrs.h"
 
 #include <dlfcn.h>
 #include <spawn.h>
@@ -10734,12 +10735,17 @@ void sub_i32_cases(const Plugin& pl) {
  * tree-attention outputs on. Random candidate rows are far apart in logit, so the one place the
  * device may differ from the host (expf / logf in the log-softmax) cannot reorder the pool.
  * Exact on every output. */
-void mtp_tree_cases(const Plugin& pl) {
-    const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
-    if (!r) { ok("mtp_tree_grow", false, "row absent"); return; }
+void mtp_tree_coupled_cases(const Plugin& pl);
+/* One configuration: confidence thresholds `pa` / `pr` (0 = off, then the parameters are not even
+ * passed), `pruned` varying each row's slope so the thresholds keep some candidates and drop
+ * others. Returns the number of inert (token -1) entries in the final trees, -1 on a launch or
+ * allocation failure. */
+static int mtp_tree_run(const RadKernelInfo* r, double pa, double pr, const char* label,
+                        uint32_t seed0 = 12345) {
+    const bool pruned = pa > 0.0 || pr > 0.0;
     const int M = 5, W = 3, R = 3, N = 6, K = RAD_MTP_TREE_K, B = 4, SP = 9, PITCH = 8;
     const int sw = rad_mtp_tree_state_words(N, W, R);
-    uint32_t seed = 12345;
+    uint32_t seed = seed0;
     auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xffffff; };
     std::vector<int32_t> hstate((size_t)M * sw, 0), dstate0;
     void* dst = up_i32(hstate);
@@ -10765,7 +10771,7 @@ void mtp_tree_cases(const Plugin& pl) {
     if (!dst || !dtab || !dhpos || !dhrow || !dtok || !dpar || !dsel || !dnsel || !dvm || !drb ||
         !dsrc || !ddst) {
         ok("mtp_tree_grow", false, "alloc");
-        return;
+        return -1;
     }
     std::vector<int32_t> wtok((size_t)M * PITCH), wpar((size_t)M * PITCH);
     int bad = 0;
@@ -10775,7 +10781,9 @@ void mtp_tree_cases(const Plugin& pl) {
         std::vector<float> val((size_t)rows * K);
         for (int i = 0; i < rows; ++i) {
             std::vector<float> v((size_t)K);
-            for (int c = 0; c < K; ++c) v[(size_t)c] = 8.0f - 1.7f * c - (rnd() % 100) * 0.001f;
+            /* pruned: each row its own slope, from a nearly flat to a steep distribution */
+            const float slope = pruned ? 0.15f + (rnd() % 100) * 0.02f : 1.7f;
+            for (int c = 0; c < K; ++c) v[(size_t)c] = 8.0f - slope * c - (rnd() % 100) * 0.001f;
             for (int c = 0; c < K; ++c) {
                 idx[(size_t)i * K + c] = (int)(rnd() % 50000);
                 val[(size_t)i * K + c] = v[(size_t)c];
@@ -10786,6 +10794,8 @@ void mtp_tree_cases(const Plugin& pl) {
         std::vector<RadParam> ps = { PI("M", M), PI("round", round), PI("rounds", R),
                                      PI("nodes", N), PI("width", W), PI("block_size", B),
                                      PI("sel_pitch", SP) };
+        if (pa > 0.0) ps.push_back(PF("prune_abs", pa));
+        if (pr > 0.0) ps.push_back(PF("prune_rel", pr));
         const bool first = round == 1;
         const int rc = launch(r, { T(didx, RAD_I32, { rows, K }), T(dval, RAD_F32, { rows, K }),
                                    T(dst, RAD_I32, { M, sw }),
@@ -10797,11 +10807,12 @@ void mtp_tree_cases(const Plugin& pl) {
                                    T(dvm, RAD_I64, { M * W }), T(drb, RAD_I32, { M }),
                                    T(dsrc, RAD_I32, { M * W }), T(ddst, RAD_I32, { M * W }) },
                               ps);
-        if (rc != RAD_OK) { ok("mtp_tree_grow launch", false, "rc " + std::to_string(rc)); return; }
+        if (rc != RAD_OK) { ok("mtp_tree_grow launch", false, "rc " + std::to_string(rc)); return -1; }
         /* the host walk */
         RadMtpTreeCfg cfg{};
         cfg.round = round; cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = B;
         cfg.sel_pitch = SP; cfg.pitch = PITCH;
+        rad_mtp_tree_set_prune(&cfg, pa, pr);
         std::vector<int32_t> hsel((size_t)M * W * SP, 0), hnsel((size_t)M * W, 0), hrb((size_t)M, 0);
         std::vector<long long> hvm((size_t)M * W, 0);
         std::vector<int32_t> hsrc((size_t)M * W, 0), hdst((size_t)M * W, 0);
@@ -10843,14 +10854,180 @@ void mtp_tree_cases(const Plugin& pl) {
             }
         }
     }
-    /* the final tree is a tree: parents precede their children, tokens set */
-    for (int m = 0; m < M; ++m)
+    /* the final tree is a tree: parents precede their children, tokens set (an inert entry of a
+     * pruned tree is token -1 under the root, and then only past the created nodes) */
+    int inert = 0;
+    for (int m = 0; m < M; ++m) {
+        bool seen = false;
         for (int j = 0; j < N; ++j) {
             const int pj = wpar[(size_t)m * PITCH + j];
             bad += !(pj >= 0 && pj <= j);
+            const int tj = wtok[(size_t)m * PITCH + j];
+            if (tj < 0) { ++inert; seen = true; bad += !pruned || pj != 0; }
+            else bad += seen;            /* the inert entries are a suffix */
         }
-    ok("mtp_tree_grow matches the host walk over three rounds", bad == 0,
-       fmt("%d entries differ", bad));
+        bad += wtok[(size_t)m * PITCH] < 0;   /* node 1, the trunk, always exists */
+    }
+    ok(label, bad == 0, fmt("%d entries differ", bad));
+    return inert;
+}
+
+void mtp_tree_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
+    if (!r) { ok("mtp_tree_grow", false, "row absent"); return; }
+    mtp_tree_run(r, 0.0, 0.0, "mtp_tree_grow matches the host walk over three rounds");
+    /* confidence pruning (abi/rad_mtp_tree.h): the device against the same host walk, thresholds
+     * singly and together, and one nothing but the trunk meets (a pure chain, the rest inert) */
+    mtp_tree_run(r, 0.05, 0.0, "mtp_tree_grow with prune_abs 0.05 matches the host walk");
+    mtp_tree_run(r, 0.0, 0.3, "mtp_tree_grow with prune_rel 0.3 matches the host walk");
+    mtp_tree_run(r, 0.02, 0.1, "mtp_tree_grow with both thresholds matches the host walk");
+    const int inert = mtp_tree_run(r, 0.99, 1.0, "mtp_tree_grow pruned to the chain matches the host walk");
+    ok("mtp_tree_grow pruned to the chain leaves inert entries", inert > 0, fmt("%d inert", inert));
+    /* more random rows against the same walk, thresholds in the middle of the rows' slopes, where
+     * a candidate near one is what the device's expf / logf could flip */
+    for (uint32_t sd = 1; sd <= 24; ++sd) {
+        const double pa = (sd % 3) ? 0.03 * (double)(1 + sd % 5) : 0.0;
+        double pr = (sd % 2) ? 0.0 : 0.1 * (double)(1 + sd % 4);
+        if (pa == 0.0 && pr == 0.0) pr = 0.25;
+        mtp_tree_run(r, pa, pr, "mtp_tree_grow pruned, another seed", 7919u * sd + 17u);
+    }
+    mtp_tree_coupled_cases(pl);
+}
+
+/* mtp_tree_grow with --draft-coupling (abi/rad_mtp_tree_rrs.h): the same three rounds with the
+ * draw, the card ids and the node-state plane operands, device against the header's host walk
+ * (rad_mtp_tree_grow_seq_cpl), for fixed seeds. One sequence is greedy (mode 0) and one carries
+ * another card's draw: their states stay untouched and their trees are the uncoupled ones. Tokens,
+ * parents, the children counts and the drawn order of every state are exact; Q's FP64 weights
+ * match to the last bits of the double exp (ocml against libm). */
+static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label);
+void mtp_tree_coupled_cases(const Plugin& pl) {
+    mtp_tree_coupled_run(pl, 0.0, 0.0, "mtp_tree_grow coupled matches the host walk (tree, draft orders, child counts)");
+    /* with confidence pruning: decided by the slot priorities (DESIGN-coupling.md 3.5) */
+    mtp_tree_coupled_run(pl, 0.05, 0.3, "mtp_tree_grow coupled and pruned matches the host walk");
+    mtp_tree_coupled_run(pl, 0.0, 0.5, "mtp_tree_grow coupled and rel-pruned matches the host walk");
+}
+
+static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label) {
+    const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
+    if (!r) { ok("mtp_tree_grow coupled", false, "row absent"); return; }
+    const int M = 6, W = 3, R = 3, N = 8, K = RAD_MTP_TREE_K, PITCH = 8, VOC = 50000;
+    const int sw = rad_mtp_tree_state_words(N, W, R);
+    const int SWORDS = (int)RAD_MTP_COUPLE_STATE_WORDS, DWORDS = (int)RAD_MTP_COUPLE_DRAW_WORDS;
+    uint32_t seed = 987654;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xffffff; };
+    std::vector<int32_t> hstate((size_t)M * sw, 0);
+    void* dst = up_i32(hstate);
+    std::vector<RadMtpCoupleDraw> draws((size_t)M);
+    std::vector<int32_t> cards((size_t)M);
+    for (int m = 0; m < M; ++m) {
+        draws[(size_t)m] = RadMtpCoupleDraw{ 0x1000ull + 7919ull * (uint64_t)m, 40ull + (uint64_t)m,
+                                             (uint64_t)(m + 1), m, 1u };
+        cards[(size_t)m] = m;
+    }
+    draws[4].mode = 0;           /* greedy */
+    cards[5] = 99;               /* another card's draw */
+    std::vector<int32_t> dwords((size_t)M * DWORDS);
+    std::memcpy(dwords.data(), draws.data(), dwords.size() * 4);
+    std::vector<RadMtpCoupleState> hplane((size_t)N * M);   /* [node, seq] */
+    std::vector<int32_t> pwords((size_t)N * M * SWORDS, 0);
+    void* ddraw = up_i32(dwords);
+    void* dcard = up_i32(cards);
+    void* dplane = up_i32(pwords);
+    void* dtok = dalloc((size_t)M * PITCH * 4);
+    void* dpar = dalloc((size_t)M * PITCH * 4);
+    void* dsrc = dalloc((size_t)M * W * 4);
+    void* ddst = dalloc((size_t)M * W * 4);
+    if (!dst || !ddraw || !dcard || !dplane || !dtok || !dpar || !dsrc || !ddst) {
+        ok("mtp_tree_grow coupled", false, "alloc");
+        return;
+    }
+    std::vector<int32_t> wtok((size_t)M * PITCH), wpar((size_t)M * PITCH);
+    int bad = 0;
+    for (int round = 1; round <= R; ++round) {
+        const int rows = round == 1 ? M : M * W;
+        std::vector<int32_t> idx((size_t)rows * K);
+        std::vector<float> val((size_t)rows * K);
+        for (int i = 0; i < rows; ++i) {
+            const int nv = 3 + (int)(rnd() % 6);   /* 3..8 live candidates; holes after */
+            for (int c = 0; c < K; ++c) {
+                if (c < nv && nv <= K) {
+                    int id;
+                    bool dup;
+                    do {
+                        id = (int)(rnd() % VOC);
+                        dup = false;
+                        for (int q = 0; q < c; ++q) dup = dup || idx[(size_t)i * K + q] == id;
+                    } while (dup);
+                    idx[(size_t)i * K + c] = id;
+                    val[(size_t)i * K + c] = 6.0f - 0.9f * c - (rnd() % 100) * 0.01f;
+                } else {
+                    idx[(size_t)i * K + c] = -1;
+                    val[(size_t)i * K + c] = -INFINITY;
+                }
+            }
+        }
+        void* didx = up_i32(idx);
+        void* dval = up_f32(val);
+        std::vector<RadParam> ps = { PI("M", M), PI("round", round), PI("rounds", R),
+                                     PI("nodes", N), PI("width", W), PI("n_vocab", VOC) };
+        if (pa > 0.0 || pr > 0.0) { ps.push_back(PF("prune_abs", pa)); ps.push_back(PF("prune_rel", pr)); }
+        const int rc = launch(r, { T(didx, RAD_I32, { rows, K }), T(dval, RAD_F32, { rows, K }),
+                                   T(dst, RAD_I32, { M, sw }), T(nullptr, RAD_I32, { 1 }),
+                                   T(nullptr, RAD_I32, { 1 }), T(nullptr, RAD_I32, { 1 }),
+                                   T(dtok, RAD_I32, { M, PITCH }), T(dpar, RAD_I32, { M, PITCH }),
+                                   T(nullptr, RAD_I32, { 1 }), T(nullptr, RAD_I32, { 1 }),
+                                   T(nullptr, RAD_I64, { 1 }), T(nullptr, RAD_I32, { 1 }),
+                                   T(dsrc, RAD_I32, { M * W }), T(ddst, RAD_I32, { M * W }),
+                                   T(ddraw, RAD_U32, { M, DWORDS }), T(dcard, RAD_I32, { M }),
+                                   T(dplane, RAD_U32, { N, M, SWORDS }) },
+                              ps);
+        if (rc != RAD_OK) { ok("mtp_tree_grow coupled launch", false, "rc " + std::to_string(rc)); return; }
+        RadMtpTreeCfg cfg{};
+        cfg.round = round; cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.pitch = PITCH;
+        rad_mtp_tree_set_prune(&cfg, pa, pr);
+        for (int m = 0; m < M; ++m) {
+            RadMtpTreeCpl cpl{};
+            cpl.draw = reinterpret_cast<const uint32_t*>(&draws[(size_t)m]);
+            cpl.card = cards[(size_t)m];
+            cpl.state = reinterpret_cast<uint32_t*>(hplane.data());
+            cpl.st_node = (int64_t)M * SWORDS;
+            cpl.st_seq = SWORDS;
+            cpl.rows = N;
+            cpl.vocab = VOC;
+            std::vector<int32_t> srcw((size_t)W), dstw((size_t)W);
+            rad_mtp_tree_grow_seq_cpl(&cfg, hstate.data() + (size_t)m * sw, idx.data(), val.data(),
+                                      (long)m * (round == 1 ? 1 : W), K, 1, 0, nullptr,
+                                      wtok.data() + (size_t)m * PITCH, wpar.data() + (size_t)m * PITCH,
+                                      nullptr, nullptr, nullptr, nullptr, m, srcw.data(), dstw.data(),
+                                      &cpl);
+        }
+        const std::vector<int32_t> gtok = down_i32(dtok, (size_t)M * PITCH);
+        const std::vector<int32_t> gpar = down_i32(dpar, (size_t)M * PITCH);
+        const int nt = round < R ? W : N;
+        for (int m = 0; m < M; ++m)
+            for (int j = 0; j < nt; ++j) {
+                bad += gtok[(size_t)m * PITCH + j] != wtok[(size_t)m * PITCH + j];
+                bad += gpar[(size_t)m * PITCH + j] != wpar[(size_t)m * PITCH + j];
+            }
+    }
+    const std::vector<int32_t> gplane = down_i32(dplane, (size_t)N * M * SWORDS);
+    int nbound = 0;
+    for (int f = 0; f < N; ++f)
+        for (int m = 0; m < M; ++m) {
+            RadMtpCoupleState g;
+            std::memcpy(&g, gplane.data() + ((size_t)f * M + m) * SWORDS, sizeof g);
+            const RadMtpCoupleState& h = hplane[(size_t)f * M + m];
+            bad += g.status != h.status || g.round != h.round || g.count != h.count ||
+                   g.x != h.x || g.nkids != h.nkids;
+            for (int i = 0; i < 8; ++i) {
+                bad += g.ids[i] != h.ids[i];
+                bad += std::fabs(g.q[i] - h.q[i]) > 1e-12 * std::fabs(h.q[i]);
+            }
+            nbound += h.status == 1;
+            if (m == 4 || m == 5) bad += g.status != 0;   /* greedy / foreign draw: untouched */
+        }
+    ok(label, bad == 0 && nbound > 0, fmt("%d entries differ, %d coupled node state(s)", bad, nbound));
 }
 
 /* iota with and without a period. Exact. */

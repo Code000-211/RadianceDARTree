@@ -3152,7 +3152,7 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
 | `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params`? → `stats` |
-| `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
+| `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` `leaves`/opt `prune_abs`:f64/opt `prune_rel`:f64/opt | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
 | `dflash_couple_propose` | `M`(range) `steps` `top_k` `rank` `n_vocab` `anchor_stride` `max_rounds` `q_temp`:f64/opt | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w, `seq_ids`, `draw`, `tokens`:inout → `state`:inout |
 
@@ -3165,6 +3165,37 @@ their host oracle in one library and marks them per row, so the device rows coun
 kernels while the oracle stays reference; on a machine with no card only the oracle is left, and
 the gate refuses the coupling there. A `RADIANCE_KERNELS` list is exclusive:
 if it is set, it must name `spechub` or the coupled ops are not loaded at all.
+
+With a draft tree (`draft-tree on`) coupling is **recursive rejection sampling over the siblings**
+(`abi/rad_mtp_rrs.h`, `DESIGN-coupling.md`): a node's children are sampled WITHOUT replacement from its
+Q (Gumbel-top-k over `log Q`, seeded from the coupling draw, reproducible per seed) and
+`mtp_couple_verify` walks them in draft order: child `x_i` is accepted with probability
+`min(1, P_i(x_i) / q_i(x_i))`; on a rejection `P_{i+1} = norm((P_i - q_i)+)` and `q_{i+1}` is `q_i` with
+`x_i` removed and renormalised; with every child rejected the token is a draw from the last residual. The
+emitted token is distributed as `P` (Sequoia, Alg. 1). `RadMtpCoupleState::nkids` (appended; 0 elsewhere)
+is the children count, `ids[0 .. nkids)` the children in draft order; a state with `nkids <= 1` is the
+chain's single draw and the verify is the maximal coupling described here, bit for bit.
+
+`mtp_couple_propose` with `leaves` > 0 (a stage-1 tree's round 1) draws the trunk token and `leaves`
+siblings in draft order into `idx` columns `0 .. leaves` (holes, id -1, after them; the core's leaf capture
+reads columns 1..) and writes the state with `nkids = 1 + leaves` (fewer when Q's support is smaller).
+With the optional `prune_abs` / `prune_rel` (confidence pruning, `draft-tree-prune` / `-rel`) the op keeps
+only the leading draft slots that pass the grower's rule applied to the SLOT priorities, the j-th largest
+q of Q with base 0 (slot j is kept iff q_(j) >= `prune_abs` and q_(j) >= `prune_rel` * q_(0); slot 0, the
+trunk, always): `nkids` is the kept count and the later columns are holes. The rule reads Q's ranks only,
+never the value of the token drawn into a slot, so it drops a suffix of the draft order and recursive
+rejection sampling stays exact (`DESIGN-coupling.md` 3.5); the core's own pruning of the leaves, which scores
+a leaf by the head's logit of that token, is not used under coupling.
+`mtp_tree_grow` with the three trailing operands `cdraw` (`[M, 8]` u32 draw rows), `cseq` (`[M]` i32, the
+card ids) and `cstate` (`[N, M, 40]` u32, inout) is the stage-2 form: for every frontier row of a sequence
+whose draw is a sampled one for its card, the grower draws the row's children without replacement,
+presents them to the best-first pool as slots (slot j: the j-th largest q's priority, the j-th drawn
+token), so every node's children are created as a prefix of its draft order, and counts the children it
+created into the node's state (`cstate[node, seq]`, `round` = depth + 1). With `prune_abs` / `prune_rel` the
+grower's confidence pruning acts on those same slot priorities (a node's cut children are a suffix of its
+draft order, chosen by q-rank and the parent's cumulative score, never by the drawn token's own probability).
+Without the operands, for a
+greedy draw or a draw staged for another card, the op is the uncoupled grower.
 
 `mtp_couple_propose` runs on a draft round's
 final reranked top-8 and samples the proposal `x ~ Q`, where `Q` is the FP64 softmax of those
@@ -3795,7 +3826,7 @@ therefore not established.
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
 | `dflash_tree` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `nodes` `temp`:f64/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens`, `parents` |
 
-| `mtp_tree_grow` | `M` `round` `rounds` `nodes` `width` `block_size`/opt `sel_pitch`/opt | `didx`, `dval`, `state`:inout, `head_pos`?, `head_row`?, `table`? → `tok`, `par`, `sel`?, `nsel`?, `vmask`?, `rb`?, `src`?, `dst`? |
+| `mtp_tree_grow` | `M` `round` `rounds` `nodes` `width` `block_size`/opt `sel_pitch`/opt `prune_abs`:f64/opt `prune_rel`:f64/opt `n_vocab`/opt | `didx`, `dval`, `state`:inout, `head_pos`?, `head_row`?, `table`?, `cdraw`?, `cseq`?, `cstate`:inout? → `tok`, `par`, `sel`?, `nsel`?, `vmask`?, `rb`?, `src`?, `dst`? |
 
 ### Serial draft tree growth (`mtp_tree_grow`)
 
@@ -3826,6 +3857,19 @@ round). `abi/rad_mtp_tree.h` is the algorithm; libref and libr4d run that one fu
   w-th new node's token and parent node id (0 the root), a token of -1 ending the list; after round
   `rounds`, entry `j - 1` node `j`'s token and parent for `j = 1..N`, which is what the block-style take
   reads (`docs/PLUGIN.md`).
+- Confidence pruning, `prune_abs` and `prune_rel` (probabilities, 0 or absent = off; with both absent the
+  op is the one above bit for bit). A candidate enters the pool only if its cumulative probability
+  `exp(cum) >= prune_abs` AND its probability `>= prune_rel *` the probability of the best candidate of
+  its own frontier row (the row's first column of largest logit). The best candidate of every
+  frontier row, the trunk, is never pruned, so a tree pruned hard enough is the chain of best children.
+  The thresholds are compared in the log domain, `log(prune_abs)` against the candidate's cumulative
+  log probability and `log(prune_rel)` against `dval_c - max`, two floats rounded once on the host
+  (`rad_mtp_tree_set_prune`), so every library decides the same. A pruned pool never invents a node: a pool
+  that runs dry ends a round's creation early (the frontier is shorter: the token list ends at the
+  first -1) and the final tree's entries past the created nodes are **inert**, token -1 and parent 0
+  (node 1, the trunk's first, always exists: with no valid candidate at all it is token 0 under the
+  root, as unpruned). The core turns an inert entry into a duplicate of node 1 under the root
+  (`ADV_BTAKE`), a verify row the acceptance walk never takes (`docs/GUIDE.md`, "pruned trees").
 - With `sel_pitch` > 0 (`block_size` the head's KV page, `table` the head's block table `[M, pitch]`,
   `sel` `[M * W, sel_pitch]` i32, `nsel` `[M * W]`, `vmask` `[M * W]` i64 and `rb` `[M]`, all together),
   after a round below `rounds` the next pass's operands for `attn_paged_tree_sel`: `rb = block *

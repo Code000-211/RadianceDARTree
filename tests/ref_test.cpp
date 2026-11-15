@@ -16,9 +16,11 @@
 #include "../libref/ref_common.h"
 #include "../core/sample/host_ref.h"   /* the host chain, for the whitelist's op-for-op form */
 #include "rad_sample.h"
+#include "rad_spechub.h"   /* the coupling state, for mtp_tree_grow's coupled form */
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 #include "rad_planes.h"
+#include "rad_mtp_tree.h"   /* the grower's own walk, for the pruned fuzz */
 
 #include <algorithm>
 #include <cmath>
@@ -13072,6 +13074,80 @@ TEST(mtp_tree_grow_takes_the_best_of_the_pool_and_hangs_it_on_its_parent) {
     }
 }
 
+/* --draft-coupling with a stage-2 tree (abi/rad_mtp_tree_rrs.h): the same op with the draw, card and
+ * state-plane operands draws every frontier row's children without replacement and counts the
+ * children it creates into the node's state, in draft order. A greedy draw or a draw staged for
+ * another card is the uncoupled op, word for word. M = 1, R = 3, N = 5, W = 2. */
+namespace {
+int tg_coupled(int round, T& didx, T& dval, T& st, T& tok, T& par, T* draw, T* card, T* plane) {
+    A b;
+    b.t(didx).t(dval).t(st).tnull().tnull().tnull().t(tok).t(par);
+    b.tnull().tnull().tnull().tnull().tnull().tnull();
+    if (draw) b.t(*draw).t(*card).t(*plane); else b.tnull().tnull().tnull();
+    b.i("M", 1).i("round", round).i("rounds", 3).i("nodes", 5).i("width", kTgW).i("n_vocab", 1000);
+    return run("mtp_tree_grow", b);
+}
+}  /* namespace */
+
+TEST(mtp_tree_grow_with_a_coupled_draw_creates_each_nodes_children_in_draft_order) {
+    const int64_t N = 5, R = 3, sw = tg_state_words(N, kTgW, R), SW = (int64_t)RAD_MTP_COUPLE_STATE_WORDS;
+    const std::vector<float> steep = { 3, 2, 1, 0.5f, -1, -2, -3, -4 };
+    auto run_tree = [&](uint32_t mode, int32_t card, bool coupled, T* tok_out, T* par_out, T* plane) {
+        T st(RAD_I32, { 1, sw });
+        T tok(RAD_I32, { 1, N }), par(RAD_I32, { 1, N });
+        T draw(RAD_U32, { 1, 8 }), cs(RAD_I32, { 1 });
+        RadMtpCoupleDraw d{};
+        d.seed = 77; d.base = 5; d.seq = 1; d.card = 0; d.mode = mode;
+        std::memcpy(draw.mem.data(), &d, sizeof d);
+        cs.n({ card });
+        for (int round = 1; round <= (int)R; ++round) {
+            const int64_t rows = round == 1 ? 1 : kTgW;
+            T di(RAD_I32, { rows, 8 }), dv(RAD_F32, { rows, 8 });
+            std::vector<int64_t> ids;
+            std::vector<float> vs;
+            for (int64_t r = 0; r < rows; ++r)
+                for (int c = 0; c < 8; ++c) { ids.push_back(100 * (round + r) + c); vs.push_back(steep[(size_t)c]); }
+            di.n(ids); dv.f(vs);
+            CHECK_OK(tg_coupled(round, di, dv, st, tok, par, coupled ? &draw : nullptr,
+                                coupled ? &cs : nullptr, coupled ? plane : nullptr));
+        }
+        *tok_out = clone_t(tok);
+        *par_out = clone_t(par);
+    };
+    T tokc(RAD_I32, { 1, N }), parc(RAD_I32, { 1, N }), plane(RAD_U32, { N, 1, SW });
+    run_tree(1, 0, true, &tokc, &parc, &plane);
+    /* node states: Q over the eight, children as the tree has them, in node order */
+    int coupled_nodes = 0;
+    for (int64_t f = 0; f < N; ++f) {
+        RadMtpCoupleState s;
+        std::memcpy(&s, plane.mem.data() + (size_t)f * (size_t)SW * 4, sizeof s);
+        std::vector<int64_t> kids;
+        for (int64_t j = 0; j < N; ++j)
+            if (parc.iat(j) == f) kids.push_back(tokc.iat(j));
+        if (kids.empty()) { CHECK(s.nkids == 0); continue; }
+        ++coupled_nodes;
+        CHECK_EQ(s.status, 1);
+        CHECK(rad_mtp_couple_state_valid(s, 1000));
+        CHECK_EQ((size_t)s.nkids, kids.size());
+        for (size_t q = 0; q < kids.size(); ++q) CHECK_EQ((int64_t)s.ids[q], kids[q]);
+    }
+    CHECK(coupled_nodes >= 2);
+    /* a greedy draw: the uncoupled op, states untouched */
+    T tok0(RAD_I32, { 1, N }), par0(RAD_I32, { 1, N }), plane0(RAD_U32, { N, 1, SW });
+    T tokg(RAD_I32, { 1, N }), parg(RAD_I32, { 1, N }), planeg(RAD_U32, { N, 1, SW });
+    run_tree(0, 0, true, &tokg, &parg, &planeg);
+    run_tree(1, 0, false, &tok0, &par0, &plane0);
+    for (int64_t j = 0; j < N; ++j) {
+        CHECK_EQ(tokg.iat(j), tok0.iat(j));
+        CHECK_EQ(parg.iat(j), par0.iat(j));
+    }
+    for (size_t w = 0; w < (size_t)(N * SW); ++w) {
+        uint32_t x;
+        std::memcpy(&x, planeg.mem.data() + w * 4, 4);
+        CHECK_EQ(x, 0u);
+    }
+}
+
 /* The hidden-state routing: every frontier row continues from its PARENT's head output, found in a
  * per-node store (row `s * Q + node`, Q = 1 + (R - 1) * W), because the pool may hang a node off a
  * node of any earlier pass. M = 2 sequences, W = 2, R = 4, N = 6, Q = 7. */
@@ -13221,4 +13297,273 @@ TEST(mtp_tree_grow_writes_the_next_passs_tree_attention_operands) {
     T tok2(RAD_I32, { 1, 2 }), par2(RAD_I32, { 1, 2 });
     CHECK(tg_launch(1, d1, v1, st, tok2, par2) != RAD_OK);
     CHECK(tg_launch(3, d1, v1, st, tok, par) != RAD_OK);
+}
+
+/* ================================================================== mtp_tree_grow, confidence pruning
+ * abi/rad_mtp_tree.h: `prune_abs` / `prune_rel` (both optional, 0 = off). A candidate becomes a pool
+ * entry only if its cumulative probability >= prune_abs and its probability >= prune_rel * its
+ * parent's best candidate's; every frontier row's best candidate (the trunk) is never pruned. The
+ * pruned tree's unfilled entries are inert: token -1, parent 0. Logits 3,2,1,0,-1,-2,-3,-4 are
+ * probabilities .632 .233 .0855 .0315 ... (ratio to the best e^-1 = .368, e^-2 = .135, ...). */
+namespace {
+struct TpGrow {
+    int64_t M, N, R, W;
+    T st, tok, par;
+    TpGrow(int64_t m, int64_t n, int64_t r, int64_t w)
+        : M(m), N(n), R(r), W(w), st(RAD_I32, { m, tg_state_words(n, w, r) }),
+          tok(RAD_I32, { m, n }), par(RAD_I32, { m, n }) {}
+    /* One round over the candidate rows (M for round 1, M * W after); a negative threshold passes
+     * no parameter at all. */
+    int run_round(int round, T& didx, T& dval, double pa = -1, double pr = -1) {
+        A b;
+        b.t(didx).t(dval).t(st).tnull().tnull().tnull().t(tok).t(par);
+        b.i("M", (int)M).i("round", round).i("rounds", (int)R).i("nodes", (int)N).i("width", (int)W);
+        if (pa >= 0) b.d("prune_abs", pa);
+        if (pr >= 0) b.d("prune_rel", pr);
+        return run("mtp_tree_grow", b);
+    }
+};
+/* Candidate rows of ids base + 10 * row + c, row r's logits from lg[r]. */
+void tp_rows(T& d, T& v, const std::vector<std::vector<float>>& lg, int base) {
+    std::vector<int64_t> di;
+    std::vector<float> vf;
+    for (size_t r = 0; r < lg.size(); ++r)
+        for (int c = 0; c < 8; ++c) {
+            di.push_back(base + 10 * (int64_t)r + c);
+            vf.push_back(lg[r][(size_t)c]);
+        }
+    d.n(di); v.f(vf);
+}
+const std::vector<float> kSteep = { 3, 2, 1, 0, -1, -2, -3, -4 };
+const std::vector<float> kPeak  = { 5, -40, -40, -40, -40, -40, -40, -40 };
+}  /* namespace */
+
+TEST(mtp_tree_grow_with_the_thresholds_off_is_the_same_walk) {
+    /* Random candidate rows over three rounds, W = 2 and 3: passing no threshold and passing zeros
+     * give the same tree and the same state words, bit for bit. */
+    uint32_t seed = 12345;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (int)(seed >> 8); };
+    for (int64_t W = 2; W <= 3; ++W)
+        for (int trial = 0; trial < 40; ++trial) {
+            const int64_t N = 9, R = 3, M = 2;
+            TpGrow a(M, N, R, W), b(M, N, R, W);
+            for (int round = 1; round <= (int)R; ++round) {
+                const int64_t rows = round == 1 ? M : M * W;
+                std::vector<std::vector<float>> lg;
+                for (int64_t r = 0; r < rows; ++r) {
+                    std::vector<float> row;
+                    for (int c = 0; c < 8; ++c) row.push_back((float)(rnd() % 400) / 50.0f - 4.0f);
+                    lg.push_back(row);
+                }
+                T d(RAD_I32, { rows, 8 }), v(RAD_F32, { rows, 8 });
+                tp_rows(d, v, lg, 100 * round);
+                CHECK_OK(a.run_round(round, d, v));
+                CHECK_OK(b.run_round(round, d, v, 0.0, 0.0));
+            }
+            CHECK(std::memcmp(a.st.t.data, b.st.t.data, a.st.mem.size() - 8) == 0);
+            CHECK(std::memcmp(a.tok.t.data, b.tok.t.data, a.tok.mem.size() - 8) == 0);
+            CHECK(std::memcmp(a.par.t.data, b.par.t.data, a.par.mem.size() - 8) == 0);
+        }
+}
+
+TEST(mtp_tree_grow_pruned_hard_is_the_chain_of_best_children) {
+    /* A threshold nothing but the best candidate meets: node j hangs off node j - 1 and carries
+     * column 0 (the largest logit) of its parent's row; the nodes past the chain are inert. */
+    const int64_t N = 6, R = 3, W = 2;
+    for (int mode = 0; mode < 3; ++mode) {
+        const double pa = mode == 0 ? 0.99 : 0.0, pr = mode == 1 ? 1.0 : mode == 2 ? 0.99 : 0.0;
+        TpGrow g(1, N, R, W);
+        T d1(RAD_I32, { 1, 8 }), v1(RAD_F32, { 1, 8 });
+        tp_rows(d1, v1, { kSteep }, 10);
+        CHECK_OK(g.run_round(1, d1, v1, pa, pr));
+        /* one new node, the list ends after it: a token of -1 */
+        CHECK_EQ(g.tok.iat(0), 10); CHECK_EQ(g.par.iat(0), 0);
+        CHECK_EQ(g.tok.iat(1), -1);
+        /* round 2 reads one live frontier row (node 1) and one inert */
+        T d2(RAD_I32, { 2, 8 }), v2(RAD_F32, { 2, 8 });
+        tp_rows(d2, v2, { kSteep, kSteep }, 20);
+        CHECK_OK(g.run_round(2, d2, v2, pa, pr));
+        CHECK_EQ(g.tok.iat(0), 20); CHECK_EQ(g.par.iat(0), 1);
+        CHECK_EQ(g.tok.iat(1), -1);
+        T d3(RAD_I32, { 2, 8 }), v3(RAD_F32, { 2, 8 });
+        tp_rows(d3, v3, { kSteep, kSteep }, 30);
+        CHECK_OK(g.run_round(3, d3, v3, pa, pr));
+        const int64_t chain_tok[3] = { 10, 20, 30 };
+        for (int64_t j = 0; j < 3; ++j) { CHECK_EQ(g.tok.iat(j), chain_tok[j]); CHECK_EQ(g.par.iat(j), j); }
+        for (int64_t j = 3; j < N; ++j) { CHECK_EQ(g.tok.iat(j), -1); CHECK_EQ(g.par.iat(j), 0); }
+    }
+}
+
+TEST(mtp_tree_grow_pruned_keeps_the_candidates_both_thresholds_pass) {
+    const int64_t N = 5, R = 2, W = 2;
+    /* Round 2's rows: node 1's children are peaked (only the trunk), node 2's likewise. */
+    T d2(RAD_I32, { 2, 8 }), v2(RAD_F32, { 2, 8 });
+    tp_rows(d2, v2, { kPeak, kPeak }, 20);
+    T d1(RAD_I32, { 1, 8 }), v1(RAD_F32, { 1, 8 });
+    tp_rows(d1, v1, { kSteep }, 10);
+    /* Unpruned: nodes 1, 2 (the root's two best), then node 1's child (cum -.458), node 2's child
+     * (-1.458), then the root's third (-2.458, token 12): all five. */
+    {
+        TpGrow g(1, N, R, W);
+        CHECK_OK(g.run_round(1, d1, v1));
+        CHECK_OK(g.run_round(2, d2, v2));
+        const int64_t t[5] = { 10, 11, 20, 30, 12 }, p[5] = { 0, 0, 1, 2, 0 };
+        for (int j = 0; j < 5; ++j) { CHECK_EQ(g.tok.iat(j), t[j]); CHECK_EQ(g.par.iat(j), p[j]); }
+    }
+    /* rel .3: the root's second (ratio .368) stays, its third (.135) goes: five nodes, the fifth
+     * inert. abs .2 says the same by cumulative probability (.233 stays, .0855 goes). */
+    for (int mode = 0; mode < 2; ++mode) {
+        TpGrow g(1, N, R, W);
+        const double pa = mode == 1 ? 0.2 : 0.0, pr = mode == 0 ? 0.3 : 0.0;
+        CHECK_OK(g.run_round(1, d1, v1, pa, pr));
+        CHECK_EQ(g.tok.iat(0), 10); CHECK_EQ(g.tok.iat(1), 11);
+        CHECK_OK(g.run_round(2, d2, v2, pa, pr));
+        const int64_t t[5] = { 10, 11, 20, 30, -1 }, p[5] = { 0, 0, 1, 2, 0 };
+        for (int j = 0; j < 5; ++j) { CHECK_EQ(g.tok.iat(j), t[j]); CHECK_EQ(g.par.iat(j), p[j]); }
+    }
+    /* abs .25 prunes the root's second (.233): node 2 is node 1's child, the rest inert. The
+     * mid-round list is [10, -1]. Both thresholds together need both: rel .3 alone keeps the
+     * second, abs .25 alone drops it, so together it is dropped. */
+    for (int mode = 0; mode < 2; ++mode) {
+        TpGrow g(1, N, R, W);
+        const double pa = 0.25, pr = mode == 1 ? 0.3 : 0.0;
+        CHECK_OK(g.run_round(1, d1, v1, pa, pr));
+        CHECK_EQ(g.tok.iat(0), 10); CHECK_EQ(g.tok.iat(1), -1);
+        CHECK_OK(g.run_round(2, d2, v2, pa, pr));
+        const int64_t t[5] = { 10, 20, -1, -1, -1 }, p[5] = { 0, 1, 0, 0, 0 };
+        for (int j = 0; j < 5; ++j) { CHECK_EQ(g.tok.iat(j), t[j]); CHECK_EQ(g.par.iat(j), p[j]); }
+    }
+}
+
+TEST(mtp_tree_grow_pruned_never_drops_the_trunk_even_at_a_tiny_probability) {
+    /* A flat row: eight candidates of probability 1/8. abs .5 prunes seven of them, but the best
+     * (the first column of the largest logit) is kept, so node 1 exists and carries column 0; a
+     * row whose largest logit is column 3 trunks through column 3. */
+    const int64_t N = 3, R = 1, W = 1;
+    {
+        TpGrow g(1, N, R, W);
+        T d(RAD_I32, { 1, 8 }), v(RAD_F32, { 1, 8 });
+        tp_rows(d, v, { std::vector<float>(8, 0.0f) }, 10);
+        CHECK_OK(g.run_round(1, d, v, 0.5, 0.0));
+        CHECK_EQ(g.tok.iat(0), 10); CHECK_EQ(g.par.iat(0), 0);
+        CHECK_EQ(g.tok.iat(1), -1); CHECK_EQ(g.tok.iat(2), -1);
+    }
+    {
+        TpGrow g(1, N, R, W);
+        T d(RAD_I32, { 1, 8 }), v(RAD_F32, { 1, 8 });
+        tp_rows(d, v, { { 0, 0, 0, 9, 0, 0, 0, 0 } }, 10);
+        CHECK_OK(g.run_round(1, d, v, 0.99, 1.0));
+        CHECK_EQ(g.tok.iat(0), 13); CHECK_EQ(g.tok.iat(1), -1);
+    }
+    /* No valid candidate at all: node 1 is still made (token 0 under the root, as unpruned), so the
+     * tree has its trunk's first node; the rest is inert. */
+    {
+        TpGrow g(1, N, R, W);
+        T d(RAD_I32, { 1, 8 }), v(RAD_F32, { 1, 8 });
+        d.n(std::vector<int64_t>(8, -1)); v.f(std::vector<float>(8, 0.0f));
+        CHECK_OK(g.run_round(1, d, v, 0.5, 0.0));
+        CHECK_EQ(g.tok.iat(0), 0); CHECK_EQ(g.par.iat(0), 0);
+        CHECK_EQ(g.tok.iat(1), -1); CHECK_EQ(g.tok.iat(2), -1);
+    }
+}
+
+TEST(mtp_tree_grow_pruned_pool_keeps_the_trunk_of_a_kept_node) {
+    /* A frontier node that passed pruning is itself a parent: its own best child is trunk and
+     * enters the pool whatever its cumulative probability. Node 2 (cum .233) has two children of
+     * conditional probability .5; with abs .2 the best (cum .117) is kept as trunk and its twin
+     * (same cum, not the best) is pruned. */
+    const int64_t N = 6, R = 2, W = 2;
+    TpGrow g(1, N, R, W);
+    T d1(RAD_I32, { 1, 8 }), v1(RAD_F32, { 1, 8 });
+    tp_rows(d1, v1, { kSteep }, 10);
+    CHECK_OK(g.run_round(1, d1, v1, 0.2, 0.0));
+    CHECK_EQ(g.tok.iat(0), 10); CHECK_EQ(g.tok.iat(1), 11);
+    T d2(RAD_I32, { 2, 8 }), v2(RAD_F32, { 2, 8 });
+    const std::vector<float> two = { 2, 2, -40, -40, -40, -40, -40, -40 };
+    tp_rows(d2, v2, { kPeak, two }, 20);
+    CHECK_OK(g.run_round(2, d2, v2, 0.2, 0.0));
+    /* node 3: node 1's best child (cum .632), node 4: node 2's best child (trunk), then nothing
+     * the thresholds pass: N = 6 leaves two inert. */
+    const int64_t t[6] = { 10, 11, 20, 30, -1, -1 }, p[6] = { 0, 0, 1, 2, 0, 0 };
+    for (int j = 0; j < 6; ++j) { CHECK_EQ(g.tok.iat(j), t[j]); CHECK_EQ(g.par.iat(j), p[j]); }
+}
+
+/* The pruned grower's structural guarantees over random widths, rounds, budgets, thresholds and
+ * rows (some candidates invalid): the created nodes are a prefix and the entries past them are
+ * inert (-1 under the root), a parent precedes its child within the head's depth, no two siblings
+ * share a token, node 1 always exists, a frontier list ends at its first -1 (no hole in a round's
+ * frontier), and thresholds at 1 give exactly the chain of every round's best candidate. */
+TEST(mtp_tree_grow_pruned_fuzz_keeps_the_trees_structure_and_the_trunk) {
+    uint32_t s = 0x9e3779b9u;
+    auto rnd = [&]() { s = s * 1664525u + 1013904223u; return (int)(s >> 8); };
+    long heavy_chains = 0;
+    for (int trial = 0; trial < 6000; ++trial) {
+        const int W = 1 + rnd() % 4, R = 1 + rnd() % 5;
+        const int N = std::max(1, R + rnd() % 12), K = RAD_MTP_TREE_K, PITCH = N, SP = 5;
+        const bool heavy = rnd() % 4 == 0;
+        const double pa = heavy ? 1.0 : (rnd() % 3 == 0 ? 0.0 : (rnd() % 1000) / 1000.0);
+        double pr = heavy ? 1.0 : (rnd() % 3 == 0 ? 0.0 : (rnd() % 1000) / 1000.0);
+        if (pa == 0.0 && pr == 0.0) pr = 0.3;     /* off is the unpruned walk, pinned elsewhere */
+        std::vector<int> st((size_t)rad_mtp_tree_state_words(N, W, R), 0), table(64, 1);
+        std::vector<int> tok((size_t)PITCH), par((size_t)PITCH);
+        std::vector<int> best_tok;       /* heavy: the best candidate of each round's first row */
+        for (int round = 1; round <= R; ++round) {
+            const int rows = round == 1 ? 1 : W;
+            std::vector<int> idx((size_t)rows * K);
+            std::vector<float> val((size_t)rows * K);
+            for (int r = 0; r < rows; ++r) {
+                std::set<int> used;
+                for (int c = 0; c < K; ++c) {
+                    int id;
+                    do id = rnd() % 5000; while (used.count(id));
+                    used.insert(id);
+                    idx[(size_t)r * K + c] = rnd() % 9 == 0 ? -1 : id;
+                    val[(size_t)r * K + c] = (float)(rnd() % 800) / 60.0f - 6.0f;
+                }
+            }
+            RadMtpTreeCfg c{};
+            c.round = round; c.rounds = R; c.nodes = N; c.width = W; c.block = 4;
+            c.sel_pitch = SP; c.pitch = PITCH;
+            rad_mtp_tree_set_prune(&c, pa, pr);
+            std::vector<int> sel((size_t)W * SP), ns((size_t)W), src((size_t)W), dst((size_t)W);
+            std::vector<long long> vm((size_t)W);
+            int rb = 0;
+            CHECK_EQ(rad_mtp_tree_grow_seq(&c, st.data(), idx.data(), val.data(), 0, K, 1,
+                                           round == 1 ? 7 : -1, table.data(), tok.data(),
+                                           par.data(), sel.data(), ns.data(), vm.data(), &rb, 0,
+                                           src.data(), dst.data()), 0);
+            if (round < R) {
+                bool hole = false;
+                int live = 0;
+                for (int w = 0; w < W; ++w) {
+                    if (tok[(size_t)w] < 0) hole = true;
+                    else { CHECK(!hole); ++live; }
+                }
+                if (heavy) CHECK(live <= 1);
+            }
+            if (heavy && round == 1) {
+                int best = -1;
+                float mx = -INFINITY;
+                for (int cc = 0; cc < K; ++cc)
+                    if (idx[(size_t)cc] >= 0 && val[(size_t)cc] > mx) { mx = val[(size_t)cc]; best = cc; }
+                CHECK_EQ(tok[0], best >= 0 ? idx[(size_t)best] : 0);
+            }
+        }
+        int n = 0;
+        while (n < N && tok[(size_t)n] >= 0) ++n;
+        CHECK(n >= 1);
+        for (int j = n; j < N; ++j) { CHECK_EQ(tok[(size_t)j], -1); CHECK_EQ(par[(size_t)j], 0); }
+        std::set<std::pair<int, int>> sib;
+        for (int j = 1; j <= n; ++j) {
+            const int p = par[(size_t)j - 1];
+            CHECK(p >= 0 && p < j);
+            int depth = 0;
+            for (int x = j; x > 0; x = par[(size_t)x - 1]) ++depth;
+            CHECK(depth <= R);
+            CHECK(sib.insert({ p, tok[(size_t)j - 1] }).second);
+            if (heavy) CHECK_EQ(p, j - 1);
+        }
+        if (heavy) { CHECK(n <= R); ++heavy_chains; }
+    }
+    CHECK(heavy_chains > 1000);
 }

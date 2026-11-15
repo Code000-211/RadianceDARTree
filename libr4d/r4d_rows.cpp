@@ -889,6 +889,9 @@ static const RadParamSpec pMtpTreeGrow[] = {
     { "width",      RAD_P_INT, RAD_REQUIRED },
     { "block_size", RAD_P_INT, RAD_OPTIONAL },
     { "sel_pitch",  RAD_P_INT, RAD_OPTIONAL },
+    { "prune_abs",  RAD_P_F64, RAD_OPTIONAL },
+    { "prune_rel",  RAD_P_F64, RAD_OPTIONAL },
+    { "n_vocab",    RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oMtpTreeGrow[] = {
     { "didx",     RAD_OPD_IN,    0 },
@@ -905,6 +908,9 @@ static const RadOperandSpec oMtpTreeGrow[] = {
     { "rb",       RAD_OPD_OUT,   1 },
     { "src",      RAD_OPD_OUT,   1 },
     { "dst",      RAD_OPD_OUT,   1 },
+    { "cdraw",    RAD_OPD_IN,    1 },
+    { "cseq",     RAD_OPD_IN,    1 },
+    { "cstate",   RAD_OPD_INOUT, 1 },
 };
 /* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
 static const RadParamSpec pDflashTree[] = {
@@ -1628,7 +1634,9 @@ static const RadParamSpec pQsaScore[] = {
     { "n",      RAD_P_INT, RAD_REQUIRED },
     { "heads",  RAD_P_INT, RAD_REQUIRED },
     { "blocks", RAD_P_INT, RAD_REQUIRED },
-    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    /* A capacity: the sequence count is the cu operand's (r4d_qsa_score_bf16.hip), so a tree
+     * step's region score, whose `seqs` is max_tok, may declare smaller in a sizing declare. */
+    { "seqs",   RAD_P_INT, RAD_REQUIRED, RAD_PROLE_CAPACITY },
     { "dtype",  RAD_P_STR, RAD_REQUIRED },
 };
 static const RadOperandSpec oQsaScore[] = {

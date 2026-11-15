@@ -410,11 +410,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "16 rows a verify\n", ctx->max_spec);
             return RAD_E_UNSUPPORTED;
         }
-        if (ctx->draft_coupling) {
-            fprintf(stderr, "radiance: qwen4exp: --draft-coupling does not combine with a draft "
-                            "tree (the coupled proposal reads column 0 as a token)\n");
-            return RAD_E_UNSUPPORTED;
-        }
         if (ctx->draft_rounds > Model::kMaxRounds) {
             fprintf(stderr, "radiance: qwen4exp: a draft tree of %d head rounds (%d at most)\n",
                     ctx->draft_rounds, Model::kMaxRounds);
@@ -429,6 +424,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: qwen4exp: --draft-tree-width %lld exceeds the %lld nodes of "
                             "the draft tree\n", (long long)m.tree_w, (long long)m.tree_n);
             return RAD_E_UNSUPPORTED;
+        }
+        /* --draft-coupling with a tree: recursive rejection sampling over the siblings
+         * (abi/rad_mtp_rrs.h). Stage 1 draws its leaves in round 1's propose op, whose state
+         * plane is one row a round; stage 2's grower writes one state row a node. */
+        if (ctx->draft_coupling) {
+            if (m.tree_w <= 1 && ctx->draft_rounds > RAD_MTP_COUPLE_MAX_ROUNDS) {
+                fprintf(stderr, "radiance: qwen4exp: --draft-coupling with a draft tree of %d head "
+                                "rounds (%d at most)\n", ctx->draft_rounds,
+                        RAD_MTP_COUPLE_MAX_ROUNDS);
+                return RAD_E_UNSUPPORTED;
+            }
+            if (m.tree_w > 1 && ctx->max_spec > RAD_MTP_COUPLE_MAX_ROWS) {
+                fprintf(stderr, "radiance: qwen4exp: --draft-coupling with a stage-2 draft tree of "
+                                "%d nodes (%d at most)\n", ctx->max_spec, RAD_MTP_COUPLE_MAX_ROWS);
+                return RAD_E_UNSUPPORTED;
+            }
+            if (m.tree_w > RAD_MTP_RRS_MAX_WIDTH) {
+                fprintf(stderr, "radiance: qwen4exp: --draft-coupling with a draft tree frontier of "
+                                "%lld rows (%d at most)\n", (long long)m.tree_w,
+                        RAD_MTP_RRS_MAX_WIDTH);
+                return RAD_E_UNSUPPORTED;
+            }
         }
         /* A tree step writes the KV of rows the verify may drop and compacts them in place
          * (tree_compact); a streamed group's host mirror and ring have no such step. */
@@ -1577,24 +1594,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * head's reranked top-8; a plain bf16 head leaves one candidate and nothing to couple
              * over. The engine checks the drafter shape (a linear serial chain). */
             if (ctx->draft_coupling) {
-                if (!m.b_mtp_didx || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS) {
+                /* One state row per head round (a chain, a stage-1 tree), or per node a stage-2
+                 * tree's grower may give children to. */
+                const int64_t crows = !m.tree_on ? (int64_t)g.max_spec
+                                    : m.tree_w > 1 ? (int64_t)g.max_spec : m.tree_r;
+                const int64_t cmax = m.tree_on && m.tree_w > 1 ? RAD_MTP_COUPLE_MAX_ROWS
+                                                               : RAD_MTP_COUPLE_MAX_ROUNDS;
+                if (!m.b_mtp_didx || crows < 1 || crows > cmax) {
                     rad_note(b, "--draft-coupling on requires the 2-bit candidate head's reranked "
-                                "top8 and max_spec 1..%d",
-                             RAD_MTP_COUPLE_MAX_ROUNDS);
+                                "top8 and 1..%d coupled rounds (nodes of a stage-2 tree)",
+                             (int)cmax);
                     return RAD_E_UNSUPPORTED;
                 }
                 m.b_mtp_couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
                                               {g.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS},
                                               RAD_BUF_PERSIST);
                 m.b_mtp_couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
-                                              {g.max_spec, g.max_seqs,
+                                              {crows, g.max_seqs,
                                                RAD_MTP_COUPLE_STATE_WORDS},
                                               RAD_BUF_PERSIST);
                 if (!m.b_mtp_couple_draws || !m.b_mtp_couple_state) return RAD_E_INVAL;
                 rad_note(b, "MTP coupled: the head samples x~Q from its reranked top8 each round "
                             "(FP64), and the sampler couples the target's own draw to it; %lld "
-                            "round(s), fixed-seed tokens are NOT preserved",
-                         (long long)g.max_spec);
+                            "round(s)%s, fixed-seed tokens are NOT preserved",
+                         (long long)(m.tree_on ? m.tree_r : g.max_spec),
+                         m.tree_on ? ", siblings drawn without replacement and verified by "
+                                     "recursive rejection sampling" : "");
             }
         }
 
@@ -1697,6 +1722,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ts.qsa.emit_sel = m.mtp.attn.qsa_sel != 0;
         }
 
+        /* Stage 1 with coupling: round 1's propose op draws the leaves beside the trunk token. */
+        if (m.tree_on && m.tree_w <= 1 && ctx->draft_coupling) {
+            m.mtp.couple_leaves = std::min<int>(std::max(ctx->draft_tree_leaves, 0),
+                                                (int)kDraftTopR - 1);
+            /* The leaves' confidence pruning decided by q-rank inside the propose op, never by
+             * the drawn token's own probability (DESIGN-coupling.md 3.5). */
+            m.mtp.couple_prune_abs = std::max<double>(ctx->draft_tree_prune_abs, 0.0);
+            m.mtp.couple_prune_rel = std::max<double>(ctx->draft_tree_prune_rel, 0.0);
+        }
         m.mtp.media = m.media;
         RAD_ARCH_TRY(m.mtp.declare(b, nm, g, (int)g.n_layer, m.kv_full, &m.kv_qsa_bkey, m.n_rot,
                                    m.w_tok, m.w_lm_head, m.hccfg,
@@ -1736,6 +1770,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             dd.tree_leaves = std::min<int>(std::max(ctx->draft_tree_leaves, 0),
                                            (int)kDraftTopR - 1);
             dd.tree_width  = (int)m.tree_w;   /* checked against N above, never clamped here */
+            /* Stage 1's confidence pruning of the first round's leaves is the core's (advance.h),
+             * which reads the candidates' logits beside their ids. With --draft-coupling the
+             * leaves are drawn tokens in draft order, not the shortlist's columns: the propose
+             * op prunes them by q-rank itself and the core's capture takes what it left. */
+            if (dd.tree_width == 1 && !ctx->draft_coupling &&
+                (ctx->draft_tree_prune_abs > 0.0f || ctx->draft_tree_prune_rel > 0.0f))
+                dd.proposal_score = m.b_mtp_dval;
             m.tree_r = dd.depth;
             m.tree_n = dd.tree_nodes;
             if (dd.tree_width > 1) {
@@ -1744,17 +1785,60 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * freezes `round` as a parameter). */
                 dd.proposal       = m.b_mtp_ptok;
                 dd.proposal_pitch = m.tree_pitch;
+                /* Confidence pruning (--draft-tree-prune / -rel): the thresholds are op parameters
+                 * only when on, so the unpruned graph is the one it always was. */
+                const double pabs = std::max<double>(ctx->draft_tree_prune_abs, 0.0);
+                const double prel = std::max<double>(ctx->draft_tree_prune_rel, 0.0);
+                const bool   prune = pabs > 0.0 || prel > 0.0;
                 for (int r = 1; r <= (int)m.tree_r; ++r) {
-                    m.op_grow[r - 1] = rw(b, RAD_OP(b, "mtp_tree_grow",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
-                                   RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
-                                   RAD_INT("width", m.tree_w), RAD_INT("block_size", kKvBlock),
-                                   RAD_INT("sel_pitch", m.qsacfg.topk + 1)),
-                        RAD_NOWEIGHTS),
+                    /* With --draft-coupling the grower also draws each frontier row's children
+                     * without replacement and writes the node states (abi/rad_mtp_tree_rrs.h);
+                     * its pruning then reads slot priorities only (DESIGN-coupling.md 3.5). */
+                    if (ctx->draft_coupling) {
+                        const rad_op grow = prune
+                            ? RAD_OP(b, "mtp_tree_grow",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
+                                           RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
+                                           RAD_INT("width", m.tree_w),
+                                           RAD_INT("block_size", kKvBlock),
+                                           RAD_INT("sel_pitch", m.qsacfg.topk + 1),
+                                           RAD_F64("prune_abs", pabs), RAD_F64("prune_rel", prel),
+                                           RAD_INT("n_vocab", g.n_vocab_all)),
+                                RAD_NOWEIGHTS)
+                            : RAD_OP(b, "mtp_tree_grow",
+                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
+                                           RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
+                                           RAD_INT("width", m.tree_w),
+                                           RAD_INT("block_size", kKvBlock),
+                                           RAD_INT("sel_pitch", m.qsacfg.topk + 1),
+                                           RAD_INT("n_vocab", g.n_vocab_all)),
+                                RAD_NOWEIGHTS);
+                        m.op_grow[r - 1] = rw(b, grow,
+                            { m.b_mtp_didx, m.b_mtp_dval, m.b_mtp_gstate, m.b_mtp_couple_draws },
+                            { m.b_mtp_ptok, m.b_mtp_ptree, m.b_mtp_gstate, m.b_mtp_tsel,
+                              m.b_mtp_tnsel, m.b_mtp_tvmask, m.b_mtp_trb, m.b_mtp_tsrc,
+                              m.b_mtp_tdst, m.b_mtp_couple_state });
+                    } else {
+                    const rad_op grow = prune
+                        ? RAD_OP(b, "mtp_tree_grow",
+                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
+                                       RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
+                                       RAD_INT("width", m.tree_w), RAD_INT("block_size", kKvBlock),
+                                       RAD_INT("sel_pitch", m.qsacfg.topk + 1),
+                                       RAD_F64("prune_abs", pabs), RAD_F64("prune_rel", prel)),
+                            RAD_NOWEIGHTS)
+                        : RAD_OP(b, "mtp_tree_grow",
+                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
+                                       RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
+                                       RAD_INT("width", m.tree_w), RAD_INT("block_size", kKvBlock),
+                                       RAD_INT("sel_pitch", m.qsacfg.topk + 1)),
+                            RAD_NOWEIGHTS);
+                    m.op_grow[r - 1] = rw(b, grow,
                         { m.b_mtp_didx, m.b_mtp_dval, m.b_mtp_gstate },
                         { m.b_mtp_ptok, m.b_mtp_ptree, m.b_mtp_gstate, m.b_mtp_tsel,
                           m.b_mtp_tnsel, m.b_mtp_tvmask, m.b_mtp_trb, m.b_mtp_tsrc,
                           m.b_mtp_tdst });
+                    }
                     if (!m.op_grow[r - 1]) {
                         rad_note(b, "a stage-2 draft tree needs the mtp_tree_grow op, which no "
                                     "loaded library serves");
@@ -2055,7 +2139,10 @@ static void head_tree_grow(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brows(m.b_mtp_ptok, S), brows(m.b_mtp_ptree, S),
                 brows(m.b_mtp_tsel, S * W), brows(m.b_mtp_tnsel, S * W),
                 brows(m.b_mtp_tvmask, S * W), brows(m.b_mtp_trb, S),
-                brows(m.b_mtp_tsrc, S * W), brows(m.b_mtp_tdst, S * W));
+                brows(m.b_mtp_tsrc, S * W), brows(m.b_mtp_tdst, S * W),
+                m.b_mtp_couple_draws ? praw(batch->seq_ids, RAD_I32, batch->n_seq) : RAD_NONE,
+                m.b_mtp_couple_draws ? brows(m.b_mtp_couple_draws, S) : RAD_NONE,
+                m.b_mtp_couple_draws ? RAD_B(m.b_mtp_couple_state) : RAD_NONE);
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {

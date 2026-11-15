@@ -835,6 +835,17 @@ std::vector<Case> build_cases() {
     add("dflash_tree", { HI("M", 5), HI("steps", 3), HI("top_k", 12), HI("rank", 37),
                          HI("n_vocab", 97), HI("anchor_stride", 2), HI("nodes", 2),
                          HS("dtype", "bf16") });
+    /* A serial head's tree growth (abi/rad_mtp_tree.h, the one walk libref and libavx share), with
+     * and without confidence pruning (`prune_abs` / `prune_rel`), in the first, a middle and the last
+     * round: the same tree and the same state words. */
+    for (int round : { 1, 2, 3 }) {
+        add("mtp_tree_grow", { HI("M", 4), HI("round", round), HI("rounds", 3), HI("nodes", 6),
+                               HI("width", 3) });
+        add("mtp_tree_grow", { HI("M", 4), HI("round", round), HI("rounds", 3), HI("nodes", 6),
+                               HI("width", 3), HF("prune_abs", 0.1), HF("prune_rel", 0.2) });
+        add("mtp_tree_grow", { HI("M", 3), HI("round", round), HI("rounds", 3), HI("nodes", 9),
+                               HI("width", 2), HF("prune_rel", 0.5) });
+    }
     /* DFlash2's convolution: the 27B drafter's form (2 taps, groups of 16) over a narrower row,
      * then groups that are no multiple of a vector, three taps and a one-row block. f16 rows take
      * the path through f32 copies, bf16 and f32 the fused one. */

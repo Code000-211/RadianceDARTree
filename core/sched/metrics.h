@@ -151,6 +151,21 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* A serial head's tree (--draft-tree, confidence pruning --draft-tree-prune): verifies of a
+     * head's tree, the nodes their budgets allowed and the ones that were real (not pruned,
+     * Scheduler::tree_active), and histograms by active nodes and by accepted depth (the drafts a
+     * verify took, index = count). Cumulative. */
+    int64_t tree_verifies = 0;
+    int64_t tree_nodes_budget = 0;
+    int64_t tree_nodes_active = 0;
+    /* Dynamic rows (--draft-tree-rows, --draft-tree-chain): steps issued in the chain's form, the
+     * nodes the issued count dropped from the budget, and of those the ACTIVE ones (acceptance the
+     * prediction cost). Only the steps the predictor shaped count. */
+    int64_t tree_chain_steps = 0;
+    int64_t tree_rows_cut = 0;
+    int64_t tree_active_cut = 0;
+    int64_t tree_active_hist [RAD_METRICS_MAX_SPEC + 1] = {};
+    int64_t tree_accdepth_hist[RAD_METRICS_MAX_SPEC + 1] = {};
     /* Prompt lookup's verify gate (sched/lookup.h), when lookup is the only drafter: proposals
      * made, proposals held back unverified and their drafts, and of the held proposals scored
      * against the text that followed, the drafts that came true (what a verify would have

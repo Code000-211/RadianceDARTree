@@ -351,3 +351,29 @@ TEST(the_tree_rows_resolve_to_libr4d_at_flash_nexts_geometry) {
         CHECK_EQ(row("mtp_tree_grow", g), std::string("mtp_tree_grow_i32"));
     }
 }
+
+/* The parameters a tree deployment's sizing declare relies on being capacities (the sequence count
+ * is read from an operand, so a smaller level may declare fewer): the plugin's arch_test mirrors
+ * this list. A region score's `seqs` is max_tok, which a sizing declare lowers. */
+TEST(the_sizing_declares_capacity_parameters_are_capacities_in_every_kernel_library) {
+    Registry r;
+    const int st = r.load_dir(dir_of("kernels"), { "libr4d", "libref" });
+    if (!r.plugin("libr4d")) {
+        (void)st;
+        ARTIFACT_MISSING("libr4d under " + dir_of("kernels"));
+    }
+    const std::pair<const char*, const char*> want[] = {
+        { "qsa_score", "seqs" }, { "qsa_work", "work" },
+        { "attn_paged_gate_quant", "max_seqs" } };
+    for (const auto& w : want) {
+        const RadOpSchema* s = r.schema(w.first);
+        REQUIRE(s != nullptr);
+        int role = -1;
+        for (int k = 0; k < s->n_params; ++k)
+            if (s->params[k].key && std::strcmp(s->params[k].key, w.second) == 0)
+                role = s->params[k].role;
+        CHECK_EQ(role, (int)RAD_PROLE_CAPACITY);
+        if (role != RAD_PROLE_CAPACITY)
+            fprintf(stderr, "    %s.%s is not a capacity\n", w.first, w.second);
+    }
+}

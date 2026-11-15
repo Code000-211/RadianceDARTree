@@ -3518,6 +3518,79 @@ TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
     CHECK(!ch.s.staged_any_couple());
 }
 
+/* A DRAFT TREE'S COUPLED ROWS (recursive rejection sampling over the siblings, abi/rad_mtp_rrs.h).
+ *
+ * The tree is the chain 1..3 plus two leaves under the root (nodes 4, 5). Row 0 (the root) drafted
+ * the trunk 21 and the leaves 31, 32 in that draft order (nkids 3); rows 1 and 2 are the chain's
+ * single draws. build_step stages each row's state at the row's DEPTH position, keeps the prefix of
+ * the drafted children the verify still carries (a window that cut the leaves, or a tree whose
+ * leaf is not the drawn one), and leaves childless rows unbound. */
+TEST(a_draft_trees_coupled_rows_keep_the_prefix_of_their_drafted_children) {
+    HostChain ch(64, 2, 5, nullptr, 8, "spechub.so", true);
+    if (!ch.ok) {
+        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
+                ::radtest::current(), home().c_str());
+        return;
+    }
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    const int32_t draft[5] = { 21, 22, 23, 31, 32 };
+    const int32_t par[5]   = { 0, 1, 2, 0, 0 };
+    Request r = make_req(7, { 1, 2, 3 }, sp);
+    r.draft = draft;
+    r.draft_parent = par;
+    r.n_draft = 5;
+    std::string err;
+    CHECK_OK(ch.s.begin_request(r.id, r.sp, &err));
+    const uint64_t n_out = r.output.size();
+    RadMtpCoupleState bound[3];
+    couple_states(r.id, r.sp.seed, draft, 3, n_out, bound);
+    for (int k = 0; k < 3; ++k) bound[k].pos = n_out + (uint64_t)k;   /* rows 0..2 are depths 0..2 */
+    RadMtpCoupleState& root = bound[0];
+    root.count = 4;
+    root.ids[0] = 21; root.ids[1] = 31; root.ids[2] = 32; root.ids[3] = 40;
+    root.q[0] = root.q[1] = root.q[2] = root.q[3] = 0.25;
+    root.nkids = 3;
+    CHECK(rad_mtp_couple_state_valid(root, 64));
+    CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3, true));
+    std::vector<Request*> reqs = { &r };
+    CHECK_OK(ch.s.build_step(reqs));
+    int64_t n = 0;
+    const DeviceSampleParams* p = ch.s.staged_params(&n);
+    CHECK_EQ(n, 6);
+    CHECK(ch.s.staged_any_couple());
+    CHECK_EQ(ch.s.staged_couple(0).nkids, 3);
+    CHECK_EQ(ch.s.staged_couple(0).round, 1);
+    CHECK_EQ(ch.s.staged_couple(0).pos, n_out);
+    for (int k = 1; k < 3; ++k) {
+        CHECK_EQ(ch.s.staged_couple(k).round, k + 1);
+        CHECK_EQ(ch.s.staged_couple(k).nkids, 0);
+        CHECK_EQ(ch.s.staged_couple(k).pos, p[k].pos);   /* depth = row index on the chain */
+    }
+    for (int k = 3; k < 6; ++k) CHECK_EQ(ch.s.staged_couple(k).round, 0);   /* no children */
+    CHECK_EQ(p[3].pos, n_out + 3);   /* the chain's third node: depth 3 */
+    CHECK_EQ(p[4].pos, n_out + 1);   /* a root's leaf: depth 1, the trunk's depth */
+
+    /* A window that cut the last leaf: the verify keeps the two children it still carries. */
+    r.n_draft = 4;
+    CHECK_OK(ch.s.build_step(reqs));
+    CHECK_EQ(ch.s.staged_couple(0).nkids, 2);
+    /* A leaf that is not the drawn one: only the trunk survives, which is the chain's draw. */
+    const int32_t draft2[5] = { 21, 22, 23, 33, 32 };
+    r.draft = draft2;
+    r.n_draft = 5;
+    CHECK_OK(ch.s.build_step(reqs));
+    CHECK_EQ(ch.s.staged_couple(0).nkids, 1);
+    CHECK_EQ(ch.s.staged_couple(0).x, 21);
+    /* A trunk that is not the drawn one: the row is not bound at all. */
+    const int32_t draft3[5] = { 25, 22, 23, 31, 32 };
+    r.draft = draft3;
+    CHECK_OK(ch.s.build_step(reqs));
+    CHECK_EQ(ch.s.staged_couple(0).round, 0);
+    /* A greedy request binds nothing. */
+    ch.s.end_request(r.id);
+}
+
 /* THE SNAPSHOT THE EVIDENCE READS.
  *
  * In the coupled serial path build_step stages the bound rows, then the drafter's build_greedy
@@ -3715,6 +3788,39 @@ TEST(a_top1_row_issues_no_candidate_cut) {
     Request b = make_req(2, { 1 }, two);
     CHECK_OK(ch.step({ &b }, lg, &tok));
     for (const char* op : kCuts) CHECK(issued(op));
+}
+
+/* A chain-form verify over the first nodes of a tree that is not a chain (Request::draft_chain):
+ * the sampler stages a coupled state for row k only while the next token is really its child, that
+ * is k + 1 <= draft_chain; the rows past the leading run keep the ordinary pick. */
+TEST(a_chain_form_verify_binds_coupled_rows_only_inside_the_leading_chain) {
+    HostChain ch(64, 2, 3, nullptr, 8, "spechub.so", true);
+    if (!ch.ok) {
+        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
+                ::radtest::current(), home().c_str());
+        return;
+    }
+    for (int lead = -1; lead <= 3; ++lead) {
+        SamplingParams sp;
+        sp.temp = 1.0f;
+        const int32_t draft[3] = { 21, 22, 23 };
+        Request r = make_req(70 + (uint64_t)(lead + 1), { 1, 2, 3 }, sp);
+        r.draft = draft;
+        r.n_draft = 3;
+        r.draft_chain = lead;
+        std::string err;
+        CHECK_OK(ch.s.begin_request(r.id, r.sp, &err));
+        const uint64_t n_out = r.output.size();
+        RadMtpCoupleState bound[3];
+        couple_states(r.id, r.sp.seed, draft, 3, rad_mtp_couple_verify_pos(n_out, 1), bound);
+        CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3));
+        std::vector<Request*> reqs = { &r };
+        CHECK_OK(ch.s.build_step(reqs));
+        const int want = lead < 0 ? 3 : lead;
+        for (int k = 0; k < 3; ++k) CHECK_EQ(ch.s.staged_couple(k).round, k < want ? k + 1 : 0);
+        CHECK_EQ(ch.s.staged_any_couple(), want > 0);
+        ch.s.end_request(r.id);
+    }
 }
 
 RAD_TEST_MAIN()

@@ -12,6 +12,19 @@
  * node the budget has left (they are never embedded). Ties go to the candidate pooled first
  * (lower frontier row, then lower candidate column).
  *
+ * Confidence pruning (optional, off by default: then every statement above holds bit for bit). A
+ * candidate becomes a pool entry only if its cumulative probability exp(cum) >= prune_abs AND its
+ * probability >= prune_rel * the probability of the best candidate of its own parent (the first
+ * column of the row's largest logit); a threshold of 0 is off. The best candidate of every frontier
+ * row, the trunk, is never pruned, so with both thresholds high the tree is the plain chain of
+ * best children. Pruned growth never invents a node: a pool that runs dry ends the creation (the
+ * pass's frontier is shorter, a token of -1 ends its list) and the final tree's remaining entries
+ * are INERT, token -1 and parent 0, which the core makes a duplicate of node 1 (the trunk's first
+ * node) that no acceptance walk takes. The thresholds are compared in the log domain against
+ * values the walk computes anyway: log(prune_abs) against the candidate's cumulative log
+ * probability, log(prune_rel) against logit - max logit, both floats the host rounds once
+ * (rad_mtp_tree_set_prune), so libref and libr4d decide identically.
+ *
  * The state is plain 32-bit words per sequence, persistent across the passes of a step:
  *
  *     [0] head        the head's index of node 0 (its K and V sit at slot head, node k's at head + k)
@@ -59,10 +72,62 @@ typedef struct RadMtpTreeCfg {
     int block;       /* the head's KV page, in tokens */
     int sel_pitch;   /* the page list's width; 0 when the attention operands are not written */
     int pitch;       /* tok/par row pitch, at least N */
+    /* Confidence pruning (rad_mtp_tree_set_prune); a zeroed cfg prunes nothing. */
+    int   prune;     /* nonzero when either threshold is on */
+    float log_abs;   /* log(prune_abs), -inf when off: keep a candidate whose cum log prob >= it */
+    float log_rel;   /* log(prune_rel), -inf when off: keep one whose logit - max logit >= it */
 } RadMtpTreeCfg;
 
 static inline int rad_mtp_tree_state_words(int nodes, int width, int rounds) {
     return 4 + width + 6 * (nodes + 1) + 4 * RAD_MTP_TREE_K * width * rounds;
+}
+
+/* The thresholds (probabilities, 0 = off) into the cfg's log domain. */
+RAD_MTP_HD static inline void rad_mtp_tree_set_prune(RadMtpTreeCfg* c, double prune_abs,
+                                                     double prune_rel) {
+    const int a = prune_abs > 0.0, r = prune_rel > 0.0;
+    c->prune   = a || r;
+    c->log_abs = a ? logf((float)prune_abs) : -INFINITY;
+    c->log_rel = r ? logf((float)prune_rel) : -INFINITY;
+}
+
+/* One candidate row's normalised scores, the arithmetic every consumer shares (the grower's pool,
+ * the core's stage-1 leaf capture): out[c] = (v_c - mx) - lse for a valid candidate (id >= 0, logit
+ * a number above -inf), NaN for an invalid one; *mx_out the largest valid logit, *lse_out the log
+ * of the sum of exp(v - mx) in column order. Returns the first column of the largest logit, or -1
+ * when no candidate is valid (then nothing is written but out). */
+RAD_MTP_HD static inline int rad_mtp_tree_row_logp(const int* idx, const float* val, float* out,
+                                                    float* mx_out, float* lse_out) {
+    float mx = -INFINITY;
+    int best = -1;
+    for (int c = 0; c < RAD_MTP_TREE_K; ++c) {
+        out[c] = NAN;
+        const float v = val[c];
+        if (idx[c] >= 0 && v == v && v > mx) { mx = v; best = c; }
+    }
+    if (best < 0) return -1;
+    float sum = 0.0f;
+    for (int c = 0; c < RAD_MTP_TREE_K; ++c) {
+        const float v = val[c];
+        if (idx[c] >= 0 && v == v && v > -INFINITY) sum += expf(v - mx);
+    }
+    const float lse = logf(sum);
+    for (int c = 0; c < RAD_MTP_TREE_K; ++c) {
+        const float v = val[c];
+        if (idx[c] >= 0 && v == v && v > -INFINITY) out[c] = (v - mx) - lse;
+    }
+    *mx_out = mx;
+    *lse_out = lse;
+    return best;
+}
+
+/* Whether candidate c of a row scored by rad_mtp_tree_row_logp is kept by the cfg's pruning, given
+ * its parent's cumulative log probability `base`: the best column always, any column when pruning
+ * is off, else both thresholds. `v` its logit. */
+RAD_MTP_HD static inline int rad_mtp_tree_keep(const RadMtpTreeCfg* cfg, int c, int best,
+                                               float base, float lp, float v, float mx) {
+    if (!cfg->prune || c == best) return 1;
+    return (base + lp) >= cfg->log_abs && (v - mx) >= cfg->log_rel;
 }
 
 RAD_MTP_HD static inline float rad_mtp_tree_bits_f(int v) { float f; memcpy(&f, &v, 4); return f; }
@@ -101,26 +166,19 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
     for (int w = 0; w < nfront && w < W; ++w) {
         const int f = front[w];
         const long r = row0 + (long)w * stride;
-        float mx = -INFINITY;
-        for (int c = 0; c < K; ++c) {
-            const float v = dval[r * row_stride + c];
-            if (didx[r * row_stride + c] >= 0 && v == v && v > mx) mx = v;
-        }
-        if (!(mx > -INFINITY)) continue;
-        float sum = 0.0f;
-        for (int c = 0; c < K; ++c) {
-            const float v = dval[r * row_stride + c];
-            if (didx[r * row_stride + c] >= 0 && v == v && v > -INFINITY) sum += expf(v - mx);
-        }
-        const float lse = logf(sum);
+        float lp[RAD_MTP_TREE_K], mx = 0.0f, lse = 0.0f;
+        const int bestc = rad_mtp_tree_row_logp(didx + r * row_stride, dval + r * row_stride, lp,
+                                                &mx, &lse);
+        if (bestc < 0) continue;
         const float base = rad_mtp_tree_bits_f(nd[6 * f + 3]);
         for (int c = 0; c < K; ++c) {
-            const float v = dval[r * row_stride + c];
-            const int   t = didx[r * row_stride + c];
-            if (t < 0 || !(v == v) || !(v > -INFINITY)) continue;
+            if (!(lp[c] == lp[c])) continue;     /* NaN: an invalid candidate */
             if (st[3] >= pcap) break;
+            if (!rad_mtp_tree_keep(cfg, c, bestc, base, lp[c], dval[r * row_stride + c], mx))
+                continue;
             int* e = pool + 4 * st[3]++;
-            e[0] = f; e[1] = t; e[2] = rad_mtp_tree_f_bits(base + ((v - mx) - lse)); e[3] = 0;
+            e[0] = f; e[1] = didx[r * row_stride + c]; e[2] = rad_mtp_tree_f_bits(base + lp[c]);
+            e[3] = 0;
         }
     }
 
@@ -137,6 +195,9 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
             const float v = rad_mtp_tree_bits_f(pool[4 * e + 2]);
             if (best < 0 || v > bv) { best = e; bv = v; }
         }
+        /* A pruned pool that runs dry ends the creation: no placeholder node is made (but node 1,
+         * the trunk's first, always exists), the rest of the tree stays inert. */
+        if (best < 0 && cfg->prune && st[1] > 0) break;
         const int id = ++st[1];
         int* n = nd + 6 * id;
         if (best < 0) {
@@ -158,7 +219,9 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
 
     if (cfg->round >= R) {
         for (int j = 1; j <= N; ++j) {
-            tok[j - 1] = j <= st[1] ? nd[6 * j + 0] : (st[1] >= 1 ? nd[6 * 1 + 0] : 0);
+            /* pruned: the entries past the created nodes are inert (-1), else a copy of node 1's */
+            tok[j - 1] = j <= st[1] ? nd[6 * j + 0]
+                                    : cfg->prune ? -1 : (st[1] >= 1 ? nd[6 * 1 + 0] : 0);
             par[j - 1] = j <= st[1] ? nd[6 * j + 1] : 0;
         }
         st[2] = 0;

@@ -542,6 +542,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-coupling", { "on" } },
         { "--draft-tree", { "on" } }, { "--draft-tree-leaves", { "4" } },
         { "--draft-tree-nodes", { "8" } }, { "--draft-tree-width", { "2" } },
+        { "--draft-tree-prune", { "0.1" } }, { "--draft-tree-prune-rel", { "0.3" } },
+        { "--draft-tree-rows", { "1" } }, { "--draft-tree-chain", { "2" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -978,6 +980,41 @@ TEST(a_serial_trees_flags_default_to_the_plugins_choice_and_parse_their_ranges) 
     CHECK_EQ(parse_fresh({ "--draft-tree-leaves", "-1" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--draft-tree-width", "0" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--draft-tree-nodes", "65" }), RAD_E_INVAL);
+}
+
+/* Confidence pruning of a serial tree: both thresholds are probabilities, off at 0, and a value
+ * outside [0, 1] or not a number is refused rather than served as another tree. */
+TEST(the_tree_pruning_thresholds_default_off_and_parse_as_probabilities) {
+    Config c;
+    CHECK_EQ(c.draft_tree_prune, 0.0);
+    CHECK_EQ(c.draft_tree_prune_rel, 0.0);
+    CHECK_EQ(parse({ "--draft-tree-prune", "0.05", "--draft-tree-prune-rel", "0.3" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree_prune, 0.05);
+    CHECK_EQ(c.draft_tree_prune_rel, 0.3);
+    CHECK_EQ(parse({ "--draft-tree-prune", "0", "--draft-tree-prune-rel", "1" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree_prune, 0.0);
+    CHECK_EQ(c.draft_tree_prune_rel, 1.0);
+    for (const char* bad : { "-0.1", "1.5", "high", "" }) {
+        CHECK_EQ(parse_fresh({ "--draft-tree-prune", bad }), RAD_E_INVAL);
+        CHECK_EQ(parse_fresh({ "--draft-tree-prune-rel", bad }), RAD_E_INVAL);
+    }
+}
+
+/* Dynamic rows: both off by default; rows takes off or a margin, chain a hold of 0 to 2. */
+TEST(the_dynamic_row_flags_default_off_and_parse) {
+    Config c;
+    CHECK_EQ(c.draft_tree_rows, -1);
+    CHECK_EQ(c.draft_tree_chain, 0);
+    CHECK_EQ(parse({ "--draft-tree-rows", "2", "--draft-tree-chain", "1" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree_rows, 2);
+    CHECK_EQ(c.draft_tree_chain, 1);
+    CHECK_EQ(parse({ "--draft-tree-rows", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree_rows, 0);
+    CHECK_EQ(parse({ "--draft-tree-rows", "off", "--draft-tree-chain", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree_rows, -1);
+    CHECK_EQ(c.draft_tree_chain, 0);
+    for (const char* bad : { "-1", "65", "many", "" }) CHECK_EQ(parse_fresh({ "--draft-tree-rows", bad }), RAD_E_INVAL);
+    for (const char* bad : { "-1", "3", "yes", "" }) CHECK_EQ(parse_fresh({ "--draft-tree-chain", bad }), RAD_E_INVAL);
 }
 
 /* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not

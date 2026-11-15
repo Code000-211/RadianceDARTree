@@ -37,16 +37,24 @@ typedef struct RadMtpCoupleState {
     int32_t  status, round, x, count;
     int32_t  ids[8];
     double   q[8];
+    /* A draft TREE's node (abi/rad_mtp_rrs.h): the node drafted `nkids` children, sampled without
+     * replacement from q, and ids[0 .. nkids) are them in draft order (x == ids[0]; ids[nkids ..
+     * count) the rest of the support). nkids <= 1 is the linear chain's single draw, whose ids
+     * keep the shortlist's order. Zero from every writer that is not a tree's. */
+    int32_t  nkids, pad_;
 } RadMtpCoupleState;
 #define RAD_MTP_COUPLE_DRAW_WORDS  (sizeof(RadMtpCoupleDraw) / 4)
 #define RAD_MTP_COUPLE_STATE_WORDS (sizeof(RadMtpCoupleState) / 4)
 #define RAD_MTP_COUPLE_MAX_ROUNDS 8
+/* The rows of a draft tree a request can have coupled states for (one per verify row that has
+ * children): the grower's node limit. */
+#define RAD_MTP_COUPLE_MAX_ROWS   64
 /* Draft stream of round r: seed ^ (KEY_DRAFT + r) at coordinate `base`. Acceptance and the
  * residual draw use RAD_SAMPLE_KEY_ACCEPT / RAD_SAMPLE_KEY_RESID at the verify position. */
 #define RAD_MTP_COUPLE_KEY_DRAFT 0x4d5450434f55504cull
 #ifdef __cplusplus
 static_assert(sizeof(RadMtpCoupleDraw) == 32, "MTP coupling draw wire");
-static_assert(sizeof(RadMtpCoupleState) == 152, "MTP coupling state wire");
+static_assert(sizeof(RadMtpCoupleState) == 160, "MTP coupling state wire");
 static_assert(offsetof(RadMtpCoupleState, q) % 8 == 0, "MTP coupling q alignment");
 #endif
 
@@ -101,6 +109,7 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_state_valid(const RadMtpCoupleS
         sum += s.q[i];
         has_x |= s.ids[i] == s.x;
     }
+    if (s.nkids < 0 || s.nkids > s.count || (s.nkids >= 2 && s.ids[0] != s.x)) return false;
     return has_x && (sum - 1) <= 1e-12 && (1 - sum) <= 1e-12;
 }
 
@@ -327,6 +336,8 @@ static inline RAD_SPECHUB_HD int32_t rad_dflash_couple_step(const float* sc, con
     s->pos = 0;
     s->round = round;
     s->count = 0;
+    s->nkids = 0;   /* a walk's position is one draw: the chain's wire */
+    s->pad_ = 0;
     for (int i = 0; i < 8; ++i) { s->ids[i] = -1; s->q[i] = 0; }
     if (d.mode != 1) {
         s->status = 0;

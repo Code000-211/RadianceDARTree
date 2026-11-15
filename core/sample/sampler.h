@@ -182,7 +182,7 @@ public:
     /* --draft-coupling: bind the per-round states of the linear draft just published, `n` of
      * them (0 clears). Each must name this request, the round it belongs to, and a `draw.mode` the
      * row actually ran. RAD_E_NOTFOUND for a request already ended here. */
-    int set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n);
+    int set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n, bool tree = false);
 
     /* ---------------------------------------------------------- step path */
 
@@ -268,7 +268,7 @@ private:
         /* --draft-coupling: the linear draft's per-round states for the window the scheduler
          * published, bound by set_mtp_couple and consumed by build_step. `couple_n` is how many of
          * `couple` are live; 0 for a request whose drafts carry no coupled proposal. */
-        RadMtpCoupleState couple[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+        RadMtpCoupleState couple[RAD_MTP_COUPLE_MAX_ROWS]{};
         int               couple_n = 0;
     };
 

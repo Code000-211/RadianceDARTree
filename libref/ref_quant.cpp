@@ -25,6 +25,7 @@
 #include "ref_gemm.h"   /* Mat and Scales, for gemm_nt_q_gated */
 #include "ref_ops.h"
 #include "rad_mtp_tree.h"
+#include "rad_mtp_tree_rrs.h"
 
 using namespace ref;
 
@@ -881,6 +882,7 @@ int ref_mtp_tree_grow(const RadArgs* a, RadStream) {
     const RadTensor* srct  = a->n_t > 12 ? t_in(a, 12) : nullptr;
     const RadTensor* dstt  = a->n_t > 13 ? t_in(a, 13) : nullptr;
     if (!didx->data || !dval->data || !st->data || !tok->data || !par->data) return RAD_E_INVAL;
+    const int64_t n_vocab_c = p_int(a, "n_vocab", 0);
     if (didx->dtype != RAD_I32 || dval->dtype != RAD_F32 || st->dtype != RAD_I32 ||
         tok->dtype != RAD_I32 || par->dtype != RAD_I32)
         return RAD_E_DTYPE;
@@ -892,6 +894,8 @@ int ref_mtp_tree_grow(const RadArgs* a, RadStream) {
     cfg.width  = (int)p_int(a, "width", 0);
     cfg.block  = (int)p_int(a, "block_size", 0);
     cfg.sel_pitch = (int)p_int(a, "sel_pitch", 0);
+    rad_mtp_tree_set_prune(&cfg, (double)p_f32(a, "prune_abs", 0.0f),
+                           (double)p_f32(a, "prune_rel", 0.0f));
     const int64_t M = band_rows(st->rank >= 2 ? st->shape[0] : numel(st), p_int(a, "M", 0));
     cfg.pitch = (int)(tok->rank >= 2 ? tok->shape[tok->rank - 1] : cfg.nodes);
     if (M <= 0 || cfg.round < 1 || cfg.rounds < 1 || cfg.nodes < 1 || cfg.width < 1 ||
@@ -900,6 +904,18 @@ int ref_mtp_tree_grow(const RadArgs* a, RadStream) {
     const int64_t sw = rad_mtp_tree_state_words(cfg.nodes, cfg.width, cfg.rounds);
     if (st->rank < 2 || st->shape[1] < sw || st->shape[0] < M) return RAD_E_SHAPE;
     if (cfg.pitch < cfg.nodes || numel(tok) < M * cfg.pitch || numel(par) < M * cfg.pitch)
+        return RAD_E_SHAPE;
+    const RadTensor* cdrawt = a->n_t > 14 ? t_in(a, 14) : nullptr;
+    const RadTensor* cseqt  = a->n_t > 15 ? t_in(a, 15) : nullptr;
+    const RadTensor* cstt   = a->n_t > 16 ? t_in(a, 16) : nullptr;
+    /* The coupled form (--draft-coupling, abi/rad_mtp_tree_rrs.h): present with all three operands. */
+    const bool cpl_on = cdrawt && cseqt && cstt;
+    if (cpl_on && (cdrawt->dtype != RAD_U32 || cseqt->dtype != RAD_I32 || cstt->dtype != RAD_U32 ||
+                   cstt->rank != 3 || cstt->shape[2] != (int64_t)RAD_MTP_COUPLE_STATE_WORDS ||
+                   cstt->shape[1] < M || cdrawt->shape[0] < M ||
+                   cdrawt->shape[cdrawt->rank - 1] < (int64_t)RAD_MTP_COUPLE_DRAW_WORDS ||
+                   numel(cseqt) < M || cdrawt->stride[0] % 2 || cstt->stride[0] % 2 ||
+                   cstt->stride[1] % 2 || (uintptr_t)cdrawt->data % 8 || (uintptr_t)cstt->data % 8))
         return RAD_E_SHAPE;
     const int64_t per = cfg.round == 1 ? 1 : cfg.width;   /* candidate rows a sequence */
     if (didx->rank < 2 || didx->shape[didx->rank - 1] != RAD_MTP_TREE_K ||
@@ -935,13 +951,23 @@ int ref_mtp_tree_grow(const RadArgs* a, RadStream) {
         std::vector<int> nsw((size_t)cfg.width, 0);
         int rb = 0;
         std::vector<int> srcw((size_t)cfg.width, 0), dstw((size_t)cfg.width, 0);
-        const int rc = rad_mtp_tree_grow_seq(
+        RadMtpTreeCpl cpl{};
+        if (cpl_on) {
+            cpl.draw = (const uint32_t*)cdrawt->data + m * cdrawt->stride[0];
+            cpl.card = ((const int32_t*)cseqt->data)[offlin(cseqt, m)];
+            cpl.state = (uint32_t*)cstt->data;
+            cpl.st_node = cstt->stride[0];
+            cpl.st_seq = cstt->stride[1];
+            cpl.rows = (int)cstt->shape[0];
+            cpl.vocab = n_vocab_c;
+        }
+        const int rc = rad_mtp_tree_grow_seq_cpl(
             &cfg, sp, ip, fp, m * per, drs, 1, head,
             att ? (const int*)tab->data + m * tab->stride[0] : nullptr,
             (int*)tok->data + m * tok->stride[0], (int*)par->data + m * par->stride[0],
             att ? selw.data() : nullptr, att ? nsw.data() : nullptr, att ? vm.data() : nullptr,
             att ? &rb : nullptr, m, srct ? srcw.data() : nullptr,
-            dstt ? dstw.data() : nullptr);
+            dstt ? dstw.data() : nullptr, cpl_on ? &cpl : nullptr);
         if (rc < 0) return RAD_E_SHAPE;
         if (cfg.round < cfg.rounds)
             for (int w = 0; w < cfg.width; ++w) {

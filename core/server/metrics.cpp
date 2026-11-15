@@ -191,6 +191,16 @@ void Metrics::sample(const SchedMetrics& m) {
     c_decode_tokens_.advance_to(m.decode_tokens);
     c_draft_tokens_.advance_to(m.draft_tokens);
     c_draft_accepted_.advance_to(m.draft_accepted);
+    c_tree_verifies_.advance_to(m.tree_verifies);
+    c_tree_nodes_budget_.advance_to(m.tree_nodes_budget);
+    c_tree_nodes_active_.advance_to(m.tree_nodes_active);
+    c_tree_chain_steps_.advance_to(m.tree_chain_steps);
+    c_tree_rows_cut_.advance_to(m.tree_rows_cut);
+    c_tree_active_cut_.advance_to(m.tree_active_cut);
+    for (int d = 0; d <= (int)MAX_DRAFT_POS; ++d) {
+        g_tree_active_[d].set((double)m.tree_active_hist[d]);
+        g_tree_accdepth_[d].set((double)m.tree_accdepth_hist[d]);
+    }
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
     c_lookup_proposals_.advance_to(m.lookup_proposals);
@@ -259,6 +269,25 @@ struct Writer {
     }
     /* The buckets in ascending order, then the count once for both +Inf and _count, the order
      * Histogram::observe makes consistent. */
+    /* A histogram of small whole numbers kept as counts per value (`counts[v]`, v = 0..top): the
+     * bucket le="v" holds every observation <= v, `sum` the exact sum of the values. */
+    void hist_counts(const char* name, const char* doc, const std::string& labels,
+                     const double* counts, int top, double sum) {
+        help(name, doc, "histogram");
+        double cum = 0.0;
+        for (int v = 0; v <= top; ++v) {
+            cum += counts[v];
+            out += name; out += "_bucket";
+            out += labels.substr(0, labels.size() - 1);
+            out += ",le=\""; out += std::to_string(v); out += "\"} ";
+            out += num(cum); out += '\n';
+        }
+        out += name; out += "_bucket";
+        out += labels.substr(0, labels.size() - 1);
+        out += ",le=\"+Inf\"} "; out += num(cum); out += '\n';
+        out += name; out += "_sum"; out += labels; out += ' '; out += num(sum); out += '\n';
+        out += name; out += "_count"; out += labels; out += ' '; out += num(cum); out += '\n';
+    }
     void hist(const char* name, const char* doc, const std::string& labels, const Histogram& h) {
         help(name, doc, "histogram");
         for (size_t i = 0; i < h.bounds().size(); ++i) {
@@ -559,6 +588,47 @@ std::string Metrics::render() const {
         for (int j = 0; j < seen; ++j)
             w.out += "radiance:draft_position_accepted_total" + base + ",position=\"" +
                      std::to_string(j) + "\"} " + num(g_draft_pos_accepted_[j].get()) + '\n';
+    }
+    /* A serial head's tree (--draft-tree on a head that grows one): how many of a verify's nodes
+     * were real after confidence pruning (--draft-tree-prune), and how deep the accepted path was.
+     * The histograms' _sum / _count give the means a sweep reads; the counters the totals. */
+    if (c_tree_verifies_.get() > 0) {
+        double act[MAX_DRAFT_POS + 1], dep[MAX_DRAFT_POS + 1];
+        double asum = 0.0, dsum = 0.0;
+        int atop = 0, dtop = 0;
+        for (int d = 0; d <= (int)MAX_DRAFT_POS; ++d) {
+            act[d] = g_tree_active_[d].get();
+            dep[d] = g_tree_accdepth_[d].get();
+            asum += act[d] * d;
+            dsum += dep[d] * d;
+            if (act[d] > 0) atop = d;
+            if (dep[d] > 0) dtop = d;
+        }
+        w.hist_counts("radiance:spec_tree_active_nodes",
+                      "Nodes a tree verify carried that were real, not confidence-pruned "
+                      "(--draft-tree-prune), per verify.", L, act, atop, asum);
+        w.hist_counts("radiance:spec_tree_accepted_depth",
+                      "Draft tokens a tree verify accepted (the accepted path's length), per verify.",
+                      L, dep, dtop, dsum);
+        w.counter("radiance:spec_tree_verifies_total", "Verifies of a serial head's tree.", L,
+                  c_tree_verifies_.get());
+        w.counter("radiance:spec_tree_nodes_budget_total",
+                  "Nodes a tree verify's budget allowed, summed over verifies.", L,
+                  c_tree_nodes_budget_.get());
+        w.counter("radiance:spec_tree_nodes_active_total",
+                  "Nodes a tree verify carried that were real (not pruned), summed over verifies.",
+                  L, c_tree_nodes_active_.get());
+        if (c_tree_chain_steps_.get() > 0 || c_tree_rows_cut_.get() > 0) {
+            w.counter("radiance:spec_tree_chain_steps_total",
+                      "Steps issued in the chain's form (--draft-tree-chain).", L,
+                      c_tree_chain_steps_.get());
+            w.counter("radiance:spec_tree_rows_cut_total",
+                      "Nodes the predicted row count dropped from a tree's budget "
+                      "(--draft-tree-rows).", L, c_tree_rows_cut_.get());
+            w.counter("radiance:spec_tree_active_cut_total",
+                      "Of those, nodes that were real: the acceptance the prediction cost.", L,
+                      c_tree_active_cut_.get());
+        }
     }
     /* Adaptive draft window, only under --draft-window adaptive: the current mean window (at one
      * sequence, that sequence's window) and its history as verifies by drafts carried. */

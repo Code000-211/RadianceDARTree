@@ -246,12 +246,15 @@ static const RadOperandSpec oScatterRows[] = { OPD("v"), OPD("idx"), INOUT("x") 
 /* mtp_tree_grow: libref's schema (ref_registry.cpp), the growth of a serial draft head's tree. */
 static const RadParamSpec pMtpTreeGrow[] = { P_INT("M"), P_INT("round"), P_INT("rounds"),
                                              P_INT("nodes"), P_INT("width"),
-                                             P_INTO("block_size"), P_INTO("sel_pitch") };
+                                             P_INTO("block_size"), P_INTO("sel_pitch"),
+                                             P_F64O("prune_abs"), P_F64O("prune_rel"),
+                                             P_INTO("n_vocab") };
 static const RadOperandSpec oMtpTreeGrow[] = { OPD("didx"), OPD("dval"), INOUT("state"),
                                                OPD_O("head_pos"), OPD_O("head_row"),
                                                OPD_O("table"), OUT("tok"), OUT("par"),
                                                OUT_O("sel"), OUT_O("nsel"), OUT_O("vmask"),
-                                               OUT_O("rb"), OUT_O("src"), OUT_O("dst") };
+                                               OUT_O("rb"), OUT_O("src"), OUT_O("dst"),
+                                               OPD_O("cdraw"), OPD_O("cseq"), INOUT_O("cstate") };
 
 static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_STR("to") };
 
@@ -473,7 +476,7 @@ static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page")
  * tokens (tail store, work list); `seqs` is the declared height of `cu`'s sequences, whose count is
  * cu's length less one. `work` bounds the blocks that can complete. */
 static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
-                                          P_INT("seqs"), P_STR("dtype") };
+                                          P_CAP("seqs"), P_STR("dtype") };
 static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD("cu"), OPD("nc"),
                                             OUT("score") };
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),

@@ -2676,6 +2676,51 @@ TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
     CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"6\"}"), -1.0, 1e-9);
 }
 
+/* A serial head's tree (--draft-tree, --draft-tree-prune): the real nodes a verify carried and the
+ * accepted depth are histograms with one bucket a whole number, exposed once a tree verify ran, so
+ * a deployment without a tree scrapes what it did before. */
+TEST(a_serial_trees_active_nodes_and_accepted_depth_are_histograms) {
+    Metrics m("m", 1024);
+    server::SchedMetrics s;
+    m.sample(s);
+    CHECK(m.render().find("radiance:spec_tree_") == std::string::npos);
+
+    s.tree_verifies = 5;
+    s.tree_nodes_budget = 30;
+    s.tree_nodes_active = 24;
+    s.tree_active_hist[4] = 3;      /* three verifies of four real nodes ... */
+    s.tree_active_hist[6] = 2;      /* ... two of the full six */
+    s.tree_accdepth_hist[1] = 2;
+    s.tree_accdepth_hist[3] = 3;
+    m.sample(s);
+    PromDoc d = parse_prom(m.render());
+    CHECK_EQ((int)d.errors.size(), 0);
+    CHECK_EQ(d.type["radiance:spec_tree_active_nodes"], std::string("histogram"));
+    CHECK_EQ(d.type["radiance:spec_tree_accepted_depth"], std::string("histogram"));
+    CHECK_EQ(d.type["radiance:spec_tree_verifies_total"], std::string("counter"));
+    auto value = [&d](const std::string& name) {
+        auto it = d.samples.find(name);
+        return it == d.samples.end() ? -1.0 : it->second;
+    };
+    const std::string L = "{model_name=\"m\",engine=\"0\"";
+    const std::string A = "radiance:spec_tree_active_nodes";
+    CHECK_NEAR(value(A + "_bucket" + L + ",le=\"3\"}"), 0.0, 1e-9);
+    CHECK_NEAR(value(A + "_bucket" + L + ",le=\"4\"}"), 3.0, 1e-9);
+    CHECK_NEAR(value(A + "_bucket" + L + ",le=\"5\"}"), 3.0, 1e-9);
+    CHECK_NEAR(value(A + "_bucket" + L + ",le=\"6\"}"), 5.0, 1e-9);
+    CHECK_NEAR(value(A + "_bucket" + L + ",le=\"+Inf\"}"), 5.0, 1e-9);
+    CHECK_NEAR(value(A + "_sum" + L + "}"), 24.0, 1e-9);
+    CHECK_NEAR(value(A + "_count" + L + "}"), 5.0, 1e-9);
+    const std::string D = "radiance:spec_tree_accepted_depth";
+    CHECK_NEAR(value(D + "_bucket" + L + ",le=\"1\"}"), 2.0, 1e-9);
+    CHECK_NEAR(value(D + "_bucket" + L + ",le=\"2\"}"), 2.0, 1e-9);
+    CHECK_NEAR(value(D + "_bucket" + L + ",le=\"3\"}"), 5.0, 1e-9);
+    CHECK_NEAR(value(D + "_sum" + L + "}"), 11.0, 1e-9);
+    CHECK_NEAR(value("radiance:spec_tree_verifies_total" + L + "}"), 5.0, 1e-9);
+    CHECK_NEAR(value("radiance:spec_tree_nodes_budget_total" + L + "}"), 30.0, 1e-9);
+    CHECK_NEAR(value("radiance:spec_tree_nodes_active_total" + L + "}"), 24.0, 1e-9);
+}
+
 TEST(models_and_health_answer) {
     Fixture f;
     HttpResponse r = f.get("/v1/models");

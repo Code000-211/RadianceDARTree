@@ -661,10 +661,11 @@ private:
     bool     mtp_couple_ = false;
     rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
+    int64_t  couple_planes_ = 0;                     /* its rounds (a draft tree's: coupled rows) */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
     std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
-    RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROWS] = {};
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
@@ -721,6 +722,9 @@ private:
     int     draft_rounds_ = 0;
     int     tree_leaves_ = 0;
     int     tree_width_ = 1;
+    /* --draft-tree-prune / -rel (Config): either threshold on. The plugin's grower and the
+     * core's stage-1 leaf capture apply the one rule (abi/rad_mtp_tree.h). */
+    bool    tree_prune_ = false;
     /* The nodes a serial tree verifies after `done` rounds: the chain and the leaves it adds, up
      * to the budget; `done` for a chain. What expect_draft and set_draft must agree on. */
     int     serial_nodes(int done) const;

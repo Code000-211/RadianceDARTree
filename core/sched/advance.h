@@ -194,6 +194,18 @@ struct AdvanceArgs {
     /* ADV_TRUNK: RadBatch::spec_path, [n_seq, path_pitch] in the slab (-1: none staged). */
     int64_t path_off = -1;
     int32_t path_pitch = 0;
+    /* Confidence pruning of a serial tree's depth-1 leaves (stage 1; abi/rad_mtp_tree.h is the one
+     * rule, the grower applies it to stage 2). `src_val` [row, src_pitch] f32: the logits of the
+     * proposal row's candidates, read by ADV_ROUND (round 2) / ADV_TAKE (round 1) beside `src`.
+     * `prune` nonzero turns the rule on: a leaf is kept only if its log probability (the row's
+     * log-softmax over its valid candidates) >= prune_log_abs and its logit - the row's largest
+     * logit >= prune_log_rel; the row's best candidate is always kept. Null `src_val` or zero
+     * `prune` leaves the capture as it was. ADV_BTAKE (tree_nodes > 0) turns a plugin's inert
+     * entry (a token below 0 or past `vocab`) into a duplicate of node 1 under the root. */
+    const float* src_val = nullptr;
+    int32_t prune = 0;
+    float   prune_log_abs = 0.0f;
+    float   prune_log_rel = 0.0f;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */

@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 #include "r4d_gdn_args.h"
 #include "rad_mtp_tree.h"
+#include "rad_mtp_tree_rrs.h"
 
 struct MtpTreeArgs {
   const int* didx;  const float* dval;
@@ -26,6 +27,10 @@ struct MtpTreeArgs {
   int M;
   RadMtpTreeCfg cfg;
   long per;                       // candidate rows a sequence: 1 in round 1, else width
+  // The coupled form (abi/rad_mtp_tree_rrs.h), all null for an uncoupled head.
+  const unsigned* cdraw;  long cdraw_stride;
+  const int* cseq;        long cseq_stride;
+  unsigned* cstate;       long cst_node, cst_seq;  int cst_rows;  long cvocab;
 };
 
 __global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
@@ -34,7 +39,14 @@ __global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
   int head = -1;
   if (a.cfg.round == 1 && a.head_pos && a.head_row) head = a.head_pos[a.head_row[m]];
   const bool att = a.cfg.sel_pitch > 0 && a.sel && a.nsel && a.vmask && a.rb && a.table;
-  rad_mtp_tree_grow_seq(&a.cfg, a.state + (long)m * a.state_stride, a.didx, a.dval,
+  RadMtpTreeCpl cpl{};
+  if (a.cdraw && a.cseq && a.cstate) {
+    cpl.draw = a.cdraw + (long)m * a.cdraw_stride;
+    cpl.card = a.cseq[(long)m * a.cseq_stride];
+    cpl.state = a.cstate; cpl.st_node = a.cst_node; cpl.st_seq = a.cst_seq;
+    cpl.rows = a.cst_rows; cpl.vocab = a.cvocab;
+  }
+  rad_mtp_tree_grow_seq_cpl(&a.cfg, a.state + (long)m * a.state_stride, a.didx, a.dval,
                         (long)m * a.per, a.row_stride, 1, head,
                         att ? a.table + (long)m * a.table_stride : nullptr,
                         a.tok + (long)m * a.tok_stride, a.par + (long)m * a.par_stride,
@@ -43,7 +55,8 @@ __global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
                         att ? a.vmask + (long)m * a.cfg.width : nullptr,
                         att ? a.rb + m : nullptr,
                         (long)m, a.src ? a.src + (long)m * a.cfg.width : nullptr,
-                        a.dst ? a.dst + (long)m * a.cfg.width : nullptr);
+                        a.dst ? a.dst + (long)m * a.cfg.width : nullptr,
+                        (a.cdraw && a.cseq && a.cstate) ? &cpl : nullptr);
 }
 
 extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
@@ -63,6 +76,7 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
   k.cfg.width  = (int)r4d_geti_or(a, "width", 0);
   k.cfg.block  = (int)r4d_geti_or(a, "block_size", 0);
   k.cfg.sel_pitch = (int)r4d_geti_or(a, "sel_pitch", 0);
+  rad_mtp_tree_set_prune(&k.cfg, r4d_getf(a, "prune_abs", 0.0), r4d_getf(a, "prune_rel", 0.0));
   if (st->rank != 2 || tok->rank != 2 || par->rank != 2 || didx->rank != 2 || dval->rank != 2)
     return R4D_NO(RAD_E_SHAPE);
   const long long M = st->shape[0];
@@ -113,6 +127,21 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
   if (dstt) {
     if (dstt->dtype != RAD_I32 || r4d_numel(dstt) < M * k.cfg.width) return R4D_NO(RAD_E_SHAPE);
     k.dst = (int*)dstt->data;
+  }
+  const RadTensor *cdr = r4d_opt(a, 14), *csq = r4d_opt(a, 15), *cst = r4d_opt(a, 16);
+  if (cdr && csq && cst) {
+    if (cdr->dtype != RAD_U32 || csq->dtype != RAD_I32 || cst->dtype != RAD_U32 || cdr->rank != 2 ||
+        cst->rank != 3 || cst->shape[2] != (long)RAD_MTP_COUPLE_STATE_WORDS || cst->shape[1] < M ||
+        cdr->shape[0] < M || cdr->shape[1] < (long)RAD_MTP_COUPLE_DRAW_WORDS ||
+        r4d_numel(csq) < M || cdr->stride[1] != 1 || cst->stride[2] != 1 || cdr->stride[0] % 2 ||
+        cst->stride[0] % 2 || cst->stride[1] % 2 || (uintptr_t)cdr->data % 8 ||
+        (uintptr_t)cst->data % 8)
+      return R4D_NO(RAD_E_SHAPE);
+    k.cdraw = (const unsigned*)cdr->data;  k.cdraw_stride = (long)cdr->stride[0];
+    k.cseq = (const int*)csq->data;        k.cseq_stride = csq->rank >= 1 ? (long)csq->stride[csq->rank - 1] : 1;
+    k.cstate = (unsigned*)cst->data;       k.cst_node = (long)cst->stride[0];
+    k.cst_seq = (long)cst->stride[1];      k.cst_rows = (int)cst->shape[0];
+    k.cvocab = (long)r4d_geti_or(a, "n_vocab", 0);
   }
   k.M = (int)M;
   hipLaunchKernelGGL(r4d_mtp_tree_grow_kernel, dim3((unsigned)((M + 63) / 64)), dim3(64), 0,

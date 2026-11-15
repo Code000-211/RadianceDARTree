@@ -14,6 +14,9 @@ namespace {
 #define PI(k) { k, RAD_P_INT, RAD_REQUIRED, 0 }
 const RadParamSpec kProposeParams[] = {
     PI("M"), PI("n_vocab"), PI("round"), PI("max_rounds"),
+    { "leaves", RAD_P_INT, RAD_OPTIONAL, 0 },
+    { "prune_abs", RAD_P_F64, RAD_OPTIONAL, 0 },
+    { "prune_rel", RAD_P_F64, RAD_OPTIONAL, 0 },
 };
 const RadParamSpec kVerifyParams[] = { PI("M"), PI("n_cand"), PI("n_vocab") };
 const RadParamSpec kDflashParams[] = {
@@ -58,14 +61,20 @@ const RadOperandSpec kDflashOperands[] = {
 };
 
 const RadOpSchema kSchemas[] = {
-    { "mtp_couple_propose", kProposeParams, 4, kProposeOperands, 5,
+    { "mtp_couple_propose", kProposeParams, 7, kProposeOperands, 5,
       "Linear MTP round `round`: x~Q, Q = FP64 T1 softmax of the final top8 scores; x into idx "
       "column 0 and the state into state[round-1][row]. mode0 rows keep column 0 (status 0); bad "
-      "ids/scores or seq_ids != draw.card keep it too (status -1)." },
+      "ids/scores or seq_ids != draw.card keep it too (status -1). `leaves` > 0 on round 1 (a draft "
+      "tree's root): the proposal and `leaves` siblings are drawn without replacement (Gumbel-top-k "
+      "over Q) into idx columns 0..leaves, the rest holes, and the state's ids are in that order "
+      "with nkids set. `prune_abs` / `prune_rel` (optional, with `leaves`) keep only the leading draft "
+      "slots whose priority (the j-th largest q) passes the grower's confidence rule: a suffix of "
+      "the draft order is dropped by q-rank, never by the drawn token's value." },
     { "mtp_couple_verify", kVerifyParams, 3, kVerifyOperands, 5,
       "Maximal coupling of a bound mtp_couple state after sample_pick over all surviving target "
       "candidates, FP64 P and 53-bit ACCEPT/RESID uniforms at params.pos; residual (P-Q)+ with "
-      "r(x)=0. Rows whose state is not status 1, not bound to params seed/pos, malformed, or whose "
+      "r(x)=0; a tree node (state.nkids >= 2) runs recursive rejection sampling over its drafted "
+      "children in draft order. Rows whose state is not status 1, not bound to params seed/pos, malformed, or whose "
       "(P,Q) admit no coupling keep the ordinary token." },
     { "dflash_couple_propose", kDflashParams, 8, kDflashOperands, 10,
       "DFlash2's candidate walk, sampled: at each step Q = FP64 softmax of (unary + low-rank edge "
@@ -230,6 +239,14 @@ int rad_mtp_couple_propose_args(const RadArgs* a, RadMtpCoupleProposeCall* out) 
     c.M = M;
     c.vocab = v;
     c.round = (int)rad_param_geti(a->p, a->n_p, "round", 0);
+    c.leaves = (int)rad_param_geti(a->p, a->n_p, "leaves", 0);
+    if (c.leaves < 0 || c.leaves > 7) return RAD_E_UNSUPPORTED;
+    {
+        RadMtpTreeCfg pc{};
+        rad_mtp_tree_set_prune(&pc, rad_param_getf(a->p, a->n_p, "prune_abs", 0.0),
+                               rad_param_getf(a->p, a->n_p, "prune_rel", 0.0));
+        c.prune = pc.prune; c.log_abs = pc.log_abs; c.log_rel = pc.log_rel;
+    }
     c.idx   = (int32_t*)a->t[0].data;
     c.val   = (const float*)a->t[1].data;
     c.card  = (const int32_t*)a->t[2].data;

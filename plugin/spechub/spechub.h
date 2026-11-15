@@ -10,6 +10,7 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"   /* rad_param_geti/getdim: the pure readers, inline and total */
 #include "rad_spechub.h"
+#include "rad_mtp_rrs.h"
 
 #include <cmath>
 #include <cstdint>
@@ -31,6 +32,12 @@ struct RadMtpCoupleProposeCall {
     int64_t        vocab;
     int64_t        ld_idx, ld_val, ld_draw, st_round, st_row;
     int            round;
+    int            leaves;  /* round 1 of a draft tree: sibling candidates drafted beside x (0: the chain) */
+    /* Confidence pruning of the leaves (rad_mtp_tree_set_prune's floats; prune 0: off). It reads
+     * the slot priorities of Q only (rad_mtp_rrs_slot_keep_count), so it drops a suffix of the
+     * draft order. */
+    int            prune;
+    float          log_abs, log_rel;
 };
 
 /* The verify's operands: the sampler's own candidate plane, its parameter rows, the bound state
@@ -102,11 +109,23 @@ static inline RAD_SPECHUB_HD void rad_mtp_couple_propose_row(const RadMtpCoupleP
         s.status = -1;
         if (s.draw.card == c.card[row] &&
             rad_mtp_couple_build_q(idx, c.val + row * c.ld_val, c.vocab, &s)) {
-            const double u = rad_spechub_uniform(s.draw.seed, s.draw.base,
-                                                 RAD_MTP_COUPLE_KEY_DRAFT + (uint64_t)c.round);
-            s.x = s.ids[rad_mtp_couple_pick(s, u)];
-            s.status = 1;
-            idx[0] = s.x;
+            if (c.leaves > 0 && c.round == 1) {
+                /* A tree's root: the trunk child and `leaves` siblings, drawn without replacement
+                 * (Gumbel-top-k over Q, abi/rad_mtp_rrs.h) in draft order into the shortlist's
+                 * first columns; the columns past them are holes, so the core's leaf capture
+                 * takes exactly the drawn ones. */
+                RadMtpTreeCfg pc{};
+                pc.prune = c.prune; pc.log_abs = c.log_abs; pc.log_rel = c.log_rel;
+                rad_mtp_rrs_draw(&s, 0, rad_mtp_rrs_slot_keep_count(s, &pc, 1 + c.leaves));
+                s.status = 1;
+                for (int i = 0; i < 8; ++i) idx[i] = i < s.nkids ? s.ids[i] : -1;
+            } else {
+                const double u = rad_spechub_uniform(s.draw.seed, s.draw.base,
+                                                     RAD_MTP_COUPLE_KEY_DRAFT + (uint64_t)c.round);
+                s.x = s.ids[rad_mtp_couple_pick(s, u)];
+                s.status = 1;
+                idx[0] = s.x;
+            }
         } else {
             s.count = 0;
             for (int i = 0; i < 8; ++i) { s.ids[i] = -1; s.q[i] = 0; }
@@ -125,6 +144,13 @@ static inline RAD_SPECHUB_HD void rad_mtp_couple_verify_row(const RadMtpCoupleVe
         !rad_mtp_couple_state_valid(s, c.vocab))
         return;
     int32_t out = -1;
+    /* A tree node with several drafted children: recursive rejection sampling over them. */
+    if (s.nkids >= 2) {
+        if (rad_mtp_rrs_decide(s, c.idx + row * c.ld[0], c.val + row * c.ld[1], c.n_cand, c.vocab,
+                               p.seed, p.pos, &out))
+            c.token[row * c.ld[4]] = out;
+        return;
+    }
     if (rad_mtp_couple_decide(s, c.idx + row * c.ld[0], c.val + row * c.ld[1], c.n_cand, c.vocab,
                               rad_spechub_uniform(p.seed, p.pos, RAD_SAMPLE_KEY_ACCEPT),
                               rad_spechub_uniform(p.seed, p.pos, RAD_SAMPLE_KEY_RESID), &out))
