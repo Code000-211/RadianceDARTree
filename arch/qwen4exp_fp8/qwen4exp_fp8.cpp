@@ -91,6 +91,7 @@
 #include <rad_prefill_split.h>
 #include <rad_mtp_tree.h>
 #include <arch/rad_block_attn_gated_fp8.h>
+#include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_gdn_fp8.h>
 #include <arch/rad_block_hc.h>
 #include <arch/rad_block_moe_fp8.h>
@@ -227,6 +228,26 @@ struct Model {
     rad_buf     b_mtp_couple_draws = 0, b_mtp_couple_state = 0;
     rad_buf     b_mtp_dpair = 0, b_mtp_dgath = 0;
 
+    /* ---- the DFlash2 drafter (arch/common/rad_block_dflash2.h), declared in place of the MTP head
+     * when the deployment chose it (drafter_mode) and the container carries one (`draft.`
+     * metadata, merged by `rad-convert --draft-model` or appended in place). It conditions on the
+     * trunk's completed layers 5, 15, 25, 35, 45, each the mean of the four hyper-connection
+     * streams (the vendor's capture patch), copied into one column slice of `b_dfsrc` as the
+     * layer finishes. */
+    bool          have_df = false;
+    Dflash2       df{};
+    Dflash2::Wire dfw{};
+    rad_kvgroup   kv_draft = 0;
+    /* A DFlash2 tree (RadBuildCtx::draft_tree): the drafter grows `max_spec` nodes over its
+     * trained block's lattice (dflash_tree) and the trunk verifies them through the same tree
+     * attention a serial head's tree uses. */
+    bool          df_tree = false;
+    enum { MAX_TAPS = 8 };
+    int           n_taps = 0;
+    int           tap_layer[MAX_TAPS] = {};
+    rad_buf       b_dfsrc = 0;                 /* [max_tok, n_taps * n_embd] */
+    rad_op        op_tap = 0;
+
     HcEnter   enter;
     HyperConn mixer;            /* the 97th connection: no write half */
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
@@ -359,6 +380,234 @@ static int declare_head_tree_buffers(RadBuilder* b, Names& nm, Model& m) {
     return RAD_OK;
 }
 
+
+/* ============================== THE DRAFTER CHOICE ==============================
+ *
+ * A container may carry both the model's MTP head and a DFlash2 drafter (`draft.` metadata:
+ * `rad-convert --in-place --draft-model`). A deployment serves one of them, chosen by the
+ * environment variable RADIANCE_DRAFTER, read by the probe (the default depth) and by declare:
+ *
+ *     mtp      (default) the serial MTP head, the DARTree serial trees
+ *     dflash2  the block drafter; a chain of 3 or 7 drafts (the block is a power of two), or with
+ *              --draft-tree on a tree of --num-speculative-tokens nodes over its trained block
+ *     both     rad-convert only: declares both so a container written in place keeps and carries
+ *              every weight of either
+ *
+ * The probe cannot see the command line, hence the environment: a first-class flag would be a
+ * RadBuildCtx field and a config key in the core. */
+enum class Drafter { Mtp, Dflash2, Both };
+
+static bool has_dflash2(const RadModelMeta* meta) {
+    const char* da = rad_meta_gets(meta, "draft.architectures", "");
+    return da && std::strstr(da, "DFlash2");
+}
+
+static Drafter drafter_mode(const RadModelMeta* meta) {
+    const char* e = std::getenv("RADIANCE_DRAFTER");
+    if (!e || !*e || !std::strcmp(e, "mtp")) return Drafter::Mtp;
+    if (!std::strcmp(e, "both")) return has_dflash2(meta) ? Drafter::Both : Drafter::Mtp;
+    if (!std::strcmp(e, "dflash2")) return has_dflash2(meta) ? Drafter::Dflash2 : Drafter::Mtp;
+    return Drafter::Mtp;
+}
+
+/* The DFlash2 drafter: its geometry, KV group, buffers and block (as qwen35_fp8's, which this
+ * follows). `base_layer` is the first absolute layer of its own KV group. */
+static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx,
+                           Model& m, int base_layer, bool primary) {
+    Names& nm = m.nm;
+    Geom   dg{};
+    RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DFlash2"));
+
+    Dflash2::Config dc{};
+    dc.n_taps   = m.n_taps;
+    dc.block    = ctx->max_spec + 1;
+    dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
+    dc.group    = rad_meta_geti(meta, "draft.dflash_config.conv_group_size", 16);
+    dc.sel_rank = rad_meta_geti(meta, "draft.dflash_config.selector_rank", 0);
+    dc.sel_topk = rad_meta_geti(meta, "draft.dflash_config.selector_top_k", 0);
+    dc.causal   = rad_meta_geti(meta, "draft.is_causal", 0) ? 1 : 0;
+    if (rad_meta_geti(meta, "draft.use_sliding_window", 0))
+        dc.window = rad_meta_geti(meta, "draft.dflash_config.swa_window_size",
+                                  rad_meta_geti(meta, "draft.sliding_window", 0));
+    if (dc.sel_rank <= 0 || dc.sel_topk <= 0) {
+        fprintf(stderr, "radiance: qwen4exp: the DFlash2 drafter states no selector geometry "
+                        "(rank %lld, top_k %lld)\n", (long long)dc.sel_rank, (long long)dc.sel_topk);
+        return RAD_E_INVAL;
+    }
+    const long long trained = rad_meta_geti(meta, "draft.dflash_config.block_size", 0);
+    /* A tree is `max_spec` nodes grown over the lattice of the block the drafter was trained at
+     * (gemma4's way): the block is the trained one and --num-speculative-tokens counts nodes. */
+    if (m.df_tree && trained > 1) {
+        dc.block      = trained;
+        dc.tree_nodes = ctx->max_spec;
+    }
+    if (dc.block < 2 || (dc.block & (dc.block - 1))) {
+        fprintf(stderr, "radiance: qwen4exp: DFlash2's convolution masks the block position with "
+                        "block_size - 1, so the query block has to be a power of two. This serve "
+                        "asks for %d draft tokens, which makes it %lld; use 3 or 7 (a chain), or "
+                        "--draft-tree on for a tree of any size up to 15 nodes.\n",
+                ctx->max_spec, (long long)dc.block);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (!m.df_tree && trained > 0 && trained != dc.block)
+        rad_note(b, "DFlash2 was trained at block_size %lld (%lld draft tokens) and runs at "
+                    "%lld; it accepts less away from its trained block length",
+                 trained, trained - 1, (long long)dc.block);
+    const double escale = rad_meta_getf(meta, "draft.dflash_config.input_embedding_scale", 1.0);
+    const double omul   = rad_meta_getf(meta, "draft.dflash_config.output_multiplier", 1.0);
+    const double scap   = rad_meta_getf(meta, "draft.dflash_config.final_logit_softcapping", 0.0);
+    if (escale != 1.0 || omul != 1.0 || scap != 0.0) {
+        fprintf(stderr, "radiance: qwen4exp: this DFlash2 checkpoint scales its input embedding by "
+                        "%g and its draft logits by %g, and soft-caps them at %g; none of the three "
+                        "is implemented\n", escale, omul, scap);
+        return RAD_E_UNSUPPORTED;
+    }
+
+    /* The window bounds the cache: the drafter's 2048 tokens, not the context length. */
+    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, dc.window, base_layer, &m.kv_draft));
+
+    const int64_t qd  = dg.n_head * dg.head_dim;
+    const int64_t kvd = dg.n_head_kv * dg.head_dim;
+    int64_t qr = dg.max_seqs * dc.block;
+    if (qr > dg.max_tok) qr = dg.max_tok;
+    const int64_t sr   = dg.max_seqs * dc.steps();
+    const int64_t spad = ((sr + 15) / 16) * 16;
+
+    Dflash2::Wire& dw = m.dfw;
+    dw.src     = m.b_dfsrc;
+    dw.c       = decl_b(b, nm.f("df_c"),    dg.act_dtype, {dg.max_tok, dg.n_embd});
+    dw.ck      = decl_b(b, nm.f("df_ck"),   dg.act_dtype, {dg.max_tok, kvd});
+    dw.cv      = decl_b(b, nm.f("df_cv"),   dg.act_dtype, {dg.max_tok, kvd});
+    dw.x       = decl_b(b, nm.f("df_x"),    dg.act_dtype, {qr, dg.n_embd});
+    dw.h       = decl_b(b, nm.f("df_h"),    dg.act_dtype, {qr, dg.n_embd});
+    dw.h2      = decl_b(b, nm.f("df_h2"),   dg.act_dtype, {qr, dg.n_embd});
+    dw.coef    = decl_b(b, nm.f("df_coef"), dg.act_dtype, {qr, dc.coef_dim(dg.n_embd)});
+    dw.q       = decl_b(b, nm.f("df_q"),    dg.act_dtype, {qr, qd});
+    dw.k       = decl_b(b, nm.f("df_k"),    dg.act_dtype, {qr, kvd});
+    dw.v       = decl_b(b, nm.f("df_v"),    dg.act_dtype, {qr, kvd});
+    dw.attn    = decl_b(b, nm.f("df_attn"), dg.act_dtype, {qr, qd});
+    dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
+    dw.ffn     = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
+    /* The activation pairs the linears read: the IQR-V4 drafter's six linears and its fc are
+     * rotated (trellis or int8, group 128), so every pair is int8 under the Hadamard
+     * (had_quant_act_i8g); `probe_i8` tells it from the fc and makes its name map. */
+    RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (dc.act_i8 && ((dc.n_taps * dg.n_embd) % dqg || (dg.n_embd % dqg) || (qd % dqg) ||
+                      (dg.n_ff % dqg))) {
+        fprintf(stderr, "radiance: qwen4exp: a rotated drafter takes widths in whole %lld-column "
+                        "scale groups; this one is n_embd %lld, q %lld, n_ff %lld\n", (long long)dqg,
+                (long long)dg.n_embd, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_INVAL;
+    }
+    auto dqs = [&](int64_t n, int64_t gr) { return (n + gr - 1) / gr; };
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), dqt, {dg.max_tok, dc.n_taps * dg.n_embd});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, dqs(dc.n_taps * dg.n_embd, dqg)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   dqt,     {dg.max_tok, dg.n_embd});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32, {dg.max_tok, dqs(dg.n_embd, dqg)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  dqt,     {qr, dg.n_embd});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32, {qr, dqs(dg.n_embd, dqg)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  dqt,     {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32, {qr, dqs(qd, dqg)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  dqt,     {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32, {qr, dqs(dg.n_ff, dqg)});
+    dw.sel_h   = decl_b(b, nm.f("df_selh"), dg.act_dtype, {sr, dg.n_embd});
+    dw.hp      = decl_b(b, nm.f("df_hp"),   dg.act_dtype, {sr, dc.sel_rank});
+    dw.dq      = decl_b(b, nm.f("df_dq"),   RAD_I8,  {sr, dg.n_embd});
+    dw.ds      = decl_b(b, nm.f("df_ds"),   RAD_F32, {sr, 1});
+    dw.dsum    = decl_b(b, nm.f("df_dsum"), RAD_F32, {dg.n_embd / 128, spad});
+    dw.dlog    = decl_b(b, nm.f("df_dlog"), dg.act_dtype, {sr, Dflash2::head_rows(dg)});
+    /* Candidates rescored against the trunk's int8 head (as the MTP head's are). */
+    {
+        const uint32_t hd = weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16);
+        if ((hd == RAD_F8E4M3 || hd == RAD_I8) && (Dflash2::head_sharded(dg) || dg.world <= 1)) {
+            m.df.w_lm  = m.w_lm_head;
+            m.df.top_w = Dflash2::kRerankR;
+        }
+    }
+    const int64_t tw = m.df.w_lm ? m.df.top_w : dc.sel_topk;
+    dw.cand    = decl_b(b, nm.f("df_cand"), RAD_I32, {sr, tw});
+    dw.unary   = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, tw});
+    if (Dflash2::head_sharded(dg)) {
+        dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, tw, 2});
+        dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * tw, 2});
+    }
+    const int64_t nodes = dc.tree_nodes > 0 ? dc.tree_nodes : dc.steps();
+    dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, nodes});
+    if (m.df_tree) {
+        dc.tree      = true;
+        dc.tree_temp = 1.25;
+        dw.parents   = decl_b(b, nm.f("dflash_parents"), RAD_I32, {dg.max_seqs, nodes});
+    }
+    if (ctx->draft_coupling && !m.df_tree) {
+        if (dc.steps() > RAD_MTP_COUPLE_MAX_ROUNDS || dc.sel_topk > RAD_DFLASH_COUPLE_MAX_K ||
+            dc.sel_rank % RAD_DFLASH_EDGE_PARTS || dc.sel_rank > RAD_DFLASH_COUPLE_MAX_R) {
+            rad_note(b, "--draft-coupling on: DFlash2's coupled walk takes at most %d drafts, %d "
+                        "candidates and a selector rank that is a multiple of %d up to %d",
+                     RAD_MTP_COUPLE_MAX_ROUNDS, RAD_DFLASH_COUPLE_MAX_K, RAD_DFLASH_EDGE_PARTS,
+                     RAD_DFLASH_COUPLE_MAX_R);
+            return RAD_E_UNSUPPORTED;
+        }
+        dc.q_temp = 0.6;
+        dw.couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                 {dg.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS}, RAD_BUF_PERSIST);
+        dw.couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                 {dc.steps(), dg.max_seqs, RAD_MTP_COUPLE_STATE_WORDS},
+                                 RAD_BUF_PERSIST);
+        if (!dw.couple_draws || !dw.couple_state) return RAD_E_INVAL;
+    } else if (ctx->draft_coupling) {
+        fprintf(stderr, "radiance: qwen4exp: --draft-coupling does not combine with a DFlash2 "
+                        "tree\n");
+        return RAD_E_UNSUPPORTED;
+    }
+
+    RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft",
+                              nm.ckpt("lm_head.weight"), dw));
+    m.have_df = true;
+    if (m.df_tree && !m.df.cfg.tree) {
+        fprintf(stderr, "radiance: qwen4exp: a DFlash2 tree of %lld nodes needs dflash_tree, which "
+                        "no library serves here\n", (long long)nodes);
+        return RAD_E_UNSUPPORTED;
+    }
+
+    RadDrafterDecl drf{};
+    drf.name           = "dflash2";
+    drf.kind           = RAD_DRAFT_BLOCK;
+    drf.depth          = ctx->max_spec;
+    drf.block          = dc.block;
+    drf.proposal       = dw.tokens;
+    drf.proposal_pitch = nodes;
+    drf.window         = dc.window;
+    drf.mask_token     = (int32_t)rad_meta_geti(meta, "draft.dflash_config.mask_token_id", -1);
+    if (drf.mask_token < 0) {
+        fprintf(stderr, "radiance: qwen4exp: this DFlash2 checkpoint declares no "
+                        "dflash_config.mask_token_id\n");
+        return RAD_E_FORMAT;
+    }
+    /* Not the program's drafter when the MTP head is (a convert declares both, only to carry
+     * every weight): one step has one draft head. */
+    if (!primary) return RAD_OK;
+    RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+    if (m.df_tree) {
+        RAD_ARCH_TRY(rad_drafter_tree(b, dw.parents));
+        rad_note(b, "DFlash2 drafter: a tree of %lld nodes a step (softmax temperature %.3g) over "
+                    "the lattice of its %lld-row block, verified in %lld rows", (long long)nodes,
+                 dc.tree_temp, (long long)dc.block, (long long)nodes + 1);
+    }
+    rad_note(b, "DFlash2 drafter: %lld layers at absolute %d..%d, %lld heads / %lld kv x %lld, "
+                "ffn %lld, %s attention with a %lld-token window, %d trunk tap(s) (the mean of the "
+                "%lld hyper-connection streams); one forward proposes %lld tokens through the "
+                "candidate selector, its head %s",
+             (long long)dg.n_layer, base_layer, base_layer + (int)dg.n_layer - 1,
+             (long long)dg.n_head_all, (long long)dg.n_head_kv_all, (long long)dg.head_dim,
+             (long long)dg.n_ff_all, dc.causal ? "causal" : "non-causal", (long long)dc.window,
+             m.n_taps, (long long)m.hccfg.hc, (long long)dc.steps(),
+             m.df.head_i8 ? "8-bit" : "2-bit");
+    return RAD_OK;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
@@ -391,8 +640,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the deepest speculation (`g.max_spec`: the tail's ring, the window groups the core sizes,
      * the logits rows, the work list) is already N, since the Geom carries it. A tree needs the
      * head, so it is off at max_spec 0 or with no head round. */
-    m.tree_on = ctx->draft_tree != 0 && ctx->draft_rounds > 0 && ctx->max_spec > 0 &&
-                ctx->draft_rounds <= ctx->max_spec;
+    const Drafter dmode = drafter_mode(meta);
+    const bool    dmode_df = dmode == Drafter::Dflash2 && ctx->max_spec > 0;
+    /* A DFlash2 tree verifies as a serial head's does, through the trunk's tree attention, with
+     * no head rounds (a block drafter proposes the whole lattice at once). */
+    m.df_tree = dmode_df && ctx->draft_tree != 0;
+    m.tree_on = m.df_tree ||
+                (!dmode_df && ctx->draft_tree != 0 && ctx->draft_rounds > 0 && ctx->max_spec > 0 &&
+                 ctx->draft_rounds <= ctx->max_spec);
     if (m.tree_on) {
         /* The region's visibility mask is 64 keys: (ratio - 1) committed keys before the anchor
          * and every row of the verify block (docs/QSA.md). The ratio is not known yet; the exact
@@ -931,7 +1186,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* Only where the blocks issue their own all-reduce at a step wider than a pass: at two
          * ranks the gated residual's fused write takes every step's (ar_exact_write_rows), so such
          * a step runs serially. */
-        m.pipe_on = m.span_on && g.world > 1 && ar_exact_write_rows(g) < g.max_tok;
+        m.pipe_on = m.span_on && g.world > 1 && ar_exact_write_rows(g) < g.max_tok && !dmode_df;
     }
     /* The pipelined step's all-reduces run on the second lane, in place over `x`, so it is the one
      * buffer that lane touches; it is live over the whole program anyway. */
@@ -1155,6 +1410,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     m.b_hout   = decl_b(b, nm.f("hout"),   g.act_dtype, {g.max_logit_rows, g.n_embd});
+    /* The DFlash2 taps, only when the container carries the drafter and the deployment chose it:
+     * the trunk's completed layers, each the mean of the hc streams (`mhc_contract`: one launch,
+     * written into the tap's column slice at the buffer's row pitch), 25 KiB a token at five
+     * taps. */
+    if (g.max_spec > 0 && (dmode == Drafter::Dflash2 || dmode == Drafter::Both)) {
+        m.n_taps = parse_layer_ids(rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr),
+                                   g.n_layer, m.tap_layer, Model::MAX_TAPS);
+        if (m.n_taps <= 0) {
+            fprintf(stderr, "radiance: qwen4exp: the DFlash2 drafter names no target layer this "
+                            "%lld-layer trunk has (draft.dflash_config.target_layer_ids)\n",
+                    (long long)g.n_layer);
+            return RAD_E_FORMAT;
+        }
+        m.b_dfsrc = decl_b(b, nm.f("dflash_src"), g.act_dtype, {T, (int64_t)m.n_taps * g.n_embd});
+        m.op_tap = rw(b, RAD_OP(b, "mhc_contract",
+                          RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", g.n_embd),
+                                     RAD_INT("hc", m.hccfg.hc), RAD_STR("dtype", g.dtype)),
+                          RAD_NOWEIGHTS),
+                      {m.b_h}, {m.b_dfsrc});
+        if (!m.b_dfsrc || !m.op_tap) return RAD_E_INVAL;
+    }
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
@@ -1549,7 +1825,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const int64_t nextn = std::getenv("RAD_DEBUG_NO_MTP") ? 0
                         : meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
                                     "mtp_num_hidden_layers", 0);
-    if (nextn > 0 && g.max_spec > 0) {
+    if (nextn > 0 && g.max_spec > 0 && !dmode_df) {
         const char* mpre = "mtp";
         /* Sized at max_tok, not max_logit_rows: the history pass that fills the head's own K and V
          * has one row per token over a whole prefill chunk. */
@@ -1861,10 +2137,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             rad_note(b, "MTP head: one gated-attention layer with 512 routed experts over the wide "
                         "stream, %d serial draft round(s)", ctx->max_spec);
         }
-    } else if (nextn > 0) {
+    } else if (nextn > 0 && !dmode_df) {
         rad_note(b, "the checkpoint's `mtp.` head is not loaded: this deployment does not "
                     "speculate");
+    } else if (nextn > 0) {
+        rad_note(b, "the checkpoint's `mtp.` head is not loaded: this deployment drafts with its "
+                    "DFlash2 drafter (RADIANCE_DRAFTER)");
     }
+
+    /* ---- the DFlash2 drafter, after the head (a convert declares both, so the container carries
+     * every weight of either; the head's layer is n_layer, the drafter's group follows it). */
+    if (g.max_spec > 0 && (dmode == Drafter::Dflash2 || dmode == Drafter::Both))
+        RAD_ARCH_TRY(declare_dflash2(b, meta, ctx, m,
+                                     (int)g.n_layer + (dmode == Drafter::Both ? 1 : 0),
+                                     dmode == Drafter::Dflash2));
 
     /* The vision tower, last: an encoder pass issues nothing else, so its activations share the
      * arena with every buffer above. Its weight groups start past every text layer and the MTP
@@ -2101,6 +2387,13 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         /* The request's control vector, on the stream the write just finished. */
         l.proj.step(c, batch, 0, T);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
+        /* The DFlash2 tap, after the layer's feed-forward write and control vector: the mean of
+         * the hc streams of the completed layer, into this tap's column slice. */
+        for (int t = 0; t < m.n_taps; ++t) {
+            if (m.tap_layer[t] != (int)li) continue;
+            RAD_ISSUE(c, m.op_tap, brows(m.b_h, T),
+                      bcol(m.b_dfsrc, (int64_t)t * g.n_embd, g.n_embd, T));
+        }
     }
     m.calib.after_step(c, T);
 }
@@ -2160,6 +2453,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
      * turns the rows it wants into a draft token or one more position of its own attention
      * history, by the sign of `draft_pass` (rad_block_mtp_hc.h). Zero is a trunk step. */
     if (batch->draft_pass != 0) {
+        /* DFlash2: positive is the query pass proposing the whole block, negative the context
+         * pass turning the tokens the trunk just committed into the drafter's own K and V. */
+        if (m.have_df) {
+            /* No refill of the trunk's cos/sin table: the drafter rotates with its own ops, and the
+             * table's planned life ends in the trunk (the head's refill is declared to extend it,
+             * the drafter's is not), so a write here could land in the drafter's buffers. */
+            if (batch->draft_pass > 0) m.df.step(c, batch);
+            else                       m.df.context(c, batch);
+            return;
+        }
         if (!m.have_mtp) {
             rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
                              "container carries no `mtp.` head, or declare ran at max_spec 0");
@@ -2260,7 +2563,14 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * (rad_block_attn_gated_fp8.h). */
     out->kv_stream_ok = 1;
     out->draft_depth = 0;
-    if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0) {
+    if (drafter_mode(meta) == Drafter::Dflash2) {
+        /* The block drafter: a chain of 3 (a block of 4, the vendor's tested block) by default;
+         * 7 (its trained block) and trees (--draft-tree on, --num-speculative-tokens N nodes up to
+         * 15, the delta net's 16 verify rows) are asked for. `tree_pays` stays 0 until measured. */
+        out->draft_depth    = 3;
+        out->tree_linear_ok = 1;
+        out->tree_pays      = 0;
+    } else if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0) {
         out->draft_depth = 3;
         /* The serial draft tree (DARTree), advertised with the head: N = 6 nodes at the default
          * operating point (the greedy chain of the head's 3 rounds plus 3 depth-1 siblings, 7 verify

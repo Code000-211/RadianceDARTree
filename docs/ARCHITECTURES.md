@@ -734,6 +734,54 @@ The vision tower is declared when the container carries one and `mm-max-patches`
 
 ---
 
+**A second drafter: DFlash2.** A container may carry incoai's `Qwen3.8-Flash-Next-DFlash2` beside the
+MTP head (`draft.*` metadata; 77 weights, 0.7 GiB). Which one a deployment serves is
+`RADIANCE_DRAFTER` in the environment of both the probe and declare: `mtp` (the default, and what
+an unset variable gives), `dflash2` (a container with no drafter falls back to the head), and
+`both`, which `rad-convert` is run under so the container carries every weight of either. The
+drafter is `arch/common/rad_block_dflash2.h` as qwen35 serves it. The block declares nothing new:
+its linears are `DenseFP8` with `w8h_ok`, whose rotated forms (computed trellis, rotated int8)
+already read an int8 activation pair from `had_quant_act_i8g`, so the six linears and `fc` are
+`gemm_nt_q` at `i8a8h` like the trunk's.
+
+- Taps: the drafter conditions on the *completed* output of zero-based layers 5, 15, 25, 35, 45,
+  each the mean of the four hyper-connection streams (the vendor's SGLang capture patch: the
+  stream after the layer's feed-forward write, `hidden_states.unflatten(-1, (hc, n_embd)).mean(-2)`).
+  One `mhc_contract` per tap, issued after the layer's write and control vector, writes the mean
+  into the tap's column slice of `dflash_src` (25 KiB a token at five taps).
+- Chain: `--num-speculative-tokens 3` (a block of 4, the vendor's tested block) or `7` (its
+  trained block of 8); the convolution masks the block position with `block_size - 1`, so any other
+  chain depth is refused at declare with that reason. The drafter's own cache is a 2048-token
+  window group.
+- Tree: `--draft-tree on` with `--num-speculative-tokens N` (up to 15, the delta net's 16 verify
+  rows) grows N nodes over the trained block's lattice with `dflash_tree` and verifies them through
+  the trunk's tree attention, as Gemma 4's DFlash2 does. `tree_pays` is 0 until a measurement says
+  the tree wins, so the tree is asked for. `--draft-coupling` does not combine with it.
+  The engine moves an accepted path's K and V in the cache (`tree_compact`) and refuses the i8
+  cache's 516-byte rows, so a tree is served at `kv-cache-dtype: bf16`.
+- A hybrid (DFlash2 below some context, the head above, since the drafter's 2048-token window
+  costs it acceptance past it) is not implemented: the two drafters are declared alternatively,
+  one per deployment, and the measured gain of the short-context half is within noise of the
+  threshold that would justify a switch between two draft paths.
+- The head is the 2-bit copy of the lm_head, its top-32 rescored against the trunk's int8
+  `output.weight` (`logit_rerank`), as the MTP head's candidates are. The prefill span
+  (`--prefill-span`) is not pipelined under it (its taps are issued by the serial step only).
+- Recipe: the drafter is quantised as the MTP block (`data/recipes/qwen4exp-iqr-v4-df2.recipe`
+  appends it to the IQR-V4 recipe): q/k/v as `attn_qg/k/v` (3-bit trellis), o as the head's
+  `attn_output` (4-bit trellis), gate_up as the shared expert's (3-bit trellis), down and `fc` as
+  rotated int8, the head as u2; norms, conv kernels and the selector's codebooks stay bf16. `fc`
+  is not the head's `fc_hidden` form (E4M3 at group 128 under an f32 scale, read only by
+  `mtp_enter`'s kernel), because block fp8 is a retired linear format here. No `calib=` on the
+  trellis rules means no Hessian: GPTQ rounds against the weights alone (relative error 0.13 at
+  3 bits).
+- A container that exists already is extended, not converted again: `RADIANCE_DRAFTER=both
+  rad-convert BASE -o NEW --reuse NEW --in-place --recipe <stored recipe + dflash lines>
+  --draft-model DIR --max-spec 3`, on a copy of the container (the stored recipe is
+  `rad-info --recipe`; `calib=` options must match it for the held weights to be copied). BASE is
+  the checkpoint's config, tokenizer and safetensors headers: only `lm_head.weight` (for the head)
+  and the drafter are read.
+
+
 # `glm5next`: GLM-5.3-Flash
 
 `arch/glm5next` is the language model of GLM-5.3-Flash (`model_type: glm5_next`) as AMD's

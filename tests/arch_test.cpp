@@ -9989,6 +9989,220 @@ TEST(flashnext_draft_head_gathers_whole_candidate_rows_at_two_ranks) {
     CHECK_EQ(gath->d.shape[1] * gath->d.shape[2], 2 * 2 * R);
 }
 
+/* ============ Flash-Next + DFlash2: incoai's block drafter on the IQR-V4 container ============ */
+
+namespace {
+
+/* RADIANCE_DRAFTER for the length of a scope. */
+struct DrafterEnv {
+    explicit DrafterEnv(const char* v) { setenv("RADIANCE_DRAFTER", v, 1); }
+    ~DrafterEnv() { unsetenv("RADIANCE_DRAFTER"); }
+};
+
+/* A computed-code trellis as the recipe writes `dflash.blk.*.attn_q` (u3 under an f32 scale a
+ * row and one f32 a 128-K block: `scale=f32 block=1x*`), or with `bf16_scale` the o projection's
+ * (u4 under a bf16 scale a [1 x 128]), both under the 128-wide Hadamard. */
+RadEncoding q4_trellis(uint32_t codes, bool bf16_scale) {
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_copy_str(e.transform, "fwht128");
+    rad_enc_add_plane(&e, "codes", codes, 1, 1);
+    rad_enc_add_plane(&e, "scale", bf16_scale ? RAD_BF16 : RAD_F32, 1, bf16_scale ? 128 : 0);
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 65536, 1);
+    e.plane[t].block[0] = 1;
+    e.plane[t].block[1] = 1;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    if (!bf16_scale) rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    return e;
+}
+
+RadEncoding q4_rot_i8() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+
+/* The recipe's DFlash2 rules (dflash.* lines of the IQR-V4 recipe), first match wins. */
+void q4_df2_encs(RadBuilder& b, bool trellis) {
+    b.encs.clear();
+    for (int l = 0; l < 2; ++l) {
+        const std::string p = "dflash.blk." + std::to_string(l) + ".";
+        if (trellis) {
+            for (const char* w : { "attn_q", "attn_k", "attn_v" })
+                b.encs.push_back({ p + w, q4_trellis(RAD_U3, false) });
+            b.encs.push_back({ p + "attn_output", q4_trellis(RAD_U4, true) });
+            b.encs.push_back({ p + "ffn_gate_up", q4_trellis(RAD_U3, false) });
+            b.encs.push_back({ p + "ffn_down", q4_rot_i8() });
+        } else {
+            b.encs.push_back({ p, q4_rot_i8() });
+        }
+    }
+    b.encs.push_back({ "dflash.fc", q4_rot_i8() });
+    b.encs.push_back({ "draft_head", u2_head() });
+}
+
+MetaKV q4_df2() {
+    MetaKV k = with_dflash2(q4_small());
+    k.set("draft.use_sliding_window", "1").set("draft.sliding_window", "2048");
+    return k;
+}
+
+}  /* namespace */
+
+/* The drafter is the MTP head unless RADIANCE_DRAFTER asks for DFlash2 and the container carries
+ * one: the probe's default depth, the declared drafter and the weights each follow. */
+TEST(flashnext_serves_one_drafter_the_environment_picks_and_mtp_by_default) {
+    MetaKV mk = q4_df2();
+    RadArchProbe pm{}, pd{};
+    CHECK_OK(qwen4exp_fp8::probe(mk.meta(), &pm));
+    CHECK_EQ(pm.draft_depth, 3);
+    CHECK_EQ(pm.tree_nodes, 6);
+    {
+        DrafterEnv e("dflash2");
+        CHECK_OK(qwen4exp_fp8::probe(mk.meta(), &pd));
+        CHECK_EQ(pd.draft_depth, 3);
+        CHECK_EQ(pd.tree_nodes, 0);         /* a block drafter's tree is the drafter's, not a head's */
+        CHECK_EQ(pd.tree_linear_ok, 1);
+    }
+    {   /* Asked for, but the container carries none: the MTP head. */
+        DrafterEnv e("dflash2");
+        MetaKV plain = q4_small();
+        RadArchProbe p{};
+        CHECK_OK(qwen4exp_fp8::probe(plain.meta(), &p));
+        CHECK_EQ(p.tree_nodes, 6);
+    }
+    for (const char* env : { "", "dflash2" }) {
+        RadBuilder b;
+        q4_df2_encs(b, true);
+        RadBuildCtx ctx = q4_ctx(0, 1);
+        if (*env) setenv("RADIANCE_DRAFTER", env, 1);
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        unsetenv("RADIANCE_DRAFTER");
+        const bool df = *env != 0;
+        CHECK_EQ(b.drafter_name, std::string(df ? "dflash2" : "mtp"));
+        CHECK_EQ((int)b.drafter.kind, (int)(df ? RAD_DRAFT_BLOCK : RAD_DRAFT_SERIAL));
+        CHECK_EQ(find_b(b, "dflash_src") != nullptr, df);
+        CHECK_EQ(find_b(b, "mtp_hin") != nullptr, !df);
+        CHECK_EQ(count_op(b, "mhc_contract"), df ? 1 : 0);
+    }
+}
+
+/* The drafter's linears are the IQR-V4 forms: trellis q/k/v/o/gate_up and rotated int8 down and fc
+ * (or all rotated int8), every one a gemm_nt_q at i8a8h over an int8 activation the Hadamard
+ * quantiser wrote, no fp8 anywhere; the taps copy the mean of the four streams of the completed
+ * layers 1, 3 and 5 into column slices of one buffer; and every pass lints clean at one and two
+ * ranks (the verify with its taps, the context pass, the query pass over a block of eight). */
+TEST(flashnext_dflash2_reads_trellis_and_rotated_int8_linears_and_taps_the_stream_mean) {
+    DrafterEnv env("dflash2");
+    MetaKV mk = q4_df2();
+    for (const bool trellis : { true, false })
+        for (int world : { 1, 2 })
+            for (int rank = 0; rank < world; ++rank) {
+                RadBuilder b;
+                q4_df2_encs(b, trellis);
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.max_spec = 7;
+                REQUIRE_EQ(qwen4exp_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+                CHECK_EQ(b.drafter_name, std::string("dflash2"));
+                CHECK_EQ(b.drafter.block, 8);
+                CHECK_EQ(b.drafter.window, 2048);
+                CHECK_EQ(b.drafter.mask_token, 248070);
+                /* Six linears a layer over two layers, and the fc. */
+                int i8 = 0, trel = 0;
+                for (const auto& o : b.ops) {
+                    if (o.op != "gemm_nt_q") continue;
+                    if (pstr(&o, "dtype") == "i8a8h") ++i8;
+                }
+                for (const auto& w : b.weights)
+                    if (w.name.find("dflash.blk.") != std::string::npos &&
+                        w.name.find("attn_q.weight") != std::string::npos)
+                        ++trel;
+                CHECK(i8 >= 2 * 6 + 1);
+                CHECK(trel >= 1);
+                for (const auto& o : b.ops) {
+                    if (o.op == "quant_act_fp8" || o.op == "gemm_nt_q_gated") {
+                        /* the trunk's own ops exist; the drafter's are the had_quant ones: no
+                         * df_* buffer is written by an fp8 quantiser */
+                        for (rad_buf w : o.writes) {
+                            const RecBuf* rb = w ? &b.bufs[(size_t)w - 1] : nullptr;
+                            if (rb) CHECK(rb->name.rfind("df_", 0) != 0);
+                        }
+                    }
+                }
+                const RecBuf* src = find_b(b, "dflash_src");
+                REQUIRE(src != nullptr);
+                CHECK_EQ(src->d.shape[1], 3 * 2560);
+
+                const auto ver = kit(b, std::vector<int>(4, 8), {});
+                const auto ctxp = context_pass(b, *ver);
+                const auto qry = query_pass(b, 4, 8, 7);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), ctxp.get(), qry.get() },
+                                          rank, world);
+                CHECK_PASSES(b, v);
+                /* The verify taps layers 1, 3 and 5: one mhc_contract each, into slices of the
+                 * row pitch of the whole buffer. */
+                const auto taps = issues_of(b, *v[0], "mhc_contract");
+                REQUIRE_EQ(taps.size(), (size_t)3);
+                for (size_t t = 0; t < taps.size(); ++t) {
+                    CHECK_EQ(taps[t]->opd[1].rows, (int64_t)4 * 8);
+                    CHECK_EQ(taps[t]->opd[1].offset, (int64_t)t * 2560);
+                    CHECK_EQ(taps[t]->opd[1].cols, (int64_t)2560);
+                }
+                /* The drafter's own passes issue no trunk op and no MTP op. */
+                for (int p = 1; p < 3; ++p) {
+                    const std::vector<std::string> ops = issued_ops(b, *v[(size_t)p]);
+                    CHECK_EQ(count_issued(ops, "mhc_contract"), 0);
+                    CHECK_EQ(count_issued(ops, "hc_read"), 0);
+                    /* DFlash2 rotates with its own rope ops: refilling the trunk's cos/sin table
+                     * would write bytes the planner may have given the drafter's buffers (the
+                     * table's life ends in the trunk, as the head's refill has to be declared to
+                     * extend). */
+                    CHECK_EQ(count_issued(ops, "rope_table"), 0);
+                    /* The context pass: fc and k, v a layer. The query pass: six linears a layer and the 2-bit head. */
+                    CHECK_EQ(count_issued(ops, "gemm_nt_q"), p == 1 ? 1 + 2 * 2 : 2 * 6 + 1);
+                    CHECK_EQ(count_issued(ops, "dflash_select"), p == 2 ? 1 : 0);
+                }
+                const auto dec = kit(b, { 1, 1, 1, 1 }, {});
+                const auto pre = kit(b, {}, { 64, 64 }, 9000);
+                const auto vd = run_passes(b, qwen4exp_fp8::step, { dec.get(), pre.get() }, rank, world);
+                CHECK_PASSES(b, vd);
+            }
+}
+
+/* --draft-tree on with DFlash2: `max_spec` nodes grown over the trained block's lattice
+ * (dflash_tree), the trunk's tree attention verifying them, the parents plane declared with the
+ * drafter. A chain of 5 is refused (a block of 6 is no power of two); a tree of 5 is not. */
+TEST(flashnext_dflash2_tree_is_max_spec_nodes_over_the_trained_block) {
+    DrafterEnv env("dflash2");
+    MetaKV mk = q4_df2();
+    for (const int n : { 6, 5, 15 }) {
+        RadBuilder b;
+        q4_df2_encs(b, true);
+        RadBuildCtx ctx = q4_ctx(0, 1);
+        ctx.max_spec = n;
+        ctx.draft_tree = 1;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK_EQ(b.drafter_name, std::string("dflash2"));
+        CHECK_EQ(b.drafter.block, 8);
+        CHECK_EQ(b.drafter.depth, n);
+        CHECK(b.drafter_tree);
+        const RecOp* sel = find_op(b, "dflash_tree");
+        REQUIRE(sel != nullptr);
+        CHECK_EQ(pint(sel, "nodes"), n);
+        const RecBuf* tok = find_b(b, "dflash_tokens");
+        REQUIRE(tok != nullptr);
+        CHECK_EQ(tok->d.shape[1], (int64_t)n);
+        CHECK(find_b(b, "dflash_parents") != nullptr);
+    }
+    RadBuilder b;
+    q4_df2_encs(b, true);
+    RadBuildCtx ctx = q4_ctx(0, 1);
+    ctx.max_spec = 5;
+    CHECK_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, mk.meta(), &ctx); }),
+             (int)RAD_E_UNSUPPORTED);
+}
+
 /* ==================================================================== embgemma2 */
 
 namespace {

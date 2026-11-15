@@ -1,0 +1,76 @@
+# Qwen3.8-Flash-Next, IQR-V4: the routed experts' gate_up as 4-bit trellis codes chosen by GPTQ on
+# Hessians recorded from the bf16 model, their down projections as 4-bit codebook codes at E4M3
+# scales, the trunk's two widest inputs (the attention's query-gate and the delta net's input
+# projection) as 5-bit trellis codes, and every other trunk linear, the n-gram layer's projections
+# and the lm_head int8, rotated where a rotated-activation kernel reads them. The draft block is
+# 3- and 4-bit trellis beside the codebook experts. $CALIB is the codebook experts' calibration
+# directory, calib/qc-fn-bf16 the Hessians of the bf16 model; neither is published.
+#
+# The first rule that matches a weight decides it; a weight no rule names keeps the checkpoint's
+# bf16.
+
+# The n-gram layer's key and value projections.
+blk.*.ple_key.weight   rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ple_value.weight rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+# The draft block (the MTP head's layer).
+blk.48.attn_qg.weight            gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+blk.48.attn_k.weight             gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+blk.48.attn_v.weight             gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+blk.48.attn_output.weight        gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 group=128 scale=bf16 dyn=1 transform=fwht128 damp=0.01 tcq_gain=1.09
+blk.48.ffn_gate_up_shexp.weight  gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+blk.48.ffn_*_exps.*.weight       gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+
+# The trunk.
+blk.*.attn_qg.weight             gptq codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.16 damp=0.01 calib=calib/qc-fn-bf16 tcq_order=1
+blk.*.attn_k.weight              rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_v.weight              rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight         rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ssm_inz.weight             gptq codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 tcq_gain=1.16 damp=0.01 calib=calib/qc-fn-bf16 tcq_order=1
+blk.*.ssm_out.weight             rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight   rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight      rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+# Ten experts that carry most of their layer's down-projection energy stay bf16.
+blk.34.ffn_*_exps.407.weight     cast dtype=bf16
+blk.34.ffn_*_exps.496.weight     cast dtype=bf16
+blk.44.ffn_*_exps.292.weight     cast dtype=bf16
+blk.44.ffn_*_exps.350.weight     cast dtype=bf16
+blk.46.ffn_*_exps.290.weight     cast dtype=bf16
+blk.46.ffn_*_exps.392.weight     cast dtype=bf16
+blk.47.ffn_*_exps.122.weight     cast dtype=bf16
+blk.47.ffn_*_exps.143.weight     cast dtype=bf16
+blk.47.ffn_*_exps.399.weight     cast dtype=bf16
+blk.47.ffn_*_exps.445.weight     cast dtype=bf16
+
+# The routed experts.
+blk.*.ffn_gate_up_exps.*.weight  gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 tcq_gain=1.12 damp=0.01 calib=calib/qc-fn-bf16 tcq_order=1
+blk.*.ffn_down_exps.*.weight     gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+
+# The hyper-connection mixing matrices and the draft head's entry.
+*_hc_down.weight                 rtn codes=fp8_e4m3 group=128 scale=f32
+*_hc_up.weight                   rtn codes=fp8_e4m3 group=80 scale=f32
+mtp.fc_hidden.weight             rtn codes=fp8_e4m3 group=128 scale=f32
+mtp.fc_embedding.weight          rtn codes=fp8_e4m3 group=128 scale=f32
+
+# The lm_head, the n-gram table and the draft vocabulary head.
+output.weight                    rtn codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ple_ngram.weight           rtn codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
+mtp.draft_head.weight            rtn codes=u2 zero=u8 group=128 scale=f16
+
+# The DFlash2 drafter (incoai/Qwen3.8-Flash-Next-DFlash2), quantised as the MTP head's block above:
+# attention q/k/v as the head's attn_qg/k/v (3-bit trellis), the output projection as its
+# attn_output (4-bit trellis), the MLP's gate/up as its shared expert's gate_up (3-bit trellis,
+# 128 rows a scale grid) and its down as the shared expert's down (rotated int8 at group 128), the
+# fc as rotated int8 like the trunk's (the head's fc_hidden form, E4M3 at group 128 under an f32
+# scale, is read only by mtp_enter's own kernel, and block fp8 is a retired linear format that
+# DenseFP8 refuses), and the draft head as the head's. The norms, the convolution kernels and the selector's codebooks stay
+# bf16 (no rule).
+dflash.blk.*.attn_q.weight       gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+dflash.blk.*.attn_k.weight       gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+dflash.blk.*.attn_v.weight       gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+dflash.blk.*.attn_output.weight  gptq codes=u4 tcq=16 tcq_code=mad tcq_rows=256 group=128 scale=bf16 dyn=1 transform=fwht128 damp=0.01 tcq_gain=1.09
+dflash.blk.*.ffn_gate_up.weight  gptq codes=u3 tcq=16 tcq_gain=1.08 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_order=1
+dflash.blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.fc.weight                 rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.draft_head.weight         rtn codes=u2 zero=u8 group=128 scale=f16

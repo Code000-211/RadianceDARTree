@@ -1504,6 +1504,12 @@ The drafter comes from the container: merge one with `rad-convert --draft-model 
 head inside the target checkpoint, which needs no key. `draft-model` in the server's file is an
 error that says so. Measure speculation by step time, not tokens per second.
 
+A container that carries both an MTP head and a DFlash2 drafter (Qwen3.8-Flash-Next with incoai's
+drafter added in place: docs/ARCHITECTURES.md, `qwen4exp`) serves the head unless the environment
+of the server says `RADIANCE_DRAFTER=dflash2`. Under it `num-speculative-tokens` is 3 or 7 (its
+block is a power of two) and, with `draft-tree: on`, the node count of a tree over its trained
+block.
+
 A drafter with a sliding window over its own cache (DFlash2) keeps that cache outside the prefix
 cache. Where a hit resumes from a window snapshot (a model whose sliding layers the cache does not
 index and that keeps no linear state, as the Gemma 4 31B under gemma4_bf16; the 26B-A4B declares
