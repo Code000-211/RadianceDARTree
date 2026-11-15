@@ -903,6 +903,8 @@ static const RadOperandSpec oMtpTreeGrow[] = {
     { "nsel",     RAD_OPD_OUT,   1 },
     { "vmask",    RAD_OPD_OUT,   1 },
     { "rb",       RAD_OPD_OUT,   1 },
+    { "src",      RAD_OPD_OUT,   1 },
+    { "dst",      RAD_OPD_OUT,   1 },
 };
 /* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
 static const RadParamSpec pDflashTree[] = {
@@ -3783,7 +3785,7 @@ static const RadOpSchema kSchemas[] = {
            "eight, pooled, and the best become the next frontier (up to `width`, the node budget "
            "permitting), or after round `rounds` every remaining node; the final tree is written as "
            "tokens and parent node ids (0 the root), and the next pass's tree-attention operands "
-           "(sel, nsel, vmask, rb) from the head's block table. abi/rad_mtp_tree.h."),
+           "(sel, nsel, vmask, rb) from the head's block table, and `src` / `dst` the hidden-state store rows each next frontier row's parent sits at and its own output goes to. abi/rad_mtp_tree.h."),
     SCHEMA("dflash_tree", pDflashTree, oDflashTree,
            "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
            "a taken node's children are the valid candidates at the next position, each with log "

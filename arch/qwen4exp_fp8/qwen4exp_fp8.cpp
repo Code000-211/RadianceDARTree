@@ -169,6 +169,8 @@ struct Model {
      * state and the next pass's tree-attention operands (mtp_tree_grow), which cross passes. */
     rad_buf b_mtp_ptree = 0, b_mtp_ptok = 0, b_mtp_gstate = 0;
     rad_buf b_mtp_tsel = 0, b_mtp_tnsel = 0, b_mtp_tvmask = 0, b_mtp_trb = 0;
+    /* The head's per-node hidden-state store and the routing into it (MtpHcBlock::Wire). */
+    rad_buf b_mtp_hstore = 0, b_mtp_tsrc = 0, b_mtp_tdst = 0;
     int64_t tree_pitch = 0;
     static constexpr int kMaxRounds = 16;
     rad_op  op_grow[kMaxRounds] = {};
@@ -315,6 +317,12 @@ static void block_slice(int64_t nb, int world, int64_t place, int64_t* lo, int64
  * leaves = min(L, N - R)), 7 verify rows with the anchor. */
 static constexpr int kTreeNodes = 6;
 
+/* The KV page of the trunk's full-attention layers and of the head's: tokens a block. A draft tree
+ * reads its in-flight rows through a 64-key region based at a page boundary (the grower's
+ * `block_size`), and the QSA block keys that region's tree attention scores are `ratio` keys wide, so
+ * a tree is declared only where the two agree. */
+static constexpr int kKvBlock = 4;
+
 /* Stage 2's buffers (RadDrafterDecl::tree_width > 1), declared with the head's candidate planes. The
  * proposal and its parents share a pitch of at least the node budget; the grower's state and the
  * tree-attention operands it leaves for the next pass live across passes (each pass is a step of
@@ -337,8 +345,16 @@ static int declare_head_tree_buffers(RadBuilder* b, Names& nm, Model& m) {
     m.b_mtp_tnsel  = decl_b(b, nm.f("mtp_tnsel"), RAD_I32, {g.max_seqs * W}, RAD_BUF_PERSIST);
     m.b_mtp_tvmask = decl_b(b, nm.f("mtp_tvmask"), RAD_I64, {g.max_seqs * W}, RAD_BUF_PERSIST);
     m.b_mtp_trb    = decl_b(b, nm.f("mtp_trb"),   RAD_I32, {g.max_seqs}, RAD_BUF_PERSIST);
+    /* Every node a head pass embeds keeps its output, because the best-first pool may hang a node
+     * off any earlier pass's node, not only the last's: Q = 1 + (R - 1) * W rows a sequence (the
+     * root and the frontiers of rounds 1 .. R - 1), row `s * Q + node id`. */
+    const int64_t Q = 1 + (R - 1) * W;
+    m.b_mtp_hstore = decl_b(b, nm.f("mtp_hstore"), g.act_dtype, {g.max_seqs * Q, m.hccfg.hc * g.n_embd},
+                            RAD_BUF_PERSIST);
+    m.b_mtp_tsrc   = decl_b(b, nm.f("mtp_tsrc"), RAD_I32, {g.max_seqs * W}, RAD_BUF_PERSIST);
+    m.b_mtp_tdst   = decl_b(b, nm.f("mtp_tdst"), RAD_I32, {g.max_seqs * W}, RAD_BUF_PERSIST);
     if (!m.b_mtp_ptok || !m.b_mtp_ptree || !m.b_mtp_gstate || !m.b_mtp_tsel || !m.b_mtp_tnsel ||
-        !m.b_mtp_tvmask || !m.b_mtp_trb)
+        !m.b_mtp_tvmask || !m.b_mtp_trb || !m.b_mtp_hstore || !m.b_mtp_tsrc || !m.b_mtp_tdst)
         return RAD_E_INVAL;
     return RAD_OK;
 }
@@ -379,7 +395,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ctx->draft_rounds <= ctx->max_spec;
     if (m.tree_on) {
         /* The region's visibility mask is 64 keys: (ratio - 1) committed keys before the anchor
-         * and every row of the verify block (docs/QSA.md). */
+         * and every row of the verify block (docs/QSA.md). The ratio is not known yet; the exact
+         * bound max_spec + ratio <= 64 is checked once the QSA geometry is read, this is the
+         * grower's own node limit. */
         if (ctx->max_spec > 60) {
             fprintf(stderr, "radiance: qwen4exp: a draft tree of %d nodes does not fit the QSA "
                             "region mask (60 at most)\n", ctx->max_spec);
@@ -405,8 +423,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.tree_r = ctx->draft_rounds;
         m.tree_n = ctx->max_spec;
         m.tree_w = std::max(ctx->draft_tree_width, 1);
-        /* Stage 2 needs W <= N frontier rows and the logits rows for the round passes. */
-        if (m.tree_w > m.tree_n) m.tree_w = m.tree_n;
+        /* Stage 2 grows W frontier rows a pass out of at most N nodes: a wider frontier is a
+         * misconfiguration, refused rather than clamped (the core stages the width it declared). */
+        if (m.tree_w > m.tree_n) {
+            fprintf(stderr, "radiance: qwen4exp: --draft-tree-width %lld exceeds the %lld nodes of "
+                            "the draft tree\n", (long long)m.tree_w, (long long)m.tree_n);
+            return RAD_E_UNSUPPORTED;
+        }
+        /* A tree step writes the KV of rows the verify may drop and compacts them in place
+         * (tree_compact); a streamed group's host mirror and ring have no such step. */
+        if (ctx->kv_stream_ok && ctx->kv_resident_blocks > 0) {
+            fprintf(stderr, "radiance: qwen4exp: a draft tree does not combine with a streamed KV "
+                            "cache (--kv-resident)\n");
+            return RAD_E_UNSUPPORTED;
+        }
     }
 
     /* Qwen4-Exp's norms are all `x_hat * (1 + w)` (`Qwen3NextRMSNorm.forward` is
@@ -1007,6 +1037,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             !m.qsaw.sequ)
             return RAD_E_INVAL;
     }
+    /* A draft tree verifies through the QSA tree attention (`attn_paged_tree_sel`) of every full
+     * layer: it needs the indexer's tree scratch and region mask, and a mask wide enough for the
+     * anchor, the (ratio - 1) committed keys of its block and N rows. The probe advertised a tree
+     * for the head's presence alone, so this is where a container without the indexer is refused. */
+    if (m.tree_on) {
+        const int64_t ratio = m.qsacfg.ratio;
+        if (ratio <= 0 || !m.qsacfg.tree || !m.qsaw.qk || !m.qsaw.vmask || !m.qsaw.rb) {
+            fprintf(stderr, "radiance: qwen4exp: a draft tree needs the QSA indexer's tree "
+                            "attention, which this container has no indexer for\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (ratio != kKvBlock) {
+            fprintf(stderr, "radiance: qwen4exp: a draft tree needs the indexer's compress ratio "
+                            "(%lld) to equal the KV page (%d tokens)\n", (long long)ratio,
+                    kKvBlock);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (ctx->max_spec + 1 + (ratio - 1) > 64) {
+            fprintf(stderr, "radiance: qwen4exp: a draft tree of %d nodes does not fit the QSA "
+                            "region mask (%lld at most at ratio %lld)\n", ctx->max_spec,
+                    (long long)(64 - ratio), (long long)ratio);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
 
     m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, conv_dim + v_dim});
     RAD_ARCH_TRY(m.a_in.declare_qs(b, nm, g, "gdn_in", conv_dim + v_dim));
@@ -1276,7 +1330,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * table rather than a new attention kernel (docs/QSA.md); the attention rows must
              * declare the same 4 or nothing resolves. Page size only affects the block-table walk:
              * pages of 4 and 16 cost the same at long context and give identical text. */
-            lay.attn.kv_block = 4;
+            lay.attn.kv_block = kKvBlock;
             /* The selection must be set before the attention is declared: `attn_paged` declares
              * `sel` and `seqused` as reads, and a read declared after the op does not count
              * (rad_block_attn_gated_fp8.h). The indexer itself is declared after the attention
@@ -1550,6 +1604,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq   = m.b_mtp_dq;   tw.ds = m.b_mtp_ds;    tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.dpair = m.b_mtp_dpair; tw.dgath = m.b_mtp_dgath;
+        tw.hstore = m.b_mtp_hstore; tw.tsrc = m.b_mtp_tsrc; tw.tdst = m.b_mtp_tdst;
         tw.couple_draws = m.b_mtp_couple_draws; tw.couple_state = m.b_mtp_couple_state;
         /* The head reuses the trunk's working buffers, all dead by the time a draft round runs (a
          * second set would be 150 MiB). Only the wide stream and the carry are its own, since
@@ -1606,16 +1661,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* Set before declare(), as for the trunk: `attn_paged` declares `sel` and `seqused` as
          * reads, which must precede the op. */
-        m.mtp.attn.kv_block = 4;
+        m.mtp.attn.kv_block = kKvBlock;
         if (m.b_mtp_tsel) {
             /* Stage 2: the rounds' rows attend over the committed pages and their own ancestors,
-             * the operands mtp_tree_grow wrote for them. */
+             * the operands mtp_tree_grow wrote for them. Divergence from the chain head: rounds
+             * >= 2 read the last `topk + 1` committed pages (a recency window), not QSA's top-k
+             * choice, and the indexer is not run for them. At or below the exactness bound
+             * (budget + ratio - 1 tokens of context) the window holds every page and the
+             * stage-2 head equals the chain head's attention; above it the drafts differ, which
+             * costs acceptance only, since the trunk's verify is exact. */
             m.mtp.attn.tree_sel   = m.b_mtp_tsel;
             m.mtp.attn.tree_nsel  = m.b_mtp_tnsel;
             m.mtp.attn.qsa_vmask  = m.b_mtp_tvmask;
             m.mtp.attn.qsa_rb     = m.b_mtp_trb;
             m.mtp.attn.tree_any   = true;
             m.mtp.tree_rounds     = true;
+            m.mtp.tree_w          = (int)m.tree_w;
         }
         if (m.qsaw.qk) {
             m.mtp.attn.qsa_sel      = m.qsaw.sel;
@@ -1673,8 +1734,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             dd.tree_nodes  = ctx->max_spec;
             dd.tree_leaves = std::min<int>(std::max(ctx->draft_tree_leaves, 0),
                                            (int)kDraftTopR - 1);
-            dd.tree_width  = std::max(ctx->draft_tree_width, 1);
-            m.tree_w = dd.tree_width;
+            dd.tree_width  = (int)m.tree_w;   /* checked against N above, never clamped here */
             m.tree_r = dd.depth;
             m.tree_n = dd.tree_nodes;
             if (dd.tree_width > 1) {
@@ -1687,12 +1747,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     m.op_grow[r - 1] = rw(b, RAD_OP(b, "mtp_tree_grow",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
                                    RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
-                                   RAD_INT("width", m.tree_w), RAD_INT("block_size", 4),
+                                   RAD_INT("width", m.tree_w), RAD_INT("block_size", kKvBlock),
                                    RAD_INT("sel_pitch", m.qsacfg.topk + 1)),
                         RAD_NOWEIGHTS),
                         { m.b_mtp_didx, m.b_mtp_dval, m.b_mtp_gstate },
                         { m.b_mtp_ptok, m.b_mtp_ptree, m.b_mtp_gstate, m.b_mtp_tsel,
-                          m.b_mtp_tnsel, m.b_mtp_tvmask, m.b_mtp_trb });
+                          m.b_mtp_tnsel, m.b_mtp_tvmask, m.b_mtp_trb, m.b_mtp_tsrc,
+                          m.b_mtp_tdst });
                     if (!m.op_grow[r - 1]) {
                         rad_note(b, "a stage-2 draft tree needs the mtp_tree_grow op, which no "
                                     "loaded library serves");
@@ -1992,7 +2053,8 @@ static void head_tree_grow(RadCtx* c, const RadBatch* batch, const Model& m) {
                 praw2(kvb->block_table, RAD_I32, S, kvb->block_table_pitch),
                 brows(m.b_mtp_ptok, S), brows(m.b_mtp_ptree, S),
                 brows(m.b_mtp_tsel, S * W), brows(m.b_mtp_tnsel, S * W),
-                brows(m.b_mtp_tvmask, S * W), brows(m.b_mtp_trb, S));
+                brows(m.b_mtp_tvmask, S * W), brows(m.b_mtp_trb, S),
+                brows(m.b_mtp_tsrc, S * W), brows(m.b_mtp_tdst, S * W));
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
@@ -2112,11 +2174,13 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->draft_depth = 0;
     if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0) {
         out->draft_depth = 3;
-        /* The serial draft tree (DARTree), advertised with the head: N = R + L nodes at the default
-         * operating point (the greedy chain of 3 plus 4 depth-1 siblings, so 7 nodes, 8 verify rows,
-         * which the delta net's tree walk and the QSA region mask both take). `tree_linear_ok`:
-         * the delta net ops, the PLE windows and the QSA tail and block keys all follow
-         * RadBatch::spec_parent and spec_path (rad_block_gdn_fp8.h, rad_block_ple.h, rad_qsa.h).
+        /* The serial draft tree (DARTree), advertised with the head: N = 6 nodes at the default
+         * operating point (the greedy chain of the head's 3 rounds plus 3 depth-1 siblings, 7 verify
+         * rows with the anchor, which the delta net's tree walk and the QSA region mask both take; at
+         * most 16 rows and, at the indexer's ratio, 64 - ratio nodes). A container with no indexer,
+         * or a streamed KV cache, is refused at declare. `tree_linear_ok`: the delta net ops, the PLE
+         * windows and the QSA tail and block keys all follow RadBatch::spec_parent and spec_path
+         * (rad_block_gdn_fp8.h, rad_block_ple.h, rad_qsa.h).
          * `tree_pays` stays 0 until a measurement says the tree beats the chain on the real model:
          * `--draft-tree on` forces it, `auto` keeps the chain. */
         out->tree_nodes     = kTreeNodes;

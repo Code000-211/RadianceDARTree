@@ -1154,7 +1154,7 @@ AVX_KERNEL(softmax) {
 
 /* ------------------------------------------------------------------ mtp_tree_grow */
 /* `didx`, `dval`, `state`, `head_pos`?, `head_row`?, `table`? -> `tok`, `par`, `sel`?, `nsel`?,
- * `vmask`?, `rb`?  One pass of a serial draft head's best-first tree growth: libref's walk
+ * `vmask`?, `rb`?, `src`?, `dst`?  One pass of a serial draft head's best-first tree growth: libref's walk
  * (ref_quant.cpp), the same shared code (abi/rad_mtp_tree.h), one sequence at a time. */
 #ifndef AVX_MTP_TREE_ONCE
 #define AVX_MTP_TREE_ONCE
@@ -1172,6 +1172,8 @@ AVX_KERNEL(mtp_tree_grow) {
     const RadTensor* nsel  = a->n_t > 9  ? rad_arg_in(a, 9)  : nullptr;
     const RadTensor* vmask = a->n_t > 10 ? rad_arg_in(a, 10) : nullptr;
     const RadTensor* rbt   = a->n_t > 11 ? rad_arg_in(a, 11) : nullptr;
+    const RadTensor* srct  = a->n_t > 12 ? rad_arg_in(a, 12) : nullptr;
+    const RadTensor* dstt  = a->n_t > 13 ? rad_arg_in(a, 13) : nullptr;
     if (!didx->data || !dval->data || !st->data || !tok->data || !par->data) return RAD_E_INVAL;
     if (didx->dtype != RAD_I32 || dval->dtype != RAD_F32 || st->dtype != RAD_I32 ||
         tok->dtype != RAD_I32 || par->dtype != RAD_I32)
@@ -1204,6 +1206,9 @@ AVX_KERNEL(mtp_tree_grow) {
                 numel(rbt) < M))
         return RAD_E_SHAPE;
 
+    if ((srct && (srct->dtype != RAD_I32 || numel(srct) < M * cfg.width)) ||
+        (dstt && (dstt->dtype != RAD_I32 || numel(dstt) < M * cfg.width)))
+        return RAD_E_SHAPE;
     const int*   ip  = (const int*)didx->data;
     const float* fp  = (const float*)dval->data;
     const int64_t drs = didx->stride[0];
@@ -1222,13 +1227,20 @@ AVX_KERNEL(mtp_tree_grow) {
         std::vector<int> selw((size_t)cfg.width * (att ? cfg.sel_pitch : 1), -1);
         std::vector<int> nsw((size_t)cfg.width, 0);
         int rb = 0;
+        std::vector<int> srcw((size_t)cfg.width, 0), dstw((size_t)cfg.width, 0);
         const int rc = rad_mtp_tree_grow_seq(
             &cfg, sp, ip, fp, m * per, drs, 1, head,
             att ? (const int*)tab->data + m * tab->stride[0] : nullptr,
             (int*)tok->data + m * tok->stride[0], (int*)par->data + m * par->stride[0],
             att ? selw.data() : nullptr, att ? nsw.data() : nullptr, att ? vm.data() : nullptr,
-            att ? &rb : nullptr);
+            att ? &rb : nullptr, m, srct ? srcw.data() : nullptr,
+            dstt ? dstw.data() : nullptr);
         if (rc < 0) return RAD_E_SHAPE;
+        if (cfg.round < cfg.rounds)
+            for (int w = 0; w < cfg.width; ++w) {
+                if (srct) ((int*)srct->data)[(m * cfg.width + w) * srct->stride[srct->rank - 1]] = srcw[(size_t)w];
+                if (dstt) ((int*)dstt->data)[(m * cfg.width + w) * dstt->stride[dstt->rank - 1]] = dstw[(size_t)w];
+            }
         if (att && cfg.round < cfg.rounds) {
             for (int w = 0; w < cfg.width; ++w) {
                 int* srow = (int*)sel->data + (m * cfg.width + w) * sel->stride[0];

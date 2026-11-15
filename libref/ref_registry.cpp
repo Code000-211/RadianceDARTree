@@ -350,7 +350,10 @@ static const RadOperandSpec oDflashTree[] = { OPD("cand"), OPD("unary"), OPD_O("
 
 /* mtp_tree_grow (abi/rad_mtp_tree.h). `state` holds rad_mtp_tree_state_words(nodes, width, rounds)
  * words a sequence. Round 1 reads each sequence's head index at head_pos[head_row[s]]; the four
- * attention outputs go together, written when `sel_pitch` > 0. */
+ * attention outputs go together, written when `sel_pitch` > 0. `src` and `dst` [M * width] i32 (optional, written after a round
+ * below `rounds`) route the head's hidden state through a per-node store of Q = 1 + (rounds - 1) *
+ * width rows a sequence (row `s * Q + node`): the store row of each next-pass frontier row's
+ * parent, and the one its own output goes to (-1: none). */
 static const RadParamSpec pMtpTreeGrow[] = { P_INT("M"), P_INT("round"), P_INT("rounds"),
                                              P_INT("nodes"), P_INT("width"),
                                              P_INTO("block_size"), P_INTO("sel_pitch") };
@@ -358,7 +361,7 @@ static const RadOperandSpec oMtpTreeGrow[] = { OPD("didx"), OPD("dval"), INOUT("
                                                OPD_O("head_pos"), OPD_O("head_row"),
                                                OPD_O("table"), OUT("tok"), OUT("par"),
                                                OUT_O("sel"), OUT_O("nsel"), OUT_O("vmask"),
-                                               OUT_O("rb") };
+                                               OUT_O("rb"), OUT_O("src"), OUT_O("dst") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };

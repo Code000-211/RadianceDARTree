@@ -384,7 +384,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                   RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
                                   RAD_INT("block_size", kv_block > 0 ? kv_block
                                                                      : (int64_t)RAD_KV_BLOCK),
-                                  RAD_INT("max_seqs", qsa_rows()), RAD_INT("max_ctx", g.max_ctx),
+                                  RAD_INT("max_seqs", qsa_gq_rows()), RAD_INT("max_ctx", g.max_ctx),
                                   RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype),
                                   RAD_INT("sel_pitch", qsa_topk + 1)),
                        RAD_NOWEIGHTS);
@@ -817,10 +817,17 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     if (tree) {
         /* Rows of the verify block: the page lists and masks are the selection's, per row; the
          * block table and the sequences' bounds are the step's whole (rb and cu index by
-         * sequence, vmask, sel, nsel, q and out by row), so a chunk offsets only the row
-         * operands. */
+         * sequence, vmask, sel, nsel, q and out by row). */
         const int64_t qw = g.q_dim(), hd = g.head_dim;
-        const int64_t chunk = tree_gated ? qsa_gq_rows() : qsa_rows();
+        /* One launch, never split: the kernel maps a launch-local row to its sequence through
+         * `cu_seqlens` and indexes `rb` and the block table by that sequence, so a chunk past the
+         * first would read the wrong sequence's pages with the step's whole operands. The op is
+         * declared at qsa_gq_rows() >= max_tok >= tree_rows. */
+        const int64_t chunk = qsa_gq_rows();
+        if (tree_rows > chunk) {
+            rad_step_fail(c, "a tree verify has more rows than one tree attention launch takes");
+            return;
+        }
         const int64_t S = batch->n_seq;
         const RadOperand btab = praw2(table, RAD_I32, S, kvb->block_table_pitch);
         const RadOperand rbs  = brows(qsa_rb, S);

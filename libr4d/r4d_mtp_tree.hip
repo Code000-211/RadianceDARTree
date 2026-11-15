@@ -22,6 +22,7 @@ struct MtpTreeArgs {
   int* tok;  long tok_stride;
   int* par;  long par_stride;
   int* sel;  int* nsel;  long long* vmask;  int* rb;
+  int* src;  int* dst;            // the hidden-state store routing of the next pass, W a sequence
   int M;
   RadMtpTreeCfg cfg;
   long per;                       // candidate rows a sequence: 1 in round 1, else width
@@ -40,7 +41,9 @@ __global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
                         att ? a.sel + (long)m * a.cfg.width * a.cfg.sel_pitch : nullptr,
                         att ? a.nsel + (long)m * a.cfg.width : nullptr,
                         att ? a.vmask + (long)m * a.cfg.width : nullptr,
-                        att ? a.rb + m : nullptr);
+                        att ? a.rb + m : nullptr,
+                        (long)m, a.src ? a.src + (long)m * a.cfg.width : nullptr,
+                        a.dst ? a.dst + (long)m * a.cfg.width : nullptr);
 }
 
 extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
@@ -48,7 +51,7 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
   const RadTensor *hpos = r4d_opt(a, 3), *hrow = r4d_opt(a, 4), *tab = r4d_opt(a, 5);
   const RadTensor *tok = r4d_opt(a, 6), *par = r4d_opt(a, 7);
   const RadTensor *sel = r4d_opt(a, 8), *nsel = r4d_opt(a, 9), *vmask = r4d_opt(a, 10),
-                  *rbt = r4d_opt(a, 11);
+                  *rbt = r4d_opt(a, 11), *srct = r4d_opt(a, 12), *dstt = r4d_opt(a, 13);
   if (!didx || !dval || !st || !tok || !par) return R4D_NO(RAD_E_INVAL);
   if (didx->dtype != RAD_I32 || dval->dtype != RAD_F32 || st->dtype != RAD_I32 ||
       tok->dtype != RAD_I32 || par->dtype != RAD_I32)
@@ -103,6 +106,14 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
   k.nsel = att ? (int*)nsel->data : nullptr;
   k.vmask = att ? (long long*)vmask->data : nullptr;
   k.rb = att ? (int*)rbt->data : nullptr;
+  if (srct) {
+    if (srct->dtype != RAD_I32 || r4d_numel(srct) < M * k.cfg.width) return R4D_NO(RAD_E_SHAPE);
+    k.src = (int*)srct->data;
+  }
+  if (dstt) {
+    if (dstt->dtype != RAD_I32 || r4d_numel(dstt) < M * k.cfg.width) return R4D_NO(RAD_E_SHAPE);
+    k.dst = (int*)dstt->data;
+  }
   k.M = (int)M;
   hipLaunchKernelGGL(r4d_mtp_tree_grow_kernel, dim3((unsigned)((M + 63) / 64)), dim3(64), 0,
                      (hipStream_t)s, k);

@@ -10603,7 +10603,10 @@ void mtp_tree_cases(const Plugin& pl) {
     void* dnsel = dalloc((size_t)M * W * 4);
     void* dvm = dalloc((size_t)M * W * 8);
     void* drb = dalloc((size_t)M * 4);
-    if (!dst || !dtab || !dhpos || !dhrow || !dtok || !dpar || !dsel || !dnsel || !dvm || !drb) {
+    void* dsrc = dalloc((size_t)M * W * 4);
+    void* ddst = dalloc((size_t)M * W * 4);
+    if (!dst || !dtab || !dhpos || !dhrow || !dtok || !dpar || !dsel || !dnsel || !dvm || !drb ||
+        !dsrc || !ddst) {
         ok("mtp_tree_grow", false, "alloc");
         return;
     }
@@ -10634,7 +10637,8 @@ void mtp_tree_cases(const Plugin& pl) {
                                    T(dtab, RAD_I32, { M, 64 }),
                                    T(dtok, RAD_I32, { M, PITCH }), T(dpar, RAD_I32, { M, PITCH }),
                                    T(dsel, RAD_I32, { M * W, SP }), T(dnsel, RAD_I32, { M * W }),
-                                   T(dvm, RAD_I64, { M * W }), T(drb, RAD_I32, { M }) },
+                                   T(dvm, RAD_I64, { M * W }), T(drb, RAD_I32, { M }),
+                                   T(dsrc, RAD_I32, { M * W }), T(ddst, RAD_I32, { M * W }) },
                               ps);
         if (rc != RAD_OK) { ok("mtp_tree_grow launch", false, "rc " + std::to_string(rc)); return; }
         /* the host walk */
@@ -10643,6 +10647,7 @@ void mtp_tree_cases(const Plugin& pl) {
         cfg.sel_pitch = SP; cfg.pitch = PITCH;
         std::vector<int32_t> hsel((size_t)M * W * SP, 0), hnsel((size_t)M * W, 0), hrb((size_t)M, 0);
         std::vector<long long> hvm((size_t)M * W, 0);
+        std::vector<int32_t> hsrc((size_t)M * W, 0), hdst((size_t)M * W, 0);
         for (int m = 0; m < M; ++m) {
             const int head = round == 1 ? hpos[(size_t)hrow[(size_t)m]] : -1;
             rad_mtp_tree_grow_seq(&cfg, hstate.data() + (size_t)m * sw, idx.data(), val.data(),
@@ -10650,13 +10655,16 @@ void mtp_tree_cases(const Plugin& pl) {
                                   table.data() + (size_t)m * 64, wtok.data() + (size_t)m * PITCH,
                                   wpar.data() + (size_t)m * PITCH, hsel.data() + (size_t)m * W * SP,
                                   hnsel.data() + (size_t)m * W, hvm.data() + (size_t)m * W,
-                                  hrb.data() + m);
+                                  hrb.data() + m, m, hsrc.data() + (size_t)m * W,
+                                  hdst.data() + (size_t)m * W);
         }
         const std::vector<int32_t> gtok = down_i32(dtok, (size_t)M * PITCH);
         const std::vector<int32_t> gpar = down_i32(dpar, (size_t)M * PITCH);
         const std::vector<int32_t> gsel = down_i32(dsel, (size_t)M * W * SP);
         const std::vector<int32_t> gnsel = down_i32(dnsel, (size_t)M * W);
         const std::vector<int32_t> grb = down_i32(drb, (size_t)M);
+        const std::vector<int32_t> gsrc = down_i32(dsrc, (size_t)M * W);
+        const std::vector<int32_t> gdst = down_i32(ddst, (size_t)M * W);
         std::vector<long long> gvm((size_t)M * W);
         st_memcpy(gvm.data(), dvm, gvm.size() * 8, hipMemcpyDeviceToHost);
         const int nt = round < R ? W : N;
@@ -10668,6 +10676,8 @@ void mtp_tree_cases(const Plugin& pl) {
             if (round < R) {
                 bad += grb[(size_t)m] != hrb[(size_t)m];
                 for (int w = 0; w < W; ++w) {
+                    bad += gsrc[(size_t)m * W + w] != hsrc[(size_t)m * W + w];
+                    bad += gdst[(size_t)m * W + w] != hdst[(size_t)m * W + w];
                     bad += gnsel[(size_t)m * W + w] != hnsel[(size_t)m * W + w];
                     bad += gvm[(size_t)m * W + w] != hvm[(size_t)m * W + w];
                     for (int k = 0; k < SP; ++k)

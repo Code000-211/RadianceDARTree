@@ -12961,6 +12961,119 @@ TEST(mtp_tree_grow_takes_the_best_of_the_pool_and_hangs_it_on_its_parent) {
     }
 }
 
+/* The hidden-state routing: every frontier row continues from its PARENT's head output, found in a
+ * per-node store (row `s * Q + node`, Q = 1 + (R - 1) * W), because the pool may hang a node off a
+ * node of any earlier pass. M = 2 sequences, W = 2, R = 4, N = 6, Q = 7. */
+namespace {
+int tg_route(int round, int64_t M, T& didx, T& dval, T& st, T& tok, T& par, T& src, T& dst,
+             int64_t N = 6, int64_t R = 4) {
+    A b;
+    b.t(didx).t(dval).t(st).tnull().tnull().tnull().t(tok).t(par);
+    b.tnull().tnull().tnull().tnull().t(src).t(dst);
+    b.i("M", (int)M).i("round", round).i("rounds", R).i("nodes", N).i("width", kTgW);
+    return run("mtp_tree_grow", b);
+}
+std::vector<int64_t> tg_ids(int64_t base) {
+    std::vector<int64_t> v;
+    for (int64_t i = 0; i < 8; ++i) v.push_back(base + i);
+    return v;
+}
+}  /* namespace */
+
+TEST(mtp_tree_grow_routes_each_frontier_row_to_its_parents_hidden_state) {
+    const int64_t M = 2, N = 6, R = 4, Q = 1 + (R - 1) * kTgW;
+    T st(RAD_I32, { M, tg_state_words(N, kTgW, R) });
+    T tok(RAD_I32, { M, N }), par(RAD_I32, { M, N });
+    T src(RAD_I32, { M * kTgW }), dst(RAD_I32, { M * kTgW });
+    const std::vector<float> steep = { 3, 2, 1, 0, -1, -2, -3, -4 };
+    const std::vector<float> peak  = { 3, -40, -40, -40, -40, -40, -40, -40 };
+    const std::vector<float> root  = { 3, 2, -40, -41, -42, -43, -44, -45 };
+
+    /* Round 1: both sequences' roots (store row s * Q) have nodes 1 and 2. */
+    {
+        T d(RAD_I32, { M, 8 }), v(RAD_F32, { M, 8 });
+        std::vector<int64_t> di = tg_ids(10);
+        const std::vector<int64_t> d2 = tg_ids(10);
+        di.insert(di.end(), d2.begin(), d2.end());
+        std::vector<float> vf = root;
+        vf.insert(vf.end(), root.begin(), root.end());
+        d.n(di); v.f(vf);
+        CHECK_OK(tg_route(1, M, d, v, st, tok, par, src, dst));
+        for (int64_t s = 0; s < M; ++s) {
+            CHECK_EQ(src.iat(s * 2 + 0), s * Q);     CHECK_EQ(src.iat(s * 2 + 1), s * Q);
+            CHECK_EQ(dst.iat(s * 2 + 0), s * Q + 1); CHECK_EQ(dst.iat(s * 2 + 1), s * Q + 2);
+        }
+    }
+    /* Round 2 over rows s * 2 + w (w the slot of node 1 + w). Sequence 0: row 0 offers nothing, so
+     * both new nodes (3, 4) hang off node 2, row 1. Sequence 1: row 0 is peaked (its best child is
+     * the best of the pool) and row 1 steep: node 3 off node 1, node 4 off node 2. */
+    {
+        T d(RAD_I32, { 4, 8 }), v(RAD_F32, { 4, 8 });
+        std::vector<int64_t> di(8, -1);
+        for (const int64_t base : { 20, 30, 40 }) {
+            const auto x = tg_ids(base);
+            di.insert(di.end(), x.begin(), x.end());
+        }
+        std::vector<float> vf(8, 0.0f);
+        vf.insert(vf.end(), steep.begin(), steep.end());
+        vf.insert(vf.end(), peak.begin(), peak.end());
+        vf.insert(vf.end(), steep.begin(), steep.end());
+        d.n(di); v.f(vf);
+        CHECK_OK(tg_route(2, M, d, v, st, tok, par, src, dst));
+        CHECK_EQ(par.iat(0 * N + 0), 2); CHECK_EQ(par.iat(0 * N + 1), 2);
+        CHECK_EQ(src.iat(0), 0 * Q + 2); CHECK_EQ(src.iat(1), 0 * Q + 2);
+        CHECK_EQ(dst.iat(0), 0 * Q + 3); CHECK_EQ(dst.iat(1), 0 * Q + 4);
+        CHECK_EQ(par.iat(1 * N + 0), 1); CHECK_EQ(par.iat(1 * N + 1), 2);
+        CHECK_EQ(src.iat(2), 1 * Q + 1); CHECK_EQ(src.iat(3), 1 * Q + 2);
+        CHECK_EQ(dst.iat(2), 1 * Q + 3); CHECK_EQ(dst.iat(3), 1 * Q + 4);
+    }
+    /* Round 3: nothing new on the frontier, so the best leftovers are node 2's later children,
+     * whose parent sits in an EARLIER pass than the last: the source is still node 2's store row. */
+    {
+        T d(RAD_I32, { 4, 8 }), v(RAD_F32, { 4, 8 });
+        d.n(std::vector<int64_t>(32, -1));
+        v.f(std::vector<float>(32, 0.0f));
+        CHECK_OK(tg_route(3, M, d, v, st, tok, par, src, dst));
+        for (int64_t s = 0; s < M; ++s) {
+            CHECK_EQ(par.iat(s * N + 0), 2); CHECK_EQ(par.iat(s * N + 1), 2);
+            CHECK_EQ(src.iat(s * 2 + 0), s * Q + 2); CHECK_EQ(src.iat(s * 2 + 1), s * Q + 2);
+            CHECK_EQ(dst.iat(s * 2 + 0), s * Q + 5); CHECK_EQ(dst.iat(s * 2 + 1), s * Q + 6);
+        }
+    }
+    /* A pool that runs dry pads with a node under the root, whose row is the root's. */
+    {
+        T st1(RAD_I32, { 1, tg_state_words(N, kTgW, R) });
+        T tk(RAD_I32, { 1, N }), pr(RAD_I32, { 1, N }), s1(RAD_I32, { 2 }), d1(RAD_I32, { 2 });
+        T d(RAD_I32, { 1, 8 }), v(RAD_F32, { 1, 8 });
+        std::vector<int64_t> di(8, -1);
+        di[0] = 7;
+        d.n(di); v.f(std::vector<float>(8, 1.0f));
+        CHECK_OK(tg_route(1, 1, d, v, st1, tk, pr, s1, d1));
+        CHECK_EQ(s1.iat(0), 0); CHECK_EQ(s1.iat(1), 0);
+        CHECK_EQ(d1.iat(0), 1); CHECK_EQ(d1.iat(1), 2);
+    }
+    /* A row past the new nodes (the node budget is spent) reads the root's row and writes nowhere:
+     * N = 3, R = 3, W = 2, so round 2 can create one node. Q = 5. */
+    {
+        const int64_t N3 = 3, R3 = 3;
+        T st1(RAD_I32, { 1, tg_state_words(N3, kTgW, R3) });
+        T tk(RAD_I32, { 1, N3 }), pr(RAD_I32, { 1, N3 }), s1(RAD_I32, { 2 }), d1(RAD_I32, { 2 });
+        T d(RAD_I32, { 1, 8 }), v(RAD_F32, { 1, 8 });
+        d.n(tg_ids(10)); v.f(root);
+        CHECK_OK(tg_route(1, 1, d, v, st1, tk, pr, s1, d1, N3, R3));
+        T d2(RAD_I32, { 2, 8 }), v2(RAD_F32, { 2, 8 });
+        std::vector<int64_t> di = tg_ids(20);
+        const auto none = std::vector<int64_t>(8, -1);
+        di.insert(di.end(), none.begin(), none.end());
+        std::vector<float> vf = peak;
+        vf.insert(vf.end(), 8, 0.0f);
+        d2.n(di); v2.f(vf);
+        CHECK_OK(tg_route(2, 1, d2, v2, st1, tk, pr, s1, d1, N3, R3));
+        CHECK_EQ(s1.iat(0), 1); CHECK_EQ(s1.iat(1), 0);
+        CHECK_EQ(d1.iat(0), 3); CHECK_EQ(d1.iat(1), -1);
+    }
+}
+
 TEST(mtp_tree_grow_writes_the_next_passs_tree_attention_operands) {
     const int64_t sw = tg_state_words(kTgN, kTgW, kTgR);
     T st(RAD_I32, { 1, sw });

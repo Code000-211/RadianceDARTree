@@ -29,7 +29,10 @@
  * docs/OPS.md `attn_paged_tree_sel`): `sel` the committed pages below the row's region (the last
  * `sel_pitch` when there are more -- the head then reads a recency window, not QSA's choice),
  * `nsel` their count, `vmask` the region keys [rb, rb + 64) the row reads, `rb`
- * = block * floor(head / block). After the last pass: the final tree, `tok[j-1]` / `par[j-1]` for
+ * = block * floor(head / block). `src` / `dst` (W entries each, optional) route the head's hidden
+ * state: row `seq * Q + id` of a per-node store (Q = 1 + (R - 1) * W) holds node `id`'s head
+ * output; `src[w]` is the store row of new row w's parent (the row to continue from), `dst[w]` the
+ * store row new row w's own output goes to (-1: none). After the last pass: the final tree, `tok[j-1]` / `par[j-1]` for
  * j = 1..N.
  */
 #ifndef RAD_MTP_TREE_H
@@ -70,12 +73,13 @@ RAD_MTP_HD static inline int   rad_mtp_tree_f_bits(float f) { int v; memcpy(&v, 
  * in a pass of `width` rows a sequence, so row w is row0 + w * stride); `head_in` the head index of
  * node 0 for round 1 (negative: keep the state's). `tok` / `par` the sequence's output rows;
  * `sel` / `nsel` / `vmask` the W rows of the next pass's operands (null: none), `table` the
- * sequence's block-table row (null: none) and `rb_out` its region base. Returns 0, or a negative
+ * sequence's block-table row (null: none), `rb_out` its region base, `seq` its index and `src_out` / `dst_out`
+ * the hidden-state routing (null: none). Returns 0, or a negative
  * code: -1 a bad configuration. */
 RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
     const RadMtpTreeCfg* cfg, int* st, const int* didx, const float* dval, long row0,
     long row_stride, long stride, int head_in, const int* table, int* tok, int* par, int* sel,
-    int* nsel, long long* vmask, int* rb_out) {
+    int* nsel, long long* vmask, int* rb_out, long seq, int* src_out, int* dst_out) {
     const int K = RAD_MTP_TREE_K, N = cfg->nodes, W = cfg->width, R = cfg->rounds;
     if (N < 1 || N > RAD_MTP_TREE_MAX_NODES || W < 1 || R < 1 || cfg->round < 1 ||
         cfg->round > R || cfg->pitch < N)
@@ -159,6 +163,20 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
         }
         st[2] = 0;
         return 0;
+    }
+
+    /* The hidden-state routing of the next pass. A head pass's hidden rows are kept per node in a
+     * store of Q = 1 + (R - 1) * W rows a sequence (row `seq * Q + id`): the pass scatters each
+     * frontier row to its node's store row (`dst`, -1 for a row past the new nodes), and the next
+     * pass gathers each of its rows from its parent's (`src`). A pooled candidate may hang off a
+     * node of any earlier pass, not only the last, so the store keeps them all; a row past the new
+     * nodes reads the root's, which is finite and whose output is discarded. */
+    if (src_out || dst_out) {
+        const long q = 1 + (long)(R - 1) * W;
+        for (int w = 0; w < W; ++w) {
+            if (src_out) src_out[w] = (int)(seq * q + (w < n_made ? nd[6 * made[w] + 1] : 0));
+            if (dst_out) dst_out[w] = w < n_made ? (int)(seq * q + made[w]) : -1;
+        }
     }
 
     /* the next frontier */

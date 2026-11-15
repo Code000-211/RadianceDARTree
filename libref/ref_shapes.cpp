@@ -2533,7 +2533,7 @@ int ref_mtp_tree_grow_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.skip(); o.skip(); o.skip();                          /* head_pos, head_row, table */
     o.t_idx({ M, N }, 50000, -1, 0);                       /* tok */
     o.t_idx({ M, N }, N + 1, -1, 0);                       /* par */
-    o.skip(); o.skip(); o.skip(); o.skip();                /* sel, nsel, vmask, rb */
+    o.skip(); o.skip(); o.skip(); o.skip(); o.skip(); o.skip();   /* sel, nsel, vmask, rb, src, dst */
     return o.finish("mtp_tree_grow", operand, out);
 }
 

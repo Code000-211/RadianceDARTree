@@ -1153,16 +1153,24 @@ std::string describes_differently(const KfCase& c, const RadOpSchema* schema, co
     return std::string();
 }
 
-void Replay::replay_case(size_t fi, const KfCase& c) {
+void Replay::replay_case(size_t fi, const KfCase& rec) {
+    const KfCase* cp = &rec;
+    KfCase padded;
     const Kfixture& fx = fx_[fi];
-    const RadOpSchema* schema = reg_->schema(c.op);
+    const RadOpSchema* schema = reg_->schema(rec.op);
     if (!schema) {
-        nm_.stale[c.op + "  (no plugin declares a schema for it)"]++;
+        nm_.stale[rec.op + "  (no plugin declares a schema for it)"]++;
         ++st_.stale;
         ++st_.skipped;
         return;
     }
-    /* Operands are positional, so a fixture whose count differs from the schema's is stale. */
+    /* Operands are positional, so a fixture whose count differs from the schema's is stale --
+     * except a recording that predates trailing OPTIONAL operands, which reads them as absent. */
+    if ((int)rec.opd.size() < schema->n_operands) {
+        padded = rec;
+        if (kf_pad_optional_operands(&padded, schema)) cp = &padded;
+    }
+    const KfCase& c = *cp;
     if ((int)c.opd.size() != schema->n_operands) {
         nm_.stale[c.op + "  (fixture recorded " + std::to_string(c.opd.size()) + " operand(s), "
                   "the schema declares " + std::to_string(schema->n_operands) +

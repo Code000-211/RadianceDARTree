@@ -13193,4 +13193,35 @@ TEST(flashnext_stage_two_head_rounds_carry_w_frontier_rows_and_grow_the_tree) {
     }
     /* the trunk's verify issued no grower */
     CHECK_EQ(issues_of(b, *v[0], "mtp_tree_grow").size(), (size_t)0);
+
+    /* The hidden state is routed by parent through a per-node store: the history pass stores the
+     * roots (iota of the store rows, then a scatter), round 2 gathers each of its W rows from its
+     * parent's stored row before the head runs and stores its own, and the last round only
+     * gathers. No pass carries the head's output by a row-wise cast. */
+    CHECK_EQ(issues_of(b, *v[1], "iota").size(), (size_t)1);
+    CHECK_EQ(issues_of(b, *v[1], "scatter_rows").size(), (size_t)1);
+    CHECK_EQ(issues_of(b, *v[2], "gather_rows").size(), (size_t)1);
+    CHECK_EQ(issues_of(b, *v[2], "scatter_rows").size(), (size_t)1);
+    CHECK_EQ(issues_of(b, *v[3], "gather_rows").size(), (size_t)1);
+    CHECK_EQ(issues_of(b, *v[3], "scatter_rows").size(), (size_t)0);
+    CHECK_EQ(issues_of(b, *v[2], "mtp_enter").size(), (size_t)1);
+    /* the routing the grower writes is what the gather and the scatter read */
+    {
+        const auto g = issues_of(b, *v[2], "gather_rows");
+        const auto gr = issues_of(b, *v[1], "mtp_tree_grow");
+        REQUIRE_EQ(gr.size(), (size_t)1);
+        REQUIRE(gr[0]->opd.size() >= 14);
+        REQUIRE(g[0]->opd.size() >= 3);
+        CHECK_EQ(g[0]->opd[1].handle, gr[0]->opd[12].handle);
+    }
+}
+
+TEST(flashnext_refuses_a_draft_tree_wider_than_its_node_budget) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    RadBuilder b;
+    b.encs = { { "draft_head", u2_head() } };
+    /* W = 9 > N = 7 */
+    RadBuildCtx ctx = q4_tree_ctx(0, 1, 7, 3, 0, 9);
+    CHECK(qwen4exp_fp8::declare(&b, &meta, &ctx) != RAD_OK);
 }

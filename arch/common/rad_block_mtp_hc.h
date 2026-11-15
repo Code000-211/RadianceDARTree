@@ -98,6 +98,12 @@ struct MtpHcBlock {
         rad_buf src  = 0;
         rad_buf hin  = 0;   /* [max_tok, hc * n_embd]  what this round continues from */
         rad_buf hw   = 0;   /* [max_tok, hc * n_embd]  the head's own wide stream */
+        /* Stage 2 of a draft tree only (tree_rounds): a persistent store of every node's head
+         * output, `hstore` [max_seqs * Q, hc * n_embd] with Q = 1 + (depth - 1) * tree_w, and the
+         * routing mtp_tree_grow writes for the next pass, `tsrc` (the store row each row continues
+         * from: its parent's) and `tdst` (the row its own output goes to, negative: none), both
+         * [max_seqs * tree_w] i32. */
+        rad_buf hstore = 0, tsrc = 0, tdst = 0;
         rad_buf e    = 0;   /* [max_tok, n_embd]       the input token's embedding */
         rad_buf inj  = 0;   /* [max_tok, hc]           both connections' write gains */
         rad_buf hout = 0;   /* [max_logit_rows, n_embd]  the mixer's output, the lm_head's input */
@@ -155,9 +161,15 @@ struct MtpHcBlock {
      * written by mtp_tree_grow), and the indexer, whose selection those rows do not use and whose
      * keys the next history pass rewrites, is not run. Set by the plugin before declare(). */
     bool         tree_rounds = false;
+    /* The frontier width W of the tree rounds: the history pass stores the root's hidden state at
+     * store row `s * Q`, and every later round row continues from its parent's store row (the
+     * parent may sit in ANY earlier pass, since the best-first pool keeps all candidates, so a
+     * carry of the last pass alone would route the wrong hidden state). */
+    int          tree_w = 1;
     MoeFP8       mlp{};
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
+    rad_op op_tgather = 0, op_tiota = 0, op_tscatter = 0;
 
     /* Media rows over the head's embedding (see MtpBlockFP8::media). Set before declare when the
      * program has an encoder. */
@@ -232,6 +244,17 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                   RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS),
                    {w.src}, {w.hin});
+    if (tree_rounds) {
+        if (!w.hstore || !w.tsrc || !w.tdst || tree_w < 2 || depth < 2) return RAD_E_INVAL;
+        /* A round's rows continue from their parents' stored hidden states: not in place, `hin`
+         * is the destination and the store the source. */
+        op_tgather = rw(b, RAD_OP(b, "gather_rows",
+                            RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)g.max_seqs * tree_w),
+                                       RAD_INT("n", HN), RAD_STR("dtype", g.dtype)),
+                            RAD_NOWEIGHTS),
+                        {w.hstore, w.tsrc}, {w.hin});
+        if (!op_tgather) return RAD_E_INVAL;
+    }
     op_embed = rw(b, RAD_OP(b, "embed_lookup",
                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", g.n_embd),
                                 RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
@@ -318,6 +341,20 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                 RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
                      RAD_NOWEIGHTS),
                  {w.hw}, {w.hin});
+    if (tree_rounds) {
+        /* The history pass's rows are the roots: store row s * Q. */
+        op_tiota = rw(b, RAD_OP(b, "iota",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("start", 0),
+                                     RAD_INT("step", 1 + (depth - 1) * tree_w)),
+                          RAD_NOWEIGHTS),
+                      {}, {w.tdst});
+        op_tscatter = rw(b, RAD_OP(b, "scatter_rows",
+                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)g.max_seqs * tree_w),
+                                         RAD_INT("n", HN), RAD_STR("dtype", g.dtype)),
+                              RAD_NOWEIGHTS),
+                         {w.hw, w.tdst, w.hstore}, {w.hstore});
+        if (!op_tiota || !op_tscatter) return RAD_E_INVAL;
+    }
 
     /* ---- the head's mixer: a connection with no write half that collapses the wide stream for
      * the lm_head, which reads bf16, so no fp8 codes. */
@@ -485,6 +522,9 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
                          "the history pass (RadBatch::draft_out_ids) and has no pass of its own");
         return;
     }
+    const bool tree_pass = tree_rounds && r > 1 && batch->spec_parent;
+    if (tree_pass)
+        RAD_ISSUE_N(c, op_tgather, T, RAD_B(w.hstore), brows(w.tsrc, T), brows(w.hin, T));
     if (r < 0 && batch->n_out > 0)
         RAD_ISSUE_N(c, op_gather, batch->n_out,
                     RAD_B(w.src), praw(batch->out_ids, RAD_I32, batch->n_out),
@@ -511,7 +551,7 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
 
     /* The indexer runs first because the attention reads its selection; `w.h` is already final,
      * written by the connection above. */
-    if (!(tree_rounds && r > 1 && batch->spec_parent))
+    if (!tree_pass)
         qsa.step(c, attn.w.h, batch, qsa_win_cu);
     attn.step(c, batch);
 
@@ -533,8 +573,15 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
 
     /* The carry, only if a later round reads it: a history pass is round 1, followed by round 2
      * when depth > 1; the last round is followed by a trunk step. */
-    if (r < 0 ? depth > 1 : r < depth)
-        RAD_ISSUE_N(c, op_carry, L, brows(w.hw, L), brows(w.hin, L));
+    if (r < 0 ? depth > 1 : r < depth) {
+        if (tree_rounds) {
+            if (r < 0)
+                RAD_ISSUE_N(c, op_tiota, L, brows(w.tdst, L));
+            RAD_ISSUE_N(c, op_tscatter, L, brows(w.hw, L), brows(w.tdst, L), RAD_B(w.hstore));
+        } else {
+            RAD_ISSUE_N(c, op_carry, L, brows(w.hw, L), brows(w.hin, L));
+        }
+    }
 
     mixer.read(c, L, 0, L);
     if (q2) {

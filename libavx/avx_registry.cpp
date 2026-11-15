@@ -251,7 +251,7 @@ static const RadOperandSpec oMtpTreeGrow[] = { OPD("didx"), OPD("dval"), INOUT("
                                                OPD_O("head_pos"), OPD_O("head_row"),
                                                OPD_O("table"), OUT("tok"), OUT("par"),
                                                OUT_O("sel"), OUT_O("nsel"), OUT_O("vmask"),
-                                               OUT_O("rb") };
+                                               OUT_O("rb"), OUT_O("src"), OUT_O("dst") };
 
 static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_STR("to") };
 

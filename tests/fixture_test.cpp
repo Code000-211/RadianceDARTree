@@ -2126,4 +2126,33 @@ TEST(the_fallback_shape_table_agrees_with_the_reference) {
     }
 }
 
+/* A recording made before trailing OPTIONAL operands were appended replays with them absent; a
+ * missing required operand, or a recording longer than the schema, is still refused. */
+TEST(a_recording_short_only_of_optional_operands_is_padded_with_absent_ones) {
+    static const RadOperandSpec ops[] = {
+        { "x", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 },
+        { "opt_a", RAD_OPD_IN, 1 }, { "opt_b", RAD_OPD_IN, 1 }, { "req", RAD_OPD_IN, 0 },
+    };
+    RadOpSchema sc{};
+    sc.op = "t";
+    sc.operands = ops;
+    KfCase c;
+    c.opd.resize(2);
+    sc.n_operands = 4;
+    CHECK(kf_pad_optional_operands(&c, &sc));
+    CHECK_EQ((int64_t)c.opd.size(), (int64_t)4);
+    CHECK(!c.opd[1].absent);
+    CHECK(c.opd[2].absent && c.opd[3].absent);
+    CHECK_EQ((int64_t)c.opd[3].role, (int64_t)RAD_OPD_IN);
+    KfCase d;
+    d.opd.resize(2);
+    sc.n_operands = 5;                       /* opt_a, opt_b, req: req is required */
+    CHECK(!kf_pad_optional_operands(&d, &sc));
+    CHECK_EQ((int64_t)d.opd.size(), (int64_t)2);
+    KfCase e;
+    e.opd.resize(5);
+    sc.n_operands = 4;                       /* longer than the schema */
+    CHECK(!kf_pad_optional_operands(&e, &sc));
+}
+
 RAD_TEST_MAIN()

@@ -890,6 +890,21 @@ int kf_lay_weight(const RadKernelInfo* info, const RadParam* p, int n_p, int ope
     return info->relayout(p, n_p, operand, &d.enc, d.sel.data(), pt, n, out->data(), lay->bytes);
 }
 
+bool kf_pad_optional_operands(KfCase* c, const RadOpSchema* schema) {
+    const size_t have = c->opd.size();
+    const size_t want = (size_t)schema->n_operands;
+    if (have > want) return false;
+    for (size_t k = have; k < want; ++k)
+        if (!schema->operands[k].optional) return false;
+    for (size_t k = have; k < want; ++k) {
+        KfOperand o;
+        o.role = schema->operands[k].role;
+        o.absent = true;
+        c->opd.push_back(std::move(o));
+    }
+    return true;
+}
+
 int64_t kf_vocab_rows(const std::vector<KfOperand>& opd) {
     int64_t v = 0;
     for (const KfOperand& d : opd)

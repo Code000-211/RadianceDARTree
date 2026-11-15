@@ -3795,7 +3795,7 @@ therefore not established.
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
 | `dflash_tree` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `nodes` `temp`:f64/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens`, `parents` |
 
-| `mtp_tree_grow` | `M` `round` `rounds` `nodes` `width` `block_size`/opt `sel_pitch`/opt | `didx`, `dval`, `state`:inout, `head_pos`?, `head_row`?, `table`? → `tok`, `par`, `sel`?, `nsel`?, `vmask`?, `rb`? |
+| `mtp_tree_grow` | `M` `round` `rounds` `nodes` `width` `block_size`/opt `sel_pitch`/opt | `didx`, `dval`, `state`:inout, `head_pos`?, `head_row`?, `table`? → `tok`, `par`, `sel`?, `nsel`?, `vmask`?, `rb`?, `src`?, `dst`? |
 
 ### Serial draft tree growth (`mtp_tree_grow`)
 
@@ -3834,6 +3834,15 @@ round). `abi/rad_mtp_tree.h` is the algorithm; libref and libr4d run that one fu
   which costs acceptance and nothing else), and row `w`'s `vmask` the keys `[rb, head]` plus bit
   `head - rb + id` for every ancestor-or-self `id >= 1` of its node. A row past the new nodes reads
   one key and is discarded.
+- `src`, `dst` `[M * W]` i32 (optional, written after a round below `rounds`, with or without the
+  attention operands): the head's hidden-state routing. A node's head input is its parent's head output, and
+  the best-first pool may hang a node off a node of any earlier pass, so the plugin keeps every
+  node's output in a store of `Q = 1 + (rounds - 1) * width` rows a sequence (row `s * Q + node id`;
+  the root is node 0). For the next pass's row `s * W + w`: `src` the store row of its node's
+  parent (the plugin gathers it into the head's input with `gather_rows`), and `dst` the store row
+  its own output goes to (the plugin scatters with `scatter_rows`; -1 for a row past the new nodes,
+  which writes nothing). A row past the new nodes has `src` the root's row, so the input is finite.
+  The history pass (round 1) stores the root at `s * Q`.
 
 `dflash_tree` grows the same lattice into a tree of `nodes` nodes instead of walking one path
 (`rad_drafter_tree`). Node 0 is the anchor at lattice position -1 with log probability 0. A node at

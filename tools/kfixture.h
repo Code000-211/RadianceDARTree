@@ -221,6 +221,12 @@ int kf_lay_table(const RadKernelInfo* info, const RadParam* p, int n_p, int oper
  * vocabulary) and reader (which does not) agree. */
 int64_t kf_vocab_rows(const std::vector<KfOperand>& opd);
 
+/* Pads a recorded case that has fewer operands than the schema declares with absent operands,
+ * provided every missing trailing operand is declared optional (a fixture recorded before an
+ * optional operand was appended). Returns false, leaving the case unchanged, when the recording
+ * has more operands than the schema or any missing operand is required. */
+bool kf_pad_optional_operands(KfCase* c, const RadOpSchema* schema);
+
 /* Draws operand `k`'s bytes. Large plain operands are drawn on every core: the stream is cut into
  * RAD_FILL_BLOCK blocks seeded by index, so the bytes do not depend on the thread count. A weight
  * table with an encoding goes through kf_draw_table (and an undecodable one comes back zeroed;
