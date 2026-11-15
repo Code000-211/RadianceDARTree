@@ -1500,7 +1500,7 @@ static const RadOperandSpec oQsaWork[] = {
     { "num_accepted", RAD_OPD_IN,  1 },
     { "sstage",       RAD_OPD_OUT, 1 },   /* [T * ratio, n]: row x's scratch block's raw keys */
     { "spage",        RAD_OPD_OUT, 1 },   /* [T]: x if row x completes a block, else -1 */
-    { "sbpos",        RAD_OPD_OUT, 1 },   /* [T]: that block's first token's position */
+    { "sbpos",        RAD_OPD_OUT, 1 },   /* [T] (or [T, 3] under M-RoPE): that block's first token's position */
     { "rtab",         RAD_OPD_OUT, 1 },   /* [T, RW]: scratch row of row x's region block i, or -1 */
     { "rnc",          RAD_OPD_OUT, 1 },   /* [T]: how many region blocks row x's path completes */
     { "rcu",          RAD_OPD_OUT, 1 },   /* [T + 1]: rcu[w] = w, for the per-row qsa_score */

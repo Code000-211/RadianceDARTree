@@ -234,6 +234,7 @@ TEST(the_serial_tree_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadKVGroupDecl, no_tree_compact), (size_t)56);
     CHECK_EQ(offsetof(RadArchProbe, tree_linear_ok), (size_t)128);
     CHECK_EQ(offsetof(RadArchProbe, tree_nodes), (size_t)136);
+    CHECK_EQ(offsetof(RadArchProbe, tree_nodes_max), (size_t)140);
     CHECK_EQ(sizeof(RadArchProbe), (size_t)144);
     CHECK_EQ(offsetof(RadBuildCtx, draft_rounds), (size_t)200);
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_leaves), (size_t)204);

@@ -1308,11 +1308,12 @@ int Engine::declare() {
         serial_tree_ = false;
         if (draft_tree_ && pb.tree_nodes > 0) {
             const int rounds = cfg_.n_spec;
-            const int nodes = cfg_.draft_tree_nodes > 0 ? cfg_.draft_tree_nodes : pb.tree_nodes;
-            if (nodes < rounds || nodes > RAD_SCHED_MAX_SPEC) {
-                RAD_ERR("--draft-tree-nodes %d: a serial head's tree carries its %d round(s) of "
-                        "greedy chain and at most %d nodes in all", nodes, rounds,
-                        (int)RAD_SCHED_MAX_SPEC);
+            int nodes = 0;
+            std::string why;
+            if (draft_tree_nodes_resolve(rounds, cfg_.draft_tree_leaves, cfg_.draft_tree_nodes,
+                                         pb.tree_nodes, pb.tree_nodes_max,
+                                         (int)RAD_SCHED_MAX_SPEC, &nodes, &why) != 0) {
+                RAD_ERR("%s", why.c_str());
                 return RAD_E_INVAL;
             }
             serial_tree_   = true;

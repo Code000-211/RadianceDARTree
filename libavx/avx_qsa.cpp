@@ -793,15 +793,25 @@ AVX_KERNEL(qsa_work) {
     if (rp && (rp->rank != 2 || rp->shape[0] < 3 || rp->shape[1] < T)) return RAD_E_SHAPE;
     if (na && numel(na) < n_seq) return RAD_E_SHAPE;
     const bool scr = sp != nullptr;
+    int64_t sbstep = 1;
     if (scr != (sst && spg && sbp && rtb && rnc && rcu) ||
         (!scr && (sst || spg || sbp || rtb || rnc || rcu)))
         return RAD_E_INVAL;
     if (scr) {
-        if (rp) return RAD_E_UNSUPPORTED;
         if (numel(sp) < T || sst->rank != 2 || sst->shape[0] < T * ratio || sst->shape[1] != n ||
             numel(spg) < T || numel(sbp) < T || rtb->rank != 2 || rtb->shape[0] < T ||
             numel(rnc) < T || numel(rcu) < T + 1)
             return RAD_E_SHAPE;
+        /* sbpos: one position a row, or (rank 2) a [>= T, 1 or 3] column slice of a [T, 3]
+         * buffer, three columns required with `rope` (as bpos). */
+        if (sbp->rank == 2) {
+            if (sbp->shape[0] < T || sbp->stride[1] != 1 || sbp->stride[0] < sbp->shape[1] ||
+                (rp && sbp->shape[1] < 3))
+                return RAD_E_SHAPE;
+            sbstep = sbp->stride[0];
+        } else if (rp) {
+            return RAD_E_SHAPE;
+        }
     }
     for (int64_t t = 0; t < T; ++t)
         if (ldi(po, offlin(po, t)) < 0) return RAD_E_INVAL;
@@ -855,6 +865,7 @@ AVX_KERNEL(qsa_work) {
                                         : (ldi(po, offlin(po, t1 - 1)) + 1) / ratio);
     }
     const int ncomp = rp ? 3 : 1;
+    auto sbpos_at = [&](int64_t x, int c) { return sbp && sbp->rank == 2 ? x * sbstep + c : (sbp ? offlin(sbp, x) : 0); };
     AVX_PARALLEL_FOR_IF(mw * ratio * n >= AVX_PAR_MIN)
     for (int64_t w = 0; w < mw; ++w) {
         auto bpos_at = [&](int c) { return bp->rank == 2 ? w * bstep + c : offlin(bp, w); };
@@ -893,7 +904,7 @@ AVX_KERNEL(qsa_work) {
     for (int64_t x = 0; x <= T; ++x) st_int_dt(rcu->dtype, rcu->data, offlin(rcu, x), x);
     for (int64_t x = 0; x < T; ++x) {
         st_int_dt(spg->dtype, spg->data, offlin(spg, x), -1);
-        st_int_dt(sbp->dtype, sbp->data, offlin(sbp, x), 0);
+        for (int c = 0; c < ncomp; ++c) st_int_dt(sbp->dtype, sbp->data, sbpos_at(x, c), 0);
         st_int_dt(rnc->dtype, rnc->data, offlin(rnc, x), 0);
         for (int64_t i = 0; i < rtb->shape[1]; ++i)
             st_int_dt(rtb->dtype, rtb->data, x * rtb->stride[0] + i * rtb->stride[1], -1);
@@ -918,7 +929,18 @@ AVX_KERNEL(qsa_work) {
                           anc((b0 + i) * ratio + ratio - 1));
             if ((px + 1) % ratio != 0 || si < 0) continue;
             st_int_dt(spg->dtype, spg->data, offlin(spg, x), x);
-            st_int_dt(sbp->dtype, sbp->data, offlin(sbp, x), px - ratio + 1);
+            const int64_t f0 = px - ratio + 1;     /* the block's first token */
+            if (!rp) {
+                st_int_dt(sbp->dtype, sbp->data, sbpos_at(x, 0), f0);
+            } else {
+                /* In this step: the ancestor row's own components; earlier: text, rotated at its
+                 * index plus the shift of the step's first row (as the committed items). */
+                const int64_t rs = rp->stride[0], rc = rp->stride[1];
+                const int64_t ar = f0 >= p0 ? anc(f0) : -1;
+                for (int c = 0; c < 3; ++c)
+                    st_int_dt(sbp->dtype, sbp->data, sbpos_at(x, c),
+                           ar >= 0 ? ldi(rp, c * rs + ar * rc) : f0 + (ldi(rp, t0 * rc) - p0));
+            }
             for (int64_t i = 0; i < ratio; ++i) {
                 const int64_t q = px - ratio + 1 + i;
                 if (q >= p0) widen(k, anc(q) * k->stride[0], k->stride[1], n, sbuf);

@@ -994,7 +994,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.qsaw.skey   = decl_b(b, nm.f("qsa_skey"),   g.act_dtype, { g.max_tok, hd });
             m.qsaw.sstage = decl_b(b, nm.f("qsa_sstage"), g.act_dtype, { g.max_tok * rt, hd });
             m.qsaw.spage  = decl_b(b, nm.f("qsa_spage"),  RAD_I32, { g.max_tok });
-            m.qsaw.sbpos  = decl_b(b, nm.f("qsa_sbpos"),  RAD_I32, { g.max_tok });
+            m.qsaw.sbpos  = g.rope_mc ? decl_b(b, nm.f("qsa_sbpos"), RAD_I32, { g.max_tok, 3 })
+                                      : decl_b(b, nm.f("qsa_sbpos"), RAD_I32, { g.max_tok });
             m.qsaw.rnc    = decl_b(b, nm.f("qsa_rnc"),    RAD_I32, { g.max_tok });
             m.qsaw.rcu    = decl_b(b, nm.f("qsa_rcu"),    RAD_I32, { g.max_tok + 1 });
             m.qsaw.rtab   = decl_b(b, nm.f("qsa_rtab"),   RAD_I32, { g.max_tok, RW });
@@ -2184,6 +2185,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
          * `tree_pays` stays 0 until a measurement says the tree beats the chain on the real model:
          * `--draft-tree on` forces it, `auto` keeps the chain. */
         out->tree_nodes     = kTreeNodes;
+        out->tree_nodes_max = 15;   /* the delta net's tree walk takes 16 rows a verify, anchor included */
         out->tree_linear_ok = 1;
         out->tree_pays      = 0;
     }

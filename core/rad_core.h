@@ -1247,6 +1247,15 @@ namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 void config_usage(const char* argv0);
 
+/* A serial head's tree budget: the node count N one verify carries, given the head's `rounds`
+ * (num-speculative-tokens), the wanted `leaves`, the asked `--draft-tree-nodes` (0: derive), the
+ * plugin's probe budget `probe_nodes` and its limit `probe_max` (0: none), and the core's `hard`
+ * limit. Derived, N = max(probe_nodes, rounds + leaves) clamped to the limit; asked, it is checked
+ * against the rounds and the limit. Returns 0 and sets *nodes, or -1 with *why naming the problem
+ * (the flag only where the user passed it). */
+int draft_tree_nodes_resolve(int rounds, int leaves, int asked, int probe_nodes, int probe_max,
+                             int hard, int* nodes, std::string* why);
+
 /* One entry of the option table: the flag with its dashes, the argument's placeholder (null for a
  * switch) and the help text. The YAML loader (fleet/config.h) reads the table for its key names,
  * so a key exists exactly when its flag does. */

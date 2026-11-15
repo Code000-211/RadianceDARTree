@@ -519,6 +519,26 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
     return true;
 }
 
+int draft_tree_nodes_resolve(int rounds, int leaves, int asked, int probe_nodes, int probe_max,
+                             int hard, int* nodes, std::string* why) {
+    const int cap = probe_max > 0 ? std::min(probe_max, hard) : hard;
+    const int n = asked > 0 ? asked : std::min(std::max(probe_nodes, rounds + std::max(0, leaves)), cap);
+    if (n < rounds || n > cap) {
+        char b[256];
+        if (asked > 0)
+            snprintf(b, sizeof b, "--draft-tree-nodes %d: a serial head's tree carries its %d "
+                     "round(s) of greedy chain and at most %d nodes in all", n, rounds, cap);
+        else
+            snprintf(b, sizeof b, "draft tree: this model's head runs %d round(s) of greedy chain "
+                     "(--num-speculative-tokens) but its tree verify carries at most %d nodes; use "
+                     "at most %d round(s)", rounds, cap, cap);
+        if (why) *why = b;
+        return -1;
+    }
+    *nodes = n;
+    return 0;
+}
+
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {

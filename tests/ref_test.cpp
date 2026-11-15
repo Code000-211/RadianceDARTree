@@ -10096,6 +10096,117 @@ TEST(qsa_tail_compact_moves_the_accepted_path_to_depth_order) {
     CHECK_EQ(run("qsa_tail_compact", a), RAD_E_INVAL);
 }
 
+/* qsa_work on a tree step with M-RoPE planes (RadBatch::rope_pos). Three facts, on a chain with a
+ * sibling (positions 24..31, the anchor on a block boundary) over a tail of earlier keys:
+ *  1. Text planes (every component = position + one shift): every output equals the plane-less
+ *     tree step's, the positions moved by the shift in all three components. With shift 0 this is
+ *     the equivalence the engine's old "drop rope_pos on a tree step" workaround relied on, which
+ *     holds only for a request with no media shift.
+ *  2. Planes that differ per row (a media request's rows, or anything else that is not
+ *     position + shift): a scratch block whose first token is in the step takes the components of
+ *     its ancestor row at that depth, not position + shift of the anchor.
+ *  3. A block whose first token is before the step is text: its index plus the anchor row's shift. */
+TEST(qsa_work_tree_with_mrope_planes_rotates_scratch_blocks_at_their_ancestors_components) {
+    const int64_t n = 2, ratio = 4, ring = 16, work = 6, R = 9;
+    for (int64_t base : { 24LL, 22LL }) {
+    const std::vector<int64_t> par = { -1, 0, 1, 2, 3, 4, 5, 6, 3 };   /* a chain 0..7, row 8 under 3 */
+    std::vector<int64_t> dep(R, 0), pv, sv;
+    for (int64_t j = 0; j < R; ++j) {
+        dep[(size_t)j] = j ? dep[(size_t)par[(size_t)j]] + 1 : 0;
+        pv.push_back(base + dep[(size_t)j]);
+        sv.push_back(par[(size_t)j]);
+    }
+    std::vector<float> kv, tv;
+    for (int64_t t = 0; t < R; ++t) { kv.push_back((float)(100 + t)); kv.push_back((float)(200 + t)); }
+    for (int64_t r = 0; r < ring; ++r) { tv.push_back((float)(-r)); tv.push_back(0.25f); }
+    /* The outputs, sized for the plane-less (rank 1) or the plane (three columns) form. */
+    struct Outs {
+        T stage, page, bpos, sst, spg, sbp, rtb, rnc;
+        Outs(bool mc, int64_t work_, int64_t R_)
+            : stage(RAD_BF16, { work_ * 4, 2 }), page(RAD_I32, { work_ }),
+              bpos(RAD_I32, mc ? std::vector<int64_t>{ work_, 3 } : std::vector<int64_t>{ work_ }),
+              sst(RAD_BF16, { R_ * 4, 2 }), spg(RAD_I32, { R_ }),
+              sbp(RAD_I32, mc ? std::vector<int64_t>{ R_, 3 } : std::vector<int64_t>{ R_ }),
+              rtb(RAD_I32, { R_, 8 }), rnc(RAD_I32, { R_ }) {}
+    };
+    auto step = [&](const std::vector<int64_t>* rope_v, Outs& o) {
+        T &page = o.page, &bpos = o.bpos, &stage = o.stage, &spg = o.spg, &sbp = o.sbp, &sst = o.sst,
+          &rtb = o.rtb, &rnc = o.rnc;
+        T k(RAD_BF16, { R, n }); k.f(kv);
+        T pos(RAD_I32, { R }); pos.n(pv);
+        T cu(RAD_I32, { 2 }); cu.n({ 0, R });
+        T tail(RAD_BF16, { 1, 1, ring, n }); tail.f(tv);
+        T sx(RAD_I32, { 1, 1 }); sx.n({ 0 });
+        std::vector<int64_t> id;
+        for (int64_t b = 0; b < 40; ++b) id.push_back(b + 50);
+        T bt(RAD_I32, { 1, 40 }); bt.n(id);
+        T sp(RAD_I32, { R }); sp.n(sv);
+        T nc(RAD_I32, { 1 }), rcu(RAD_I32, { R + 1 });
+        A a; a.t(k).t(pos).t(cu).t(tail).t(sx).t(bt);
+        T rope(RAD_I32, { 3, R });
+        if (rope_v) { rope.n(*rope_v); a.t(rope); } else { a.tnull(); }
+        a.t(stage).t(page).t(bpos).t(nc).t(sp).tnull().t(sst).t(spg).t(sbp).t(rtb).t(rnc).t(rcu)
+         .i("M", R).i("n", n).i("ratio", ratio).i("ring", ring).i("seqs", 1).i("work", work)
+         .s("dtype", "bf16");
+        REQUIRE_EQ(run("qsa_work", a), RAD_OK);
+    };
+    Outs O0(false, work, R);
+    step(nullptr, O0);
+    T &pg0 = O0.page, &bp0 = O0.bpos, &st0 = O0.stage, &sg0 = O0.spg, &sb0 = O0.sbp, &ss0 = O0.sst,
+      &rt0 = O0.rtb, &rn0 = O0.rnc;
+
+    /* 1. Text planes with shift 0 and with shift 1000. */
+    for (int64_t shift : { 0LL, 1000LL }) {
+        std::vector<int64_t> rv;
+        for (int c = 0; c < 3; ++c)
+            for (int64_t j = 0; j < R; ++j) rv.push_back(pv[(size_t)j] + shift);
+        Outs O1(true, work, R);
+        step(&rv, O1);
+        T &pg = O1.page, &bp = O1.bpos, &st = O1.stage, &sg = O1.spg, &sb = O1.sbp, &ss = O1.sst,
+          &rt = O1.rtb, &rn = O1.rnc;
+        for (int64_t i = 0; i < work; ++i) {
+            CHECK_EQ(pg.iat(i), pg0.iat(i));
+            for (int c = 0; c < 3; ++c) CHECK_EQ(bp.iat(i * 3 + c), bp0.iat(i) + (pg0.iat(i) >= 0 ? shift : 0));
+        }
+        for (int64_t x = 0; x < R; ++x) {
+            CHECK_EQ(sg.iat(x), sg0.iat(x));
+            CHECK_EQ(rn.iat(x), rn0.iat(x));
+            for (int c = 0; c < 3; ++c) CHECK_EQ(sb.iat(x * 3 + c), sg0.iat(x) >= 0 ? sb0.iat(x) + shift : 0);
+        }
+        CHECK(st.mem == st0.mem);
+        CHECK(ss.mem == ss0.mem);
+        CHECK(rt.mem == rt0.mem);
+    }
+
+    /* 2 and 3. Planes that are not position + shift. A row completing a block (position + 1 a
+     * multiple of ratio) takes, for a first token q0 in the step, its ancestor row's components,
+     * else (q0 before the anchor: text from the tail) q0 + the shift of row 0. */
+    std::vector<int64_t> rv;
+    for (int c = 0; c < 3; ++c)
+        for (int64_t j = 0; j < R; ++j) rv.push_back(1000 * (c + 1) + 7 * j);
+    Outs O2(true, work, R);
+    step(&rv, O2);
+    T &sg = O2.spg, &sb = O2.sbp;
+    int64_t completing = 0, in_step = 0;
+    for (int64_t x = 0; x < R; ++x) {
+        const bool done = (pv[(size_t)x] + 1) % ratio == 0;
+        CHECK_EQ(sg.iat(x), done ? x : -1LL);
+        const int64_t q0 = pv[(size_t)x] - ratio + 1;
+        int64_t y = x;
+        while (y > 0 && pv[(size_t)y] > q0) y = par[(size_t)y];
+        for (int c = 0; c < 3; ++c) {
+            const int64_t want = !done ? 0 : q0 >= base ? 1000 * (c + 1) + 7 * y
+                                                        : q0 + (1000 - base);
+            CHECK_EQ(sb.iat(x * 3 + c), want);
+        }
+        completing += done;
+        in_step += done && q0 >= base;
+    }
+    CHECK(completing >= 1);
+    CHECK(in_step >= (base == 24 ? 2 : 1));    /* both branches are exercised */
+    }
+}
+
 /* qsa_tail_store stores a tree row at its flat slot, siblings at distinct rows. */
 TEST(qsa_tail_store_stores_tree_rows_at_their_flat_slots) {
     const int64_t n = 2, ring = 8;

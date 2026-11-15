@@ -13026,8 +13026,43 @@ TEST(flashnext_declares_a_draft_tree_only_when_the_engine_asks_for_one) {
         RadArchProbe pr{};
         REQUIRE_EQ(qwen4exp_fp8::probe(&meta, &pr), RAD_OK);
         CHECK_EQ((int)pr.tree_nodes, 6);
+        CHECK_EQ((int)pr.tree_nodes_max, 15);
         CHECK_EQ((int)pr.tree_linear_ok, 1);
         CHECK_EQ((int)pr.draft_depth, 3);
+    }
+}
+
+/* The sizing declare lowers max_tok and requires every fixed parameter to stay put: the tree
+ * attention's max_seqs is the verify's row bound (max_seqs x (N + 1)), not a function of max_tok, so
+ * the activation arena's levels resolve. N = 10 is what 7 rounds and 3 leaves derive. */
+TEST(the_tree_attention_ops_declare_the_same_max_seqs_at_the_sizing_max_tok) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (const int world : { 1, 2 }) {
+        RadBuildCtx c = q4_tree_ctx(0, world, 10, 7, 3, 1);
+        c.max_tok = 2048;
+        RadBuilder full;
+        full.encs = { { "draft_head", u2_head() } };
+        REQUIRE_EQ(qwen4exp_fp8::declare(&full, &meta, &c), RAD_OK);
+        RadBuildCtx p = c;
+        p.max_tok = 256;
+        p.shape_probe = 1;
+        RadBuilder small;
+        small.encs = { { "draft_head", u2_head() } };
+        REQUIRE_EQ(qwen4exp_fp8::declare(&small, &meta, &p), RAD_OK);
+        REQUIRE_EQ(small.ops.size(), full.ops.size());
+        int tree_ops = 0;
+        for (size_t i = 0; i < full.ops.size(); ++i) {
+            if (full.ops[i].op.rfind("attn_paged_tree_sel", 0) != 0) continue;
+            ++tree_ops;
+            CHECK_EQ(small.ops[i].op, full.ops[i].op);
+            const RecParam* a = param(&full.ops[i], "max_seqs");
+            const RecParam* q = param(&small.ops[i], "max_seqs");
+            REQUIRE(a != nullptr && q != nullptr);
+            CHECK_EQ(a->ival, q->ival);
+            CHECK(a->ival >= 4 * 11);
+        }
+        CHECK(tree_ops > 0);
     }
 }
 

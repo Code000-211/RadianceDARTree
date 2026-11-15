@@ -1411,12 +1411,21 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
      * sequence (the records' bound; the device cannot refuse a longer one, so q_len, which the
      * block fixes, is the check). */
     RuSpec spec{};
-    const long long qlen = r4d_geti_or(a, "q_len", 0);
+    /* `q_len` is the DECLARED band (up to the step's max_tok, 2048), which prefill never issues
+     * here (chunk ops serve it), so it is not the check. What this step issues is q->shape[0]
+     * rows over N sequences; a sequence longer than RU_TMAX would overrun the tree's LDS records. */
+    const long long qlen = q->shape[0];
     if (spar || spath) {
         rc = ru_spec_planes(spar, spath, q->shape[0], N, &spec);
         if (rc != RAD_OK) return rc;
         if (!anc || state->dtype != RAD_F32 || !ta_bf16_ok(ta)) return R4D_NO(RAD_E_UNSUPPORTED);
-        if (qlen > RU_TMAX) return R4D_NO(RAD_E_SHAPE);
+        if (qlen > (long long)RU_TMAX * N) {
+            std::fprintf(stderr, "[r4d] gdn_recurrent_update tree verify: %lld rows over %d "
+                         "sequence(s) exceeds the %d rows a sequence may verify (a draft tree "
+                         "wider than %d nodes cannot run on the delta net)\n",
+                         qlen, N, (int)RU_TMAX, (int)RU_TMAX);
+            return R4D_NO(RAD_E_SHAPE);
+        }
     }
 
     /* Slot and head strides come from the tensor, so a cache with padded slots is served too
@@ -1431,7 +1440,7 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
         nacc ? nacc->data : nullptr, z ? z->data : nullptr, (long)z_row,
         nw ? nw->data : nullptr,
         neps, nact, N, (int)H, (int)Hg, (int)K, (int)V, scale, thr, sfp16, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, spec, (int)qlen));
+        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, spec, (int)((qlen + N - 1) / (N > 0 ? N : 1))));
 }
 
 

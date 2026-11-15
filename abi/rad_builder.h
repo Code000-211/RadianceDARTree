@@ -1774,6 +1774,10 @@ typedef struct RadArchProbe {
      * none), which the engine then uses as RadBuildCtx::max_spec when it runs a tree, with the
      * probe's `draft_depth` as the head's round count. */
     int32_t tree_nodes;
+    /* The most nodes one verify of that tree may carry (0: no limit of the plugin's own beyond the
+     * core's). The core derives the default budget as max(tree_nodes, rounds + leaves) and clamps
+     * it to this, and refuses an explicit --draft-tree-nodes or a round count above it, naming it. */
+    int32_t tree_nodes_max;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

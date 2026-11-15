@@ -1614,3 +1614,29 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
 }
 
 RAD_TEST_MAIN()
+
+/* The default tree budget of a serial head is rounds + leaves (never below the plugin's own), clamped
+ * to the plugin's limit; --num-speculative-tokens 7 with the default 3 leaves is 10 nodes, not the
+ * probe's 6. An error names --draft-tree-nodes only when the user passed it. */
+TEST(a_serial_trees_default_node_budget_follows_the_rounds_and_the_plugins_limit) {
+    int n = 0;
+    std::string why;
+    CHECK_EQ(draft_tree_nodes_resolve(3, 3, 0, 6, 15, 64, &n, &why), 0);
+    CHECK_EQ(n, 6);
+    CHECK_EQ(draft_tree_nodes_resolve(7, 3, 0, 6, 15, 64, &n, &why), 0);
+    CHECK_EQ(n, 10);
+    CHECK_EQ(draft_tree_nodes_resolve(7, 7, 0, 6, 15, 64, &n, &why), 0);
+    CHECK_EQ(n, 14);
+    CHECK_EQ(draft_tree_nodes_resolve(12, 7, 0, 6, 15, 64, &n, &why), 0);
+    CHECK_EQ(n, 15);
+    CHECK_EQ(draft_tree_nodes_resolve(7, 3, 9, 6, 15, 64, &n, &why), 0);
+    CHECK_EQ(n, 9);
+    CHECK_EQ(draft_tree_nodes_resolve(7, 3, 0, 6, 0, 64, &n, &why), 0);
+    CHECK_EQ(n, 10);
+    CHECK_EQ(draft_tree_nodes_resolve(16, 3, 0, 6, 15, 64, &n, &why), -1);
+    CHECK(why.find("--draft-tree-nodes") == std::string::npos);
+    CHECK(why.find("at most 15") != std::string::npos);
+    CHECK_EQ(draft_tree_nodes_resolve(7, 3, 20, 6, 15, 64, &n, &why), -1);
+    CHECK(why.find("--draft-tree-nodes 20") != std::string::npos);
+    CHECK_EQ(draft_tree_nodes_resolve(7, 3, 5, 6, 15, 64, &n, &why), -1);
+}

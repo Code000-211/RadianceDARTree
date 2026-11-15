@@ -57,7 +57,7 @@ constexpr int kMaxRatio = 32;
     const int32_t* __restrict__ sp, const int32_t* __restrict__ na,                             \
     uint16_t* __restrict__ sstage, int32_t* __restrict__ spage, int32_t* __restrict__ sbpos,    \
     int32_t* __restrict__ rtab, int32_t* __restrict__ rnc, int32_t* __restrict__ rcu,           \
-    int T, int rt_ld, int rt_cols, int sg_ld
+    int T, int rt_ld, int rt_cols, int sg_ld, int sbstep
 
 /* Tree sequence: its first row has parent -1 (spec_parent absent: never). */
 __device__ __forceinline__ bool qw_tree(const int32_t* sp, const int32_t* cu, int i) {
@@ -80,7 +80,10 @@ __device__ __forceinline__ void qsa_work_scratch(QSA_WORK_PARAMS, int x) {
     const int t = (int)threadIdx.x;
     __shared__ int sh_src[kMaxRatio];
     if (x == 0 && t == 0) rcu[T] = T;
-    if (t == 0) { rcu[x] = x; spage[x] = -1; sbpos[x] = 0; rnc[x] = 0; }
+    if (t == 0) {
+        rcu[x] = x; spage[x] = -1; rnc[x] = 0;
+        for (int c = 0; c < (rope ? 3 : 1); ++c) sbpos[(size_t)x * sbstep + c] = 0;
+    }
     for (int i = t; i < rt_cols; i += kThreads) rtab[(size_t)x * rt_ld + i] = -1;
     int s = -1;
     for (int i = 0; i < seqs && i < kMaxSeq; ++i)
@@ -98,12 +101,24 @@ __device__ __forceinline__ void qsa_work_scratch(QSA_WORK_PARAMS, int x) {
         rtab[(size_t)x * rt_ld + i] = qw_anc(pos, sp, t0, x, (b0 + i) * ratio + ratio - 1);
     if (t == 0) rnc[x] = nr;
     if ((px + 1) % ratio != 0 || si < 0) return;
-    if (t == 0) { spage[x] = x; sbpos[x] = px - ratio + 1; }
+    if (t == 0) spage[x] = x;
     if (t < ratio) {
         const int q = px - ratio + 1 + t;
         sh_src[t] = q >= p0 ? qw_anc(pos, sp, t0, x, q) : -1;
     }
     __syncthreads();
+    if (t == 0) {
+        /* The block's first token: its ancestor row's own components when in this step, else text
+         * at its index plus the shift of the sequence's first row (as the committed items). */
+        const int f0 = px - ratio + 1;
+        if (!rope) {
+            sbpos[(size_t)x * sbstep] = f0;
+        } else {
+            for (int c = 0; c < 3; ++c)
+                sbpos[(size_t)x * sbstep + c] =
+                    sh_src[0] >= 0 ? rope[(size_t)c * rplane + sh_src[0]] : f0 + (rope[t0] - p0);
+        }
+    }
     for (int i = 0; i < ratio; ++i) {
         const int q = px - ratio + 1 + i;
         const uint16_t* src = sh_src[i] >= 0 ? k + (size_t)sh_src[i] * k_ld
@@ -128,7 +143,7 @@ __device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
             qsa_work_scratch(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring,
                              seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope,
                              rplane, bstep, sp, na, sstage, spage, sbpos, rtab, rnc, rcu, T, rt_ld,
-                             rt_cols, sg_ld, w - max_work);
+                             rt_cols, sg_ld, sbstep, w - max_work);
         return;
     }
 
@@ -211,7 +226,7 @@ void qsa_work_kernel(QSA_WORK_PARAMS) {
     if (CH::on) r4d_chain_wait();
     qsa_work_body(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, n, ratio, ring, seqs,
                   max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, rope, rplane, bstep, sp, na,
-                  sstage, spage, sbpos, rtab, rnc, rcu, T, rt_ld, rt_cols, sg_ld);
+                  sstage, spage, sbpos, rtab, rnc, rcu, T, rt_ld, rt_cols, sg_ld, sbstep);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_WORK_PARAMS
@@ -233,7 +248,9 @@ void qsa_work_kernel(QSA_WORK_PARAMS) {
 //   sp     [T]                     i32, optional: spec_parent (tree verify)
 //   na     [seqs]                  i32, optional: num_accepted (heal)
 //   sstage [T * ratio][n]          bf16, with sp: row x's scratch keys
-//   spage, sbpos, rnc [T]          i32, with sp
+//   spage, rnc [T]                 i32, with sp
+//   sbpos  [T][sbstep]             i32, with sp: row x's scratch block's first-token position; with
+//                                  rope its three components, as bpos
 //   rtab   [T][rt_cols]            i32, with sp: row x's region blocks' scratch rows, -1 past rnc[x]
 //   rcu    [T + 1]                 i32, with sp: rcu[w] = w
 static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long sidx, long bt,
@@ -242,7 +259,7 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
                                  int s_row, int sidx_ld, int bt_ld, int g_ld, long rope,
                                  int rplane, int bstep, long sp, long na, long sstage, long spage,
                                  long sbpos, long rtab, long rnc, long rcu, int T, int rt_ld,
-                                 int rt_cols, int sg_ld, RadStream stream, bool chain) {
+                                 int rt_cols, int sg_ld, int sbstep, RadStream stream, bool chain) {
     if (!k || !pos || !cu || !state || !sidx || !bt || !stage || !page || !bpos || !nc)
         return R4D_NO(RAD_E_INVAL);
     if (n <= 0 || ratio <= 0 || ring < ratio || seqs <= 0 || max_work <= 0 || seqs > kMaxSeq)
@@ -256,6 +273,7 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
         return R4D_NO(RAD_E_INVAL);
     if (!scr && (sstage || spage || sbpos || rtab || rnc || rcu)) return R4D_NO(RAD_E_INVAL);
     if (!sg_ld) sg_ld = n;
+    if (!sbstep) sbstep = 1;
     /* The scratch items are `T` more workgroups after the `max_work` ones. */
     const unsigned grid = (unsigned)(max_work + (scr ? T : 0));
     /* Each form named at its own launch: a test reads the kernel a launch site names. */
@@ -267,7 +285,7 @@ static int r4d_qsa_work_bf16_emit(long k, long pos, long cu, long state, long si
              seqs, max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld, (const int32_t*)rope, \
              rplane, bstep, (const int32_t*)sp, (const int32_t*)na, (uint16_t*)sstage,        \
              (int32_t*)spage, (int32_t*)sbpos, (int32_t*)rtab, (int32_t*)rnc, (int32_t*)rcu,  \
-             T, rt_ld, rt_cols, sg_ld)
+             T, rt_ld, rt_cols, sg_ld, sbstep)
     const int rc = chain ? R4D_QWORK(r4dchain) : R4D_QWORK(R4dUnchained);
 #undef R4D_QWORK
     return rc;
@@ -342,10 +360,19 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
     if (mw < seqs) return R4D_NO(RAD_E_SHAPE);
     /* The tree operands go together: spec_parent with its six outputs. */
     const bool scr = sp != nullptr;
+    long long sbstep = 1;
     if (scr != (ss && sg && sb && rt && rn && rc) || (!scr && (ss || sg || sb || rt || rn || rc)))
         return R4D_NO(RAD_E_INVAL);
     if (scr) {
-        if (rp) return R4D_NO(RAD_E_UNSUPPORTED);
+        /* sbpos: [T] or a [>= T, 1 or 3] column slice (three columns with `rope`), as bpos. */
+        if (sb->rank == 2) {
+            if (sb->shape[0] < T || sb->stride[1] != 1 || sb->stride[0] < sb->shape[1] ||
+                (rp && sb->shape[1] < 3))
+                return R4D_NO(RAD_E_SHAPE);
+            sbstep = sb->stride[0];
+        } else if (rp || !r4d_contig(sb)) {
+            return R4D_NO(rp ? RAD_E_SHAPE : RAD_E_STRIDE);
+        }
         if (ratio > kMaxRatio) return R4D_NO(RAD_E_SHAPE);
         if (r4d_numel(sp) < T || ss->rank != 2 || ss->shape[0] < T * ratio || ss->shape[1] != n ||
             r4d_numel(sg) < T || r4d_numel(sb) < T || rt->rank != 2 || rt->shape[0] < T ||
@@ -353,7 +380,7 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
             return R4D_NO(RAD_E_SHAPE);
         if (sp->dtype != RAD_I32 || sg->dtype != RAD_I32 || sb->dtype != RAD_I32 ||
             rt->dtype != RAD_I32 || rn->dtype != RAD_I32 || rc->dtype != RAD_I32 ||
-            !r4d_contig(sp) || !r4d_contig(sg) || !r4d_contig(sb) || !r4d_contig(rn) ||
+            !r4d_contig(sp) || !r4d_contig(sg) || !r4d_contig(rn) ||
             !r4d_contig(rc) || rt->stride[1] != 1 || ss->stride[1] != 1 || ss->dtype != RAD_BF16)
             return R4D_NO(RAD_E_STRIDE);
     }
@@ -372,7 +399,7 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
                                   r4d_addr(sp), r4d_addr(na), r4d_addr(ss), r4d_addr(sg),
                                   r4d_addr(sb), r4d_addr(rt), r4d_addr(rn), r4d_addr(rc), (int)T,
                                   rt ? (int)rt->stride[0] : 0, rt ? (int)rt->shape[1] : 0,
-                                  ss ? (int)r4d_row_pitch(ss) : 0, stream,
+                                  ss ? (int)r4d_row_pitch(ss) : 0, (int)sbstep, stream,
                                   r4d_geti_or(a, "chain", 0) != 0);
 }
 

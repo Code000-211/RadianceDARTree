@@ -93,6 +93,14 @@ struct AttnGatedFP8 {
      * 2048-row launch is about 2.16 ms per layer versus 3.0 ms for eight 256-row launches, each
      * with its own tail. */
     int64_t qsa_gq_rows() const { return g.max_tok > qsa_rows() ? g.max_tok : qsa_rows(); }
+    /* The tree attention's row bound: a tree verify is at most `max_seqs` sequences of `max_spec + 1`
+     * rows (the anchor and its nodes), so one launch never has to be split, and the bound is
+     * independent of max_tok, which the sizing declare lowers (it needs every fixed parameter
+     * constant). */
+    int64_t qsa_tree_rows() const {
+        const int64_t r = g.max_seqs * (g.max_spec + 1);
+        return r > qsa_rows() ? r : qsa_rows();
+    }
     /* The rotation's pairing. Halves (NeoX, HF's rotate_half over the partial rotary width) and
      * adjacent pairs (GPT-J) are both self-consistent and pass every per-op check, so it must be
      * stated. "mrope" over one position component per token is NeoX (rad_block_attn_gated.h).
@@ -384,7 +392,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                   RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
                                   RAD_INT("block_size", kv_block > 0 ? kv_block
                                                                      : (int64_t)RAD_KV_BLOCK),
-                                  RAD_INT("max_seqs", qsa_gq_rows()), RAD_INT("max_ctx", g.max_ctx),
+                                  RAD_INT("max_seqs", qsa_tree_rows()), RAD_INT("max_ctx", g.max_ctx),
                                   RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype),
                                   RAD_INT("sel_pitch", qsa_topk + 1)),
                        RAD_NOWEIGHTS);
@@ -539,7 +547,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                            RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                            RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
                                            RAD_INT("block_size", rad_kv_block_size(b, kv)),
-                                           RAD_INT("max_seqs", qsa_gq_rows()),
+                                           RAD_INT("max_seqs", qsa_tree_rows()),
                                            RAD_INT("max_ctx", g.max_ctx),
                                            RAD_STR("q_dtype", g.dtype),
                                            RAD_STR("kv_dtype", g.kv_dtype),
@@ -822,8 +830,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         /* One launch, never split: the kernel maps a launch-local row to its sequence through
          * `cu_seqlens` and indexes `rb` and the block table by that sequence, so a chunk past the
          * first would read the wrong sequence's pages with the step's whole operands. The op is
-         * declared at qsa_gq_rows() >= max_tok >= tree_rows. */
-        const int64_t chunk = qsa_gq_rows();
+         * declared at qsa_tree_rows() >= max_seqs * (max_spec + 1) >= tree_rows. */
+        const int64_t chunk = qsa_tree_rows();
         if (tree_rows > chunk) {
             rad_step_fail(c, "a tree verify has more rows than one tree attention launch takes");
             return;

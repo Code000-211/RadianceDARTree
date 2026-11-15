@@ -5023,6 +5023,7 @@ struct Rig {
          *d_v, *d_cu, *d_cidx, *d_sidx, *d_nacc, *d_spar, *d_spath;
     std::vector<uint16_t> hw;
     std::vector<float> halog, hdtb, hnw;
+    int64_t declared = 0;   /* when > 0, the `q_len` the launch is declared with (the plan's band top) */
 
     Rig(const Plugin& pl, bool had_, uint32_t seed) : had(had_) {
         rc = find(pl, "gdn_conv_update_w4_h128_bf16");
@@ -5125,9 +5126,10 @@ struct Rig {
         const RadTensor tsp = s.spar.empty() ? none : T(d_spar, RAD_I32, { Td });
         const RadTensor tph = s.spath.empty() ? none : T(d_spath, RAD_I32, { N, PITCH });
 
-        std::vector<RadParam> pc = { PI("q_len", maxq), PI("head_k", K), PI("head_v", V),
+        const int64_t ql = declared > 0 ? declared : maxq;
+        std::vector<RadParam> pc = { PI("q_len", ql), PI("head_k", K), PI("head_v", V),
                                      PI("conv_width", W) };
-        std::vector<RadParam> pr = { PI("q_len", maxq), PI("head_k", K), PI("head_v", V),
+        std::vector<RadParam> pr = { PI("q_len", ql), PI("head_k", K), PI("head_v", V),
                                      PI("n_head_v", H), PF("scale", 0.088388), PF("eps", 1e-6),
                                      PS("act", "silu"), PS("state_form", "anchor") };
         std::vector<RadParam> pf = pr;
@@ -5497,7 +5499,62 @@ static void kv_window_compact_check(const Plugin& pl) {
     ok(nm, why.empty(), why);
 }
 
+/* The declared band is not the issued size. The block declares gdn_recurrent_update with q_len up
+ * to the step's max_tok (2048) and state_form=anchor; a tree verify issues at most 16 rows a
+ * sequence. The kernel once refused such a step because it tested the declared 2048 against its
+ * 16-row record bound. Here a 7-row tree and a 15-row, two-sequence step run with q_len declared
+ * 2048 and must equal the same step declared at its own size, bytes of o, conv cache and state. */
+static void gdn_declared_band(const Plugin& pl) {
+    const char* nm = "gdn tree verify with the band declared at 2048: issued 7 and 15 rows are "
+                     "served, as when declared at their size";
+    if (!sel("gdn_recurrent_update_k128_v128_bf16_fp32state") && !sel(nm)) return;
+    using namespace gdnt;
+    Rig rig(pl, false, 0x51ab1e5u);
+    if (!rig.good) { ok(nm, false, "a row is absent or hipMalloc failed"); return; }
+    uint32_t seed = 0x2468aceu;
+    auto rnd = [&seed]() {
+        seed = st_mix32(seed + 0x9e3779b9u);
+        return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f;
+    };
+    World w0;
+    w0.cs.resize((size_t)(NS * CD * SL));
+    for (auto& e : w0.cs) e = h_to_bf16(rnd());
+    w0.st.assign((size_t)(2 * NS * H * V * K), 0.0f);
+    for (size_t i = 0; i < (size_t)(NS * H * V * K); ++i) w0.st[i] = 0.1f * rnd();
+    struct Case { std::vector<int> len, par; };
+    const std::vector<Case> cases = {
+        { { 7 },    { -1, 0, 0, 1, 1, 2, 2 } },
+        { { 8, 7 }, { -1, 0, 1, 2, 0, 0, 0, 0, -1, 0, 0, 1, 1, 2, 2 } },
+    };
+    std::string why;
+    for (const Case& c : cases) {
+        const int n = (int)c.par.size();
+        Step st;
+        for (size_t i = 0; i < c.len.size(); ++i) {
+            st.seq.push_back((int)i); st.len.push_back(c.len[i]); st.nacc.push_back(1);
+        }
+        st.spar = c.par;
+        st.rows.in.resize((size_t)(n * INW)); st.rows.ab.resize((size_t)(n * 2 * H));
+        for (auto& e : st.rows.in) e = h_to_bf16(rnd());
+        for (auto& e : st.rows.ab) e = h_to_bf16(rnd());
+        std::vector<uint16_t> o_d, o_n; World wd, wn;
+        rig.put(w0); rig.declared = 2048;
+        int e = rig.run(false, st, &o_d, nullptr, nullptr);
+        wd = rig.get();
+        if (e != RAD_OK) { why = std::to_string(n) + " rows declared 2048: rc=" + std::to_string(e); break; }
+        rig.put(w0); rig.declared = 0;
+        e = rig.run(false, st, &o_n, nullptr, nullptr);
+        wn = rig.get();
+        if (e != RAD_OK) { why = std::to_string(n) + " rows declared at size: rc=" + std::to_string(e); break; }
+        if (o_d != o_n || wd.cs != wn.cs || wd.st != wn.st) {
+            why = std::to_string(n) + " rows: the declared band changed the result"; break;
+        }
+        if (wd.st == w0.st) { why = std::to_string(n) + " rows: the state did not move"; break; }
+    }
+    ok(nm, why.empty(), why);
+}
 static void gdn_tree(const Plugin& pl) {
+    gdn_declared_band(pl);
     const char* nmp = "gdn tree verify (conv_update + recurrent_update): rows equal their chains, "
                       "committed paths equal the chain, libref";
     const char* nmf = "gdn tree verify (gdn_conv_recurrent_update): rows equal their chains, "
@@ -25379,6 +25436,104 @@ static void qsa_tree_ref_case(const Plugin& pl) {
     ok(what, bad == 0, fmt("%d trees, %d differences", trees, bad));
 }
 
+/* qsa_work on a tree step WITH M-RoPE planes (RadBatch::rope_pos), device against libref, and
+ * against the closed form the contract states. The planes hold values no position computation
+ * could produce by accident (a media request's rows rotate at their own components, not at the
+ * depth): rope[c][row] = 1000 * (c + 1) + 7 * row. Contract (ref_qsa_work, "TREE"): a committed
+ * (anchor or heal) block's component c at first token f < p0 is f + (rope[0][t0] - p0) (text);
+ * the scratch block of row x with first token q0 = pos[x] - ratio + 1 is rope[c][ancestor of x at
+ * q0] when q0 >= p0, else q0 + (rope[0][t0] - p0). Every output must equal libref's byte for
+ * byte. */
+static void qsa_tree_mrope_case(const Plugin& pl) {
+    const char* what = "qsa_work tree + M-RoPE planes vs libref and the closed form";
+    const RadKernelInfo* w = find(pl, "qsa_work_bf16");
+    const RadKernelInfo* rw = qsa_ref_row("qsa_work");
+    if (!w || !rw) { ok(what, false, "a row is absent"); return; }
+    using namespace qsat;
+    int bad = 0, trees = 0;
+    for (int64_t seed = 1; seed <= 24; ++seed) {
+        uint64_t g = (uint64_t)seed * 7919;
+        const int64_t base = 22 + seed % 9, Rn = 4 + seed % 10;
+        auto par = qsa_rand_tree(g, Rn, seed & 1);
+        std::vector<int64_t> dep((size_t)Rn, 0);
+        for (int64_t j = 1; j < Rn; ++j) dep[(size_t)j] = dep[(size_t)par[(size_t)j]] + 1;
+        const int64_t na = 1 + seed % 6;
+        QB rope(RAD_I32, { 3, Rn });
+        for (int c = 0; c < 3; ++c)
+            for (int64_t j = 0; j < Rn; ++j) rope.seti(c * Rn + j, 1000 * (c + 1) + 7 * j);
+        QB tl(RAD_BF16, { 1, 1, ring, n });
+        for (int64_t r = 0; r < ring; ++r)
+            for (int64_t d = 0; d < n; ++d) tl.setf(r * n + d, (float)((r * 3 + d) % 11) - 5);
+        QState S(3);
+        struct Out { QB stage, page, bpos, nc, sst, spg, sbp, rtb, rnc, rcu; };
+        auto mk = [&] {
+            return Out{ QB(RAD_BF16, { work * ratio, n }), QB(RAD_I32, { work }), QB(RAD_I32, { work, 3 }),
+                        QB(RAD_I32, { 1 }), QB(RAD_BF16, { Rn * ratio, n }), QB(RAD_I32, { Rn }),
+                        QB(RAD_I32, { Rn, 3 }), QB(RAD_I32, { Rn, RW }), QB(RAD_I32, { Rn }),
+                        QB(RAD_I32, { Rn + 1 }) };
+        };
+        Out o[2] = { mk(), mk() };
+        QB k(RAD_BF16, { Rn, n }), pos(RAD_I32, { Rn }), cu(RAD_I32, { 2 }), sp(RAD_I32, { Rn }), nav(RAD_I32, { 1 });
+        for (int64_t j = 0; j < Rn; ++j) {
+            pos.seti(j, base + dep[(size_t)j]);
+            sp.seti(j, j ? par[(size_t)j] : -1);
+            const auto kr = qsa_key(g, false);
+            for (int64_t d = 0; d < n; ++d) k.setf(j * n + d, kr[(size_t)d]);
+        }
+        cu.setv({ 0, Rn });
+        nav.seti(0, na);
+        bool launched = true;
+        for (int dev = 0; dev < 2; ++dev) {
+            QB tail = tl;
+            Out& O = o[dev];
+            launched = launched &&
+                qsa_launch(dev ? w : rw, { &k, &pos, &cu, &tail, &S.sx, &S.tab, &rope, &O.stage, &O.page, &O.bpos,
+                                           &O.nc, &sp, &nav, &O.sst, &O.spg, &O.sbp, &O.rtb, &O.rnc, &O.rcu },
+                           { PI("M", Rn), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", 1),
+                             PI("work", work), PS("dtype", "bf16") }, dev == 1) == RAD_OK;
+        }
+        if (!launched) { ok(what, false, "a launch failed"); return; }
+        ++trees;
+        auto same = [&](const QB& a, const QB& b, const char* nm) {
+            if (a.h == b.h) return;
+            ++bad; std::printf("        seed %lld: %s differs\n", (long long)seed, nm);
+        };
+        same(o[0].nc, o[1].nc, "nc"); same(o[0].page, o[1].page, "page"); same(o[0].bpos, o[1].bpos, "bpos");
+        same(o[0].stage, o[1].stage, "stage"); same(o[0].spg, o[1].spg, "spage");
+        same(o[0].sbp, o[1].sbp, "sbpos"); same(o[0].rtb, o[1].rtb, "rtab");
+        same(o[0].rnc, o[1].rnc, "rnc"); same(o[0].rcu, o[1].rcu, "rcu");
+        /* The closed form, on the device output. */
+        const int64_t p0 = base, shift = rope.geti(0) - p0;
+        const Out& D = o[1];
+        for (int64_t x = 0; x < Rn; ++x) {
+            const int64_t px = base + dep[(size_t)x];
+            if ((px + 1) % ratio != 0) continue;
+            const int64_t q0 = px - ratio + 1;
+            int64_t y = x;
+            while (base + dep[(size_t)y] > q0 && y > 0) y = par[(size_t)y];
+            for (int c = 0; c < 3; ++c) {
+                const int64_t want = q0 >= p0 ? rope.geti(c * Rn + y) : q0 + shift;
+                if (D.sbp.geti(x * 3 + c) != want) {
+                    ++bad; std::printf("        seed %lld: sbpos[%lld][%d] %lld want %lld\n", (long long)seed,
+                                       (long long)x, c, (long long)D.sbp.geti(x * 3 + c), (long long)want);
+                }
+            }
+        }
+        for (int64_t i = 0; i < work; ++i) {
+            if (D.page.geti(i) < 0) continue;
+            for (int c = 0; c < 3; ++c) {
+                /* A tree step's committed blocks start below the anchor: the shifted text form. */
+                const int64_t b = D.bpos.geti(i * 3 + c) - shift;
+                if (b < 0 || b % ratio != 0) {
+                    ++bad; std::printf("        seed %lld: bpos[%lld][%d] %lld not a shifted block start\n",
+                                       (long long)seed, (long long)i, c, (long long)D.bpos.geti(i * 3 + c));
+                }
+            }
+        }
+    }
+    ok(what, bad == 0, fmt("%d trees, %d differences", trees, bad));
+}
+
 /* A batch of several sequences, device against libref, the whole two-step flow: each sequence is
  * prefilled and given one step by libref (a verify for a tree sequence, a decode for an ordinary
  * one), then ONE batch step runs on both sides from the same bytes: compaction, work (heal and
@@ -34228,6 +34383,7 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\nthe QSA work list, against a host walk of the batch\n");
         qsa_work_case(pl);
         qsa_tree_ref_case(pl);
+        qsa_tree_mrope_case(pl);
         qsa_tree_exact_case(pl);
         qsa_batch_ref_case(pl);
     }

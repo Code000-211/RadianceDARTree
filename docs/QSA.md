@@ -188,7 +188,7 @@ A step after a tree verify that is not itself a tree (a plain decode, a prefill)
 `qsa_tail_compact` and passes `num_accepted` to `qsa_work`. The MTP head's own tail is stored
 committed-order by its history pass and needs neither.
 
-Sizes: `skey [T, n]` and `sstage [T * ratio, n]` bf16, `spage`, `sbpos`, `rnc` `[T]`, `rcu`
+Sizes: `skey [T, n]` and `sstage [T * ratio, n]` bf16, `spage`, `rnc` `[T]`, `sbpos` `[T]` (`[T, 3]` under M-RoPE, like `bpos`: with `rope_pos`, component c is that of the block's first token's ancestor row when it is in the step, else its index plus the anchor row's text shift), `rcu`
 `[T + 1]`, `rtab [T, RW]` i32, `rscore [T, RW]` f32, `vmask [T]` i64, with `RW >= (max node depth +
 ratio) / ratio + 1` (8 covers depth 28); the score plane must be at least `b0 + RW` wide, which the
 caller's `reach` bound (`max_ctx_len + n_tok + n_spec + ratio`) already gives. A verify block is at

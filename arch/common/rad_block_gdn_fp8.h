@@ -320,7 +320,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                         {w.in.x}, {w.q, w.k, w.v});
     /* `state_form`: anchor when speculating, else per_candidate (rad_block_gdn.h explains). */
     op_recur = rw(b, RAD_OP(b, "gdn_recurrent_update",
-                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_spec > 0 && g.max_tok > 16 ? 16 : g.max_tok), RAD_INT("head_k", cfg.head_k),
+                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_k", cfg.head_k),
                                  RAD_INT("head_v", cfg.head_v),
                                  RAD_INT("n_head_v", cfg.n_head_v),
                                  RAD_F64("scale", q_scale),

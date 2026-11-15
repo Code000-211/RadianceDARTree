@@ -114,7 +114,7 @@ struct QsaIndexer {
         rad_buf skey   = 0;   /* [max_tok, head_dim] bf16: a row's scratch block key */
         rad_buf sstage = 0;   /* [max_tok * ratio, head_dim] bf16: its raw keys */
         rad_buf spage  = 0;   /* [max_tok] i32 */
-        rad_buf sbpos  = 0;   /* [max_tok] i32 */
+        rad_buf sbpos  = 0;   /* [max_tok] i32, or [max_tok, 3] under M-RoPE (as bpos) */
         rad_buf rnc    = 0;   /* [max_tok] i32: region blocks the row's path completes */
         rad_buf rcu    = 0;   /* [max_tok + 1] i32 */
         rad_buf rtab   = 0;   /* [max_tok, region] i32 */
@@ -420,9 +420,16 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     /* Block positions: one component per block, or three under M-RoPE with planes. Under M-RoPE
      * `bpos` is [max_work, 3]; this step passes [work, 3], or only column 0 when the pass has no
      * planes (qsa_work then writes component 0 and the block key reads the one-component form). */
-    const bool mc = g.rope_mc && batch->rope_pos && !tree;
+    const bool mc = g.rope_mc && batch->rope_pos;
     RadOperand bpos = g.rope_mc ? RAD_B_COL(w.bpos, 0, mc ? 3 : 1) : brows(w.bpos, work);
     if (g.rope_mc) bpos.rows = work;
+    /* A tree step's scratch positions, [T, 3] likewise: each row's block's first token's own
+     * components (a media request's text rotates at depth + its shift, not at the depth). */
+    RadOperand sbpos = RAD_NONE;
+    if (tree) {
+        sbpos = g.rope_mc ? RAD_B_COL(w.sbpos, 0, mc ? 3 : 1) : brows(w.sbpos, T);
+        if (g.rope_mc) sbpos.rows = T;
+    }
     if (tree || heal) {
         /* The trailing optionals, in order: spec_parent, num_accepted, then (a tree step only) the
          * scratch outputs. An absent one is a hole. */
@@ -440,7 +447,7 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
                     (tree || heal) ? praw(batch->num_accepted, RAD_I32, S) : RAD_NONE,
                     tree ? brows(w.sstage, T * c.ratio) : RAD_NONE,
                     tree ? brows(w.spage, T) : RAD_NONE,
-                    tree ? brows(w.sbpos, T) : RAD_NONE,
+                    sbpos,
                     tree ? brows(w.rtab, T) : RAD_NONE,
                     tree ? brows(w.rnc, T) : RAD_NONE,
                     tree ? brows(w.rcu, T + 1) : RAD_NONE);
@@ -465,7 +472,7 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     if (tree)
         RAD_ISSUE_N(c_, op_bkey2, T,
                     brows(w.sstage, T * c.ratio), RAD_W(w_kn),
-                    brows(w.spage, T), brows(w.sbpos, T), brows(w.skey, T));
+                    brows(w.spage, T), sbpos, brows(w.skey, T));
     if (tree)
         RAD_ISSUE_N(c_, op_tail, T,
                     bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
