@@ -329,6 +329,7 @@ void qsa_select_kernel(QSA_SELECT_PARAMS) {
  * to that kernel's global-memory path. A region wider than rscore's columns, or one that does not
  * fit the 64-bit mask, is clamped (libref refuses it). The keys are read from global memory every
  * pass: a tree launch is decode-sized. */
+constexpr int kTreeRows = 64;       /* rows of a tree whose parents the walk keeps in LDS */
 constexpr int kTreeRegMax = 32;     /* region blocks the mask walk keeps flags for */
 
 #define QSA_SELECT_TREE_PARAMS                                                                  \
@@ -337,7 +338,7 @@ constexpr int kTreeRegMax = 32;     /* region blocks the mask walk keeps flags f
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sp,                             \
     const float* __restrict__ rs, int32_t* __restrict__ sel, int32_t* __restrict__ nsel,        \
     int32_t* __restrict__ seqused, int64_t* __restrict__ vmask, int nb, int topk, int ratio,    \
-    int nseq, int s_ld, int t_ld, int o_ld, int rs_ld, int rs_cols
+    int nseq, int s_ld, int t_ld, int o_ld, int rs_ld, int rs_cols, int cap
 template <bool Signed>
 __device__ __forceinline__ void qsa_select_tree_body(QSA_SELECT_TREE_PARAMS) {
 
@@ -346,6 +347,8 @@ __device__ __forceinline__ void qsa_select_tree_body(QSA_SELECT_TREE_PARAMS) {
     __shared__ uint32_t wsum[kWaves];
     __shared__ uint32_t sh_T, sh_need, sh_out, sh_hic, sh_eqc;
     __shared__ int      sh_seq;
+    __shared__ int      sh_sp[kTreeRows], sh_pos[kTreeRows];
+    R4D_DYN_LDS(uint32_t, sh_key);         /* the union's keys, when it fits `cap` */
 
     const int m = blockIdx.x;
     const int t = threadIdx.x;
@@ -380,9 +383,24 @@ __device__ __forceinline__ void qsa_select_tree_body(QSA_SELECT_TREE_PARAMS) {
     const float*   rr = rs + (size_t)m * rs_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
     int32_t*       ou = sel   + (size_t)m * o_ld;
-    auto keyat = [&](int u) -> uint32_t {
+    /* The key cache of the single-workgroup kernel: the keys are staged once and the five passes
+     * below (four digits, the tie count, the emit, the region walk) read LDS. */
+    const bool cached = n <= cap;
+    auto rawkey = [&](int u) -> uint32_t {
         return u < nC ? keyof<Signed>(sc[u], tb[u]) : keyof<Signed>(rr[u - nC], 0);
     };
+    /* The row's sequence's parents and positions (its first kTreeRows rows) in LDS: the ancestor
+     * walk at the end is a serial chain of dependent loads, a global round trip a level. */
+    const int t1 = cu[seq + 1];
+    if (tree && t < kTreeRows) {
+        const int y = t0 + t;
+        sh_sp[t]  = y < t1 ? sp[y] : -1;
+        sh_pos[t] = y < t1 ? pos[y] / ratio : 0;     /* the row's block */
+    }
+    if (cached)
+        for (int u = t; u < n; u += kThreads) sh_key[u] = rawkey(u);
+    __syncthreads();
+    auto keyat = [&](int u) -> uint32_t { return cached ? sh_key[u] : rawkey(u); };
 
     /* ---- the threshold, as the single-workgroup kernel's, over the union. */
     uint32_t T = 0, need = 0;
@@ -490,13 +508,13 @@ __device__ __forceinline__ void qsa_select_tree_body(QSA_SELECT_TREE_PARAMS) {
     seqused[m] = (int32_t)(out * (uint32_t)ratio);
     /* Which region blocks were taken: above the threshold, or among the first `need` ties in block
      * order (the committed ties come first). */
-    bool taken[kTreeRegMax];
+    uint32_t taken = 0;                       /* bit r: region block r was taken */
     uint32_t ties = n_eq_c;
     for (int r = 0; r < nR; ++r) {
         const uint32_t k = keyat(nC + r);
         const bool hi = k != 0u && (n <= topk || k > T);
         const bool eq = k != 0u && n > topk && k == T;
-        taken[r] = hi || (eq && ties < need);
+        taken |= (uint32_t)(hi || (eq && ties < need)) << r;
         if (eq) ++ties;
     }
     /* A key is visible when its block is not complete on this row's path or was taken. */
@@ -504,16 +522,36 @@ __device__ __forceinline__ void qsa_select_tree_body(QSA_SELECT_TREE_PARAMS) {
     uint64_t bits = 0;
     for (int q = rb; q < base; ++q) {
         const int c = q / ratio;
-        if (c >= own || (c - b0 < nR && taken[c - b0])) bits |= 1ull << (q - rb);
+        if (c >= own || (c - b0 < nR && ((taken >> (c - b0)) & 1u))) bits |= 1ull << (q - rb);
     }
-    int y = m;
-    for (int g = 0; g < 64; ++g) {
-        const int c = pos[y] / ratio;
-        const int k = base - rb + (y - t0);
-        if (k < 64 && (c >= own || (c - b0 < nR && c >= b0 && taken[c - b0]))) bits |= 1ull << k;
-        const int pj = sp[y];
-        if (pj < 0) break;
-        y = t0 + pj;
+    /* The row's ancestors-or-self: the chain of parents, over LDS while it stays inside the
+     * first kTreeRows rows. */
+    {
+        int yl = m - t0;
+        uint64_t anc = 0;
+        while (yl >= 0 && yl < kTreeRows) {
+            anc |= 1ull << yl;
+            yl = sh_sp[yl];
+        }
+        int yg = yl >= kTreeRows ? t0 + yl : -1;       /* a chain that left the staged rows */
+        uint64_t m2 = anc;
+        while (m2) {
+            const int j = __builtin_ctzll(m2);
+            m2 &= m2 - 1;
+            const int c = sh_pos[j];
+            const int k = base - rb + j;
+            if (k < 64 && (c >= own || (c - b0 < nR && c >= b0 && ((taken >> (c - b0)) & 1u))))
+                bits |= 1ull << k;
+        }
+        for (int g = 0; yg >= 0 && g < 64; ++g) {
+            const int c = pos[yg] / ratio;
+            const int k = base - rb + (yg - t0);
+            if (k < 64 && (c >= own || (c - b0 < nR && c >= b0 && ((taken >> (c - b0)) & 1u))))
+                bits |= 1ull << k;
+            const int pj = sp[yg];
+            if (pj < 0) break;
+            yg = t0 + pj;
+        }
     }
     vmask[m] = (int64_t)bits;
 }
@@ -522,7 +560,7 @@ __global__ __launch_bounds__(kThreads)
 void qsa_select_tree_kernel(QSA_SELECT_TREE_PARAMS) {
     if (CH::on) r4d_chain_wait();
     qsa_select_tree_body<Signed>(score, bt, nc, pos, cu, sp, rs, sel, nsel, seqused, vmask, nb,
-                                 topk, ratio, nseq, s_ld, t_ld, o_ld, rs_ld, rs_cols);
+                                 topk, ratio, nseq, s_ld, t_ld, o_ld, rs_ld, rs_cols, cap);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_SELECT_TREE_PARAMS
@@ -1475,13 +1513,16 @@ static int r4d_qsa_select_tree_emit(long score, long bt, long nc, long pos, long
     if (!s_ld) s_ld = nb;
     if (!t_ld) t_ld = nb;
     if (!o_ld) o_ld = topk + 1;
+    int cap = lds_cap_of();
+    const int rcols = rs_cols < kTreeRegMax ? rs_cols : kTreeRegMax;
+    if (cap > nb + rcols) cap = nb + rcols;
     /* Each form named at its own launch: a test reads the kernel a launch site names. */
 #define R4D_QSELT(CH_)                                                                          \
     R4D_EMIT(stream, (qsa_select_tree_kernel<Signed, CH_>), dim3((unsigned)M), dim3(kThreads),  \
-             0, (const float*)score, (const int32_t*)bt, (const int32_t*)nc,                    \
+             (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt, (const int32_t*)nc,                    \
              (const int32_t*)pos, (const int32_t*)cu, (const int32_t*)sp, (const float*)rs,     \
              (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused, (int64_t*)vmask, nb, topk,       \
-             ratio, nseq, s_ld, t_ld, o_ld, rs_ld, rs_cols)
+             ratio, nseq, s_ld, t_ld, o_ld, rs_ld, rs_cols, cap)
     const int rc = chain ? R4D_QSELT(r4dchain) : R4D_QSELT(R4dUnchained);
 #undef R4D_QSELT
     return rc;

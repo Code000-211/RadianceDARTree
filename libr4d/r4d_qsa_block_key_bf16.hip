@@ -69,6 +69,11 @@ __device__ __forceinline__ void qsa_block_key_body(QSA_BLOCK_KEY_PARAMS) {
     const int b = blockIdx.x;
     const int t = threadIdx.x;
 
+    /* A block with no page (a decode step's work list is padded, and a tree step's scratch list
+     * has a row a block) is skipped before any work; the condition is the workgroup's, so no
+     * barrier below is split. */
+    if (page && page[b] < 0) return;
+
     /* Mean in f32 over the block's rows, rounded to bf16 once. */
     float acc = 0.0f;
     if (t < n) {

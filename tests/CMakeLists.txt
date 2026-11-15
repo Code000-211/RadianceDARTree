@@ -1005,6 +1005,17 @@ if(TARGET r4d_bf16_capacity_test)
   endif()
 endif()
 
+# The tree verify's folded delta-net op chained, on a real card (skips without one).
+if(TARGET r4d_gdn_tree_chain_test)
+  set_target_properties(r4d_gdn_tree_chain_test PROPERTIES ENABLE_EXPORTS ON)
+  if(TARGET libr4d)
+    add_dependencies(r4d_gdn_tree_chain_test libr4d)
+    add_test(NAME r4d_gdn_tree_chain_test_card COMMAND r4d_gdn_tree_chain_test)
+    set_tests_properties(r4d_gdn_tree_chain_test_card PROPERTIES LABELS "gpu" RUN_SERIAL TRUE
+      ENVIRONMENT "RADIANCE_HOME=${RAD_PLUGIN_OUT};RAD_TEST_CPU_BUDGET=0" TIMEOUT 300)
+  endif()
+endif()
+
 # The vendor record, verified: every file under vendor/ -- the lifts, the patch series, the record
 # itself -- hashed against vendor/SHA256SUMS. A changed file the record does not carry, or one that
 # arrived unrecorded, is an unrecorded change to a lifted dependency, which is the thing UPSTREAM

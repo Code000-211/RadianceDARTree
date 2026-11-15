@@ -5553,6 +5553,106 @@ static void gdn_declared_band(const Plugin& pl) {
     }
     ok(nm, why.empty(), why);
 }
+/* --perfgdnt QLEN BRANCH [iters]: the tree verify's delta-net step at the engine's per-rank shape
+ * (128 x 128 heads, 24 value heads on 8 key heads, one sequence, f32 anchor state, the previous
+ * block's 3 rows committed): the fold (gdn_conv_recurrent_update, when QLEN <= 8) and the pair
+ * (gdn_conv_update, gdn_recurrent_update), each timed alone (warm, or cold with --cold). BRANCH 0
+ * is a chain-shaped spec_parent, 1 a branching one (a binary heap), 2 a stage-one star. */
+static void gdn_tree_perf(const Plugin& pl, int64_t Q, int branch, int iters) {
+    constexpr int64_t K = 128, V = 128, H = 24, Hg = 8, W = 4, NS = 2, COLS = 6, PITCH = 16;
+    const int64_t CD = 2 * Hg * K + H * V, INW = CD + H * V;
+    const int64_t SL = W - 2 + std::max<int64_t>(8, Q);
+    const RadKernelInfo* rc = find(pl, "gdn_conv_update_w4_h128_bf16");
+    const RadKernelInfo* rr = find(pl, "gdn_recurrent_update_k128_v128_bf16_fp32state");
+    const RadKernelInfo* rf = find(pl, "gdn_conv_recurrent_update_k128_v128_bf16");
+    if (!rc || !rr || !rf) { std::printf("--perfgdnt: a row is absent\n"); return; }
+    uint32_t seed = 0x2468aceu;
+    auto rnd = [&seed]() { seed = st_mix32(seed + 0x9e3779b9u); return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f; };
+    std::vector<uint16_t> hin((size_t)(Q * INW)), hab((size_t)(Q * 2 * H)), hw((size_t)(CD * W)),
+        hcs((size_t)(NS * CD * SL));
+    for (auto& e : hin) e = h_to_bf16(rnd());
+    for (auto& e : hab) e = h_to_bf16(rnd());
+    for (auto& e : hw) e = h_to_bf16(0.5f * rnd());
+    for (auto& e : hcs) e = h_to_bf16(rnd());
+    std::vector<float> halog((size_t)H, -2.0f), hdtb((size_t)H, -20.0f), hnw((size_t)V, 1.0f);   /* eg == 1: the state does not decay away over a timing loop */
+    std::vector<float> hst((size_t)(2 * NS * H * V * K), 0.0f);
+    for (size_t i = 0; i < (size_t)(NS * H * V * K); ++i) hst[i] = 0.1f * rnd();
+    std::vector<int32_t> par((size_t)Q), path((size_t)PITCH, 0), cu = { 0, (int32_t)Q }, cidx = { 0 },
+        sidx = { 0, 0, 0, (int32_t)NS, (int32_t)NS, (int32_t)NS }, nacc = { std::getenv("GDNT_NACC") ? std::atoi(std::getenv("GDNT_NACC")) : 3 };
+    for (int64_t i = 0; i < Q; ++i) {
+        if (branch == 0) par[(size_t)i] = (int32_t)i - 1;
+        else if (branch == 1) par[(size_t)i] = i == 0 ? -1 : (int32_t)((i - 1) / 2);
+        else par[(size_t)i] = i == 0 ? -1 : (i < 4 ? (int32_t)i - 1 : 0);
+    }
+    if (const char* ev = std::getenv("GDNT_PAR")) {   /* an explicit spec_parent: "-1,0,1,..." */
+        std::string es(ev); size_t pos = 0; int64_t i = 0;
+        while (pos < es.size() && i < Q) {
+            par[(size_t)i++] = std::atoi(es.c_str() + pos);
+            pos = es.find(',', pos); if (pos == std::string::npos) break; ++pos;
+        }
+    }
+    for (int i = 0; i < PITCH; ++i) path[(size_t)i] = i < 3 ? i : 0;
+    auto up = [&](const void* h, size_t b) { void* d = dalloc(b); st_memcpy(d, h, b, hipMemcpyHostToDevice); return d; };
+    void *d_in = up(hin.data(), hin.size() * 2), *d_ab = up(hab.data(), hab.size() * 2),
+         *d_w = up(hw.data(), hw.size() * 2), *d_cs = up(hcs.data(), hcs.size() * 2),
+         *d_alog = up(halog.data(), (size_t)H * 4), *d_dtb = up(hdtb.data(), (size_t)H * 4),
+         *d_nw = up(hnw.data(), (size_t)V * 4), *d_st = up(hst.data(), hst.size() * 4),
+         *d_cu = up(cu.data(), 8), *d_cidx = up(cidx.data(), 4), *d_sidx = up(sidx.data(), 24),
+         *d_nacc = up(nacc.data(), 4), *d_par = up(par.data(), (size_t)Q * 4),
+         *d_path = up(path.data(), (size_t)PITCH * 4);
+    void* d_o = dalloc((size_t)(Q * H * V) * 2);
+    void* d_q = dalloc((size_t)(Q * Hg * K) * 2); void* d_k = dalloc((size_t)(Q * Hg * K) * 2);
+    void* d_v = dalloc((size_t)(Q * H * V) * 2);
+    auto view = [](void* base, uint32_t dt, int64_t rows, int64_t cols, int64_t pitch, int64_t col0) {
+        RadTensor t = T((char*)base + (size_t)col0 * esz(dt), dt, { rows, cols });
+        t.stride[0] = pitch; return t;
+    };
+    RadTensor none; std::memset(&none, 0, sizeof(none));
+    const RadTensor tx = view(d_in, RAD_BF16, Q, CD, INW, 0), tz = view(d_in, RAD_BF16, Q, H * V, INW, CD),
+        ta = view(d_ab, RAD_BF16, Q, H, 2 * H, 0), tb = view(d_ab, RAD_BF16, Q, H, 2 * H, H),
+        tw = T(d_w, RAD_BF16, { CD, W }), tal = T(d_alog, RAD_F32, { H }), tdt = T(d_dtb, RAD_F32, { H }),
+        tnw = T(d_nw, RAD_F32, { V }), tcs = T(d_cs, RAD_BF16, { NS, CD, SL }),
+        tst = T(d_st, RAD_F32, { 2 * NS, H, V, K }), tci = T(d_cidx, RAD_I32, { 1 }),
+        tsi = T(d_sidx, RAD_I32, { 1, COLS }), tna = T(d_nacc, RAD_I32, { 1 }), tcu = T(d_cu, RAD_I32, { 2 }),
+        to = T(d_o, RAD_BF16, { Q, H, V }), tq = T(d_q, RAD_BF16, { Q, Hg, K }),
+        tk = T(d_k, RAD_BF16, { Q, Hg, K }), tv = T(d_v, RAD_BF16, { Q, H, V }),
+        tsp = T(d_par, RAD_I32, { Q }), tph = T(d_path, RAD_I32, { 1, PITCH });
+    std::vector<RadParam> pc = { PI("q_len", Q), PI("head_k", K), PI("head_v", V), PI("conv_width", W) };
+    std::vector<RadParam> pr = { PI("q_len", Q), PI("head_k", K), PI("head_v", V), PI("n_head_v", H),
+                                 PF("scale", 0.088388), PF("eps", 1e-6), PS("act", "sigmoid"),
+                                 PS("state_form", "anchor") };
+    std::vector<RadParam> pf = pr; pf.push_back(PI("conv_width", W));
+    if (std::getenv("GDNT_CHAIN")) pf.push_back(PI("chain", 1));
+    auto launch = [&](const RadKernelInfo* r, std::vector<RadTensor>& ts, std::vector<RadParam>& ps) {
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        return r->launch(&a, (RadStream) nullptr);
+    };
+    const bool nospec = std::getenv("GDNT_NOSPEC") != nullptr;
+    std::vector<RadTensor> tf = { tx, tw, none, tcs, tci, ta, tb, tal, tdt, tst, tsi, tna, tcu, tz, tnw,
+                                  to, none, none, nospec ? none : tsp, nospec ? none : tph };
+    std::vector<RadTensor> tcv = { tx, tw, none, tcs, tci, tna, tcu, tq, tk, tv, tsp, tph };
+    std::vector<RadTensor> trc = { tq, tk, tv, ta, tb, tal, tdt, tst, tsi, tna, tcu, tz, tnw, to, none, none, tsp, tph };
+    std::printf("gdn tree q_len %lld branch %d (H %lld Hg %lld)\n", (long long)Q, branch, (long long)H, (long long)Hg);
+    if (Q <= 8) {
+        const int e = launch(rf, tf, pf);
+        if (e != RAD_OK) std::printf("  fold: refused rc=%d\n", e);
+        else {
+            st_stream_sync(nullptr);
+            const double t_f = st_time_us([&](int) { launch(rf, tf, pf); }, iters, nullptr);
+            std::printf("  fold            %8.2f us\n", t_f);
+        }
+    }
+    const int e1 = launch(rc, tcv, pc), e2 = launch(rr, trc, pr);
+    if (e1 != RAD_OK || e2 != RAD_OK) { std::printf("  pair: refused %d %d\n", e1, e2); return; }
+    st_stream_sync(nullptr);
+    const double t_c = st_time_us([&](int) { launch(rc, tcv, pc); }, iters, nullptr);
+    const double t_r = st_time_us([&](int) { launch(rr, trc, pr); }, iters, nullptr);
+    const double t_p = st_time_us([&](int) { launch(rc, tcv, pc); launch(rr, trc, pr); }, iters, nullptr);
+    std::printf("  conv_update     %8.2f us\n  recurrent       %8.2f us\n  pair back2back  %8.2f us\n", t_c, t_r, t_p);
+}
+
 static void gdn_tree(const Plugin& pl) {
     gdn_declared_band(pl);
     const char* nmp = "gdn tree verify (conv_update + recurrent_update): rows equal their chains, "
@@ -17873,6 +17973,47 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
           T(d_se, RAD_I32, { M, topk + 1 }), T(d_ns, RAD_I32, { M }), T(d_su, RAD_I32, { M }) },
         { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", 1) },
         (double)M * live * 8.0);
+    /* The tree verify form (spec_parent, rscore, vmask) at the engine's geometry (blocks 4096):
+     * a chain of M rows over one sequence, a region of a block or two past the committed ones. */
+    {
+        const int64_t tnb = 4096, tcols = 8;
+        if (live + 1 <= tnb) {
+            std::vector<int32_t> spv((size_t)M), tpo((size_t)M);
+            for (int64_t m = 0; m < M; ++m) {
+                spv[(size_t)m] = m ? (int32_t)(m - 1) : -1;
+                tpo[(size_t)m] = (int32_t)(ctx - M + m);
+            }
+            std::vector<float> rsv((size_t)(M * tcols));
+            for (size_t i = 0; i < rsv.size(); ++i) rsv[i] = (float)(((i * 31 + 5) % 97) - 48) / 53.0f;
+            void* d_sp = dalloc((size_t)M * 4);
+            void* d_tp = dalloc((size_t)M * 4);
+            void* d_rs = dalloc(rsv.size() * 4);
+            void* d_vm = dalloc((size_t)M * 8);
+            void* d_ts = dalloc((size_t)(M * tnb) * 4);
+            if (d_sp && d_tp && d_rs && d_vm && d_ts) {
+                st_memcpy(d_sp, spv.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_tp, tpo.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_rs, rsv.data(), rsv.size() * 4, hipMemcpyHostToDevice);
+                std::vector<float> tsc((size_t)(M * tnb), 0.0f);
+                for (int64_t m = 0; m < M; ++m)
+                    for (int64_t b = 0; b < live; ++b)
+                        tsc[(size_t)(m * tnb + b)] =
+                            (float)(((b * 17 + m * 5 + 3) % 1013) - 500) / 211.0f;
+                st_memcpy(d_ts, tsc.data(), tsc.size() * 4, hipMemcpyHostToDevice);
+                RadTensor ts_t = T(d_ts, RAD_F32, { M, tnb });
+                ts_t.shape[1] = live + 1;
+                run("qsa_select_i32", "qsa_select_i32 (tree rows, blocks=4096)",
+                    { ts_t, T(d_bt, RAD_I32, { 1, nb }), T(d_nc, RAD_I32, { 1 }),
+                      T(d_tp, RAD_I32, { M }), T(d_cu, RAD_I32, { 2 }),
+                      T(d_se, RAD_I32, { M, topk + 1 }), T(d_ns, RAD_I32, { M }),
+                      T(d_su, RAD_I32, { M }), T(d_sp, RAD_I32, { M }),
+                      T(d_rs, RAD_F32, { M, tcols }), T(d_vm, RAD_I64, { M }) },
+                    { PI("M", M), PI("blocks", tnb), PI("topk", topk), PI("ratio", ratio),
+                      PI("seqs", 1) },
+                    (double)M * live * 8.0);
+            }
+        }
+    }
 }
 
 /* ------------------------------------------------------------- GLM's DSA indexer, timed at length
@@ -35806,6 +35947,7 @@ int main(int argc, char** argv) {
     const char* mla_fill = "prefill";
     int qsa_it = 200;
     long long hc_m = 0;
+    long long gt_q = 0; int gt_b = 0, gt_it = 200;
     int hc_it = 20;
     long long mtp_m = 0;
     int mtp_it = 300;
@@ -36061,6 +36203,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             mtp_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mtp_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfgdnt")) {
+            if (i + 2 >= argc) { usage(); return 2; }
+            gt_q = std::strtoll(argv[++i], nullptr, 0);
+            gt_b = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gt_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -36171,6 +36318,14 @@ int main(int argc, char** argv) {
         for (int f8 = 1; f8 >= 0; --f8) mtp_enter_check(pl, mtp_m, f8 != 0, false, mtp_it);
 #else
         skip("draft head entry timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (gt_q) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        gdn_tree_perf(pl, gt_q, gt_b, gt_it);
+        dfree_all();
 #endif
         return 0;
     }

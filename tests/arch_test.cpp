@@ -13129,14 +13129,17 @@ TEST(flashnext_tree_steps_route_the_decode_half_through_the_tree_ops) {
             CHECK(!absent(is->opd[11]) && !absent(is->opd[12]));   /* spec_parent, num_accepted */
             CHECK(!absent(is->opd[13]) && !absent(is->opd[18 - 1]));
         }
-        CHECK_EQ(issues_of(b, *v[0], "gdn_conv_recurrent_update").size() +
-                 issues_of(b, *v[0], "gdn_conv_recurrent_update_had").size(), (size_t)0);
-        for (const char* op : { "gdn_conv_update", "gdn_recurrent_update" })
+        /* The fold is issued with both planes as its trailing operands; no pair remains. */
+        size_t folds = 0;
+        for (const char* op : { "gdn_conv_recurrent_update", "gdn_conv_recurrent_update_had" })
             for (const RecIssue* is : issues_of(b, *v[0], op)) {
-                const size_t at = std::string(op) == "gdn_conv_update" ? 10 : 16;
-                REQUIRE(is->opd.size() >= at + 2);
-                CHECK(!absent(is->opd[at]) && !absent(is->opd[at + 1]));
+                ++folds;
+                REQUIRE(is->opd.size() >= 20);
+                CHECK(!absent(is->opd[18]) && !absent(is->opd[19]));
             }
+        CHECK(folds > 0);
+        CHECK_EQ(issues_of(b, *v[0], "gdn_conv_update").size() +
+                 issues_of(b, *v[0], "gdn_recurrent_update").size(), (size_t)0);
         for (const RecIssue* is : issues_of(b, *v[0], "ngram_ids")) {
             REQUIRE(is->opd.size() >= 12);
             CHECK(!absent(is->opd[11]));
@@ -13157,6 +13160,14 @@ TEST(flashnext_tree_steps_route_the_decode_half_through_the_tree_ops) {
         CHECK_EQ(issues_of(b, *v[0], "attn_paged_tree_sel").size() +
                  issues_of(b, *v[0], "attn_paged_tree_sel_gate_quant").size(), (size_t)0);
         CHECK_EQ(issues_of(b, *v[0], "int_affine").size(), (size_t)0);
+        size_t folds = 0;
+        for (const char* op : { "gdn_conv_recurrent_update", "gdn_conv_recurrent_update_had" })
+            for (const RecIssue* is : issues_of(b, *v[0], op)) {
+                ++folds;
+                REQUIRE(is->opd.size() >= 20);
+                CHECK(absent(is->opd[18]) && !absent(is->opd[19]));
+            }
+        CHECK(folds > 0);
         for (const RecIssue* is : issues_of(b, *v[0], "gdn_conv_update")) {
             REQUIRE(is->opd.size() >= 12);
             CHECK(absent(is->opd[10]) && !absent(is->opd[11]));

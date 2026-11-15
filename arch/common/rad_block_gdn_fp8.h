@@ -519,8 +519,8 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     /* Tree verification (RadBatch::spec_parent, spec_path; docs/OPS.md "Tree verification of the
      * delta net"): the decode half's rows follow their ancestors and the committed state replays
      * the previous verify's accepted rows. Absent planes are today's operand lists. The fold is
-     * not issued for such a step: libr4d's tree forms decline the chained launch (the `chain`
-     * parameter the selector sets on a chainable row), and only the pair is unchained. The conv
+     * folded too (its tree form takes the planes as its trailing operands and chains like the chain form; only
+     * rows past the fold's band run the pair). The conv
      * window needs no kv_window_compact, the conv op gathers by spec_path itself. */
     const RadOperand spar  = tree_verify_step(batch)
                                  ? praw(batch->spec_parent, RAD_I32, DT) : RAD_NONE;
@@ -528,7 +528,21 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                                  ? praw2(batch->spec_path, RAD_I32, D, batch->spec_path_pitch)
                                  : RAD_NONE;
     const bool treed = tree_verify_step(batch) || tree_path_step(batch);
-    if (D > 0 && op_cr && qd <= cr_rows && !treed) {
+    if (D > 0 && op_cr && qd <= cr_rows) {
+        /* The tree planes are trailing operands, present only on a tree step: a chain's issue is
+         * the list it always was. */
+        if (treed)
+            RAD_ISSUE_N(c, op_cr, qd,
+                        bcol(w.in.x, 0, conv_dim, DT), RAD_W(w_conv), RAD_NONE,
+                        kv_cache(kv_conv, layer), praw(cv_idx, RAD_I32, D),
+                        bcol(w.ab, 0, H, DT), bcol(w.ab, H, H, DT),
+                        RAD_W(w_a_log), RAD_W(w_dt_bias), kv_cache(kv_state, layer),
+                        praw2(st_idx, RAD_I32, D, st_w), praw(batch->num_accepted, RAD_I32, D),
+                        praw(batch->cu_seqlens, RAD_I32, D + 1),
+                        bcol(w.in.x, conv_dim, v_dim, DT), RAD_W(w_out_norm), brows(w.o.x, DT),
+                        cr_codes ? brows(w.o.cq(), DT) : RAD_NONE,
+                        cr_codes ? brows(w.o.cs(), DT) : RAD_NONE, spar, spath);
+        else
         RAD_ISSUE_N(c, op_cr, qd,
                     bcol(w.in.x, 0, conv_dim, DT), RAD_W(w_conv), RAD_NONE, kv_cache(kv_conv, layer),
                     praw(cv_idx, RAD_I32, D),
