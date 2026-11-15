@@ -93,6 +93,26 @@ inline int64_t floor_mod(int64_t a, int64_t b) {    /* b > 0 */
  *                                          continuing the last sequence, and these are their ids
  *                                          as the step that runs them will compute them. The
  *                                          window is the step's own.
+ *   spec_parent  [M]              i32  ?   a tree verify (RadBatch::spec_parent, rad_drafter_tree):
+ *                                          see below
+ *
+ * ============================== A tree verify ==============================
+ *
+ * With `spec_parent`, the rows of a sequence are the nodes of a verify tree, not a chain: the
+ * entry of row t is its parent's row within the sequence (-1 for the root, the first row; -2, an
+ * ordinary causal row, whose parent is the row before it), every parent before its child. The
+ * shifted tokens of row t are then the tokens of its ANCESTORS: t1 is the parent's, t2 the
+ * grandparent's, and a shift that runs past the root continues into the committed window `prev`
+ * exactly as a chain's would (the root's own predecessors are what the sequential decode of the
+ * path would have there). The EOS rule is unchanged. A chain (parent[t] = t - 1) and an ordinary
+ * run (-2) hash exactly as without the operand.
+ *
+ * The window is written back in ROW layout, token t at entry ctx - 1 + t whatever its parent, so
+ * the root is at entry `ctx - 1` (= ngram - 2). The next step reads at `num_accepted - 1`; a tree
+ * step that accepted the path rows p[0] = 0, p[1], ... left the committed ids at entries
+ * ctx - 1 + p[t], not ctx - 1 + t, and kv_window_compact(off = ngram - 2) moves them down before
+ * that read. The operand requires `num_accepted` (the prefill layout has no row layout to
+ * compact) and excludes `ahead_ids` (a prompt continuing a chain).
  */
 int ref_ngram_ids(const RadArgs* a, RadStream) {
     /* Eleven positions, four optional, so the optionals are tested one by one; `have()` would
@@ -109,6 +129,7 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
     const RadTensor* nacc  = t_in(a, 8);      /* optional */
     const RadTensor* ids   = t_in(a, 9);
     const RadTensor* ahead = a->n_t > 10 ? t_in(a, 10) : nullptr;     /* optional */
+    const RadTensor* spar  = a->n_t > 11 ? t_in(a, 11) : nullptr;     /* optional */
     if (!tok || !st || !cu || !mult || !vsz || !off_ || !ids) return RAD_E_INVAL;
 
     const int64_t heads = p_int(a, "heads", 0);
@@ -126,6 +147,10 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
     const int64_t per = heads / (ngram - 1);
     const int64_t ctx = ngram - 1;
     if (ngram > 8) return RAD_E_UNSUPPORTED;      /* the shift window lives in a stack frame */
+    /* A tree verify leaves the row-layout window the compaction reads, and cannot carry a prompt
+     * that continues a chain. */
+    if (spar && (!nacc || ahead)) return RAD_E_INVAL;
+    if (spar && numel(spar) < M) return RAD_E_SHAPE;
 
     if (numel(mult) < ngram || numel(vsz) < heads || numel(off_) < heads) return RAD_E_SHAPE;
     if (numel(ids) < M * heads) return RAD_E_SHAPE;
@@ -146,6 +171,11 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
         const int64_t bos = cu_at(cu, s), eot = cu_at(cu, s + 1);
         if (bos < 0 || eot < bos || eot > M) return RAD_E_SHAPE;
         if (nacc && eot > bos && ctx - 1 + (eot - bos) > W) return RAD_E_SHAPE;
+        /* Every parent precedes its child; a bad tree would walk off the block. */
+        for (int64_t t = 0; spar && t < eot - bos; ++t) {
+            const int64_t v = ld_int(spar->dtype, spar->data, offlin(spar, bos + t));
+            if (v < -2 || v >= t) return RAD_E_INVAL;
+        }
     }
 
     const int64_t ids_ld = rowoff(ids, 1, heads);
@@ -172,6 +202,26 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
             return p < ctx ? prev[p] : ld_int(tok->dtype, tok->data, offlin(tok, bos + p - ctx));
         };
 
+        /* Row t's parent within the sequence, or -1 at the root: spec_parent's -2 is a causal row,
+         * whose parent is the row before it. */
+        auto parent = [&](int64_t t) -> int64_t {
+            const int64_t v = ld_int(spar->dtype, spar->data, offlin(spar, bos + t));
+            return v == -2 ? t - 1 : v;
+        };
+        /* The token `k` shifts back from row t along its ancestors; past the root the shift
+         * continues into the committed window, where a chain would have found it. */
+        auto anc = [&](int64_t t, int64_t k) -> int64_t {
+            int64_t cur = t, rem = k;
+            while (rem > 0) {
+                const int64_t p = parent(cur);
+                if (p < 0) break;
+                cur = p;
+                --rem;
+            }
+            return rem == 0 ? ld_int(tok->dtype, tok->data, offlin(tok, bos + cur))
+                            : prev[ctx - rem];
+        };
+
         /* The last sequence runs on into the prompt that follows, whose ids land in `ahead`. */
         const int64_t reach = T + (ahead && s + 1 == n_seq ? A : 0);
         for (int64_t t = 0; t < reach; ++t) {
@@ -184,7 +234,7 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
             bool cut = false;
             for (int64_t k = 1; k < ngram; ++k) {
                 if (cut || sh[k - 1] == eos) { cut = true; sh[k] = eos; continue; }
-                sh[k] = hist(p - k);
+                sh[k] = spar ? anc(t, k) : hist(p - k);
             }
 
             /* One mix per n-gram order, extended in place: the (b+2)-gram's mix is the

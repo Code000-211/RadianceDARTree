@@ -540,6 +540,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
+        { "--draft-tree", { "on" } }, { "--draft-tree-leaves", { "4" } },
+        { "--draft-tree-nodes", { "8" } }, { "--draft-tree-width", { "2" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -948,6 +950,34 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
+/* A serial head's tree: --draft-tree is auto (the plugin's measurement decides) unless said, its
+ * leaves default to 3 and at most 7 (the top 8 less the pick), its node budget to auto (0) and its
+ * frontier width to 1 (the chain and its leaves); a misspelt mode or an out-of-range count is
+ * refused rather than served as another shape. */
+TEST(a_serial_trees_flags_default_to_the_plugins_choice_and_parse_their_ranges) {
+    Config c;
+    CHECK_EQ(c.draft_tree, -1);
+    CHECK_EQ(c.draft_tree_leaves, 3);
+    CHECK_EQ(c.draft_tree_nodes, 0);
+    CHECK_EQ(c.draft_tree_width, 1);
+    CHECK_EQ(parse({ "--draft-tree", "on", "--draft-tree-leaves", "7", "--draft-tree-nodes", "12",
+                     "--draft-tree-width", "3" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree, 1);
+    CHECK_EQ(c.draft_tree_leaves, 7);
+    CHECK_EQ(c.draft_tree_nodes, 12);
+    CHECK_EQ(c.draft_tree_width, 3);
+    CHECK_EQ(parse({ "--draft-tree", "off" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree, 0);
+    CHECK_EQ(parse({ "--draft-tree", "auto" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_tree, -1);
+    for (const char* bad : { "yes", "ON", "" })
+        CHECK_EQ(parse_fresh({ "--draft-tree", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-tree-leaves", "8" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-tree-leaves", "-1" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-tree-width", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-tree-nodes", "65" }), RAD_E_INVAL);
 }
 
 /* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not

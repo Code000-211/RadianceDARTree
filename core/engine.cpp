@@ -1220,7 +1220,7 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (flex_pending_.load(std::memory_order_acquire) || quiet_pending_.load(std::memory_order_acquire))
         return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
-        sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
+        sched_.expect_draft(serial_row_[(size_t)i].seq, serial_nodes(serial_done_));
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
@@ -2994,6 +2994,10 @@ std::string Engine::engine_info() const {
         sp["drafter"] = drafter_name_;
         sp["kind"]    = drafter_.kind == RAD_DRAFT_BLOCK ? "block" : "serial";
         sp["depth"]   = drafter_.depth;
+        if (serial_tree_) {
+            sp["tree"] = { { "nodes", cfg_.n_spec }, { "leaves", tree_leaves_ },
+                           { "width", tree_width_ } };
+        }
     }
     e["speculation"] = std::move(sp);
     /* --expert-stats: where the counts are, for a client that reads them. */

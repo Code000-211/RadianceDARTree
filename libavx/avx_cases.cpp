@@ -404,6 +404,14 @@ std::vector<Case> build_cases() {
                                      HI("block_size", 16), HI("causal", 1), HI("window", 8),
                                      HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
                                      HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* The selected-pages-plus-region form: its shape function describes a one-sequence page list. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 5 })
+            add("attn_paged_tree_sel", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", 4),
+                                         HI("block_size", 16), HI("causal", 1), HI("window", 0),
+                                         HS("q_dtype", dt), HS("kv_dtype", dt), HF("scale", 0.125),
+                                         HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2),
+                                         HI("sel_pitch", 4) });
     /* The sink form: a block of 8 non-causal rows (LiLiCorr's query pass), a decode row and the
      * prefill panel form, with and without a window. */
     for (const char* dt : { "f32", "bf16" })
@@ -780,6 +788,7 @@ std::vector<Case> build_cases() {
                                        HF("eps", 1e-6), HF("l2_eps", 1e-6),
                                        HF("softplus_thr", 20.0), HS("act", "silu"),
                                        HI("state_fp16", 0), HI("n_head_k", 2), HI("n_seq", 2) });
+    add("kv_window_compact", { HI("off", 2), HS("dtype", "f32") });
     for (const char* act : { "silu", "sigmoid" })
         add("gdn_gated_rmsnorm", { HI("M", 12), HI("channels", 128), HF("eps", 1e-6),
                                    HS("act", act) });

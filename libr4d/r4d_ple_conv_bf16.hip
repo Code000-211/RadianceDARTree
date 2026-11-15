@@ -27,6 +27,13 @@
 //
 // The window write-back is in the same launch; see the note at the end of the kernel. It relies
 // on `hist < kPcBT`, asserted below.
+//
+// TREE (`spar`, RadBatch::spec_parent; ple_conv only): the rows of a sequence are the nodes of a
+// verify tree and the tap `k = (width-1-j)*dilation` rows back is the input of the node's
+// ANCESTOR k levels up, the walk running on past the root into the window (libref/ref_ple.cpp,
+// docs/OPS.md). Any node, in any tile, may then read the window, and tile 0 rewrites it, so a tree
+// launch has ONE tile per sequence and its thread walks every row. The taps are summed in the
+// chain's order, so a node is bit-identical to the last row of a sequential decode of its path.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_chain.h"
@@ -62,8 +69,9 @@ __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z))
     const int32_t* __restrict__ hini, const int32_t* __restrict__ nacc,                         \
     uint16_t* __restrict__ y, const uint16_t* __restrict__ bias, uint32_t n, uint32_t wid,      \
     uint32_t dil, uint32_t hist, uint32_t xld, uint32_t rld, uint32_t yld, uint32_t wld,        \
-    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len
-template <bool SILU>
+    long long cs_slot, long long cs_ch, long long cs_tok, long long state_len,                  \
+    const int32_t* __restrict__ spar
+template <bool SILU, bool TREE>
 __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 
     const uint32_t c = blockIdx.x * kPcThreads + threadIdx.x;
@@ -74,7 +82,8 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
     if (slen <= 0) return;
     const int32_t t0 = (int32_t)(blockIdx.y * kPcBT);
     if (t0 >= slen) return;
-    const int32_t t1 = min(t0 + (int32_t)kPcBT, slen);
+    /* A tree launch has one tile, which walks the whole sequence. */
+    const int32_t t1 = TREE ? slen : min(t0 + (int32_t)kPcBT, slen);
 
     const int32_t slot = sidx ? sidx[s] : (int32_t)s;
     if (slot < 0) return;
@@ -100,7 +109,21 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 #pragma unroll
         for (uint32_t j = 0; j < kPcMaxW; ++j) {
             if (j < wid) {
-                const int32_t src = t - (int32_t)hist + (int32_t)(j * dil);
+                int32_t src = t - (int32_t)hist + (int32_t)(j * dil);
+                if (TREE) {
+                    /* The ancestor k levels up, or what is left of k past the root as a window
+                     * slot (src = -rem, as for a chain row below k). A parent that does not
+                     * precede its child (libref refuses it) ends the walk at the window. */
+                    int32_t cur = t, rem = (int32_t)((wid - 1 - j) * dil);
+                    while (rem > 0) {
+                        const int32_t v = spar[bos + cur];
+                        const int32_t par = v == -2 ? cur - 1 : v;
+                        if (par < 0 || par >= cur) break;
+                        cur = par;
+                        --rem;
+                    }
+                    src = rem == 0 ? cur : -rem;
+                }
                 const float v = src >= 0 ? bf16_to_f32(xc[(size_t)src * xld])
                                          : (hc ? bf16_to_f32(hc[(src + (int32_t)hist) * cs_tok]) : 0.0f);
                 acc += v * wt[j];
@@ -154,17 +177,17 @@ __device__ __forceinline__ void ple_conv_body(PLE_CONV_PARAMS) {
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
  * chained form (r4d_chain.h), taken at decode heights. */
-template <bool SILU, class CH>
+template <bool SILU, class CH, bool TREE = false>
 __global__ __launch_bounds__(kPcThreads)
 void ple_conv_kernel(PLE_CONV_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    ple_conv_body<SILU>(x, w, cs, cu, resid, sidx, hini, nacc, y, bias, n, wid, dil, hist, xld, rld,
-                        yld, wld, cs_slot, cs_ch, cs_tok, state_len);
+    ple_conv_body<SILU, TREE>(x, w, cs, cu, resid, sidx, hini, nacc, y, bias, n, wid, dil, hist,
+                              xld, rld, yld, wld, cs_slot, cs_ch, cs_tok, state_len, spar);
     if (CH::on) r4d_chain_done();
 }
 #undef PLE_CONV_PARAMS
 
-enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y };
+enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y, PC_SPAR };
 /* ple_conv_bias: ple_conv's operands with `b`, the per-channel bias inside the silu (Mamba-2's
  * conv1d), before `y`. */
 enum { PB_B = PC_Y, PB_Y };
@@ -174,7 +197,8 @@ enum { CC_X = 0, CC_W, CC_CS, CC_CU, CC_CIDX, CC_HINIT, CC_NACC, CC_Y };
 int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, const RadTensor* w,
                 const RadTensor* cs, const RadTensor* cu, const RadTensor* resid,
                 const RadTensor* cidx, const RadTensor* hini, const RadTensor* nacc,
-                const RadTensor* y, const RadTensor* b = nullptr) {
+                const RadTensor* y, const RadTensor* b = nullptr,
+                const RadTensor* spar = nullptr) {
     if (!x || !w || !cu || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
@@ -188,6 +212,13 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
      * refused. */
     if (hini && hini->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
     if (nacc && nacc->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    /* A tree verify (spec_parent) is a decode step: the row-layout window it leaves is what
+     * kv_window_compact reads. */
+    if (spar) {
+        if (spar->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+        if (!r4d_contig(spar)) return R4D_NO(RAD_E_STRIDE);
+        if (!nacc || !silu || b) return R4D_NO(RAD_E_INVAL);
+    }
 
     const long long n   = r4d_geti_or(a, "n", 0);
     const long long wid = r4d_geti_or(a, "width", 0);
@@ -207,6 +238,7 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
      * the band's upper bound and a grid sized by it would run off the arena. */
     if (T <= 0 || ty != T || (resid && tr != T)) return R4D_NO(RAD_E_SHAPE);
     if (wrows < n) return R4D_NO(RAD_E_SHAPE);
+    if (spar && r4d_numel(spar) < T) return R4D_NO(RAD_E_SHAPE);
     if (b && (r4d_numel(b) != n || !r4d_contig(b))) return R4D_NO(RAD_E_SHAPE);
 
     const long long N = r4d_numel(cu) - 1;
@@ -228,10 +260,11 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
     }
 
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
-    const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
+    /* One tile for a tree: a node may read the window from any row, and tile 0 rewrites it. */
+    const uint32_t tb = spar ? 1u : (uint32_t)((T + kPcBT - 1) / kPcBT);
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && T <= 64;
-#define R4D_PC(S_, CH_)                                                                         \
-    hipLaunchKernelGGL((ple_conv_kernel<S_, CH_>), dim3(cb, tb, (uint32_t)N),                   \
+#define R4D_PC(S_, CH_, TR_)                                                                    \
+    hipLaunchKernelGGL((ple_conv_kernel<S_, CH_, TR_>), dim3(cb, tb, (uint32_t)N),              \
                        dim3(kPcThreads), 0, (hipStream_t)s,                                      \
                        (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),               \
                        have_cs ? (uint16_t*)r4d_addr(cs) : nullptr,                              \
@@ -243,9 +276,11 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
                        (uint16_t*)r4d_addr(y), b ? (const uint16_t*)r4d_addr(b) : nullptr,       \
                        (uint32_t)n, (uint32_t)wid, (uint32_t)dil,                                \
                        (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld, \
-                       cs_slot, cs_ch, cs_tok, state_len)
-    if (silu) { if (chain) R4D_PC(true, r4dchain);  else R4D_PC(true, R4dUnchained); }
-    else      { if (chain) R4D_PC(false, r4dchain); else R4D_PC(false, R4dUnchained); }
+                       cs_slot, cs_ch, cs_tok, state_len,                                        \
+                       spar ? (const int32_t*)r4d_addr(spar) : nullptr)
+    if (spar)       { if (chain) R4D_PC(true, r4dchain, true);  else R4D_PC(true, R4dUnchained, true); }
+    else if (silu)  { if (chain) R4D_PC(true, r4dchain, false);  else R4D_PC(true, R4dUnchained, false); }
+    else            { if (chain) R4D_PC(false, r4dchain, false); else R4D_PC(false, R4dUnchained, false); }
 #undef R4D_PC
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
@@ -255,7 +290,8 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
 extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
     return conv_launch(a, s, true, r4d_opt(a, PC_X), r4d_opt(a, PC_W), r4d_opt(a, PC_CS),
                        r4d_opt(a, PC_CU), r4d_opt(a, PC_RESID), r4d_opt(a, PC_CIDX),
-                       r4d_opt(a, PC_HINIT), r4d_opt(a, PC_NACC), r4d_opt(a, PC_Y));
+                       r4d_opt(a, PC_HINIT), r4d_opt(a, PC_NACC), r4d_opt(a, PC_Y), nullptr,
+                       r4d_opt(a, PC_SPAR));
 }
 
 extern "C" int r4d_rad_ple_conv_bias(const RadArgs* a, RadStream s) {

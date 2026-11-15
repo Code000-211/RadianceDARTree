@@ -485,7 +485,7 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t
  *
  * Operands: [0] x  [1] conv_w  [2] conv_b  [3] conv_state  [4] conv_idx  [5] a  [6] b  [7] A_log
  *           [8] dt_bias  [9] state  [10] state_idx  [11] num_accepted  [12] cu  [13] z
- *           [14] norm_w  [15] o  [16] o_q  [17] o_scale
+ *           [14] norm_w  [15] o  [16] o_q  [17] o_scale  [18] spec_parent  [19] spec_path
  *
  * The pair's q, k and v are the three temporaries. Every parameter has the same name in the step
  * op, so each step mirrors its own: the convolution's four, then the recurrent update's. */
@@ -493,14 +493,16 @@ extern "C" int r4d_fuse_gdn_conv_recurrent_update(const RadParam* p, int n_p, ui
                                                   int step, RadFuseStep* out) {
     if (!out) return RAD_E_INVAL;
     const int16_t cb = opt_opd(present, 2), oq = opt_opd(present, 16), os = opt_opd(present, 17);
+    /* The tree verify's planes (operands 18 and 19), handed to both halves. */
+    const int16_t sp = opt_opd(present, 18), spp = opt_opd(present, 19);
     switch (step) {
     case 0: {
         Step s(out, "gdn_conv_update");
         s.mirror(p, n_p, "q_len").mirror(p, n_p, "head_k").mirror(p, n_p, "head_v")
          .mirror(p, n_p, "conv_width");
-        /* x, w, b, conv_state, state_idx, num_accepted, cu, q, k, v */
+        /* x, w, b, conv_state, state_idx, num_accepted, cu, q, k, v, spec_parent, spec_path */
         return s.wire({ 0, 1, cb, 3, 4, 11, 12, RAD_FUSE_TMP(0), RAD_FUSE_TMP(1),
-                        RAD_FUSE_TMP(2) });
+                        RAD_FUSE_TMP(2), sp, spp });
     }
     case 1: {
         Step s(out, "gdn_recurrent_update");
@@ -510,9 +512,9 @@ extern "C" int r4d_fuse_gdn_conv_recurrent_update(const RadParam* p, int n_p, ui
          .mirror_opt(p, n_p, "act").mirror_opt(p, n_p, "state_fp16")
          .mirror_opt(p, n_p, "state_form");
         /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
-         * o_scale */
+         * o_scale, spec_parent, spec_path */
         return s.wire({ RAD_FUSE_TMP(0), RAD_FUSE_TMP(1), RAD_FUSE_TMP(2), 5, 6, 7, 8, 9, 10, 11,
-                        12, 13, 14, 15, oq, os });
+                        12, 13, 14, 15, oq, os, sp, spp });
     }
     default:
         return RAD_E_NOTFOUND;
@@ -698,6 +700,49 @@ static int fuse_attn_paged_gate(const RadParam* p, int n_p, uint64_t present, in
 extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64_t present,
                                               int step, RadFuseStep* out) {
     return fuse_attn_paged_gate(p, n_p, present, step, out, "gate_quant_fp8");
+}
+/* attn_paged_tree_sel_gate_quant -- attn_paged_tree_sel, then gate_quant_fp8 over its output.
+ * (rows: attn_tsel_gq_*; kernels: libr4d/r4d_attn_paged_gqa8.hip, G8_TSEL)
+ *
+ * Operands: [0] q  [1] kv_cache  [2] sel  [3] nsel  [4] k_descale?  [5] v_descale?  [6] cu_seqlens?
+ *           [7] out  [8] gate  [9] q8  [10] q8_scale  [11] vmask  [12] block_table  [13] rb
+ *           [14] seq_cu?
+ * The same no-temporary pair as attn_paged_gate_quant. */
+static int fuse_attn_paged_tree_sel_gate(const RadParam* p, int n_p, uint64_t present, int step,
+                                         RadFuseStep* out, const char* gate_op) {
+    if (!out) return RAD_E_INVAL;
+    auto opt = [present](int i) { return opt_opd(present, i); };
+    const int64_t q_len = pi(p, n_p, "q_len"), nh = pi(p, n_p, "n_head");
+    const int64_t hd = pi(p, n_p, "head_dim"), seqs = pi(p, n_p, "max_seqs", 1);
+    if (q_len <= 0 || nh <= 0 || hd <= 0 || seqs <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "attn_paged_tree_sel");
+        s.mirror(p, n_p, "q_len").mirror(p, n_p, "head_dim").mirror(p, n_p, "gqa")
+         .mirror(p, n_p, "block_size").mirror(p, n_p, "causal").mirror(p, n_p, "window")
+         .mirror(p, n_p, "q_dtype").mirror(p, n_p, "kv_dtype").mirror_opt(p, n_p, "scale")
+         .mirror_opt(p, n_p, "max_ctx").mirror_opt(p, n_p, "n_head")
+         .mirror_opt(p, n_p, "max_seqs").mirror(p, n_p, "sel_pitch");
+        return s.wire({ 0, 1, 2, 3, opt(4), opt(5), opt(6), 7, 11, 12, 13, opt(14) });
+    }
+    case 1: {
+        Step s(out, gate_op);
+        s.pint("M", (long long)(seqs * q_len * nh)).pint("n", (long long)hd)
+         .mirror(p, n_p, "group").pstr("dtype", "bf16").mirror(p, n_p, "act");
+        return s.wire({ 8, 7, 9, 10, 7 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+extern "C" int r4d_fuse_attn_paged_tree_sel_gate_quant(const RadParam* p, int n_p, uint64_t present,
+                                                       int step, RadFuseStep* out) {
+    return fuse_attn_paged_tree_sel_gate(p, n_p, present, step, out, "gate_quant_fp8");
+}
+extern "C" int r4d_fuse_attn_paged_tree_sel_gate_had_quant(const RadParam* p, int n_p,
+                                                           uint64_t present, int step,
+                                                           RadFuseStep* out) {
+    return fuse_attn_paged_tree_sel_gate(p, n_p, present, step, out, "gate_had_quant_i8g");
 }
 /* attn_paged_gate_had_quant -- the same two steps with gate_had_quant_i8g as the second. */
 extern "C" int r4d_fuse_attn_paged_gate_had_quant(const RadParam* p, int n_p, uint64_t present,

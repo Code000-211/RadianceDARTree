@@ -513,3 +513,167 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_ghq_h256_gqa, _##TAG)(const RadArgs* a
 G8_I8_ENTRIES(i8, 516, O_KVI8)
 #undef G8_I8_ENTRIES
 #endif
+
+#if R4D_ATTN_H256 && defined(G8_TSEL)
+// ============================================================== attn_paged_tree_sel
+// QSA's attention at a tree verify (docs/OPS.md, attn_paged_tree_sel): per query row, the row's
+// selected pages and then the keys of a 64-key region that its mask names, in one softmax. It is
+// the split-KV decode kernel run on a key list instead of a block table (O_TSEL): the list is the
+// row's `nsel` pages, then its visible region keys packed in ascending order, each given by its
+// flat cache slot, built per row by r4d_tsel_prep:
+//
+//     nkeys[row]   = nsel * BS               keys read through the page list (`sel`, as is)
+//     slots[row]   = flat slot of each visible region key, ascending, 64 entries a row
+//     seqused[row] = nsel * BS + popcount(vmask)
+//
+// Nothing is masked: the kernel sees exactly the keys of the row, at consecutive indices. A chain
+// row (a prefix of the region) therefore runs the plain sparse row's kernel over the plain
+// sparse row's keys, tile for tile, and a tree row is the sequential decode of its root-to-node
+// path laid out as that path's keys are -- the same bytes, however the keys sit in the pages. The
+// split law, the partial buffer and the merge are the sparse row's (the q_len 1 launch, one row a
+// "sequence"). Scratch: the decode partials, then nkeys and seqused [rows] and slots [rows, 64].
+enum { kTselKeys = 64 };
+
+static __global__ void r4d_tsel_prep_kernel(const int* __restrict__ nsel, int sel_pitch,
+                                     const unsigned long long* __restrict__ vmask,
+                                     const int* __restrict__ bt, int bt_pitch,
+                                     const int* __restrict__ rb, const int* __restrict__ cu,
+                                     int n_seq, int rows, int* __restrict__ nkeys,
+                                     int* __restrict__ ctxv, int* __restrict__ slots)
+{
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    int s = 0;
+    if (cu) { while (s + 1 < n_seq && cu[s + 1] <= r) ++s; }
+    else    { s = r / (rows / n_seq); }
+    int ns = nsel[r];
+    ns = ns < 0 ? 0 : (ns > sel_pitch ? sel_pitch : ns);
+    const unsigned long long m = vmask[r];
+    const int k = threadIdx.x;                         // 64 threads, one a region key
+    if ((m >> k) & 1ull) {
+        const int rank = (int)__builtin_popcountll(m & ((1ull << k) - 1ull));
+        const int pg   = rb[s] / G8_BLOCK_SIZE + k / G8_BLOCK_SIZE;
+        int blk = pg < bt_pitch ? bt[(size_t)s * bt_pitch + pg] : 0;
+        if (blk < 0) blk = 0;
+        slots[(size_t)r * kTselKeys + rank] = blk * G8_BLOCK_SIZE + k % G8_BLOCK_SIZE;
+    }
+    if (k == 0) {
+        nkeys[r] = ns * G8_BLOCK_SIZE;
+        ctxv[r]  = ns * G8_BLOCK_SIZE + (int)__builtin_popcountll(m);
+    }
+}
+
+/* The launch-time view of a tree-sel call: the base op's operands through fill_paged_row (sel as
+ * its block table, nsel as seqused), then the tree's. `tb` is the first tree operand: 8 for the
+ * plain op, 11 behind the gated op's gate, codes and scales. */
+struct G8Tsel {
+    const unsigned long long* vmask;
+    const int *bt, *rb, *cu;
+    int bt_pitch, n_seq, sel_pitch;
+};
+
+static int g8_tsel_operands(const RadArgs* a, const R4DArgs& r, int tb, G8Tsel* t) {
+    if (r4d_opt(a, AP_KDS) || r4d_opt(a, AP_VDS) || r4d_opt(a, AP_CU))
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    if (r.q_len != 1) return R4D_NO(RAD_E_SHAPE);
+    if (r.causal != 1 || r.window != 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor* vm = r4d_opt(a, tb);
+    const RadTensor* bt = r4d_opt(a, tb + 1);
+    const RadTensor* rb = r4d_opt(a, tb + 2);
+    const RadTensor* cu = r4d_opt(a, tb + 3);
+    const RadTensor* sel = r4d_opt(a, AP_BT);
+    const RadTensor* ns  = r4d_opt(a, AP_SEQ);
+    if (!vm || !bt || !rb) return R4D_NO(RAD_E_INVAL);
+    if (sel->dtype != RAD_I32 || ns->dtype != RAD_I32 || bt->dtype != RAD_I32 ||
+        rb->dtype != RAD_I32 || (cu && cu->dtype != RAD_I32) || vm->dtype != RAD_I64)
+        return R4D_NO(RAD_E_DTYPE);
+    if (bt->rank != 2 || !r4d_contig(bt) || !r4d_contig(rb) || !r4d_contig(vm) ||
+        (cu && !r4d_contig(cu)))
+        return R4D_NO(RAD_E_STRIDE);
+    const long long rows = r.num_seqs, n_seq = bt->shape[0];
+    if (r4d_numel(vm) != rows || n_seq <= 0 || r4d_numel(rb) != n_seq) return R4D_NO(RAD_E_SHAPE);
+    if (cu ? r4d_numel(cu) != n_seq + 1 : rows % n_seq != 0) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_aligned(vm->data, 8)) return R4D_NO(RAD_E_ALIGN);
+    t->vmask     = (const unsigned long long*)vm->data;
+    t->bt        = (const int*)bt->data;
+    t->rb        = (const int*)rb->data;
+    t->cu        = cu ? (const int*)cu->data : nullptr;
+    t->bt_pitch  = (int)bt->shape[1];
+    t->n_seq     = (int)n_seq;
+    t->sel_pitch = (int)sel->shape[1];
+    return RAD_OK;
+}
+
+/* nkeys, seqused and slots for `rows` rows. */
+static long g8_tsel_prep_bytes(long long rows) { return (long)(rows * (kTselKeys + 2) * 4); }
+static long g8_tsel_align(long v) { return (v + 255) & ~255L; }
+
+/* Declare-time size: the decode partials of the sparse row at the declared bound, plus the prep
+ * arrays at `max_seqs` rows. */
+static int64_t g8_tsel_scratch(const RadArgs* a, long long row) {
+    const int64_t dec = g8_decode_scratch(a, 256, row);
+    if (dec < 0) return dec;
+    long long rows = r4d_geti_or(a, "max_seqs", 0);
+    if (rows <= 0) {
+        const RadTensor* q = r4d_opt(a, AP_Q);
+        if (!q) return R4D_NO(RAD_E_INVAL);
+        rows = q->shape[0];
+    }
+    return g8_tsel_align(dec) + g8_tsel_prep_bytes(rows);
+}
+
+template <int KVP, int XOPT>
+static int g8_tsel_launch(const RadArgs* a, RadStream stream, long long row, int tb,
+                          bool gated, bool rot) {
+    R4DArgs r;
+    const int sp = split_of(a);
+    if (sp < 0) return R4D_NO(RAD_E_INVAL);
+    int rc = fill_paged_row(a, &r, 256, row);
+    if (rc != RAD_OK) return rc;
+    G8Tsel t;
+    rc = g8_tsel_operands(a, r, tb, &t);
+    if (rc != RAD_OK) return rc;
+    r.splits = sp;
+    const long dec = g8_tsel_align(GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r));
+    const long need = dec + g8_tsel_prep_bytes(r.num_seqs);
+    if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
+    int* nkeys = (int*)((char*)a->scratch + dec);
+    int* ctxv  = nkeys + r.num_seqs;
+    int* slots = ctxv + r.num_seqs;
+
+    const int* nsel = r.seqused_k;
+    R4DGateQuant gq{};
+    if (gated) {
+        rc = g8_gate_quant_args(a, r, &gq, rot);
+        if (rc != RAD_OK) return rc;
+    }
+    if (R4D_EMIT(stream, r4d_tsel_prep_kernel, dim3(r.num_seqs), dim3(kTselKeys), 0, nsel,
+                 t.sel_pitch, t.vmask, t.bt, t.bt_pitch, t.rb, t.cu, t.n_seq, r.num_seqs, nkeys,
+                 ctxv, slots) != RAD_OK)
+        return -5;
+    CHK8();
+    r.seqused_k  = ctxv;
+    r.tsel_nkeys = nkeys;
+    r.tsel_slots = slots;
+    return g8_decode_launch<256, KVP, XOPT | O_TSEL>(&r, stream, gated ? &gq : nullptr);
+}
+
+/* attn_paged_tree_sel_gate_quant's gate / codes / scales sit at operands 8-10 (AP_GQ_*), the tree
+ * operands after them; the plain op has the tree operands at 8. */
+#define G8_TSEL_ENTRIES(TAG, KVP, ROWB, XOPT)                                                  \
+extern "C" int64_t GQ_SYM(r4d_rad_attn_tsel_h256_gqa, _##TAG##_scratch)(const RadArgs* a) {    \
+    return g8_tsel_scratch(a, ROWB);                                                           \
+}                                                                                              \
+extern "C" int GQ_SYM(r4d_rad_attn_tsel_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) {     \
+    return g8_tsel_launch<KVP, (XOPT)>(a, s, ROWB, 8, false, false);                           \
+}                                                                                              \
+extern "C" int GQ_SYM(r4d_rad_attn_tsel_gq_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) {  \
+    return g8_tsel_launch<KVP, (XOPT)>(a, s, ROWB, 11, true, false);                           \
+}                                                                                              \
+extern "C" int GQ_SYM(r4d_rad_attn_tsel_ghq_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) { \
+    return g8_tsel_launch<KVP, (XOPT)>(a, s, ROWB, 11, true, true);                            \
+}
+G8_TSEL_ENTRIES(bf16, 1, 512, 0)
+G8_TSEL_ENTRIES(i8, 0, 516, O_KVI8)
+#undef G8_TSEL_ENTRIES
+#endif

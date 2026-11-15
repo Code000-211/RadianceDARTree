@@ -519,6 +519,22 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", BAND).pi("n", N).pi("width", WIDTH).pi("dilation", DIL).ps("dtype", "f32");
         hs.push_back(std::move(c));
 
+        /* The same over verify trees (spec_parent): the first sequence forks at the root, the
+         * second is a chain, so ancestors and the committed window both feed the taps. */
+        Hand ct("M = 64 over 5 rows, verify trees of 3 and 2", "ple_conv", 1e-5);
+        ct.dense(RAD_F32, { T, N }, hfill(44))
+          .dense(RAD_F32, { N, WIDTH }, hfill(45, 0.5f))
+          .dense(RAD_F32, { 2, N, SL }, hfill(46), true)
+          .idx({ 0, 3, 5 })
+          .dense(RAD_F32, { T, N }, hfill(47))
+          .idx({ 1, 0 })
+          .idx({ 7, 9 })
+          .idx({ 2, 3 })
+          .dense(RAD_F32, { T, N }, hfill(48), true)
+          .idx({ -1, 0, 0, -1, 0 })
+          .pi("M", BAND).pi("n", N).pi("width", WIDTH).pi("dilation", DIL).ps("dtype", "f32");
+        hs.push_back(std::move(ct));
+
         /* LFM2's form of the same window: width 3, undilated, no residual, no activation. */
         const int64_t CW = 3, CHIST = CW - 1, CSL = CHIST + 2;
         Hand k("M = 64 over 5 rows, verifies of 3 and 2", "causal_conv1d", 1e-5);
@@ -600,6 +616,22 @@ void shape_cases(std::vector<Hand>& hs) {
          .dense(RAD_I32, { T, 4 }, [](int64_t) { return -1.0f; }, true)
          .pi("M", BAND).pi("heads", 4).pi("ngram", 3).pi("eos", 5);
         hs.push_back(std::move(n));
+
+        Hand nt("M = 64 over 5 rows, verify trees of 3 and 2", "ngram_ids", 0.0);
+        nt.idx({ 11, 12, 13, 21, 22 })
+          .dense(RAD_I32, { 2, 2 + 2 }, [](int64_t i) { return (float)(100 + i); }, true)
+          .idx({ 0, 3, 5 })
+          .dense(RAD_I64, { 3 }, [](int64_t i) { return (float)(1000003 + 7919 * i); })
+          .dense(RAD_I64, { 4 }, [](int64_t i) { return (float)(97 + 2 * i); })
+          .dense(RAD_I64, { 4 }, [](int64_t i) { return (float)(1000 * i); })
+          .idx({ 1, 0 })
+          .idx({ 7, 9 })
+          .idx({ 2, 3 })
+          .dense(RAD_I32, { T, 4 }, [](int64_t) { return -1.0f; }, true)
+          .none()
+          .idx({ -1, 0, 0, -1, 0 })
+          .pi("M", BAND).pi("heads", 4).pi("ngram", 3).pi("eos", 5);
+        hs.push_back(std::move(nt));
     }
     /* GLM's two-copy speculative state, including a nonempty previous replay window. */
     for (const char* mode : { "prefill", "verify" })
@@ -1242,6 +1274,70 @@ void anchor_cases(std::vector<Hand>& hs) {
     hs.push_back(anchor_case(small, "16 x 16, 8 accepted tokens are refused", 7, 3,
                              { 8, 3, 2, 1 })
                      .refuses(RAD_E_SHAPE));
+}
+
+/* ================================================================== tree verification of the delta net
+ * `spec_parent` and `spec_path` on the three decode ops (docs/OPS.md, "Tree verification of the delta
+ * net"): libavx against libref over a branching tree in one sequence and a chain of -2 rows in the
+ * other, the previous block's committed rows gathered through a non-prefix path. */
+void tree_cases(std::vector<Hand>& hs) {
+    /* gdn_conv_update: two sequences of five rows over a window of width 4 (depth 7). Sequence 0's
+     * rows hang off row 0 and 1, sequence 1 is ordinary; num_accepted 3 and 2 read their history
+     * through the committed rows {0, 2, 4} and {0, 1}. */
+    {
+        const int64_t S = 2, QL = 5, HG = 2, H = 2, K = 16, V = 16, WID = 4;
+        const int64_t CD = 2 * HG * K + H * V, SL = WID - 2 + QL;
+        static const int32_t kPar[10] = { -1, 0, 1, 0, 3, -1, -2, -2, -2, -2 };
+        static const int32_t kPath[2][6] = { { 0, 2, 4, 0, 0, 0 }, { 0, 1, 0, 0, 0, 0 } };
+        Hand h("tree: parents and a non-prefix path", "gdn_conv_update", 2e-5);
+        h.dense(RAD_F32, { S * QL, CD }, hfill(214))
+         .dense(RAD_F32, { CD, WID }, hfill(215, 0.5f))
+         .none()
+         .dense(RAD_F32, { 3, CD, SL }, hfill(216), true)
+         .idx({ 2, 0 })
+         .idx({ 3, 2 })
+         .idx({ 0, QL, 2 * QL })
+         .dense(RAD_F32, { S * QL, HG, K }, hfill(217), true)
+         .dense(RAD_F32, { S * QL, HG, K }, hfill(218), true)
+         .dense(RAD_F32, { S * QL, H, V }, hfill(219), true)
+         .dense(RAD_I32, { S * QL }, [](int64_t i) { return (float)kPar[i]; })
+         .dense(RAD_I32, { S, 6 }, [](int64_t i) { return (float)kPath[i / 6][i % 6]; })
+         .pi("q_len", QL).pi("head_k", K).pi("head_v", V).pi("conv_width", WID)
+         .pi("max_query_len", QL);
+        hs.push_back(std::move(h));
+    }
+    /* gdn_recurrent_update, anchor form at 16 x 16 (7 rows' factors): a tree of seven rows with
+     * two non-leaf children of the anchor and a leaf, an ordinary chain beside it, and a replay of
+     * the previous block's rows {0, 4, 6} and {0, 2}. */
+    {
+        const int64_t H = 2, N = 2, SLOTS = 12, K = 16, V = 16, T = 10;
+        static const int32_t kIdx[2][6] = { { 0, 1, 2, 3, 4, 5 }, { 6, 6, 6, 7, 7, 7 } };
+        static const int32_t kPar[10] = { -1, 0, 1, 1, 0, 4, 4, -1, -2, -2 };
+        static const int32_t kPath[2][8] = { { 0, 4, 6, 0, 0, 0, 0, 0 }, { 0, 2, 0, 0, 0, 0, 0, 0 } };
+        Hand h("tree: two non-leaf children of the anchor, replay by path", "gdn_recurrent_update",
+               2e-5);
+        h.dense(RAD_F32, { T, 1, K }, hfill(221))
+         .dense(RAD_F32, { T, 1, K }, hfill(222))
+         .dense(RAD_F32, { T, H, V }, hfill(223))
+         .dense(RAD_F32, { T, H }, hfill(224))
+         .dense(RAD_F32, { T, H }, hfill(225))
+         .dense(RAD_F32, { H }, [](int64_t i) { return -1.5f + 0.5f * (float)i; })
+         .dense(RAD_F32, { H }, [](int64_t i) { return -0.75f + 0.25f * (float)i; })
+         .dense(RAD_F32, { SLOTS, H, V, K }, hfill(226, 0.1f), true)
+         .dense(RAD_I32, { N, 6 }, [](int64_t i) { return (float)kIdx[i / 6][i % 6]; })
+         .idx({ 3, 2 })
+         .idx({ 0, 7, 10 })
+         .dense(RAD_F32, { T, H, V }, hfill(227))
+         .dense(RAD_F32, { V }, [](int64_t i) { return 1.0f + 0.01f * (float)(i % 7); })
+         .dense(RAD_F32, { T, H, V }, [](int64_t) { return 0.0f; }, true)
+         .none().none()
+         .dense(RAD_I32, { T }, [](int64_t i) { return (float)kPar[i]; })
+         .dense(RAD_I32, { N, 8 }, [](int64_t i) { return (float)kPath[i / 8][i % 8]; })
+         .pi("q_len", 7).pi("head_k", K).pi("head_v", V).pi("n_head_v", H)
+         .pf("scale", 0.125).pf("eps", 1e-6).pf("l2_eps", 1e-6).pf("softplus_thr", 20.0)
+         .ps("act", "silu").ps("state_form", "anchor");
+        hs.push_back(std::move(h));
+    }
 }
 
 /* The anchor form's contract, on the library alone: with an f32 state the replay repeats the
@@ -3220,6 +3316,98 @@ void qsa_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
+    /* ---- tree verify (docs/QSA.md, "Tree verify") ------------------------------------------
+     * The tree forms of qsa_work (heal, scratch items, region tables), qsa_tail_store,
+     * qsa_tail_compact and qsa_select, libavx against libref on hand-built trees. */
+    {
+        /* Sequence 0 (rows 0..5) is a tree at base 10: positions 10 11 11 12 13 12, so rows 1 and 2
+         * complete block 2 and the anchor completes nothing; na 4 heals block 1 (position 7).
+         * Sequence 1 (rows 6..8) is ordinary at positions 20..22 with na 2: heal block 4. */
+        const int64_t n = 32, ratio = 4, ring = 7, S = 2, T = 9, slots = 3, mw = 6, RW = 4;
+        Hand h("a tree sequence's scratch items and region tables, the heal of a tree and of an "
+               "ordinary sequence", "qsa_work", 0.0);
+        h.view(RAD_BF16, { T, n }, { 5 * n, 1 }, T * 5 * n, hfill(230))
+         .idx({ 10, 11, 11, 12, 13, 12, 20, 21, 22 })
+         .idx({ 0, 6, 9 })
+         .dense(RAD_BF16, { slots, 1, ring, n }, hfill(231))
+         .dense(RAD_I32, { S, 2 }, [](int64_t i) {
+             static const float v[4] = { 1, 0, 2, 0 };
+             return v[i];
+         })
+         .dense(RAD_I32, { S, 8 }, [](int64_t i) { return (float)(100 + 3 * i); })
+         .none()
+         .dense(RAD_BF16, { mw * ratio, n }, sent, true)
+         .dense(RAD_I32, { mw }, sent, true)
+         .dense(RAD_I32, { mw }, sent, true)
+         .dense(RAD_I32, { S }, sent, true)
+         .idx({ -1, 0, 0, 1, 3, 2, -2, -2, -2 })
+         .idx({ 4, 2 })
+         .dense(RAD_BF16, { T * ratio, n }, sent, true)
+         .dense(RAD_I32, { T }, sent, true)
+         .dense(RAD_I32, { T }, sent, true)
+         .dense(RAD_I32, { T, RW }, sent, true)
+         .dense(RAD_I32, { T }, sent, true)
+         .dense(RAD_I32, { T + 1 }, sent, true)
+         .pi("M", T).pi("n", n).pi("ratio", ratio).pi("ring", ring).pi("seqs", S).pi("work", mw)
+         .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Rows of a tree sequence go to flat ring rows (10 + j) % 7; the ordinary sequence stores
+         * by position. */
+        const int64_t n = 32, ratio = 4, ring = 7, S = 2, T = 9, slots = 3;
+        Hand h("a tree sequence's rows at their flat ring rows", "qsa_tail_store", 0.0);
+        h.view(RAD_BF16, { T, n }, { 5 * n, 1 }, T * 5 * n, hfill(232))
+         .idx({ 10, 11, 11, 12, 13, 12, 20, 21, 22 })
+         .idx({ 0, 6, 9 })
+         .dense(RAD_BF16, { slots, 1, ring, n }, hfill(233), true)
+         .dense(RAD_I32, { S, 1 }, [](int64_t i) { return i == 0 ? 2.0f : 0.0f; })
+         .idx({ -1, 0, 0, 1, 3, 2, -2, -2, -2 })
+         .pi("M", T).pi("n", n).pi("ratio", ratio).pi("ring", ring).pi("seqs", S)
+         .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Previous anchor at 12 - 4 = 8 (sequence 0, slot 2), path 0 2 3 5: rows (8 + 2) % 7 -> 9 % 7,
+         * (8 + 3) % 7 -> 10 % 7, (8 + 5) % 7 -> 11 % 7 ascending in place. Sequence 1 commits one
+         * token, sequence 2 has no slot. */
+        const int64_t n = 32, ring = 7, slots = 3, S = 3;
+        Hand h("the accepted path moved to depth order, one-token and slot-less sequences untouched",
+               "qsa_tail_compact", 0.0);
+        h.idx({ 12, 30, 50 })
+         .idx({ 0, 1, 2, 3 })
+         .idx({ 4, 1, 3 })
+         .dense(RAD_I32, { S, 5 }, [](int64_t i) {
+             static const float v[15] = { 0, 2, 3, 5, 0,   0, 1, 2, 3, 4,   0, 1, 2, 3, 4 };
+             return v[i];
+         })
+         .dense(RAD_BF16, { slots, 1, ring, n }, hfill(234), true)
+         .dense(RAD_I32, { S, 1 }, [](int64_t i) { return i == 0 ? 2.0f : i == 1 ? 0.0f : -1.0f; })
+         .pi("M", S).pi("n", n).pi("ring", ring).pi("seqs", S).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        /* One tree at base 22 (b0 5, ratio 4): rows 1 and 2 complete block 5, so rows 1..5 rank six
+         * blocks (five committed, one region) at topk 3; row 0 has none. The committed block 2 has no
+         * page. A second sequence is ordinary (parent -2) and selects as before. */
+        const int64_t W = 12, topk = 3, ratio = 4, RW = 4, M = 7, S = 2;
+        Hand h("a tree row's union ranking, committed pages and region mask, beside an ordinary row",
+               "qsa_select", 0.0);
+        h.dense(RAD_F32, { M, W }, [](int64_t i) { return (float)((i * 29 + 7) % 11) * 0.5f; })
+         .dense(RAD_I32, { S, W }, [](int64_t i) { return i % W == 2 && i / W == 0 ? -1.0f : (float)(40 + i); })
+         .idx({ 5, 6 })
+         .idx({ 22, 23, 23, 24, 25, 24, 31 })
+         .idx({ 0, 6, 7 })
+         .dense(RAD_I32, { M, topk + 1 }, sent, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .idx({ -1, 0, 0, 1, 3, 2, -2 })
+         .dense(RAD_F32, { M, RW }, [](int64_t i) { return (float)((i * 13 + 3) % 7) * 0.5f; })
+         .bytes(RAD_I64, { M }, { 1 }, M, std::vector<uint8_t>((size_t)M * 8, 0x5A), true)
+         .pi("M", M).pi("blocks", W).pi("topk", topk).pi("ratio", ratio).pi("seqs", S);
+        hs.push_back(std::move(h));
+    }
+
     /* ---- dflash_conv --------------------------------------------------------------------- */
     {
         /* Groups of 24 take the broadcast path at 8 lanes and the expanded one at 16. */
@@ -4918,6 +5106,7 @@ bool hand_cases(const Check& ck) {
     shape_cases(hs);
     format_cases(hs);
     anchor_cases(hs);
+    tree_cases(hs);
     packed_cases(hs);
     gen_cases(hs);
     video_cases(hs);

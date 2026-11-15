@@ -599,6 +599,172 @@ Fix as_signed(Fix f, float shift, bool flip = false) {
     return f;
 }
 
+/* ---- tree verify (docs/QSA.md, "Tree verify"): the tree launch of r4d_rad_qsa_select against a port of
+ * libref's tree rows. One tree sequence (a random tree of `R` rows over a history of `b0` committed
+ * blocks) beside an ordinary decode sequence and a prefill-shaped one with parent -2 rows, so a
+ * launch mixes the three; scores on a coarse grid so ties decide, a dead committed page, a region
+ * that the committed blocks outrank or that outranks them. Every output (sel, nsel, seqused, vmask)
+ * is compared byte for byte, the padding and a row past M included. */
+struct TreeFix {
+    std::string name;
+    int topk = 3, ratio = 4, nb = 0, RW = 8, M = 0;
+    std::vector<float> sc, rs;             /* [M][nb], [M][RW] */
+    std::vector<int32_t> bt, nc, pos, cu, sp;
+};
+
+void ref_tree_select(const TreeFix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns,
+                     std::vector<int32_t>& su, std::vector<int64_t>& vm) {
+    const int64_t topk = f.topk, ratio = f.ratio, nb = f.nb, W = topk + 1;
+    const int S = (int)f.cu.size() - 1;
+    se.assign((size_t)f.M * W, 0); ns.assign((size_t)f.M, 0); su.assign((size_t)f.M, 0); vm.assign((size_t)f.M, 0);
+    for (int64_t m = 0; m < f.M; ++m) {
+        int s = 0;
+        for (int i = 0; i < S; ++i) if (m >= f.cu[i] && m < f.cu[i + 1]) s = i;
+        const int64_t p = f.pos[m], t0 = f.cu[s];
+        const bool tree = f.sp[t0] == -1;
+        const int64_t base = f.pos[t0], b0 = base / ratio, ntot = (p + 1) / ratio;
+        const int64_t nC = tree ? b0 : std::min<int64_t>(std::min<int64_t>(f.nc[s], nb), ntot);
+        const int64_t n = tree ? ntot : nC;
+        std::vector<float> val((size_t)n);
+        std::vector<int64_t> live;
+        for (int64_t u = 0; u < n; ++u) {
+            float v;
+            if (u < nC) {
+                v = f.sc[(size_t)(m * nb + u)];
+                if (f.bt[(size_t)(s * nb + u)] < 0) continue;
+            } else {
+                v = f.rs[(size_t)(m * f.RW + (u - nC))];
+            }
+            if (!(v > -1e30f)) continue;
+            val[(size_t)u] = v > 0.0f ? v : 0.0f;
+            live.push_back(u);
+        }
+        std::vector<int64_t> take;
+        if ((int64_t)live.size() <= topk) {
+            take = live;
+        } else {
+            std::vector<float> ord;
+            for (int64_t u : live) ord.push_back(val[(size_t)u]);
+            std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
+            const float thr = ord[(size_t)(topk - 1)];
+            for (int64_t u : live) if (val[(size_t)u] > thr) take.push_back(u);
+            for (int64_t u : live) if ((int64_t)take.size() < topk && val[(size_t)u] == thr) take.push_back(u);
+        }
+        int32_t* row = &se[(size_t)(m * W)];
+        std::vector<char> taken((size_t)n, 0);
+        int64_t out = 0;
+        for (int64_t u : take) { taken[(size_t)u] = 1; if (u < nC) row[out++] = f.bt[(size_t)(s * nb + u)]; }
+        if (!tree && n < nb && (p + 1) % ratio != 0) {
+            const int32_t part = f.bt[(size_t)(s * nb + n)];
+            if (part >= 0) row[out++] = part;
+        }
+        for (int64_t i = out; i <= topk; ++i) row[i] = -1;
+        ns[(size_t)m] = (int32_t)out;
+        if (!tree) { su[(size_t)m] = (int32_t)(out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1); continue; }
+        su[(size_t)m] = (int32_t)(out * ratio);
+        const int64_t rb = b0 * ratio;
+        auto vis = [&](int64_t c) { return c >= ntot || taken[(size_t)c] != 0; };
+        uint64_t bits = 0;
+        for (int64_t q = rb; q < base; ++q) if (vis(q / ratio)) bits |= 1ull << (q - rb);
+        for (int64_t y = m; y >= 0; y = f.sp[y] < 0 ? -1 : t0 + f.sp[y]) {
+            if (vis(f.pos[y] / ratio)) bits |= 1ull << (base - rb + (y - t0));
+        }
+        vm[(size_t)m] = (int64_t)bits;
+    }
+}
+
+TreeFix fix_tree(int it, bool coarse) {
+    TreeFix f;
+    f.name = "tree " + std::to_string(it);
+    f.ratio = 4; f.topk = 2 + it % 5; f.nb = 40 + it % 3 * 150;
+    const int R = 3 + (int)(rnd() % 11), base = 30 + (int)(rnd() % 40);
+    /* sequence 0: the tree; 1: a one-row decode (parent -2); 2: three prefill-shaped rows (-2). */
+    f.M = R + 1 + 3;
+    f.cu = { 0, R, R + 1, R + 4 };
+    f.nc.assign(3, 0); f.pos.assign((size_t)f.M, 0); f.sp.assign((size_t)f.M, -2);
+    std::vector<int> depth((size_t)R, 0);
+    f.sp[0] = -1; f.pos[0] = base;
+    for (int j = 1; j < R; ++j) {
+        int par;
+        do par = (int)(rnd() % (uint64_t)j); while (depth[(size_t)par] >= 6);
+        f.sp[(size_t)j] = par; depth[(size_t)j] = depth[(size_t)par] + 1; f.pos[(size_t)j] = base + depth[(size_t)j];
+    }
+    f.nc[0] = base / 4;
+    const int d1 = 60 + (int)(rnd() % 30), p2 = 70 + (int)(rnd() % 20);
+    f.pos[(size_t)R] = d1; f.nc[1] = (d1 + 1) / 4;
+    for (int i = 0; i < 3; ++i) f.pos[(size_t)(R + 1 + i)] = p2 + i;
+    f.nc[2] = (p2 + 3) / 4;
+    f.bt.assign((size_t)3 * f.nb, -1);
+    for (int s = 0; s < 3; ++s)
+        for (int b = 0; b < f.nb; ++b) f.bt[(size_t)(s * f.nb + b)] = (b * 7 + s * 3) % 5000 + 1;
+    f.bt[(size_t)(0 * f.nb + 2)] = -1;                  /* a dead committed page */
+    f.sc.assign((size_t)f.M * f.nb, -INFINITY);
+    f.rs.assign((size_t)f.M * f.RW, -INFINITY);
+    for (int m = 0; m < f.M; ++m) {
+        for (int b = 0; b < f.nb; ++b)
+            f.sc[(size_t)(m * f.nb + b)] = coarse ? (float)(rnd() % 6) * 0.5f : (float)(rnd() % 100000) * 1e-3f;
+        for (int i = 0; i < f.RW; ++i)
+            f.rs[(size_t)(m * f.RW + i)] = coarse ? (float)(rnd() % 6) * 0.5f : (float)(rnd() % 100000) * 1e-3f;
+    }
+    return f;
+}
+
+int run_tree(const TreeFix& f) {
+    std::vector<int32_t> want, want_n, want_su;
+    std::vector<int64_t> want_vm;
+    ref_tree_select(f, want, want_n, want_su, want_vm);
+    const int M = f.M, W = f.topk + 1, S = (int)f.cu.size() - 1;
+    std::vector<int32_t> se((size_t)(M + 1) * W, kSentinel), ns((size_t)M + 1, kSentinel), su((size_t)M + 1, kSentinel);
+    std::vector<int64_t> vm((size_t)M + 1, (int64_t)0x5555555555555555ll);
+    std::vector<float> sc = f.sc, rs = f.rs;
+    std::vector<int32_t> bt = f.bt, nc = f.nc, pos = f.pos, cu = f.cu, sp = f.sp;
+    RadTensor t[11] = {
+        tens(sc.data(), RAD_F32, {M, f.nb}),  tens(bt.data(), RAD_I32, {S, f.nb}),
+        tens(nc.data(), RAD_I32, {S}),        tens(pos.data(), RAD_I32, {M}),
+        tens(cu.data(), RAD_I32, {S + 1}),    tens(se.data(), RAD_I32, {M, W}),
+        tens(ns.data(), RAD_I32, {M}),        tens(su.data(), RAD_I32, {M}),
+        tens(sp.data(), RAD_I32, {M}),        tens(rs.data(), RAD_F32, {M, f.RW}),
+        tens(vm.data(), RAD_I64, {M}),
+    };
+    RadParam p[5]{};
+    p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb}; p[2] = {"topk", RAD_P_INT, f.topk};
+    p[3] = {"ratio", RAD_P_INT, f.ratio}; p[4] = {"seqs", RAD_P_INT, S};
+    RadArgs a{}; a.t = t; a.n_t = 11; a.p = p; a.n_p = 5;
+    const int rc = r4d_rad_qsa_select(&a, nullptr);
+    if (rc != RAD_OK) { std::printf("FAIL %-48s tree launch returned %d\n", f.name.c_str(), rc); return 1; }
+    const char* const kname = emu_last_kernel + (emu_last_kernel[0] == '(' ? 1 : 0);
+    if (std::string(kname, std::strcspn(kname, "<")) != "qsa_select_tree_kernel") {
+        std::printf("FAIL %-48s ran %s\n", f.name.c_str(), emu_last_kernel);
+        return 1;
+    }
+    int bad = 0;
+    for (int m = 0; m < M; ++m) {
+        bool ok = ns[(size_t)m] == want_n[(size_t)m] && su[(size_t)m] == want_su[(size_t)m] && vm[(size_t)m] == want_vm[(size_t)m];
+        for (int i = 0; i < W; ++i) ok = ok && se[(size_t)m * W + i] == want[(size_t)m * W + i];
+        if (ok) continue;
+        if (++bad <= 3)
+            std::printf("FAIL %-48s row %d: nsel %d want %d, seqused %d want %d, vmask %llx want %llx\n", f.name.c_str(), m,
+                        ns[(size_t)m], want_n[(size_t)m], su[(size_t)m], want_su[(size_t)m],
+                        (unsigned long long)vm[(size_t)m], (unsigned long long)want_vm[(size_t)m]);
+    }
+    /* Nothing past the rows is written. */
+    if (ns[(size_t)M] != kSentinel || su[(size_t)M] != kSentinel || vm[(size_t)M] != 0x5555555555555555ll) {
+        std::printf("FAIL %-48s wrote past M\n", f.name.c_str());
+        ++bad;
+    }
+    return bad ? 1 : 0;
+}
+
+int tree_cases(int* launches) {
+    int fails = 0;
+    for (int it = 0; it < 40; ++it) {
+        g_x = 0x9E3779B97F4A7C15ull * (uint64_t)(it + 1) + 1;
+        fails += run_tree(fix_tree(it, it % 2 == 0));
+        ++*launches;
+    }
+    return fails;
+}
+
 }  // namespace
 
 /* No argument: the fixtures above and the branch check. `sweep N`: N fix_random fixtures, about
@@ -626,6 +792,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 150; ++i) fixtures.push_back([i] { return as_signed(fix_sweep(i), 0.0f); });
     }
     int fails = 0, launches = 0;
+    fails += tree_cases(&launches);
     for (auto& make : fixtures) {
         Fix f = make();
         for (Form form : { kSingle, kWide, kAuto }) { fails += run(f, form); ++launches; }

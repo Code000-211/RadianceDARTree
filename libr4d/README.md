@@ -37,6 +37,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gdn_conv_update_w4_h128_bf16` / `..._f32wgt` | the same convolution for a decode step: a rolling speculative window over the conv state cache, writing q/k/v directly |
 | `gdn_recurrent_update_k128_v128_bf16_fp32state` | the decode-time recurrent delta-rule update against the paged fp32 state cache, gating and qk l2norm included |
 | `gdn_gated_rmsnorm_h128_bf16` | gated RMS norm over a 128-channel row, `out = rms(x) . w . act(z)` |
+| `kv_window_compact_any` | closes a rolling conv-layout window over the rows a tree verify committed (`spec_path`), one thread a (sequence, channel), any 1-8 byte element |
 | `ar_oneshot_2rank_exact` | one-shot push all-reduce over P2P, exactly 2 ranks, exact bf16/fp16/fp32 |
 | `ar_oneshot_2rank_wht6` | the same handshake with a Walsh-Hadamard-rotated 6-bit wire payload (lossy) |
 | `gemm_bf16_nt_m16` | the M ≤ 16 band (the MoE router gate), forwarded to `gemm_bf16_nt_m64`; no kernel of its own |

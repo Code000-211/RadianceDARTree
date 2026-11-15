@@ -23,7 +23,7 @@ static_assert(sizeof(AdvGroup) == 72, "AdvGroup's layout is part of the card's s
 /* Word offsets of every array the advance reads or writes. Up to kSeq rows, kTok tokens and
  * kGroups KV groups, each group with a kPitch-entry block table per row. */
 struct Slab {
-    static constexpr int kSeq = 8, kTok = 64, kPitch = 16, kGroups = 2;
+    static constexpr int kSeq = 8, kTok = 64, kPitch = 16, kGroups = 2, kPathPitch = 12;
     enum : int32_t {
         ROWS  = 0,                              /* [4][kSeq] row descriptors */
         TOK   = ROWS + 4 * kSeq,
@@ -41,7 +41,8 @@ struct Slab {
         BT    = USED + kGroups * kSeq,          /* [kGroups][kSeq][kPitch] */
         FIRST = BT + kGroups * kSeq * kPitch,   /* [kGroups][kSeq] */
         PAR   = FIRST + kGroups * kSeq,         /* [kTok] spec_parent, when a test stages trees */
-        END   = PAR + kTok
+        PATH  = PAR + kTok,                     /* [kSeq][kPathPitch] spec_path */
+        END   = PATH + kSeq * kPathPitch
     };
     alignas(16) int32_t w[END] = {};
     StepSlot st[kSeq];
@@ -682,6 +683,389 @@ TEST(a_block_drafter_step_on_the_card_continues_where_the_verify_left_off) {
         CHECK_EQ(n.w[Slab::CTX], 104);
         CHECK_EQ(n.w[Slab::ACC], 3);
     }
+}
+
+/* ================================================================== a serial head's tree */
+
+namespace {
+
+/* A serial tree's advance as the engine drives it: R rounds of a head whose proposal rows are
+ * [pick, runner-ups...] at pitch 8, leaves L, budget N. Row i's round-r proposal row is
+ * rows[r][i]. Returns the StepSlots after ADV_TAKE. */
+struct SerialRun {
+    static constexpr int kRounds = 3;
+    int32_t rows[kRounds + 1][2][8] = {};   /* [round][drafting row][column] */
+    StepSlot st[2];
+    void go(int rounds, int leaves, int nodes, int vocab, int n_rows = 2) {
+        for (int i = 0; i < 2; ++i) std::memset(&st[i], 0, sizeof st[i]);
+        for (int i = 0; i < n_rows; ++i) st[i].head = 100 + 10 * i;
+        for (int r = 2; r <= rounds; ++r) {
+            Slab s(ADV_ROUND);
+            s.a.round = r;
+            s.a.src_pitch = 8;
+            s.a.tree_nodes = nodes; s.a.leaves = leaves; s.a.vocab = vocab;
+            std::memcpy(s.st, st, sizeof st);
+            for (int i = 0; i < n_rows; ++i) {
+                s.row(i, true, i, 1, 0, i, i, i, 0);
+                std::memcpy(&s.src[i * 8], rows[r - 1][i], 8 * 4);
+            }
+            s.run();
+            std::memcpy(st, s.st, sizeof st);
+        }
+        Slab s(ADV_TAKE);
+        s.a.round = rounds;
+        s.a.src_pitch = 8;
+        s.a.tree_nodes = nodes; s.a.leaves = leaves; s.a.vocab = vocab;
+        std::memcpy(s.st, st, sizeof st);
+        for (int i = 0; i < n_rows; ++i) {
+            s.row(i, true, i, 1, 0, i, i, i, 0);
+            std::memcpy(&s.src[i * 8], rows[rounds][i], 8 * 4);
+        }
+        s.run();
+        std::memcpy(st, s.st, sizeof st);
+    }
+};
+
+}  /* namespace */
+
+/* Stage 1: the first round's runner-up columns become leaves hanging off the bonus token, behind
+ * the chain, before round 2's pass overwrites them. An id that is the pick, repeated, negative or
+ * past the vocabulary is no leaf; a short list is padded with the chain's first token so the
+ * node count is the budget's alone (the host planned the step issued ahead by it). */
+TEST(a_serial_tree_takes_the_first_rounds_runner_ups_as_leaves_behind_the_chain) {
+    SerialRun r;
+    /* round 1: pick 500, then 500 (the pick), 601, 601 (repeat), -1, 999999 (past the vocab), 602,
+     * 603; later rounds' candidates are not leaves. */
+    const int32_t c0[8] = { 500, 500, 601, 601, -1, 999999, 602, 603 };
+    std::memcpy(r.rows[1][0], c0, sizeof c0);
+    const int32_t c1[8] = { 510, 701, 702, 703, 704, 705, 706, 707 };
+    std::memcpy(r.rows[1][1], c1, sizeof c1);
+    for (int i = 0; i < 2; ++i) {
+        r.rows[2][i][0] = 520 + i;
+        r.rows[3][i][0] = 530 + i;
+    }
+    r.go(/*rounds=*/3, /*leaves=*/3, /*nodes=*/6, /*vocab=*/1000);
+    /* row 0: chain 500 520 530, leaves 601 602 603 (valid ones, in column order) */
+    const StepSlot& a = r.st[0];
+    CHECK_EQ(a.ntree, 6);
+    const int32_t at[7] = { 0, 500, 520, 530, 601, 602, 603 };
+    for (int j = 1; j <= 6; ++j) CHECK_EQ(a.tok[j], at[j]);
+    const int32_t ap[6] = { 0, 1, 2, 0, 0, 0 };      /* node j + 1's parent */
+    for (int j = 0; j < 6; ++j) CHECK_EQ(a.par[j], ap[j]);
+    /* row 1: leaves 701 702 703 */
+    const StepSlot& b = r.st[1];
+    CHECK_EQ(b.ntree, 6);
+    const int32_t bt[7] = { 0, 510, 521, 531, 701, 702, 703 };
+    for (int j = 1; j <= 6; ++j) CHECK_EQ(b.tok[j], bt[j]);
+}
+
+TEST(a_serial_tree_pads_a_short_leaf_list_with_the_chains_first_token_and_caps_at_the_budget) {
+    SerialRun r;
+    /* Only one valid runner-up, three leaves asked for: the other two repeat node 1's token. */
+    const int32_t c0[8] = { 500, 500, 601, -5, 1000, 500, -1, -1 };
+    std::memcpy(r.rows[1][0], c0, sizeof c0);
+    for (int i = 0; i < 2; ++i) { r.rows[2][i][0] = 520; r.rows[3][i][0] = 530; }
+    r.go(3, 3, 6, 1000, 1);
+    const StepSlot& a = r.st[0];
+    CHECK_EQ(a.ntree, 6);
+    CHECK_EQ(a.tok[4], 601);
+    CHECK_EQ(a.tok[5], 500);
+    CHECK_EQ(a.tok[6], 500);
+    for (int q = 3; q < 6; ++q) CHECK_EQ(a.par[q], 0);
+    /* A budget of 4 over 3 rounds holds one leaf only. */
+    SerialRun r2 = r;
+    r2.go(3, 3, 4, 1000, 1);
+    CHECK_EQ(r2.st[0].ntree, 4);
+    CHECK_EQ(r2.st[0].tok[4], 601);
+    /* A budget equal to the rounds is the chain, still a (chain-shaped) tree. */
+    SerialRun r3 = r;
+    r3.go(3, 3, 3, 1000, 1);
+    CHECK_EQ(r3.st[0].ntree, 3);
+    for (int j = 0; j < 3; ++j) CHECK_EQ(r3.st[0].par[j], j);
+}
+
+/* One round: ADV_TAKE has the candidates before anything overwrites them. */
+TEST(a_serial_tree_of_one_round_takes_its_leaves_in_the_take) {
+    SerialRun r;
+    const int32_t c0[8] = { 500, 601, 602, 500, 603, 604, 605, 606 };
+    std::memcpy(r.rows[1][0], c0, sizeof c0);
+    r.go(1, 2, 3, 1000, 1);
+    const StepSlot& a = r.st[0];
+    CHECK_EQ(a.ntree, 3);
+    CHECK_EQ(a.tok[1], 500);
+    CHECK_EQ(a.tok[2], 601);
+    CHECK_EQ(a.tok[3], 602);
+    CHECK_EQ(a.par[0], 0);
+    CHECK_EQ(a.par[1], 0);
+    CHECK_EQ(a.par[2], 0);
+}
+
+/* Without leaves (or the tree fields) a chain round and take behave as before: no capture, no
+ * parents written, ntree untouched. */
+TEST(a_chain_take_and_round_ignore_the_tree_fields_when_there_is_none) {
+    StepSlot keep{};
+    keep.ntree = 77; keep.nalt = 5; keep.par[0] = 9;
+    SerialRun r;
+    for (int i = 0; i < 2; ++i) { r.rows[1][i][0] = 11; r.rows[2][i][0] = 12; }
+    r.rows[1][0][1] = 13;
+    for (int i = 0; i < 2; ++i) r.st[i] = keep;
+    Slab s(ADV_ROUND);
+    s.a.round = 2; s.a.src_pitch = 8;
+    s.st[0] = keep;
+    s.row(0, true, 0, 1, 0, 0, 0, 0, 0);
+    std::memcpy(s.src, r.rows[1][0], 8 * 4);
+    s.run();
+    CHECK_EQ(s.st[0].ntree, 77);
+    CHECK_EQ(s.st[0].nalt, 5);
+    CHECK_EQ(s.st[0].par[0], 9);
+    CHECK_EQ(s.st[0].tok[1], 11);
+    Slab t(ADV_TAKE);
+    t.a.round = 2; t.a.src_pitch = 8;
+    t.st[0] = keep;
+    t.row(0, true, 0, 1, 0, 0, 0, 0, 0);
+    std::memcpy(t.src, r.rows[2][0], 8 * 4);
+    t.run();
+    CHECK_EQ(t.st[0].ntree, 77);
+    CHECK_EQ(t.st[0].tok[2], 12);
+}
+
+/* The verify of that tree on the card, then its acceptance and the next step's path plane. Row 0
+ * of a step with context 100: bonus 9, chain 500 520 530 (rows 1-3), leaves 601 602 603 (rows
+ * 4-6). A leaf accepted is a path of one node at row 5 whose K/V ADV_COMPACT moves to
+ * base + 1; the plane the next trunk step reads is [0, 5, identity...]. A chain-prefix path
+ * moves nothing and is the identity. */
+TEST(a_serial_tree_verifies_in_flat_slots_and_the_path_plane_follows_the_accepted_leaf) {
+    SerialRun r;
+    const int32_t c0[8] = { 500, 500, 601, 602, 603, 604, 605, 606 };
+    std::memcpy(r.rows[1][0], c0, sizeof c0);
+    r.rows[2][0][0] = 520; r.rows[3][0][0] = 530;
+    r.go(3, 3, 6, 1000, 1);
+    StepSlot st = r.st[0];
+    st.tok[0] = 9;
+    st.ctx = 100; st.n_acc = 1; st.npath = 0;
+    /* ADV_TRUNK: 7 rows */
+    Slab v(ADV_TRUNK);
+    v.a.parent_off = Slab::PAR * 4;
+    v.a.path_off = Slab::PATH * 4; v.a.path_pitch = Slab::kPathPitch;
+    v.st[0] = st;
+    v.row(0, true, 0, 7, 100, 0, 0, 0, 6);
+    v.run();
+    const int32_t depth[7] = { 0, 1, 2, 3, 1, 1, 1 };
+    const int32_t par[7] = { -1, 0, 1, 2, 0, 0, 0 };
+    for (int j = 0; j < 7; ++j) {
+        CHECK_EQ(v.w[Slab::TOK + j], j == 0 ? 9 : st.tok[j]);
+        CHECK_EQ(v.w[Slab::PAR + j], par[j]);
+        CHECK_EQ(v.w[Slab::POS + j], 100 + depth[j]);   /* rotates at its depth */
+        CHECK_EQ(v.slot(0, j), 100 + j);                /* stores at its row */
+    }
+    for (int t = 0; t < Slab::kPathPitch; ++t) CHECK_EQ(v.w[Slab::PATH + t], t);   /* identity */
+
+    /* The target picks leaf 602 after the bonus token: node 5 is accepted, its own pick is 777. */
+    Slab acc(ADV_ACCEPT);
+    acc.a.parent_off = Slab::PAR * 4;
+    for (int j = 0; j < Slab::kTok; ++j) acc.w[Slab::PAR + j] = v.w[Slab::PAR + j];
+    for (int j = 0; j < 7; ++j) acc.w[Slab::TOK + j] = v.w[Slab::TOK + j];
+    acc.st[0] = st;
+    acc.row(0, true, 0, 7, 100, 0, 0, 0, 6);
+    const int32_t y[7] = { 602, 1, 2, 3, 4, 777, 5 };
+    for (int j = 0; j < 7; ++j) acc.src[j] = y[j];
+    acc.run();
+    st = acc.st[0];
+    CHECK_EQ(st.acc, 1);
+    CHECK_EQ(st.npath, 1);
+    CHECK_EQ(st.path[0], 5);
+    CHECK_EQ(st.tok[0], 777);
+    CHECK_EQ(st.head, 101);
+    CHECK_EQ(st.hrow, 5);
+
+    /* ADV_COMPACT: node 5 at slot 105 moves to 101, and nothing else moves (a chain-prefix
+     * would not move at all). */
+    {
+        constexpr int kRow = 16;
+        alignas(16) char cache[256 * kRow];
+        for (int p = 0; p < 256; ++p) std::memset(cache + p * kRow, p, kRow);
+        Slab c(ADV_ACCEPT);
+        c.st[0] = st;
+        c.row(0, true, 0, 7, 100, 0, 0, 0, 6);
+        c.a.mode = 0;
+        c.a.n_pool = 1;
+        c.a.pool[0] = AdvPool{ cache, 0, 1, 1, kRow, 0 };
+        c.a.pool[0].grp = 0;
+        adv_compact(c.a, 0, 0, 0, 0, 0, 1);
+        for (int p = 0; p < 256; ++p) {
+            const int want = p == 101 ? 105 : p;
+            CHECK_EQ((int)(unsigned char)cache[p * kRow], want);
+        }
+        /* a chain-prefix path of 2 nodes: path {1, 2}: src == dst, nothing moves */
+        for (int p = 0; p < 256; ++p) std::memset(cache + p * kRow, p, kRow);
+        StepSlot pre = st;
+        pre.acc = 2; pre.npath = 2; pre.path[0] = 1; pre.path[1] = 2; pre.head = 102;
+        c.st[0] = pre;
+        adv_compact(c.a, 0, 0, 0, 0, 0, 1);
+        for (int p = 0; p < 256; ++p) CHECK_EQ((int)(unsigned char)cache[p * kRow], p);
+    }
+
+    /* The next trunk step: its path plane is the previous verify's committed rows. */
+    Slab nx(ADV_TRUNK);
+    nx.a.parent_off = Slab::PAR * 4;
+    nx.a.path_off = Slab::PATH * 4; nx.a.path_pitch = Slab::kPathPitch;
+    nx.st[0] = st;
+    nx.st[0].ntree = 0;       /* a chain step */
+    nx.row(0, true, 0, 3, 101, 0, 0, 0, 2);
+    nx.run();
+    CHECK_EQ(nx.w[Slab::PATH + 0], 0);
+    CHECK_EQ(nx.w[Slab::PATH + 1], 5);
+    for (int t = 2; t < Slab::kPathPitch; ++t) CHECK_EQ(nx.w[Slab::PATH + t], t);
+    CHECK_EQ(nx.w[Slab::ACC], 2);                         /* num_accepted = path length + 1 */
+}
+
+/* A path of several nodes, the plane a chain step writes and a row the card does not own. */
+TEST(the_path_plane_is_the_identity_for_a_chain_and_untouched_for_a_host_row) {
+    Slab s(ADV_TRUNK);
+    s.a.path_off = Slab::PATH * 4; s.a.path_pitch = Slab::kPathPitch;
+    for (int i = 0; i < Slab::kSeq * Slab::kPathPitch; ++i) s.w[Slab::PATH + i] = -7;
+    s.st[0].ctx = 50; s.st[0].n_acc = 4; s.st[0].npath = 0; s.st[0].ntree = 0;
+    s.st[1].ctx = 60; s.st[1].n_acc = 3; s.st[1].acc = 2; s.st[1].npath = 2;
+    s.st[1].path[0] = 2; s.st[1].path[1] = 5; s.st[1].ntree = 0;
+    s.row(0, true, 0, 2, 50, 0, 0, 0, 1);
+    s.row(1, true, 2, 2, 60, 1, 2, 2, 1);
+    s.row(2, false, 4, 2, 70, 2, 4, 4, 1);     /* a host row */
+    s.run();
+    for (int t = 0; t < Slab::kPathPitch; ++t) CHECK_EQ(s.w[Slab::PATH + t], t);
+    const int32_t want[4] = { 0, 2, 5, 3 };
+    for (int t = 0; t < 4; ++t) CHECK_EQ(s.w[Slab::PATH + Slab::kPathPitch + t], want[t]);
+    CHECK_EQ(s.w[Slab::PATH + Slab::kPathPitch + 5], 5);
+    CHECK_EQ(s.w[Slab::PATH + 2 * Slab::kPathPitch], -7);
+}
+
+/* ADV_HIST after a tree verify follows the accepted path: committed position t is node
+ * path[t - 1]'s, so its token is the target's pick at that node's row and its hidden row that
+ * node's, where a chain verify of the same committed tokens takes the first rows. Everything else
+ * (positions, slots, the last-committed repeat, the context's end) is the chain's, row for row. */
+TEST(a_history_pass_after_a_tree_verify_follows_the_accepted_path_like_a_sequential_chain) {
+    /* tree: bonus + 3 chain + 3 leaves; the leaf at row 5 is accepted, then 777 */
+    const int32_t y[7] = { 602, 1, 2, 3, 4, 777, 5 };
+    Slab tr(ADV_HIST);
+    tr.row(0, true, 0, 4, 0, 1, 0, 0, /*aux=*/0);
+    tr.w[Slab::OUT + 0] = 40;
+    tr.st[1].head = 101; tr.st[1].acc = 1; tr.st[1].npath = 1; tr.st[1].path[0] = 5;
+    for (int j = 0; j < 7; ++j) tr.src[j] = y[j];
+    tr.run();
+    /* the sequential decode of the committed path: one chain verify [bonus, 602] whose target
+     * picks are 602 then 777 */
+    Slab ch(ADV_HIST);
+    ch.row(0, true, 0, 4, 0, 1, 0, 0, 0);
+    ch.w[Slab::OUT + 0] = 40;
+    ch.st[1].head = 101; ch.st[1].acc = 1; ch.st[1].npath = 0;
+    ch.src[0] = 602; ch.src[1] = 777;
+    ch.run();
+    for (int j = 0; j < 4; ++j) {
+        CHECK_EQ(tr.w[Slab::TOK + j], ch.w[Slab::TOK + j]);
+        CHECK_EQ(tr.w[Slab::POS + j], ch.w[Slab::POS + j]);
+        CHECK_EQ(tr.slot(0, j), ch.slot(0, j));
+    }
+    CHECK_EQ(tr.w[Slab::CTX], ch.w[Slab::CTX]);
+    CHECK_EQ(tr.used(0, 0), ch.used(0, 0));
+    /* the hidden rows differ by the path: the anchor's row 0, then node 5's, repeated */
+    const int32_t rows_tree[4] = { 40, 45, 45, 45 }, rows_chain[4] = { 40, 41, 41, 41 };
+    for (int j = 0; j < 4; ++j) {
+        CHECK_EQ(tr.w[Slab::OUT + j], rows_tree[j]);
+        CHECK_EQ(ch.w[Slab::OUT + j], rows_chain[j]);
+    }
+    /* A deeper path with host-known rows first (aux 2): path {1, 4}: nodes 0, 1, 4. */
+    Slab dp(ADV_HIST);
+    dp.row(0, true, 0, 5, 0, 1, 0, 8, /*aux=*/2);
+    dp.w[Slab::OUT + 0] = 20;
+    dp.w[Slab::TOK + 0] = 41; dp.w[Slab::TOK + 1] = 42;
+    dp.st[1].head = 110; dp.st[1].acc = 2; dp.st[1].npath = 2;
+    dp.st[1].path[0] = 1; dp.st[1].path[1] = 4;
+    for (int j = 0; j < 7; ++j) dp.src[8 + j] = 9000 + j;
+    dp.run();
+    /* base = 110 - 2 - 2 = 106; j: 0,1 host; 2 -> node 0; 3 -> node 1; 4 -> node 4 */
+    const int32_t tok[5] = { 41, 42, 9000, 9001, 9004 };
+    const int32_t row[5] = { 20, 21, 22, 23, 26 };
+    for (int j = 0; j < 5; ++j) {
+        CHECK_EQ(dp.w[Slab::TOK + j], tok[j]);
+        CHECK_EQ(dp.w[Slab::POS + j], 106 + j);
+        CHECK_EQ(dp.w[Slab::OUT + j], row[j]);
+    }
+}
+
+/* ADV_ROUND_TREE with one frontier row is ADV_ROUND to the bit: the token, the position, the
+ * context, the length and the slot, round after round. */
+TEST(a_tree_round_of_width_one_is_a_chain_round) {
+    for (int r = 2; r <= 5; ++r) {
+        Slab c(ADV_ROUND), t(ADV_ROUND_TREE);
+        for (Slab* s : { &c, &t }) {
+            s->a.round = r; s->a.src_pitch = 4;
+            s->a.tree_nodes = 8; s->a.width = 1;
+            s->st[0].head = 200; s->st[0].tok[0] = 3;
+            s->st[0].ntree = 0;
+            s->row(0, true, 0, 1, 0, 0, 0, 0, 0);
+            s->src[0] = 4000 + r;
+        }
+        int32_t par[4] = { 0, 0, 0, 0 };
+        t.a.par = par;
+        /* the chain's earlier rounds left r - 2 nodes in a line */
+        t.st[0].ntree = r - 2;
+        for (int j = 0; j < r - 2; ++j) t.st[0].par[j] = j;
+        par[0] = r - 2;            /* the new node hangs off the last one */
+        c.run();
+        t.run();
+        CHECK_EQ(t.w[Slab::TOK], c.w[Slab::TOK]);
+        CHECK_EQ(t.w[Slab::POS], c.w[Slab::POS]);
+        CHECK_EQ(t.w[Slab::CTX], c.w[Slab::CTX]);
+        CHECK_EQ(t.used(0, 0), c.used(0, 0));
+        CHECK_EQ(t.slot(0, 0), c.slot(0, 0));
+    }
+}
+
+/* Width 3: the pass's children become nodes numbered on from the last round's, each embedded at
+ * the head + its depth, stored at the flat slot head + its node, the keys ending past the last of
+ * them; a row beyond the list is inert; the node budget stops the list. */
+TEST(a_tree_round_stages_its_frontier_rows_by_depth_and_flat_slot) {
+    Slab s(ADV_ROUND_TREE);
+    s.a.round = 3; s.a.src_pitch = 4;
+    s.a.tree_nodes = 5; s.a.width = 3;
+    int32_t par[4] = { 1, 2, 1, 0 };
+    s.a.par = par;
+    s.a.parent_off = Slab::PAR * 4;
+    for (int j = 0; j < Slab::kTok; ++j) s.w[Slab::PAR + j] = -2;
+    /* the previous round made nodes 1 (under 0) and 2 (under 0): depth 1 each */
+    StepSlot& S = s.st[0];
+    S.head = 100; S.ntree = 2; S.par[0] = 0; S.par[1] = 0; S.tok[1] = 11; S.tok[2] = 12;
+    s.row(0, true, 0, 3, 0, 0, 0, 0, 0);
+    s.src[0] = 21; s.src[1] = 22; s.src[2] = 23; s.src[3] = -1;
+    s.run();
+    /* new nodes 3 (par 1), 4 (par 2), 5 (par 1) -- the budget of 5 takes all three */
+    CHECK_EQ(S.ntree, 5);
+    CHECK_EQ(S.tok[3], 21); CHECK_EQ(S.tok[4], 22); CHECK_EQ(S.tok[5], 23);
+    CHECK_EQ(S.par[2], 1); CHECK_EQ(S.par[3], 2); CHECK_EQ(S.par[4], 1);
+    for (int w = 0; w < 3; ++w) {
+        CHECK_EQ(s.w[Slab::TOK + w], 21 + w);
+        CHECK_EQ(s.w[Slab::POS + w], 102);               /* head + depth 2 */
+        CHECK_EQ(s.slot(0, w), 100 + 3 + w);             /* head + node */
+        CHECK_EQ(s.w[Slab::PAR + w], par[w]);
+    }
+    CHECK_EQ(s.w[Slab::CTX], 103);
+    CHECK_EQ(s.used(0, 0), 106);                         /* keys through node 5's slot */
+    /* the budget cuts a longer list; a short one leaves inert rows */
+    Slab u(ADV_ROUND_TREE);
+    u.a.round = 4; u.a.src_pitch = 4; u.a.tree_nodes = 5; u.a.width = 3;
+    int32_t par2[4] = { 3, 0, 0, 0 };
+    u.a.par = par2;
+    u.a.parent_off = Slab::PAR * 4;
+    u.st[0] = S;
+    u.st[0].ntree = 4;
+    u.row(0, true, 0, 3, 0, 0, 0, 0, 0);
+    u.src[0] = 31; u.src[1] = 32; u.src[2] = 33;
+    u.run();
+    CHECK_EQ(u.st[0].ntree, 5);                          /* one fit */
+    CHECK_EQ(u.w[Slab::TOK], 31);
+    CHECK_EQ(u.w[Slab::POS], 100 + 3);                   /* node 3 is at depth 2: node 5 at 3 */
+    CHECK_EQ(u.w[Slab::TOK + 1], 0);
+    CHECK_EQ(u.slot(0, 1), -1);
+    CHECK_EQ(u.w[Slab::PAR + 1], -2);
 }
 
 RAD_TEST_MAIN()

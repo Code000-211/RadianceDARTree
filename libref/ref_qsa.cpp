@@ -48,6 +48,39 @@ bool rows_dense(const RadTensor* t) {
     return true;
 }
 
+
+/* ---------------------------------------------------------------- tree verify (DARTree)
+ *
+ * A sequence whose first row has `spec_parent` -1 is a tree verify: row j of its block is node j,
+ * its parent is row cu[s] + spec_parent (parents precede children), and `pos` holds DEPTH positions
+ * (base + depth, siblings share one) while the raw key of node j is stored at the FLAT ring slot
+ * (base + j) % ring. Any other sequence (-2, or no `spec_parent` at all) is the ordinary causal
+ * case. docs/QSA.md, "Tree verify", has the whole contract. */
+bool tree_seq(const RadTensor* sp, const RadTensor* cu, int64_t s) {
+    if (!sp) return false;
+    const int64_t t0 = cu_at(cu, s);
+    return cu_at(cu, s + 1) > t0 && ldi(sp, offlin(sp, t0)) == -1;
+}
+
+/* A tree sequence's rows are a tree of depth positions: the anchor first, every other parent
+ * before its child, a child one position past its parent. */
+int tree_check(const RadTensor* sp, const RadTensor* po, const RadTensor* cu, int64_t s) {
+    const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+    if (numel(sp) < t1) return RAD_E_SHAPE;
+    for (int64_t j = 1; j < t1 - t0; ++j) {
+        const int64_t par = ldi(sp, offlin(sp, t0 + j));
+        if (par < 0 || par >= j) return RAD_E_INVAL;
+        if (ldi(po, offlin(po, t0 + j)) != ldi(po, offlin(po, t0 + par)) + 1) return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
+/* Parent row (absolute) of tree row `y` of the sequence starting at `t0`, -1 for the anchor. */
+int64_t tree_parent(const RadTensor* sp, int64_t t0, int64_t y) {
+    const int64_t par = ldi(sp, offlin(sp, y));
+    return par < 0 ? -1 : t0 + par;
+}
+
 }  /* namespace */
 
 /* ------------------------------------------------------------------ qsa_score */
@@ -108,11 +141,28 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
  * order until topk are taken. The partial page bt[n] follows when (pos + 1) % ratio != 0 and
  * n < width, and -1 pads the row to topk + 1. nsel counts the entries, seqused is
  * (nsel - 1) * ratio + pos % ratio + 1 (0 for an empty table). A row no sequence holds reads
- * sequence 0, as libr4d's does. */
+ * sequence 0, as libr4d's does.
+ *
+ * TREE ROWS. With `spec_parent`, `rscore` and `vmask` a row of a tree sequence (first row's
+ * spec_parent -1) selects over the union of the committed blocks [0, b0), b0 = nc[seq] =
+ * pos[cu[seq]] / ratio, scored in `score`/`bt` as above, and the blocks b0 .. (pos + 1) / ratio - 1
+ * the row's own path completes, scored in rscore[m][b - b0] (qsa_work builds the per-row tables
+ * and a second qsa_score fills the plane). The top-k rule is the one above over that union in
+ * block order (committed blocks precede region blocks, so the tie rule is unchanged).
+ *   sel     the committed pages taken, in take order (above-threshold blocks in block order, then
+ *           the ties), -1 padded; no partial page: the keys of a region block, taken or not, and
+ *           the partial block are not pages of the attention's table.
+ *   nsel    their count; seqused = nsel * ratio (every page full), 0 for none.
+ *   vmask   bit k set iff the attention row may read the key at flat slot rb + k, rb = b0 * ratio:
+ *           the keys of the committed tokens rb .. base - 1 and of the row's ancestors-or-self at
+ *           slot base + j (node j), each when its block is the row's partial block (not complete
+ *           on the row's path) or was taken.
+ * A row of a non-tree sequence is selected as above and gets vmask 0. */
 int ref_qsa_select(const RadArgs* a, RadStream) {
     if (!have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    const RadTensor *sp = t_in(a, 8), *rs = t_in(a, 9), *vm = t_in(a, 10);
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
     const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
@@ -128,6 +178,24 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
         if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
     for (int64_t m = 0; m < M; ++m)
         if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    /* The three tree operands go together. */
+    if ((sp != nullptr) != (rs != nullptr) || (sp != nullptr) != (vm != nullptr)) return RAD_E_INVAL;
+    if (sp) {
+        if (rs->rank != 2 || rs->shape[0] < M || numel(vm) < M || numel(sp) < M) return RAD_E_SHAPE;
+        /* Everything a tree row's walk reads, checked before any write. */
+        for (int64_t s = 0; s < n_seq; ++s) {
+            if (!tree_seq(sp, cu, s)) continue;
+            const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+            if (t1 > M) return RAD_E_SHAPE;
+            RAD_REF_TRY(tree_check(sp, po, cu, s));
+            const int64_t base = ldi(po, offlin(po, t0)), b0 = base / ratio;
+            if (ldi(nc, offlin(nc, s)) != b0 || b0 > nb) return RAD_E_INVAL;
+            /* A key at flat slot base + j must land inside the 64-bit mask. */
+            if (base - b0 * ratio + (t1 - t0 - 1) > 63) return RAD_E_SHAPE;
+            for (int64_t m = t0; m < t1; ++m)
+                if ((ldi(po, offlin(po, m)) + 1) / ratio - b0 > rs->shape[1]) return RAD_E_SHAPE;
+        }
+    }
     const int64_t s_rs = sc->stride[0], s_cs = sc->stride[1];
     const int64_t bt_rs = bt->stride[0], bt_cs = bt->stride[1];
     const int64_t o_rs = se->stride[0], o_cs = se->stride[1];
@@ -135,6 +203,66 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     for (int64_t m = 0; m < M; ++m) {
         const int64_t s = seq_holding(cu, n_seq, m, 0);
         const int64_t p = ldi(po, offlin(po, m));
+        const bool tree = sp && seq_holding(cu, n_seq, m, -1) >= 0 && tree_seq(sp, cu, s);
+        if (tree) {
+            /* Candidates u in [0, ntot): committed below b0, the row's own region blocks above. */
+            const int64_t t0 = cu_at(cu, s), base = ldi(po, offlin(po, t0));
+            const int64_t b0 = base / ratio, ntot = (p + 1) / ratio;
+            std::vector<float> val((size_t)ntot);
+            std::vector<int64_t> live;
+            for (int64_t u = 0; u < ntot; ++u) {
+                float v;
+                if (u < b0) {
+                    v = ldt(sc, m * s_rs + u * s_cs);
+                    if (ldi(bt, s * bt_rs + u * bt_cs) < 0) continue;
+                } else {
+                    v = ldt(rs, m * rs->stride[0] + (u - b0) * rs->stride[1]);
+                }
+                if (sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+                val[(size_t)u] = sgn ? v : v > 0.0f ? v : 0.0f;
+                live.push_back(u);
+            }
+            std::vector<int64_t> take;
+            if ((int64_t)live.size() <= topk) {
+                take = live;
+            } else {
+                std::vector<float> ord;
+                for (int64_t u : live) ord.push_back(val[(size_t)u]);
+                std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(),
+                                 std::greater<float>());
+                const float thr = ord[(size_t)(topk - 1)];
+                for (int64_t u : live)
+                    if (val[(size_t)u] > thr) take.push_back(u);
+                for (int64_t u : live)
+                    if ((int64_t)take.size() < topk && val[(size_t)u] == thr) take.push_back(u);
+            }
+            std::vector<char> taken((size_t)ntot, 0);
+            int64_t out = 0;
+            for (int64_t u : take) {
+                taken[(size_t)u] = 1;
+                if (u < b0)
+                    st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs,
+                           ldi(bt, s * bt_rs + u * bt_cs));
+            }
+            for (int64_t i = out; i <= topk; ++i)
+                st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);
+            st_int(ns->dtype, ns->data, offlin(ns, m), out);
+            st_int(su->dtype, su->data, offlin(su, m), out * ratio);
+            /* The region's keys: committed tokens of the base block, then the path. A key is
+             * visible when its block is not complete on this row's path (the partial block) or
+             * the selection took it. */
+            const int64_t rb = b0 * ratio;
+            auto vis = [&](int64_t c) { return c >= ntot || taken[(size_t)c] != 0; };
+            uint64_t bits = 0;
+            for (int64_t q = rb; q < base; ++q)
+                if (vis(q / ratio)) bits |= 1ull << (q - rb);
+            for (int64_t y = m; y >= 0; y = tree_parent(sp, t0, y)) {
+                const int64_t c = ldi(po, offlin(po, y)) / ratio;
+                if (vis(c)) bits |= 1ull << (base - rb + (y - t0));
+            }
+            st_int(vm->dtype, vm->data, offlin(vm, m), (int64_t)bits);
+            continue;
+        }
         const int64_t n = std::min(std::min(ldi(nc, offlin(nc, s)), nb), (p + 1) / ratio);
         std::vector<float> val((size_t)n);
         std::vector<int64_t> live;
@@ -168,6 +296,7 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
         for (int64_t i = out; i <= topk; ++i) st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);
         st_int(ns->dtype, ns->data, offlin(ns, m), out);
         st_int(su->dtype, su->data, offlin(su, m), out == 0 ? 0 : (out - 1) * ratio + p % ratio + 1);
+        if (vm) st_int(vm->dtype, vm->data, offlin(vm, m), 0);
     }
     return RAD_OK;
 }
@@ -175,34 +304,89 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ qsa_tail_store */
 /* state[sidx[s][0]][0][pos[t] % ring] = k[t] for the last `ring` rows of each sequence, rows in
  * ascending order (a row whose slot is -1, or that no sequence holds, writes nothing). Every other
- * row of `state` keeps its contents. */
+ * row of `state` keeps its contents.
+ *
+ * With `spec_parent`, a row of a tree sequence is stored at its FLAT slot: row j of the block (node
+ * j) goes to (pos[cu[s]] + j) % ring, not at its depth position, since siblings share a depth.
+ * qsa_tail_compact moves the accepted path to the depth layout at the start of the next step. The
+ * block is at most `ring` rows, so every slot has one writer. */
 int ref_qsa_tail_store(const RadArgs* a, RadStream) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *po = &a->t[1], *cu = &a->t[2], *st = &a->t[3];
-    const RadTensor *sx = &a->t[4];
+    const RadTensor *sx = &a->t[4], *sp = t_in(a, 5);
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
     if (k->rank != 2 || st->rank != 4 || st->shape[1] != 1) return RAD_E_SHAPE;
     const int64_t T = k->shape[0], slots = st->shape[0], n_seq = numel(cu) - 1;
     if (T <= 0 || k->shape[1] != n || st->shape[2] < ring || st->shape[3] != n) return RAD_E_SHAPE;
     if (n_seq <= 0 || numel(po) < T) return RAD_E_SHAPE;
+    if (sp && numel(sp) < T) return RAD_E_SHAPE;
     if ((sx->rank >= 2 ? sx->shape[0] : numel(sx)) < n_seq) return RAD_E_SHAPE;
     /* The rows that write, validated before any write. */
-    std::vector<std::pair<int64_t, int64_t>> w;     /* (row, slot) */
+    struct W { int64_t row, slot, ring_row; };
+    std::vector<W> w;
     for (int64_t t = 0; t < T; ++t) {
         const int64_t s = seq_holding(cu, n_seq, t, -1);
         if (s < 0 || t < cu_at(cu, s + 1) - ring) continue;
         const int64_t si = ldi(sx, col0(sx, s));
         if (si < 0) continue;
-        if (si >= slots || ldi(po, offlin(po, t)) < 0) return RAD_E_INVAL;
-        w.push_back({ t, si });
+        const int64_t p = tree_seq(sp, cu, s) ? ldi(po, offlin(po, cu_at(cu, s))) + (t - cu_at(cu, s))
+                                              : ldi(po, offlin(po, t));
+        if (si >= slots || p < 0) return RAD_E_INVAL;
+        w.push_back({ t, si, p % ring });
     }
-    for (const auto& [t, si] : w) {
-        const int64_t row = ldi(po, offlin(po, t)) % ring;
-        const int64_t db = si * st->stride[0] + row * st->stride[2];
+    for (const auto& e : w) {
+        const int64_t db = e.slot * st->stride[0] + e.ring_row * st->stride[2];
         for (int64_t d = 0; d < n; ++d)
-            stt(st, db + d * st->stride[3], ldt(k, t * k->stride[0] + d * k->stride[1]));
+            stt(st, db + d * st->stride[3], ldt(k, e.row * k->stride[0] + d * k->stride[1]));
     }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_tail_compact */
+/* Puts the previous tree verify's accepted path where a sequential decode would have left it. A
+ * tree verify stored node j at flat ring row (base_prev + j) % ring (qsa_tail_store); the sequence
+ * committed the anchor and nodes path[1 .. na-1] (path[0] = 0), which belong at depth positions
+ * base_prev + t. With na = num_accepted[s] and base_prev = pos[cu[s]] - na (this step's anchor is
+ * the token after the last committed one), for t = 1 .. na-1 ascending:
+ *
+ *     state[slot][0][(base_prev + t) % ring] = state[slot][0][(base_prev + path[t]) % ring]
+ *
+ * in place: path[t] >= t and the ring is wider than any node index, so a destination is never a
+ * later source. An identity path is a no-op, a sequence with na < 2, no slot, no rows or a
+ * negative base_prev is skipped, and the op is NOT idempotent for a general path: it runs once
+ * per step, before qsa_work and qsa_tail_store. `path` is spec_path, [seqs, pitch]. */
+int ref_qsa_tail_compact(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *po = &a->t[0], *cu = &a->t[1], *na = &a->t[2], *pa = &a->t[3];
+    const RadTensor *st = &a->t[4], *sx = &a->t[5];
+    const int64_t n = p_int(a, "n", 0), ring = p_int(a, "ring", 0);
+    if (n <= 0 || ring <= 0) return RAD_E_INVAL;
+    if (pa->rank != 2 || st->rank != 4 || st->shape[1] != 1) return RAD_E_SHAPE;
+    const int64_t slots = st->shape[0], n_seq = numel(cu) - 1;
+    if (n_seq <= 0 || st->shape[2] < ring || st->shape[3] != n) return RAD_E_SHAPE;
+    if (numel(na) < n_seq || pa->shape[0] < n_seq) return RAD_E_SHAPE;
+    if ((sx->rank >= 2 ? sx->shape[0] : numel(sx)) < n_seq) return RAD_E_SHAPE;
+    struct Mv { int64_t slot, from, to; };
+    std::vector<Mv> mv;
+    for (int64_t s = 0; s < n_seq; ++s) {
+        const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+        const int64_t acc = ldi(na, offlin(na, s)), si = ldi(sx, col0(sx, s));
+        if (t1 <= t0 || acc < 2 || si < 0) continue;
+        if (si >= slots || t0 < 0 || t0 >= numel(po)) return RAD_E_INVAL;
+        const int64_t bp = ldi(po, offlin(po, t0)) - acc;
+        if (bp < 0) continue;
+        if (acc > pa->shape[1]) return RAD_E_SHAPE;
+        for (int64_t t = 1; t < acc; ++t) {
+            const int64_t pt = ldi(pa, s * pa->stride[0] + t * pa->stride[1]);
+            if (pt < t || pt >= ring) return RAD_E_INVAL;
+            if (pt != t) mv.push_back({ si, (bp + pt) % ring, (bp + t) % ring });
+        }
+    }
+    for (const auto& e : mv)
+        for (int64_t d = 0; d < n; ++d)
+            stt(st, e.slot * st->stride[0] + e.to * st->stride[2] + d * st->stride[3],
+                ldt(st, e.slot * st->stride[0] + e.from * st->stride[2] + d * st->stride[3]));
     return RAD_OK;
 }
 
@@ -214,12 +398,39 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
  * one its position plus the shift rope[0][cu[s]] - p0), and, when the slot exists, the block's
  * `ratio` raw keys in stage rows w * ratio + i: key q from the batch row cu[s] + q - p0 when q >= p0,
  * else from tail row q % ring. Items past the count get page -1 and position 0 and leave `stage`
- * alone. nc[s] = (last position + 1) / ratio, 0 for an empty sequence. */
+ * alone. nc[s] = (last position + 1) / ratio, 0 for an empty sequence.
+ *
+ * HEAL. With `num_accepted`, a sequence that committed na >= 2 tokens last step (anchor + na - 1
+ * accepted nodes at positions p0 - na .. p0 - 1, p0 = this step's anchor position) also owes the
+ * blocks whose last token is one of the na - 1 non-anchor committed positions: a tree verify never
+ * writes those (below). They are rebuilt from the tail ring, which qsa_tail_compact has already
+ * put in depth order, ahead of the sequence's own blocks, so a heal item is an ordinary item with
+ * all its keys from the tail. Exact and idempotent. The anchor of the previous step completed its
+ * own block then, so a prefill chunk or a plain decode (na = 1 or absent) heals nothing.
+ *
+ * TREE. With `spec_parent` a sequence whose first row has parent -1 is a tree verify:
+ *   - its batch rows complete no committed block except the anchor's: the sequence is treated as
+ *     the anchor row alone (a speculative node's block may never be committed), and nc[s] =
+ *     p0 / ratio, the committed blocks strictly below the one holding the anchor;
+ *   - every row x whose own position completes a block ((pos[x] + 1) % ratio == 0) gets a SCRATCH
+ *     item at index x: its `ratio` keys come from x and its ancestors (a key at position q >= p0
+ *     is the ancestor at that position, an older one is tail row q % ring), spage[x] = x (the row
+ *     of the scratch key buffer qsa_block_key writes), sbpos[x] its first token's position; other
+ *     rows get spage -1. The scratch items are launched as `M` more workgroups after the `work`
+ *     ones, one launch with the heal and anchor items;
+ *   - rtab[x][i] is the scratch row of the key of block b0 + i for the row's own path
+ *     (b0 = p0 / ratio, i < (pos[x] + 1) / ratio - b0), else -1, rnc[x] that count, and
+ *     rcu[w] = w: with the scratch keys as `bk` these make a second qsa_score (each row its own
+ *     one-row sequence) score every region block of every row, with the committed score kernel's
+ *     arithmetic. Under `rope` (M-RoPE planes) a tree is refused.
+ * The six outputs go together and with `spec_parent`; `num_accepted` is independent of it. */
 int ref_qsa_work(const RadArgs* a, RadStream) {
     if (a->n_t < 11) return RAD_E_INVAL;
     const RadTensor *k = t_in(a, 0), *po = t_in(a, 1), *cu = t_in(a, 2), *tl = t_in(a, 3);
     const RadTensor *sx = t_in(a, 4), *bt = t_in(a, 5), *rp = t_in(a, 6), *stg = t_in(a, 7);
     const RadTensor *pg = t_in(a, 8), *bp = t_in(a, 9), *nc = t_in(a, 10);
+    const RadTensor *sp = t_in(a, 11), *na = t_in(a, 12), *sst = t_in(a, 13), *spg = t_in(a, 14);
+    const RadTensor *sbp = t_in(a, 15), *rtb = t_in(a, 16), *rnc = t_in(a, 17), *rcu = t_in(a, 18);
     if (!k || !po || !cu || !tl || !sx || !bt || !stg || !pg || !bp || !nc) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
@@ -243,6 +454,18 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     }
     if (rp && (rp->rank != 2 || rp->shape[0] < 3 || rp->shape[1] < T)) return RAD_E_SHAPE;
+    if (na && numel(na) < n_seq) return RAD_E_SHAPE;
+    const bool scr = sp != nullptr;
+    if (scr != (sst && spg && sbp && rtb && rnc && rcu) ||
+        (!scr && (sst || spg || sbp || rtb || rnc || rcu)))
+        return RAD_E_INVAL;
+    if (scr) {
+        if (rp) return RAD_E_UNSUPPORTED;
+        if (numel(sp) < T || sst->rank != 2 || sst->shape[0] < T * ratio || sst->shape[1] != n ||
+            numel(spg) < T || numel(sbp) < T || rtb->rank != 2 || rtb->shape[0] < T ||
+            numel(rnc) < T || numel(rcu) < T + 1)
+            return RAD_E_SHAPE;
+    }
     for (int64_t t = 0; t < T; ++t)
         if (ldi(po, offlin(po, t)) < 0) return RAD_E_INVAL;
 
@@ -253,8 +476,16 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
         const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
         if (t1 <= t0) continue;
         if (t0 < 0 || t1 > T) return RAD_E_SHAPE;
-        const int64_t p0 = ldi(po, offlin(po, t0)), p1 = ldi(po, offlin(po, t1 - 1));
-        for (int64_t b = p0 / ratio; b <= (p1 + 1) / ratio - 1; ++b) {
+        const bool tree = tree_seq(sp, cu, s);
+        if (tree) RAD_REF_TRY(tree_check(sp, po, cu, s));
+        const int64_t p0 = ldi(po, offlin(po, t0));
+        const int64_t p1 = tree ? p0 : ldi(po, offlin(po, t1 - 1));
+        int64_t lo = p0 / ratio;
+        if (na && ldi(na, offlin(na, s)) >= 2) {
+            const int64_t x = p0 - ldi(na, offlin(na, s)) - ratio + 2;
+            lo = std::min(lo, x <= 0 ? (int64_t)0 : (x + ratio - 1) / ratio);
+        }
+        for (int64_t b = lo; b <= (p1 + 1) / ratio - 1; ++b) {
             if ((int64_t)items.size() >= mw) break;
             if (b >= bt->shape[1]) return RAD_E_SHAPE;
             const int64_t si = ldi(sx, col0(sx, s));
@@ -265,12 +496,22 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
             }
             items.push_back({ s, b });
         }
+        if (tree) {
+            const int64_t b0 = p0 / ratio;
+            for (int64_t x = t0; x < t1; ++x) {
+                const int64_t nr = (ldi(po, offlin(po, x)) + 1) / ratio - b0;
+                if (nr > rtb->shape[1]) return RAD_E_SHAPE;
+            }
+            if (ldi(sx, col0(sx, s)) >= slots) return RAD_E_INVAL;
+        }
     }
 
     for (int64_t s = 0; s < n_seq; ++s) {
         const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
         st_int(nc->dtype, nc->data, offlin(nc, s),
-               t1 > t0 ? (ldi(po, offlin(po, t1 - 1)) + 1) / ratio : 0);
+               t1 <= t0 ? 0
+               : tree_seq(sp, cu, s) ? ldi(po, offlin(po, t0)) / ratio
+                                     : (ldi(po, offlin(po, t1 - 1)) + 1) / ratio);
     }
     const int ncomp = rp ? 3 : 1;
     auto bpos_at = [&](int64_t w, int c) { return bp->rank == 2 ? w * bstep + c : offlin(bp, w); };
@@ -305,6 +546,49 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
             const int64_t db = (w * ratio + i) * stg->stride[0];
             for (int64_t d = 0; d < n; ++d)
                 stt(stg, db + d * stg->stride[1], ldt(src, sb + d * sc));
+        }
+    }
+    if (!scr) return RAD_OK;
+
+    /* The scratch items and the region tables, one per row. */
+    for (int64_t x = 0; x <= T; ++x) st_int(rcu->dtype, rcu->data, offlin(rcu, x), x);
+    for (int64_t x = 0; x < T; ++x) {
+        st_int(spg->dtype, spg->data, offlin(spg, x), -1);
+        st_int(sbp->dtype, sbp->data, offlin(sbp, x), 0);
+        st_int(rnc->dtype, rnc->data, offlin(rnc, x), 0);
+        for (int64_t i = 0; i < rtb->shape[1]; ++i)
+            st_int(rtb->dtype, rtb->data, x * rtb->stride[0] + i * rtb->stride[1], -1);
+    }
+    for (int64_t s = 0; s < n_seq; ++s) {
+        if (!tree_seq(sp, cu, s)) continue;
+        const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+        const int64_t p0 = ldi(po, offlin(po, t0)), si = ldi(sx, col0(sx, s)), b0 = p0 / ratio;
+        for (int64_t x = t0; x < t1; ++x) {
+            const int64_t px = ldi(po, offlin(po, x));
+            /* The ancestor of x at position q (x is its own at px). */
+            auto anc = [&](int64_t q) {
+                int64_t y = x;
+                while (ldi(po, offlin(po, y)) > q) y = tree_parent(sp, t0, y);
+                return y;
+            };
+            const int64_t nr = (px + 1) / ratio - b0;
+            st_int(rnc->dtype, rnc->data, offlin(rnc, x), nr);
+            for (int64_t i = 0; i < nr; ++i)
+                st_int(rtb->dtype, rtb->data, x * rtb->stride[0] + i * rtb->stride[1],
+                       anc((b0 + i) * ratio + ratio - 1));
+            if ((px + 1) % ratio != 0 || si < 0) continue;
+            st_int(spg->dtype, spg->data, offlin(spg, x), x);
+            st_int(sbp->dtype, sbp->data, offlin(sbp, x), px - ratio + 1);
+            for (int64_t i = 0; i < ratio; ++i) {
+                const int64_t q = px - ratio + 1 + i;
+                const int64_t db = (x * ratio + i) * sst->stride[0];
+                const RadTensor* src = q >= p0 ? k : tl;
+                const int64_t sb = q >= p0 ? anc(q) * k->stride[0]
+                                           : si * tl->stride[0] + (q % ring) * tl->stride[2];
+                const int64_t sc = q >= p0 ? k->stride[1] : tl->stride[3];
+                for (int64_t d = 0; d < n; ++d)
+                    stt(sst, db + d * sst->stride[1], ldt(src, sb + d * sc));
+            }
         }
     }
     return RAD_OK;

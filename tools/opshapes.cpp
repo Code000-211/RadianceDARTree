@@ -365,6 +365,8 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
             add(D, {S * M, Hk, hk});                   /* q */
             add(D, {S * M, Hk, hk});                   /* k */
             add(D, {S * M, Hv, hv});                   /* v */
+            skip_opd();                                /* spec_parent -- tree verify, the chain */
+            skip_opd();                                /* spec_path */
         }
         else if (op == "gdn_recurrent_update") {
             add(D, {S * M, Hk, hk});                   /* q */
@@ -383,6 +385,8 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
             add(D, {S * M, Hv, hv});                   /* o */
             skip_opd();                                /* o_q -- the folded fp8 quantiser */
             skip_opd();                                /* o_scale */
+            skip_opd();                                /* spec_parent */
+            skip_opd();                                /* spec_path */
         }
         else return RAD_E_UNSUPPORTED;
     }

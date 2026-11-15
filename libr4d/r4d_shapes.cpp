@@ -1107,6 +1107,42 @@ extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int o
     R4D_PICK(l);
 }
 
+/* attn_paged_tree_sel -- libref's description (ref_shapes.cpp): `sel_pitch` page slots a row of
+ * which two are used, and a region of the sequence's first page with only bit 0 (the row's own key)
+ * set. The gated forms' operands follow the gate, codes and scales; no description for them. */
+extern "C" int r4d_shape_attn_paged_tree_sel(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M   = pi(p, n_p, "q_len");
+    const int64_t hd  = pi(p, n_p, "head_dim");
+    const int64_t gqa = pi(p, n_p, "gqa");
+    const int64_t bs  = pi(p, n_p, "block_size");
+    const int64_t nh  = pi(p, n_p, "n_head");
+    const int64_t sp  = pi(p, n_p, "sel_pitch");
+    if (M <= 0 || hd <= 0 || gqa <= 0 || bs <= 0 || nh <= 0 || nh % gqa || sp <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t kvh = nh / gqa;
+    int64_t ctx = pi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t nblk = (ctx + bs - 1) / bs;
+    const uint32_t Q  = dt_act(p, n_p, "q_dtype");
+    const uint32_t KV = dt_act(p, n_p, "kv_dtype");
+    RadOpdDesc vm = opd_idx(M, 0, 0, 1);
+    vm.dtype = (uint32_t)RAD_I64;
+    const RadOpdDesc l[] = {
+        opd(Q, M, nh, hd),
+        opd(KV, nblk, kvh, bs, 2 * hd),
+        opd_idx(M, sp, nblk),
+        opd_idx(M, 0, 0, sp < 2 ? sp : 2),
+        opd_none(), opd_none(), opd_none(),
+        opd(Q, M, nh, hd),
+        vm,
+        opd_idx(1, nblk, nblk),
+        opd_idx(1, 0, 0, 0),
+        opd_none(),
+    };
+    R4D_PICK(l);
+}
+
 /* qk_norm_rope_gate -- the gated-attention QKV preamble (shim in r4d_qk_norm_rope_gate.hip).
  *
  * Not docs/OPS.md's `qk_norm_rope`: it splits a [q|gate] projection per head, writes q, k and the
@@ -1933,6 +1969,10 @@ extern "C" int r4d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOp
         opd((uint32_t)RAD_I32, W),
         opd((uint32_t)RAD_I32, W),
         opd((uint32_t)RAD_I32, s),
+        /* spec_parent, num_accepted, sstage, spage, sbpos, rtab, rnc, rcu: a described call is
+         * the ordinary one; the tree forms are built by hand (r4d_selftest, tests/ref_test.cpp). */
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_none(),
     };
     R4D_PICK(l);
 }
@@ -1956,6 +1996,29 @@ extern "C" int r4d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand,
                                         * synthesised case tests the scan, not the copy */
         opd(D, s, 1, g, n),            /* the tail state: [slots, heads, ring, n], heads 1 */
         opd_idx(s, 1, s),              /* the state row; one column, values inside the pool */
+        opd_none(),                    /* spec_parent */
+    };
+    R4D_PICK(l);
+}
+
+/* The tree compaction. A description cannot draw a per-sequence path, so num_accepted is the
+ * constant 1 (a decode after a prefill): every sequence is skipped and the call is the no-op. */
+extern "C" int r4d_shape_qsa_tail_compact(const RadParam* p, int n_p, int operand,
+                                          RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "ring", 4);
+    const int64_t s = pi(p, n_p, "seqs", 1);
+    if (n <= 0 || g <= 0 || s <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd_idx(M, 1, M * g),
+        opd_idx(s + 1, 1, M + 1),
+        opd_idx(s, 1, 2),              /* num_accepted: 1 .. 1 */
+        opd_idx(s, 2, 2),              /* spec_path */
+        opd(D, s, 1, g, n),
+        opd_idx(s, 1, s),
     };
     R4D_PICK(l);
 }
@@ -1980,6 +2043,7 @@ extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, Rad
         opd((uint32_t)RAD_I32, M, k + 1),
         opd((uint32_t)RAD_I32, M),
         opd((uint32_t)RAD_I32, M),
+        opd_none(), opd_none(), opd_none(),   /* spec_parent, rscore, vmask */
     };
     R4D_PICK(l);
 }

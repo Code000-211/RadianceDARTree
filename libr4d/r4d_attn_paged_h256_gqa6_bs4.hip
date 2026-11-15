@@ -19,5 +19,7 @@
 // the pages at 4 (RadKVGroupDecl takes the block size from the resolved kernel). A row saying 16
 // here would refuse at issue rather than at declare.
 #define G8_BLOCK_SIZE 4
+// attn_paged_tree_sel entry points (r4d_attn_paged_gqa8.hip): QSA attention at a tree verify.
+#define G8_TSEL 1
 
 #include "r4d_attn_paged_gqa8.hip"

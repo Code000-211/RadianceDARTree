@@ -1170,6 +1170,87 @@ TEST(a_tree_drafter_takes_a_short_block) {
     CHECK_EQ(b7.program().drafter_short_block, 8);
 }
 
+/* A SERIAL drafter may declare a tree (RadDrafterDecl::tree_nodes): its rounds are at most the
+ * node count, which is max_spec (the verify's rows, which the plugin sized its buffers by), its
+ * leaves and width fit in it, leaves need a proposal row that holds them and a head that grows
+ * the tree itself a row that holds the nodes. rad_drafter_tree then needs no parents buffer for the
+ * core's own leaves (stage 1) and one for a head's tree. A BLOCK drafter or a chain declares none
+ * of it. */
+TEST(a_serial_drafter_declares_a_tree_of_nodes_over_its_rounds) {
+    Registry reg;
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 8;
+    auto ctx = [](int max_spec) { RadBuildCtx c = make_ctx(); c.max_spec = max_spec; return c; };
+    {   /* stage 1: 3 rounds, 6 nodes, 3 leaves at pitch 8; max_spec is the nodes */
+        Builder b(reg, make_meta(), ctx(6));
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd); d.proposal_pitch = 8;
+        d.tree_nodes = 6; d.tree_leaves = 3; d.tree_width = 1;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(b.program().drafter.tree_nodes, 6);
+        CHECK_EQ(b.program().drafter.tree_leaves, 3);
+        CHECK(!b.program().drafter_tree);
+        CHECK_OK(rad_drafter_tree(&b, 0));           /* the core's own leaves: no parents */
+        CHECK(b.program().drafter_tree);
+        CHECK_EQ((int)b.program().drafter_parents, 0);
+    }
+    {   /* the node budget is max_spec, whatever the rounds */
+        Builder b(reg, make_meta(), ctx(7));
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3; d.tree_nodes = 6;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+    }
+    {   /* more rounds than nodes */
+        Builder b(reg, make_meta(), ctx(6));
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 7; d.tree_nodes = 6;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+    }
+    {   /* leaves with no proposal row to read them from, or one too short */
+        Builder b(reg, make_meta(), ctx(6));
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3; d.tree_nodes = 6; d.tree_leaves = 3;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+        d.proposal = rad_decl_buffer(&b, "prop", &bd); d.proposal_pitch = 3;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+        d.proposal_pitch = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+    }
+    {   /* leaves are runner-up columns of the top 8 */
+        Builder b(reg, make_meta(), ctx(12));
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3; d.tree_nodes = 12;
+        d.tree_leaves = 8;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd); d.proposal_pitch = 9;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+    }
+    {   /* a head that grows the tree needs a parents buffer and a row of nodes */
+        Builder b(reg, make_meta(), ctx(6));
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3; d.tree_nodes = 6; d.tree_width = 3;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd); d.proposal_pitch = 8;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_tree(&b, 0), RAD_E_INVAL);
+        const rad_buf par = rad_decl_buffer(&b, "par", &bd);
+        CHECK_OK(rad_drafter_tree(&b, par));
+        CHECK_EQ(b.program().drafter_parents, par);
+    }
+    {   /* a chain declares no tree: rad_drafter_tree is refused, and so is a block drafter's tree
+         * fields */
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 3;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_tree(&b, 0), RAD_E_STATE);
+        Builder b2(reg, make_meta(), make_ctx());
+        RadDrafterDecl e{};
+        e.kind = RAD_DRAFT_BLOCK; e.name = "df"; e.depth = 4; e.mask_token = 5; e.tree_leaves = 1;
+        e.proposal = rad_decl_buffer(&b2, "prop", &bd); e.proposal_pitch = 4;
+        CHECK_EQ(rad_declare_drafter(&b2, &e), RAD_E_INVAL);
+    }
+}
+
 /* The routing table (rad_route_table) is an i32 persistent device buffer, named once: the core
  * reads its rows between passes, where a transient's bytes may be another buffer's. */
 TEST(a_routing_table_is_a_persistent_i32_buffer) {

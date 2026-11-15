@@ -41,6 +41,13 @@ enum { kNgMaxShift = 8, kNgThreads = 256 };
 
 /* One workgroup per (token tile, sequence), with the window write-back in the same launch.
  *
+ * TREE (`spar`, RadBatch::spec_parent, docs/OPS.md): the rows are the nodes of a verify tree and
+ * the shifted tokens are the row's ANCESTORS' (libref/ref_ngram.cpp), the walk running on past the
+ * root into the window. A node of any depth in any tile may then read the window, and tile 0
+ * writes it, so a tree launch has ONE tile per sequence and its threads stride over the rows: the
+ * single block's reads all precede its barrier. The window is written in row layout (token t at
+ * entry ctx - 1 + t), which kv_window_compact then compacts along the accepted path.
+ *
  * `s` is blockIdx.y. The fold is legal because only a token with `t - bos < ctx` reads past its
  * sequence's first row into the window, and those are the first `ctx` tokens, all in tile 0. So
  * tile 0's block is the only reader of state[slot]; its threads are ordered by __syncthreads(), and
@@ -55,7 +62,8 @@ enum { kNgMaxShift = 8, kNgThreads = 256 };
     const int32_t* __restrict__ sidx, const int32_t* __restrict__ hini,                         \
     const int32_t* __restrict__ nacc, int32_t* __restrict__ ids, uint32_t heads,                \
     uint32_t ngram, uint32_t per, uint32_t W, long long eos, uint32_t ids_ld,                   \
-    int32_t* __restrict__ ahead, uint32_t n_ahead, uint32_t ahead_ld
+    int32_t* __restrict__ ahead, uint32_t n_ahead, uint32_t ahead_ld,                           \
+    const int32_t* __restrict__ spar
 __device__ __forceinline__ void ngram_ids_body(NGRAM_IDS_PARAMS) {
 
     const uint32_t s   = blockIdx.y;
@@ -71,13 +79,15 @@ __device__ __forceinline__ void ngram_ids_body(NGRAM_IDS_PARAMS) {
     const uint32_t slen = eot - bos;
     const bool warm = !hini || hini[s] != 0;
     const long long o = nacc ? (long long)nacc[s] - 1 : 0;
-    const uint32_t lt = blockIdx.x * kNgThreads + threadIdx.x;   /* this thread's row, in-sequence */
 
     /* The following prompt continues the last sequence: its tokens sit in `tok` after the step's,
      * so a row past the sequence's end hashes exactly as it will when the next step runs it, and
      * lands in `ahead` instead of `ids`. The window below is the step's own and never sees them. */
     const uint32_t reach = slen + ((ahead && s + 1u == gridDim.y) ? n_ahead : 0u);
-    if (lt < reach) {
+    /* This thread's rows, in-sequence: one at a time, by tile; a tree launch has one tile and the
+     * stride covers the rest. */
+    for (uint32_t lt = blockIdx.x * kNgThreads + threadIdx.x; lt < reach;
+         lt += gridDim.x * kNgThreads) {
         const uint32_t t = bos + lt;
         /* The `ctx` committed ids before this sequence's first row. A cold slot's window is EOS,
          * not its stale contents and not zero (a real token id). */
@@ -93,6 +103,21 @@ __device__ __forceinline__ void ngram_ids_body(NGRAM_IDS_PARAMS) {
         bool cut = false;
         for (uint32_t k = 1; k < ngram; ++k) {
             if (cut || sh[k - 1] == eos) { cut = true; sh[k] = eos; continue; }
+            if (spar) {
+                /* The ancestor k levels up, or what is left of k past the root as a window
+                 * entry. A parent that does not precede its child (libref refuses it) ends the
+                 * walk at the window. */
+                uint32_t cur = lt, rem = k;
+                while (rem > 0) {
+                    const int32_t v = spar[bos + cur];
+                    const int32_t par = v == -2 ? (int32_t)cur - 1 : v;
+                    if (par < 0 || (uint32_t)par >= cur) break;
+                    cur = (uint32_t)par;
+                    --rem;
+                }
+                sh[k] = rem == 0 ? (long long)tok[bos + cur] : prev[ctx - rem];
+                continue;
+            }
             const uint32_t q = p - k;
             sh[k] = q < ctx ? prev[q] : (long long)tok[bos + (q - ctx)];
         }
@@ -153,7 +178,7 @@ template <class CH>
 __global__ __launch_bounds__(kNgThreads)
 void ngram_ids_kernel(NGRAM_IDS_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    ngram_ids_body(tok, state, cu, mult, vsz, off, sidx, hini, nacc, ids, heads, ngram, per, W, eos, ids_ld, ahead, n_ahead, ahead_ld);
+    ngram_ids_body(tok, state, cu, mult, vsz, off, sidx, hini, nacc, ids, heads, ngram, per, W, eos, ids_ld, ahead, n_ahead, ahead_ld, spar);
     if (CH::on) r4d_chain_done();
 }
 #undef NGRAM_IDS_PARAMS
@@ -255,7 +280,7 @@ void ngram_hint_kernel(NGRAM_HINT_PARAMS) {
 }  // namespace
 
 enum { NG_TOK = 0, NG_STATE, NG_CU, NG_MULT, NG_VSZ, NG_OFF, NG_CIDX, NG_HINIT, NG_NACC, NG_IDS,
-       NG_AHEAD };
+       NG_AHEAD, NG_SPAR };
 
 extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
     const RadTensor* tok  = r4d_opt(a, NG_TOK);
@@ -269,6 +294,7 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
     const RadTensor* nacc = r4d_opt(a, NG_NACC);
     const RadTensor* ids  = r4d_opt(a, NG_IDS);
     const RadTensor* ahd  = r4d_opt(a, NG_AHEAD);
+    const RadTensor* spar = r4d_opt(a, NG_SPAR);      /* a tree verify: spec_parent [rows] */
     if (!tok || !st || !cu || !mult || !vsz || !off || !ids) return R4D_NO(RAD_E_INVAL);
     if (tok->dtype != RAD_I32 || st->dtype != RAD_I32 || ids->dtype != RAD_I32)
         return R4D_NO(RAD_E_DTYPE);
@@ -276,6 +302,13 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
     if (mult->dtype != RAD_I64 || vsz->dtype != RAD_I64 || off->dtype != RAD_I64)
         return R4D_NO(RAD_E_DTYPE);
     if (!r4d_contig(tok) || !r4d_contig(st) || !r4d_contig(cu)) return R4D_NO(RAD_E_STRIDE);
+    /* A tree leaves the row-layout window kv_window_compact reads, so it is a decode step, and
+     * the prompt that follows continues a chain. */
+    if (spar) {
+        if (spar->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+        if (!r4d_contig(spar)) return R4D_NO(RAD_E_STRIDE);
+        if (!nacc || ahd) return R4D_NO(RAD_E_INVAL);
+    }
 
     const long long M     = r4d_geti_or(a, "M", 0);
     const long long heads = r4d_geti_or(a, "heads", 0);
@@ -300,6 +333,7 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
         if (ahead_ld < 0) return R4D_NO(RAD_E_STRIDE);
     }
     if (r4d_numel(tok) < T + A) return R4D_NO(RAD_E_SHAPE);
+    if (spar && r4d_numel(spar) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(mult) < ngram || r4d_numel(vsz) < heads || r4d_numel(off) < heads)
         return R4D_NO(RAD_E_SHAPE);
 
@@ -311,7 +345,7 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
     /* (token tiles, sequences). Tiles are sized by the batch's total token count, an upper bound on
      * any one sequence's; a short sequence's extra blocks find their rows past its end. A
      * per-sequence count would mean reading `cu` on the host. */
-    const uint32_t tiles = (uint32_t)((T + A + kNgThreads - 1) / kNgThreads);
+    const uint32_t tiles = spar ? 1u : (uint32_t)((T + A + kNgThreads - 1) / kNgThreads);
 #define R4D_NGI(CH_)                                                                             \
     R4D_EMIT(stream, ngram_ids_kernel<CH_>, dim3(tiles, (uint32_t)N), dim3(kNgThreads),         \
              0,                                                                                  \
@@ -324,7 +358,7 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
              (int32_t*)r4d_addr(ids), (uint32_t)heads, (uint32_t)ngram,                          \
              (uint32_t)per, (uint32_t)W, eos, (uint32_t)ids_ld,                                  \
              A > 0 ? (int32_t*)r4d_addr(ahd) : nullptr, (uint32_t)A,                             \
-             (uint32_t)ahead_ld)
+             (uint32_t)ahead_ld, spar ? (const int32_t*)r4d_addr(spar) : nullptr)
     const int rc = r4d_geti_or(a, "chain", 0) != 0 && T <= 64 ? R4D_NGI(r4dchain)
                                                                : R4D_NGI(R4dUnchained);
 #undef R4D_NGI

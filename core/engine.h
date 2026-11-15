@@ -712,6 +712,18 @@ private:
      * the context pass by that path. */
     bool    tree_ = false;
     rad_buf tree_parents_ = 0;
+    /* A SERIAL head's tree (RadDrafterDecl::tree_nodes): its rounds R, the first round's runner-up
+     * leaves, the frontier width (1: the chain and its leaves, core only) and whether the
+     * plugin's probe states its recurrent state follows a path. Resolved before declare (the
+     * node count is max_spec), confirmed against the declared drafter after. */
+    bool    serial_tree_ = false;
+    bool    tree_linear_ok_ = false;
+    int     draft_rounds_ = 0;
+    int     tree_leaves_ = 0;
+    int     tree_width_ = 1;
+    /* The nodes a serial tree verifies after `done` rounds: the chain and the leaves it adds, up
+     * to the budget; `done` for a chain. What expect_draft and set_draft must agree on. */
+    int     serial_nodes(int done) const;
     int     tree_compact(int rows);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);

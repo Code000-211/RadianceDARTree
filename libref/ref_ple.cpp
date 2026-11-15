@@ -188,6 +188,25 @@ int ref_ple_gate(const RadArgs* a, RadStream) {
  *
  * The two agree for a one-token step. After a multi-token verify, the absent layout would give a
  * step that accepted only the first token a history ending at a rejected draft.
+ *
+ * ============================== A tree verify ==============================
+ *
+ * With `spec_parent` (RadBatch::spec_parent, rad_drafter_tree; ple_conv only) the rows of a
+ * sequence are the nodes of a verify tree: the entry of row t is its parent's row within the
+ * sequence (-1 the root, the first row; -2 an ordinary causal row, whose parent is the row before
+ * it), every parent before its child. The tap `k = (width-1-j)*dilation` timesteps back is then
+ * the input of the ANCESTOR k levels above row t (k = 3, 6, 9 at this model's shape), and an
+ * ancestor chain that ends at the root continues into the committed window, at slot
+ * `hist - (k - depth)`, exactly where a chain would have found it. The taps are summed in the same
+ * order as a chain's, so a node's output is bit-identical to the last row of a sequential decode
+ * of its root-to-node path in the same kernel. Chain rows (parent t - 1) and -2 rows reduce to
+ * the plain op.
+ *
+ * The window is written in ROW layout whatever the parents: input t at slot `hist - 1 + t`, so
+ * row 0 sits at slot `hist - 1` (the `off` of kv_window_compact, = (width-1)*dilation - 1). A step
+ * that accepted the path rows p[0] = 0, p[1], ... leaves the committed inputs at slots
+ * hist - 1 + p[i]; kv_window_compact moves them to hist - 1 + i before the next read at
+ * `num_accepted - 1`. The operand requires `num_accepted`.
  */
 /* The depthwise causal convolution and its rolling window, shared by `ple_conv` (dilated, silu,
  * optional residual) and `causal_conv1d` (LFM2's short convolution: undilated, no activation, no
@@ -196,11 +215,13 @@ struct ConvArgs {
     const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
     bool silu;
     const RadTensor* b;   /* per-channel bias inside the activation (Mamba-2's conv1d), or null */
+    const RadTensor* par = nullptr;   /* spec_parent: the rows are a verify tree (above), or null */
 };
 
 static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
     const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y, *b = o.b;
+    const RadTensor* par = o.par;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n    = p_int(a, "n", 0);
@@ -219,6 +240,9 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
     if (numel(x) < M * n || numel(y) < M * n || numel(w) < n * wid) return RAD_E_SHAPE;
     if (resid && numel(resid) < M * n) return RAD_E_SHAPE;
     if (b && numel(b) != n) return RAD_E_SHAPE;
+    /* The row layout is what kv_window_compact reads, so a tree is a decode step. */
+    if (par && !nacc) return RAD_E_INVAL;
+    if (par && numel(par) < M) return RAD_E_SHAPE;
 
     const int64_t state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : hist_len;
     if (cs->data && state_len < hist_len) return RAD_E_SHAPE;
@@ -232,6 +256,12 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
         const int64_t slen = cu_at(cu, s + 1) - cu_at(cu, s);
         if (nacc && cs->data && hist_len > 0 && slen > 0 && hist_len - 1 + slen > state_len)
             return RAD_E_SHAPE;
+        /* Every parent precedes its child; a bad tree would walk off the block. */
+        const int64_t bos = cu_at(cu, s);
+        for (int64_t t = 0; par && t < slen; ++t) {
+            const int64_t v = ld_int(par->dtype, par->data, offlin(par, bos + t));
+            if (v < -2 || v >= t) return RAD_E_INVAL;
+        }
     }
 
     const int64_t xrow = rowoff(x, 1, n), xcol = laststride(x);
@@ -269,7 +299,20 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
         for (int64_t t = 0; t < slen; ++t) {
             float acc = bias;
             for (int64_t j = 0; j < wid; ++j) {
-                const int64_t src = t - hist_len + j * dil;
+                int64_t src = t - hist_len + j * dil;
+                if (par) {
+                    /* The ancestor k levels up, or what is left of k past the root as a window
+                     * slot: src = -rem there, as for a chain row t < k. */
+                    int64_t cur = t, rem = (wid - 1 - j) * dil;
+                    while (rem > 0) {
+                        const int64_t v = ld_int(par->dtype, par->data, offlin(par, bos + cur));
+                        const int64_t p = v == -2 ? cur - 1 : v;
+                        if (p < 0) break;
+                        cur = p;
+                        --rem;
+                    }
+                    src = rem == 0 ? cur : -rem;
+                }
                 const float v = src >= 0 ? ldt(x, (bos + src) * xrow + c * xcol)
                                          : hist[src + hist_len];
                 acc += v * ldt(w, c * wrow + j * wcol);
@@ -300,7 +343,8 @@ int ref_ple_conv(const RadArgs* a, RadStream) {
     /* Nine positions, four optional; `have()` would refuse an absent optional operand. */
     if (a->n_t < 9) return RAD_E_INVAL;
     return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), t_in(a, 4),
-                                      t_in(a, 5), t_in(a, 6), t_in(a, 7), t_in(a, 8), true });
+                                      t_in(a, 5), t_in(a, 6), t_in(a, 7), t_in(a, 8), true,
+                                      nullptr, a->n_t > 9 ? t_in(a, 9) : nullptr });
 }
 
 /* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`: Mamba-2's

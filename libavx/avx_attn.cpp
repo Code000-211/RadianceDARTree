@@ -833,6 +833,127 @@ AVX_KERNEL(attn_paged_tree) {
     return AVX_FN(avx_attn_paged)(a, stream);
 }
 
+/* attn_paged_tree_sel: per row one softmax over the pages sel[row, 0..nsel[row]) and the region
+ * keys named by vmask[row] (libref's ref_attn_paged_tree_sel has the operand contract). One pass
+ * over the row's key list: scores, maximum, exp, weighted sum, as libref does. */
+AVX_KERNEL(attn_paged_tree_sel) {
+    if (!a || a->n_t < 11) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *sel = &a->t[2], *nsel = &a->t[3], *o = &a->t[7];
+    const RadTensor* vmk = rad_arg_in(a, 8);
+    const RadTensor* bt  = rad_arg_in(a, 9);
+    const RadTensor* rbt = rad_arg_in(a, 10);
+    const RadTensor* cus = a->n_t > 11 ? rad_arg_in(a, 11) : nullptr;
+    if (rad_arg_in(a, 4) || rad_arg_in(a, 5) || rad_arg_in(a, 6)) return RAD_E_UNSUPPORTED;
+    if (!q->data || !kv->data || !sel->data || !nsel->data || !o->data || !vmk || !bt || !rbt)
+        return RAD_E_INVAL;
+    if (p_int(a, "causal", 1) != 1 || p_int(a, "window", 0) != 0) return RAD_E_UNSUPPORTED;
+
+    const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
+    const int64_t gqa        = p_int(a, "gqa", 1);
+    const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0) return RAD_E_SHAPE;
+    if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
+    if (kv_heads <= 0) return RAD_E_SHAPE;
+    const int64_t q_heads = gqa * kv_heads;
+    if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    const int64_t rows = numel(q) / (q_heads * head_dim);
+    if (rows <= 0 || numel(nsel) != rows || numel(vmk) != rows) return RAD_E_SHAPE;
+    if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
+    if (kv->shape[2] != block_size || kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+    const bool i8 = kv->dtype == RAD_I8;
+    if (i8 && !kv_i8_shape(kv, head_dim)) return RAD_E_SHAPE;
+    if (sel->rank < 2 || bt->rank < 2) return RAD_E_SHAPE;
+    const int64_t pitch = sel->shape[sel->rank - 1];
+    const int64_t n_seq = bt->shape[0];
+    const int64_t bt_p  = bt->shape[bt->rank - 1];
+    if (sel->shape[0] != rows || n_seq <= 0 || numel(rbt) != n_seq) return RAD_E_SHAPE;
+    if (cus ? numel(cus) != n_seq + 1 : rows % n_seq != 0) return RAD_E_SHAPE;
+    const int64_t sel_rs = sel->stride[sel->rank - 2], sel_cs = sel->stride[sel->rank - 1];
+    const int64_t bt_rs = bt->stride[bt->rank - 2], bt_cs = bt->stride[bt->rank - 1];
+    const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
+    const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
+    const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1;
+    const int64_t o_hs = o->rank >= 3 ? o->stride[o->rank - 2] : head_dim * o_ds;
+    const int64_t o_rs = row_stride(o, q_heads * head_dim);
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+
+    /* Every row's key list, validated once: the (block, slot) of each visible key. */
+    struct Key { int64_t blk, slot; };
+    std::vector<std::vector<Key>> keys((size_t)rows);
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t s = 0;
+        if (cus) {
+            while (s + 1 < n_seq && ldi(cus, offlin(cus, s + 1)) <= r) ++s;
+        } else {
+            s = r / (rows / n_seq);
+        }
+        const int64_t ns = ldi(nsel, offlin(nsel, r));
+        if (ns < 0 || ns > pitch) return RAD_E_INVAL;
+        std::vector<Key>& kl = keys[(size_t)r];
+        kl.reserve((size_t)(ns * block_size + 64));
+        for (int64_t i = 0; i < ns; ++i) {
+            const int64_t blk = ldi(sel, r * sel_rs + i * sel_cs);
+            if (blk < 0 || blk >= kv->shape[0]) return RAD_E_INVAL;
+            for (int64_t t = 0; t < block_size; ++t) kl.push_back({ blk, t });
+        }
+        const uint64_t m = (uint64_t)ldi(vmk, offlin(vmk, r));
+        const int64_t rb = ldi(rbt, offlin(rbt, s));
+        if (m && (rb < 0 || rb % block_size)) return RAD_E_INVAL;
+        for (int k = 0; k < 64; ++k) {
+            if (!((m >> k) & 1)) continue;
+            const int64_t pg = rb / block_size + k / block_size;
+            if (pg >= bt_p) return RAD_E_INVAL;
+            const int64_t blk = ldi(bt, s * bt_rs + pg * bt_cs);
+            if (blk < 0 || blk >= kv->shape[0]) return RAD_E_INVAL;
+            kl.push_back({ blk, k % block_size });
+        }
+    }
+
+    const int64_t total = rows * q_heads;
+    AVX_PARALLEL_FOR_IF(total >= 2)
+    for (int64_t idx = 0; idx < total; ++idx) {
+        const int64_t h = idx % q_heads, tok = idx / q_heads, kh = h / gqa;
+        const std::vector<Key>& ks = keys[(size_t)tok];
+        const int64_t ob = tok * o_rs + h * o_hs;
+        float* frame = (float*)scratch_f32((size_t)(3 * head_dim) + ks.size() + 16);
+        float* qd  = frame;
+        float* row = qd + head_dim;
+        float* acc = row + head_dim;
+        float* sc  = acc + head_dim;
+        const float* qr = head_f32(q, tok * q_rs + h * q_hs, q_ds, head_dim, 1.0f, qd);
+        if (qr != qd) std::memcpy(qd, qr, (size_t)head_dim * sizeof(float));
+        float mx = -INFINITY;
+        for (size_t j = 0; j < ks.size(); ++j) {
+            const int64_t kb = ks[j].blk * kvv.sb + kh * kvv.sh + ks[j].slot * kvv.so;
+            const float km = i8 ? kv_i8_scale(kv->data, kb, head_dim, 0) : 1.0f;
+            const float* kr = head_f32(kv, kb, kvv.sd, head_dim, km, row);
+            sc[j] = dotf(qd, kr, head_dim) * scale;
+            if (sc[j] > mx) mx = sc[j];
+        }
+        if (mx == -INFINITY) {
+            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+            continue;
+        }
+        for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+        float sum = 0.0f;
+        for (size_t j = 0; j < ks.size(); ++j) {
+            const int64_t kb = ks[j].blk * kvv.sb + kh * kvv.sh + ks[j].slot * kvv.so;
+            const float w = sc_exp(sc[j] - mx);
+            sum += w;
+            const float vm = i8 ? kv_i8_scale(kv->data, kb, head_dim, 1) : 1.0f;
+            const float* vv = head_f32(kv, kb + head_dim * kvv.sd, kvv.sd, head_dim, vm, row);
+            axpy(acc, vv, w, head_dim);
+        }
+        const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int64_t d = 0; d < head_dim; ++d) acc[d] *= inv;
+        out_row(o, ob, head_dim, acc);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ attn_dense */
 /* Unpaged, unquantised attention (vision towers): `cu_seqlens` bounds one image or attention
  * window per entry, so a whole batch is one launch. `causal` is a parameter so a dense

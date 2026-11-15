@@ -1019,6 +1019,17 @@ struct Config {
      * (rad_drafter_tree), whose nodes are verify rows every drafting sequence pays for. Ignored
      * without a drafter that declares a short block. */
     int64_t draft_short_from = -1;      /* --draft-short-from */
+    /* --draft-tree auto|off|on: a draft head's proposals verified as a tree. auto (-1) follows
+     * the plugin's probe (RadArchProbe::tree_pays), off (0) keeps the chain, on (1) asks for a
+     * tree whatever the probe says and refuses a model that declares none. For a SERIAL head
+     * (the MTP of Qwen3.8-Flash-Next) the tree is the greedy chain of `n_spec` rounds plus
+     * `draft_tree_leaves` runner-up siblings of its first node; `draft_tree_nodes` caps the
+     * verify's nodes (0: rounds + leaves), and `draft_tree_width` > 1 asks the plugin's head to
+     * grow a deeper tree, that many frontier rows a round (1: the leaves above). */
+    int         draft_tree = -1;
+    int         draft_tree_leaves = 3;
+    int         draft_tree_nodes = 0;
+    int         draft_tree_width = 1;
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify

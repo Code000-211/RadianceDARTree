@@ -71,6 +71,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <set>
 
 /* posix_spawn's environment; declared here rather than relying on unistd.h's _GNU_SOURCE guard. */
 extern char** environ;
@@ -3889,6 +3890,346 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     ok(name.c_str(), n_o == 0 && n_q == 0 && n_s == 0 && live > 0, msg);
 }
 
+/* ------------------------------------------------- attn_paged_tree_sel, on an explicit tree
+ *
+ * `attn_tsel_h256_gqa<G>_<kv>` (and the `gq` / `ghq` merges) over a tree of 12 nodes below an
+ * anchor and one extra row with keys at the region's far end, in a cache of 4-token pages:
+ * 36 to 40 selected committed pages a row and a 64-key region of 16 pages behind them, in which
+ * the first two keys are committed (the base sits two keys into a page) and node j is key 2 + j.
+ * Four claims:
+ *
+ *   1. libref's `attn_paged_tree_sel` on the same bytes agrees within the kernel's f16 / bf16
+ *      rounding (rel_l2), for every row.
+ *   2. A row whose mask is a prefix of the region (the chain rows 0 to 3) is BYTE-identical to
+ *      the existing sparse row `attn_decode_h256_gqa<G>_<kv>` over the table sel ++ region pages
+ *      with seqused = nsel * 4 + prefix length: the chain kernel, same page list.
+ *   3. EVERY row is byte-identical to that existing row over the sequential decode of its
+ *      root-to-node path: the path's keys copied in order into spare pages of the cache, the table
+ *      sel ++ those pages. This is the claim the op exists for.
+ *   4. `gq` / `ghq` are byte-identical to the plain row followed by gate_quant_fp8 /
+ *      gate_had_quant_i8g (out, codes, scales).
+ *
+ * The cache is random finite values (the i8 one random codes without -128 and finite f16 scales);
+ * a page is mapped to a random block. */
+static const RadKernelInfo* tsel_libref_row(const char* op) {
+    static void* ref = nullptr;
+    if (!ref && g_plugin) {
+        std::string path(g_plugin);
+        path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+        ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!ref) return nullptr;
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    if (!count || !at) return nullptr;
+    for (int i = 0; i < count(); ++i)
+        if (std::strcmp(at(i)->op, op) == 0) return at(i);
+    return nullptr;
+}
+
+static void attn_tsel_case(const Plugin& pl, int64_t G, bool bf16) {
+    const std::string kvn = bf16 ? "bf16kv" : "i8";
+    const std::string gs  = std::to_string((long long)G);
+    const std::string n_plain = "attn_tsel_h256_gqa" + gs + "_" + kvn;
+    const std::string n_gq    = "attn_tsel_gq_h256_gqa" + gs + "_" + kvn;
+    const std::string n_ghq   = "attn_tsel_ghq_h256_gqa" + gs + "_" + kvn;
+    const bool w_plain = sel(n_plain.c_str()), w_gq = sel(n_gq.c_str()), w_ghq = sel(n_ghq.c_str());
+    if (!w_plain && !w_gq && !w_ghq) return;
+    const RadKernelInfo* tk = find(pl, n_plain.c_str());
+    const std::string n_chain = (G == 12 ? "attn_decode_h256_gqa12_" : "attn_decode_h256_gqa6_bs4_") +
+                                std::string(bf16 ? "bf16kv" : "i8");
+    const RadKernelInfo* ck = find(pl, n_chain.c_str());
+    if (!tk || !ck) { ok(n_plain.c_str(), false, "row absent"); return; }
+
+    const int64_t nkv = G == 12 ? 2 : 1, nq = G * nkv, hd = 256, bs = 4;
+    const int64_t R = 13, LP = 56, NSEL = 40, SP = 41, RB = 160;     /* RB = 4 * 40 */
+    const int64_t NB = LP + R * 16 + 4, SPARE = LP;
+    uint32_t st = 0x9e3779b9u ^ (uint32_t)G ^ (bf16 ? 0u : 0x5555u);
+    auto rnd = [&](float span) {
+        st = st * 1664525u + 1013904223u;
+        return ((float)(st >> 8) / 16777216.0f * 2.0f - 1.0f) * span;
+    };
+    auto rnd_u = [&](uint32_t n) { st = st * 1664525u + 1013904223u; return (st >> 8) % n; };
+
+    /* The sequence's block table: logical page -> a random physical block below SPARE. */
+    std::vector<int32_t> perm((size_t)SPARE);
+    for (int64_t i = 0; i < SPARE; ++i) perm[(size_t)i] = (int32_t)i;
+    for (int64_t i = SPARE - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[rnd_u((uint32_t)i + 1)]);
+    std::vector<int32_t> table((size_t)LP);
+    for (int64_t i = 0; i < LP; ++i) table[(size_t)i] = perm[(size_t)i];
+
+    /* The tree: node j's parent (row 0 is the anchor, region key 2), committed keys 0 and 1. */
+    const int par[13] = { -1, 0, 1, 2, 0, 4, 1, 6, 6, 3, 5, 9, -1 };
+    std::vector<uint64_t> vm((size_t)R);
+    for (int64_t j = 0; j < 12; ++j) {
+        uint64_t m = 0x3;
+        for (int64_t at = j; at >= 0; at = par[at]) m |= 1ull << (2 + at);
+        vm[(size_t)j] = m;
+    }
+    vm[12] = 1ull | 2ull | (1ull << 31) | (1ull << 63);          /* the region's far end */
+    std::vector<int32_t> nsel((size_t)R), selp((size_t)(R * SP));
+    for (int64_t r = 0; r < R; ++r) {
+        /* Ascending committed pages with a few dropped, as a selection leaves them. */
+        std::vector<int32_t> pg;
+        for (int64_t l = 0; l < NSEL; ++l)
+            if (!(r % 3 && rnd_u(11) == 0)) pg.push_back(table[(size_t)l]);
+        nsel[(size_t)r] = (int32_t)pg.size();
+        for (int64_t i = 0; i < SP; ++i)
+            selp[(size_t)(r * SP + i)] = i < (int64_t)pg.size() ? pg[(size_t)i] : 0;
+    }
+    std::vector<int32_t> rbv = { (int32_t)RB };
+
+    /* The cache. */
+    const int64_t rowb = bf16 ? 2 * hd : 2 * hd + 4;
+    const size_t cbytes = (size_t)(NB * nkv * bs * rowb) * (bf16 ? 2 : 1);
+    std::vector<uint8_t> hc(cbytes);
+    if (bf16) {
+        for (size_t i = 0; i + 1 < cbytes; i += 2) {
+            const uint16_t h = h_to_bf16(rnd(3.0f));
+            std::memcpy(&hc[i], &h, 2);
+        }
+    } else {
+        for (auto& x : hc) x = (uint8_t)(rnd(127.0f) + 128.0f);
+        for (size_t r0 = 0; r0 < cbytes; r0 += (size_t)rowb) {
+            for (int64_t i = 0; i < 2 * hd; ++i)
+                if (hc[r0 + (size_t)i] == 0x80) hc[r0 + (size_t)i] = 0x81;
+            const _Float16 k = (_Float16)(0.0078125f * (1.0f + (rnd(1.0f) + 1.0f) * 2.0f));
+            const _Float16 v = (_Float16)(0.03125f * (1.0f + (rnd(1.0f) + 1.0f) * 2.0f));
+            std::memcpy(&hc[r0 + (size_t)(2 * hd)], &k, 2);
+            std::memcpy(&hc[r0 + (size_t)(2 * hd + 2)], &v, 2);
+        }
+    }
+    const size_t esz = bf16 ? 2 : 1;
+    auto tok_off = [&](int64_t blk, int64_t kh, int64_t slot) {
+        return (size_t)((blk * nkv + kh) * bs + slot) * (size_t)rowb * esz;
+    };
+    std::vector<uint16_t> hq((size_t)(R * nq * hd)), hqg((size_t)(R * nq * 2 * hd));
+    for (auto& x : hq)  x = h_to_bf16(rnd(2.0f));
+    for (auto& x : hqg) x = h_to_bf16(rnd(6.0f));
+
+    /* Region key k's physical block and slot. */
+    auto reg_blk = [&](int k) { return table[(size_t)(RB / bs + k / (int)bs)]; };
+
+    /* The sequential decode of each row's path: its visible region keys copied in order into the
+     * row's 16 spare pages (block SPARE + 16 r + p), then the table sel ++ those pages. */
+    std::vector<int32_t> seq_tab((size_t)(R * (SP + 16))), seq_used((size_t)R);
+    std::vector<int32_t> ch_tab((size_t)(R * (SP + 16))), ch_used((size_t)R);
+    for (int64_t r = 0; r < R; ++r) {
+        int cnt = 0;
+        for (int k = 0; k < 64; ++k) {
+            if (!((vm[(size_t)r] >> k) & 1)) continue;
+            const int64_t db = SPARE + 16 * r + cnt / bs, ds = cnt % bs;
+            for (int64_t kh = 0; kh < nkv; ++kh)
+                std::memcpy(&hc[tok_off(db, kh, ds)], &hc[tok_off(reg_blk(k), kh, k % bs)],
+                            (size_t)rowb * esz);
+            ++cnt;
+        }
+        const int ns = nsel[(size_t)r];
+        for (int i = 0; i < SP + 16; ++i) {
+            seq_tab[(size_t)(r * (SP + 16) + i)] =
+                i < ns ? selp[(size_t)(r * SP + i)]
+                       : (int32_t)(SPARE + 16 * r + std::min(i - ns, 15));
+            ch_tab[(size_t)(r * (SP + 16) + i)] =
+                i < ns ? selp[(size_t)(r * SP + i)]
+                       : table[(size_t)(RB / bs + std::min(i - ns, 15))];
+        }
+        seq_used[(size_t)r] = (int32_t)(ns * bs + cnt);
+        ch_used[(size_t)r] = (int32_t)(ns * bs + cnt);
+    }
+
+    void* d_q = dalloc(hq.size() * 2);  void* d_c = dalloc(cbytes);
+    void* d_vm = dalloc((size_t)R * 8);
+    void* d_o = dalloc((size_t)(R * nq * hd) * 2); void* d_os = dalloc((size_t)(R * nq * hd) * 2);
+    void* d_oc = dalloc((size_t)(R * nq * hd) * 2);
+    if (!d_q || !d_c || !d_vm || !d_o || !d_os || !d_oc) {
+        ok(n_plain.c_str(), false, "hipMalloc failed"); return;
+    }
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_c, hc.data(), cbytes, hipMemcpyHostToDevice);
+    st_memcpy(d_vm, vm.data(), (size_t)R * 8, hipMemcpyHostToDevice);
+    const uint32_t kvdt = bf16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_I8;
+    const char* kvs = bf16 ? "bf16" : "i8";
+    const int64_t maxctx = (SP + 16) * bs;
+
+    auto tsel_ops = [&](void* out) {
+        return std::vector<RadTensor>{
+            T(d_q, RAD_BF16, { R, nq, hd }), T(d_c, kvdt, { NB, nkv, bs, rowb }),
+            TI32({ R, SP }, selp), TI32({ R }, nsel),
+            RadTensor{}, RadTensor{}, RadTensor{},
+            T(out, RAD_BF16, { R, nq * hd }),
+        };
+    };
+    auto tree_tail = [&](std::vector<RadTensor>& ts) {
+        ts.push_back(T(d_vm, RAD_I64, { R }));
+        ts.push_back(TI32({ 1, LP }, table));
+        ts.push_back(TI32({ 1 }, rbv));
+        ts.push_back(RadTensor{});
+    };
+    std::vector<RadParam> pt = {
+        PI("q_len", 1), PI("head_dim", hd), PI("gqa", G), PI("block_size", bs), PI("causal", 1),
+        PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", kvs), PI("n_head", nq),
+        PI("max_seqs", R), PI("max_ctx", maxctx), PI("sel_pitch", SP),
+    };
+    std::vector<RadParam> pc = {
+        PI("q_len", 1), PI("head_dim", hd), PI("gqa", G), PI("block_size", bs), PI("causal", 1),
+        PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", kvs), PI("n_head", nq),
+        PI("max_seqs", R), PI("max_ctx", maxctx),
+    };
+    const size_t ob = (size_t)(R * nq * hd) * 2;
+    auto get_out = [&](void* d) {
+        std::vector<uint8_t> v(ob);
+        st_memcpy(v.data(), d, ob, hipMemcpyDeviceToHost);
+        return v;
+    };
+    auto ndiff_rows = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int64_t r0,
+                          int64_t r1) {
+        int64_t n = 0;
+        const size_t rb_ = (size_t)(nq * hd) * 2;
+        for (size_t i = (size_t)r0 * rb_; i < (size_t)r1 * rb_; ++i) n += a[i] != b[i];
+        return n;
+    };
+
+    /* the tree rows */
+    {
+        std::vector<RadTensor> ts = tsel_ops(d_o);
+        tree_tail(ts);
+        run_case(tk, ts, pt);
+    }
+    const std::vector<uint8_t> o_tree = get_out(d_o);
+    if (w_plain) {
+        /* 1. against libref on the same bytes */
+        const RadKernelInfo* rr = tsel_libref_row("attn_paged_tree_sel");
+        if (!rr) {
+            ok((n_plain + " vs libref").c_str(), false, "libref's attn_paged_tree_sel unavailable");
+        } else {
+            std::vector<uint8_t> hout((size_t)(R * nq * hd) * 2, 0);
+            std::vector<int64_t> vm64((size_t)R);
+            for (int64_t r = 0; r < R; ++r) vm64[(size_t)r] = (int64_t)vm[(size_t)r];
+            std::vector<RadTensor> ts = {
+                T(hq.data(), RAD_BF16, { R, nq, hd }), T(hc.data(), kvdt, { NB, nkv, bs, rowb }),
+                T(selp.data(), RAD_I32, { R, SP }), T(nsel.data(), RAD_I32, { R }),
+                RadTensor{}, RadTensor{}, RadTensor{}, T(hout.data(), RAD_BF16, { R, nq * hd }),
+                T(vm64.data(), RAD_I64, { R }), T(table.data(), RAD_I32, { 1, LP }),
+                T(rbv.data(), RAD_I32, { 1 }), RadTensor{},
+            };
+            std::vector<RadParam> ps = pt;
+            RadArgs a;
+            std::memset(&a, 0, sizeof a);
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            const int rc = rr->launch(&a, nullptr);
+            double num = 0, den = 0;
+            int64_t bad = 0;
+            for (size_t i = 0; i < (size_t)(R * nq * hd); ++i) {
+                uint16_t x, y;
+                std::memcpy(&x, &o_tree[i * 2], 2);
+                std::memcpy(&y, &hout[i * 2], 2);
+                const double dx = h_bf16(x), dy = h_bf16(y);
+                if (!std::isfinite(dx)) ++bad;
+                num += (dx - dy) * (dx - dy);
+                den += dy * dy;
+            }
+            const double rel = den > 0 ? std::sqrt(num / den) : 1.0;
+            ok((n_plain + " agrees with libref").c_str(), rc == RAD_OK && bad == 0 && rel < 1.2e-2,
+               fmt("rc=%d rel_l2 %.3g, %lld non-finite", rc, rel, (long long)bad));
+        }
+        /* 2. the chain rows against the existing sparse row over sel ++ region pages */
+        {
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { R, nq, hd }), T(d_c, kvdt, { NB, nkv, bs, rowb }),
+                TI32({ R, SP + 16 }, ch_tab), TI32({ R }, ch_used),
+                RadTensor{}, RadTensor{}, RadTensor{}, T(d_oc, RAD_BF16, { R, nq * hd }),
+            };
+            run_case(ck, ts, pc);
+            const std::vector<uint8_t> o_ch = get_out(d_oc);
+            const int64_t nd = ndiff_rows(o_tree, o_ch, 0, 4);
+            ok((n_plain + " chain rows are byte-identical to " + ck->name).c_str(), nd == 0,
+               fmt("%lld bytes differ over rows 0-3", (long long)nd));
+        }
+        /* 3. every row against the sequential decode of its path */
+        {
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { R, nq, hd }), T(d_c, kvdt, { NB, nkv, bs, rowb }),
+                TI32({ R, SP + 16 }, seq_tab), TI32({ R }, seq_used),
+                RadTensor{}, RadTensor{}, RadTensor{}, T(d_os, RAD_BF16, { R, nq * hd }),
+            };
+            run_case(ck, ts, pc);
+            const std::vector<uint8_t> o_seq = get_out(d_os);
+            std::string rows;
+            int64_t nd = 0;
+            for (int64_t r = 0; r < R; ++r) {
+                const int64_t d = ndiff_rows(o_tree, o_seq, r, r + 1);
+                if (d) rows += " " + std::to_string((long long)r);
+                nd += d;
+            }
+            ok((n_plain + " rows are byte-identical to the sequential decode of their paths").c_str(),
+               nd == 0, fmt("%lld bytes differ; rows%s", (long long)nd, rows.c_str()));
+        }
+    }
+
+    /* 4. the gated merges against the plain row and the quantiser */
+    for (int rot = 0; rot < 2; ++rot) {
+        const std::string& nm = rot ? n_ghq : n_gq;
+        if (!(rot ? w_ghq : w_gq)) continue;
+        const RadKernelInfo* gk = find(pl, nm.c_str());
+        const RadKernelInfo* rg = find(pl, rot ? "gate_had_quant_i8g" : "gate_quant_fp8");
+        if (!gk || !rg) { ok(nm.c_str(), false, "row absent"); continue; }
+        const uint32_t cdt = rot ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+        const size_t q8b = (size_t)(R * nq * hd), sb = (size_t)(R * nq * (hd / 128)) * 4;
+        void* d_qg = dalloc(hqg.size() * 2);
+        void* d_qA = dalloc(q8b); void* d_qB = dalloc(q8b);
+        void* d_sA = dalloc(sb);  void* d_sB = dalloc(sb);
+        void* d_oB = dalloc(ob);
+        if (!d_qg || !d_qA || !d_qB || !d_sA || !d_sB || !d_oB) {
+            ok(nm.c_str(), false, "hipMalloc failed"); continue;
+        }
+        st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
+        RadTensor gate = T((uint8_t*)d_qg + hd * 2, RAD_BF16, { R, nq, hd });
+        gate.stride[0] = nq * 2 * hd;
+        gate.stride[1] = 2 * hd;
+        {   /* the pair: the plain row, then the quantiser in place */
+            std::vector<RadTensor> ts = tsel_ops(d_oB);
+            tree_tail(ts);
+            run_case(tk, ts, pt);
+            std::vector<RadTensor> gs_ = { gate, T(d_oB, RAD_BF16, { R * nq, hd }),
+                                           T(d_qA, cdt, { R * nq, hd }),
+                                           T(d_sA, RAD_F32, { R * nq, hd / 128 }),
+                                           T(d_oB, RAD_BF16, { R * nq, hd }) };
+            std::vector<RadParam> ps = { PI("M", R * nq), PI("n", hd), PI("group", 128),
+                                         PS("dtype", "bf16"), PS("act", "sigmoid") };
+            run_case(rg, gs_, ps);
+        }
+        {   /* the fold */
+            std::vector<RadTensor> ts = tsel_ops(d_o);
+            ts.push_back(gate);
+            ts.push_back(T(d_qB, cdt, { R, nq * hd }));
+            ts.push_back(T(d_sB, RAD_F32, { R, nq * hd / 128 }));
+            tree_tail(ts);
+            std::vector<RadParam> ps = pt;
+            ps.push_back(PI("group", 128));
+            ps.push_back(PS("act", "sigmoid"));
+            run_case(gk, ts, ps);
+        }
+        std::vector<uint8_t> oa = get_out(d_oB), obv = get_out(d_o), qa(q8b), qbv(q8b), sa(sb), sbv(sb);
+        st_memcpy(qa.data(), d_qA, q8b, hipMemcpyDeviceToHost);
+        st_memcpy(qbv.data(), d_qB, q8b, hipMemcpyDeviceToHost);
+        st_memcpy(sa.data(), d_sA, sb, hipMemcpyDeviceToHost);
+        st_memcpy(sbv.data(), d_sB, sb, hipMemcpyDeviceToHost);
+        auto nd = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+            int64_t n = 0;
+            for (size_t i = 0; i < a.size(); ++i) n += a[i] != b[i];
+            return n;
+        };
+        int64_t live = 0;
+        for (uint8_t x : qa) live += x != 0;
+        const int64_t n_o = nd(oa, obv), n_q = nd(qa, qbv), n_s = nd(sa, sbv);
+        ok((nm + " is byte-identical to the plain row and the quantiser").c_str(),
+           n_o == 0 && n_q == 0 && n_s == 0 && live > 0,
+           fmt("out %lld, codes %lld, scales %lld bytes differ; %lld nonzero codes", (long long)n_o,
+               (long long)n_q, (long long)n_s, (long long)live));
+    }
+}
+
 /* kv_store into the i8 cache (int8 K and V, one f16 scale each per token and head, absmax / 127),
  * against values the format holds exactly: each an integer from -127 to 127 times a per-(token,
  * head) step that is a power of two, with a 127 and a -127 in every head, so the scale is the step
@@ -4594,6 +4935,536 @@ static void gdn_conv_fold(const Plugin& pl) {
                           true, true);
     }
     if (sel(row) || sel(nmf)) gdn_conv_fold_run(pl, nmf, "per_candidate", false, true);
+}
+
+/* ------------------------------------------------------------------ tree verification of the delta net
+ *
+ * gdn_conv_update, gdn_recurrent_update and the folded pair (and its rotated-int8 `_had` form) take
+ * `spec_parent` and `spec_path` (docs/OPS.md, "Tree verification of the delta net"). On the card:
+ *
+ *   rows      every row of a tree verify must be, byte for byte, the last row of a CHAIN decode of its
+ *             root-to-row path on the shipped chain kernels from the same committed state. Trees: stage
+ *             one's (a chain and root leaves), two non-leaf children of the anchor, and a node whose two
+ *             children are both non-leaf at depth two (a state re-derived from the anchor by replaying
+ *             two records). A second sequence of ordinary rows (-2) shares the step.
+ *   commit    the step after a tree, given the accepted rows as spec_path, must leave the conv window and
+ *             the anchor state, and give the outputs, of a chain that decoded exactly those rows (the
+ *             replay and the window gather follow the path, not a prefix).
+ *   fold      the folded op is byte-identical to the pair, tree or not.
+ *   libref    the tree's output against libref's, relative L2 (the two round differently; the byte
+ *             checks above are the exactness claim).
+ *
+ * Heads 128 x 128, two value heads on one key head (the key head's last-arriver conv rewrite runs),
+ * window width 4, up to 8 rows a sequence (the fold's bound). Slots are the engine's non-paged linear
+ * pool: anchor slot s, factor slot NS + s, all three columns of each naming the same slot. */
+namespace gdnt {
+constexpr int64_t K = 128, V = 128, H = 2, Hg = 1, W = 4, MQ = 8, SL = W - 2 + MQ;
+constexpr int64_t CD = 2 * Hg * K + H * V, INW = CD + H * V, NS = 2, COLS = 6, PITCH = 16;
+
+struct Rows { std::vector<uint16_t> in, ab; };
+struct World { std::vector<uint16_t> cs; std::vector<float> st; };
+struct Step {
+    std::vector<int> seq, len, nacc;   /* per sequence: its slot, its rows, num_accepted */
+    Rows rows;
+    std::vector<int> spar, spath;      /* [rows] and [n_seq * PITCH], or empty */
+};
+
+struct Rig {
+    const RadKernelInfo *rc = nullptr, *rr = nullptr, *rf = nullptr;
+    bool had = false, good = false;
+    void *d_in, *d_ab, *d_w, *d_alog, *d_dtb, *d_nw, *d_cs, *d_st, *d_o, *d_oq, *d_os, *d_q, *d_k,
+         *d_v, *d_cu, *d_cidx, *d_sidx, *d_nacc, *d_spar, *d_spath;
+    std::vector<uint16_t> hw;
+    std::vector<float> halog, hdtb, hnw;
+
+    Rig(const Plugin& pl, bool had_, uint32_t seed) : had(had_) {
+        rc = find(pl, "gdn_conv_update_w4_h128_bf16");
+        rr = find(pl, "gdn_recurrent_update_k128_v128_bf16_fp32state");
+        rf = find(pl, had ? "gdn_conv_recurrent_update_had_k128_v128_bf16"
+                          : "gdn_conv_recurrent_update_k128_v128_bf16");
+        if (!rc || !rr || !rf) return;
+        auto rnd = [&seed]() {
+            seed = st_mix32(seed + 0x9e3779b9u);
+            return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f;
+        };
+        hw.resize((size_t)(CD * W));
+        for (auto& e : hw) e = h_to_bf16(0.5f * rnd());
+        halog = { -2.0f, -1.75f };
+        hdtb = { -1.0f, -0.5f };
+        hnw.resize((size_t)V);
+        for (auto& e : hnw) e = 1.0f + 0.25f * rnd();
+        const int64_t maxt = NS * MQ;
+        d_in = dalloc((size_t)(maxt * INW) * 2);  d_ab = dalloc((size_t)(maxt * 2 * H) * 2);
+        d_w = dalloc(hw.size() * 2);  d_alog = dalloc(8);  d_dtb = dalloc(8);
+        d_nw = dalloc((size_t)V * 4);
+        d_cs = dalloc((size_t)(NS * CD * SL) * 2);  d_st = dalloc((size_t)(2 * NS * H * V * K) * 4);
+        d_o = dalloc((size_t)(maxt * H * V) * 2);  d_oq = dalloc((size_t)(maxt * H * V));
+        d_os = dalloc((size_t)(maxt * H) * 4);
+        d_q = dalloc((size_t)(maxt * Hg * K) * 2);  d_k = dalloc((size_t)(maxt * Hg * K) * 2);
+        d_v = dalloc((size_t)(maxt * H * V) * 2);
+        d_cu = dalloc(64); d_cidx = dalloc(64); d_sidx = dalloc(256); d_nacc = dalloc(64);
+        d_spar = dalloc((size_t)maxt * 4); d_spath = dalloc((size_t)(NS * PITCH) * 4);
+        good = d_in && d_ab && d_w && d_cs && d_st && d_o && d_spath && d_sidx;
+        if (!good) return;
+        st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_alog, halog.data(), 8, hipMemcpyHostToDevice);
+        st_memcpy(d_dtb, hdtb.data(), 8, hipMemcpyHostToDevice);
+        st_memcpy(d_nw, hnw.data(), hnw.size() * 4, hipMemcpyHostToDevice);
+    }
+
+    void put(const World& w) {
+        st_memcpy(d_cs, w.cs.data(), w.cs.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_st, w.st.data(), w.st.size() * 4, hipMemcpyHostToDevice);
+    }
+    World get() {
+        World w;
+        w.cs.resize((size_t)(NS * CD * SL)); w.st.resize((size_t)(2 * NS * H * V * K));
+        st_memcpy(w.cs.data(), d_cs, w.cs.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(w.st.data(), d_st, w.st.size() * 4, hipMemcpyDeviceToHost);
+        return w;
+    }
+
+    /* One step on the card: `fold` the folded op, else conv_update then recurrent_update. */
+    int run(bool fold, const Step& s, std::vector<uint16_t>* o, std::vector<int8_t>* oq,
+            std::vector<float>* os) {
+        const int64_t N = (int64_t)s.seq.size();
+        int64_t Td = 0, maxq = 1;
+        std::vector<int32_t> cu(1, 0), cidx, sidx, nacc;
+        for (int64_t i = 0; i < N; ++i) {
+            Td += s.len[(size_t)i]; cu.push_back((int32_t)Td);
+            maxq = std::max<int64_t>(maxq, s.len[(size_t)i]);
+            const int sl = s.seq[(size_t)i];
+            cidx.push_back(sl);
+            const int c[COLS] = { sl, sl, sl, (int)NS + sl, (int)NS + sl, (int)NS + sl };
+            for (int j = 0; j < COLS; ++j) sidx.push_back(c[j]);
+            nacc.push_back(s.nacc[(size_t)i]);
+        }
+        st_memcpy(d_in, s.rows.in.data(), s.rows.in.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_ab, s.rows.ab.data(), s.rows.ab.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_cu, cu.data(), cu.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_cidx, cidx.data(), cidx.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_sidx, sidx.data(), sidx.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_nacc, nacc.data(), nacc.size() * 4, hipMemcpyHostToDevice);
+        if (!s.spar.empty())
+            st_memcpy(d_spar, s.spar.data(), s.spar.size() * 4, hipMemcpyHostToDevice);
+        if (!s.spath.empty())
+            st_memcpy(d_spath, s.spath.data(), s.spath.size() * 4, hipMemcpyHostToDevice);
+        st_memset(d_o, 0, (size_t)(Td * H * V) * 2);
+        st_memset(d_oq, 0, (size_t)(Td * H * V));
+        st_memset(d_os, 0, (size_t)(Td * H) * 4);
+
+        auto view = [](void* base, uint32_t dt, int64_t rows, int64_t cols, int64_t pitch,
+                       int64_t col0) {
+            RadTensor t = T((char*)base + (size_t)col0 * esz(dt), dt, { rows, cols });
+            t.stride[0] = pitch;
+            return t;
+        };
+        RadTensor none; std::memset(&none, 0, sizeof(none));
+        const RadTensor tx = view(d_in, RAD_BF16, Td, CD, INW, 0);
+        const RadTensor tz = view(d_in, RAD_BF16, Td, H * V, INW, CD);
+        const RadTensor ta = view(d_ab, RAD_BF16, Td, H, 2 * H, 0);
+        const RadTensor tb = view(d_ab, RAD_BF16, Td, H, 2 * H, H);
+        const RadTensor tw = T(d_w, RAD_BF16, { CD, W });
+        const RadTensor tal = T(d_alog, RAD_F32, { H }), tdt = T(d_dtb, RAD_F32, { H });
+        const RadTensor tnw = T(d_nw, RAD_F32, { V });
+        const RadTensor tcs = T(d_cs, RAD_BF16, { NS, CD, SL });
+        const RadTensor tst = T(d_st, RAD_F32, { 2 * NS, H, V, K });
+        const RadTensor tci = T(d_cidx, RAD_I32, { N }), tsi = T(d_sidx, RAD_I32, { N, COLS });
+        const RadTensor tna = T(d_nacc, RAD_I32, { N }), tcu = T(d_cu, RAD_I32, { N + 1 });
+        const RadTensor to = T(d_o, RAD_BF16, { Td, H, V });
+        const RadTensor toq = T(d_oq, RAD_I8, { Td, H * V }), tos = T(d_os, RAD_F32, { Td, H });
+        const RadTensor tq = T(d_q, RAD_BF16, { Td, Hg, K }), tk = T(d_k, RAD_BF16, { Td, Hg, K }),
+                        tv = T(d_v, RAD_BF16, { Td, H, V });
+        const RadTensor tsp = s.spar.empty() ? none : T(d_spar, RAD_I32, { Td });
+        const RadTensor tph = s.spath.empty() ? none : T(d_spath, RAD_I32, { N, PITCH });
+
+        std::vector<RadParam> pc = { PI("q_len", maxq), PI("head_k", K), PI("head_v", V),
+                                     PI("conv_width", W) };
+        std::vector<RadParam> pr = { PI("q_len", maxq), PI("head_k", K), PI("head_v", V),
+                                     PI("n_head_v", H), PF("scale", 0.088388), PF("eps", 1e-6),
+                                     PS("act", "silu"), PS("state_form", "anchor") };
+        std::vector<RadParam> pf = pr;
+        pf.push_back(PI("conv_width", W));
+        if (had) pf.push_back(PI("group", 128));
+        auto launch = [&](const RadKernelInfo* r, std::vector<RadTensor> ts,
+                          std::vector<RadParam>& ps) {
+            RadArgs a; std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+            a.world_size = 1;
+            const int e = r->launch(&a, (RadStream) nullptr);
+            return e != RAD_OK ? e : (st_stream_sync(nullptr) != hipSuccess ? -1000 : RAD_OK);
+        };
+        int e;
+        if (fold) {
+            e = launch(rf, { tx, tw, none, tcs, tci, ta, tb, tal, tdt, tst, tsi, tna, tcu, tz, tnw,
+                             to, had ? toq : none, had ? tos : none, tsp, tph }, pf);
+        } else {
+            e = launch(rc, { tx, tw, none, tcs, tci, tna, tcu, tq, tk, tv, tsp, tph }, pc);
+            if (e == RAD_OK)
+                e = launch(rr, { tq, tk, tv, ta, tb, tal, tdt, tst, tsi, tna, tcu, tz, tnw, to, none,
+                                 none, tsp, tph }, pr);
+        }
+        if (e != RAD_OK) return e;
+        if (o) { o->resize((size_t)(Td * H * V)); st_memcpy(o->data(), d_o, o->size() * 2, hipMemcpyDeviceToHost); }
+        if (oq) { oq->resize((size_t)(Td * H * V)); st_memcpy(oq->data(), d_oq, oq->size(), hipMemcpyDeviceToHost); }
+        if (os) { os->resize((size_t)(Td * H)); st_memcpy(os->data(), d_os, os->size() * 4, hipMemcpyDeviceToHost); }
+        return RAD_OK;
+    }
+};
+
+/* Rows `idx` of a concatenation `r` (row r's data: INW + 2H bf16 values). */
+static Rows pick(const Rows& r, const std::vector<int>& idx) {
+    Rows o;
+    for (int i : idx) {
+        o.in.insert(o.in.end(), r.in.begin() + i * INW, r.in.begin() + (i + 1) * INW);
+        o.ab.insert(o.ab.end(), r.ab.begin() + i * 2 * H, r.ab.begin() + (i + 1) * 2 * H);
+    }
+    return o;
+}
+static std::vector<int> root_path(const std::vector<int>& par, int r) {
+    std::vector<int> p;
+    for (int x = r; x >= 0; x = par[(size_t)x] < 0 ? (x > 0 ? x - 1 : -1) : par[(size_t)x])
+        p.push_back(x);
+    return std::vector<int>(p.rbegin(), p.rend());
+}
+}  // namespace gdnt
+
+/* libref's answer to the same tree step, for the tolerance check: its folded op over host copies of
+ * the bf16 data. Returns false with `why` set if the oracle is unavailable or refuses. */
+static bool gdnt_libref(const gdnt::World& w0, const gdnt::Step& s, const gdnt::Rig& rig,
+                        std::vector<float>* out, std::string* why) {
+    using namespace gdnt;
+    if (!g_plugin) { *why = "no plugin path"; return false; }
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { *why = "reference plugin unavailable"; return false; }
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (std::strcmp(at(i)->op, "gdn_conv_recurrent_update") == 0) { oracle = at(i); break; }
+    if (!oracle) { *why = "reference operation unavailable"; dlclose(ref); return false; }
+
+    const int64_t N = (int64_t)s.seq.size();
+    int64_t Td = 0, maxq = 1;
+    std::vector<int32_t> cu(1, 0), cidx, sidx, nacc;
+    for (int64_t i = 0; i < N; ++i) {
+        Td += s.len[(size_t)i]; cu.push_back((int32_t)Td);
+        maxq = std::max<int64_t>(maxq, s.len[(size_t)i]);
+        const int sl = s.seq[(size_t)i];
+        cidx.push_back(sl);
+        const int c[COLS] = { sl, sl, sl, (int)NS + sl, (int)NS + sl, (int)NS + sl };
+        for (int j = 0; j < COLS; ++j) sidx.push_back(c[j]);
+        nacc.push_back(s.nacc[(size_t)i]);
+    }
+    std::vector<uint16_t> cs = w0.cs, hw = rig.hw;
+    std::vector<float> st = w0.st, halog = rig.halog, hdtb = rig.hdtb, hnw = rig.hnw;
+    std::vector<uint16_t> in = s.rows.in, ab = s.rows.ab, ho((size_t)(Td * H * V));
+    std::vector<int32_t> spar = s.spar, spath = s.spath;
+    auto view = [](void* base, uint32_t dt, int64_t rows, int64_t cols, int64_t pitch,
+                   int64_t col0) {
+        RadTensor t = T((char*)base + (size_t)col0 * esz(dt), dt, { rows, cols });
+        t.stride[0] = pitch;
+        return t;
+    };
+    RadTensor none; std::memset(&none, 0, sizeof(none));
+    std::vector<RadTensor> ts = {
+        view(in.data(), RAD_BF16, Td, CD, INW, 0), T(hw.data(), RAD_BF16, { CD, W }), none,
+        T(cs.data(), RAD_BF16, { NS, CD, SL }), T(cidx.data(), RAD_I32, { N }),
+        view(ab.data(), RAD_BF16, Td, H, 2 * H, 0), view(ab.data(), RAD_BF16, Td, H, 2 * H, H),
+        T(halog.data(), RAD_F32, { H }), T(hdtb.data(), RAD_F32, { H }),
+        T(st.data(), RAD_F32, { 2 * NS, H, V, K }), T(sidx.data(), RAD_I32, { N, COLS }),
+        T(nacc.data(), RAD_I32, { N }), T(cu.data(), RAD_I32, { N + 1 }),
+        view(in.data(), RAD_BF16, Td, H * V, INW, CD), T(hnw.data(), RAD_F32, { V }),
+        T(ho.data(), RAD_BF16, { Td, H, V }), none, none,
+        spar.empty() ? none : T(spar.data(), RAD_I32, { Td }),
+        spath.empty() ? none : T(spath.data(), RAD_I32, { N, PITCH }),
+    };
+    std::vector<RadParam> ps = { PI("q_len", maxq), PI("head_k", K), PI("head_v", V),
+                                 PI("n_head_v", H), PF("scale", 0.088388), PF("eps", 1e-6),
+                                 PS("act", "silu"), PS("state_form", "anchor"),
+                                 PI("conv_width", W) };
+    RadArgs a; std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    const int rc = oracle->launch(&a, (RadStream) nullptr);
+    dlclose(ref);
+    if (rc != RAD_OK) { *why = "libref refused: rc=" + std::to_string(rc); return false; }
+    out->resize(ho.size());
+    for (size_t i = 0; i < ho.size(); ++i) (*out)[i] = h_bf16(ho[i]);
+    return true;
+}
+
+static void gdn_tree_check(const Plugin& pl, const char* nm, bool fold, bool had) {
+    using namespace gdnt;
+    Rig rig(pl, had, 0x7ee5eedu);
+    if (!rig.good) { ok(nm, false, "a row is absent or hipMalloc failed"); return; }
+    uint32_t seed = 0x13579bdfu;
+    auto rnd = [&seed]() {
+        seed = st_mix32(seed + 0x9e3779b9u);
+        return (float)(seed & 0xFFFFu) * (1.0f / 32768.0f) - 1.0f;
+    };
+    auto rows_of = [&](int n) {
+        Rows r;
+        r.in.resize((size_t)(n * INW)); r.ab.resize((size_t)(n * 2 * H));
+        for (auto& e : r.in) e = h_to_bf16(rnd());
+        for (auto& e : r.ab) e = h_to_bf16(rnd());
+        return r;
+    };
+    World w0;
+    w0.cs.resize((size_t)(NS * CD * SL));
+    for (auto& e : w0.cs) e = h_to_bf16(rnd());
+    w0.st.assign((size_t)(2 * NS * H * V * K), 0.0f);
+    for (size_t i = 0; i < (size_t)(NS * H * V * K); ++i) w0.st[i] = 0.1f * rnd();
+
+    const std::vector<std::vector<int>> trees = {
+        { -1, 0, 1, 2, 0, 0, 0, 0 },      /* stage one: a chain of three and four leaves off the anchor */
+        { -1, 0, 1, 1, 0, 4, 4, 5 },      /* two non-leaf children of the anchor, a leaf beside a non-leaf */
+        { -1, 0, 1, 2, 1, 4, 4, 0 },      /* the depth-one node's two children are both non-leaf */
+    };
+    std::string why;
+    int64_t row_checks = 0, commit_checks = 0;
+    double worst_ref = 0.0, mag = 0.0;
+    int tidx = 0;
+    /* Negative controls: the same rows as a chain, and the same commit as a prefix, must give
+     * different answers somewhere, or the byte checks above could not tell a tree from a chain. */
+    bool tree_sensitive = false, path_sensitive = false;
+    for (const auto& par0 : trees) {
+        ++tidx;
+        const int n0 = (int)par0.size(), n1 = 3;
+        const Rows rows = rows_of(n0 + n1);
+        std::vector<int> par = par0;
+        par.push_back(-1); par.push_back(-2); par.push_back(-2);
+        std::vector<int> all(n0 + n1);
+        for (int i = 0; i < n0 + n1; ++i) all[(size_t)i] = i;
+
+        /* A tree step from the initial world. */
+        Step st1;
+        st1.seq = { 0, 1 }; st1.len = { n0, n1 }; st1.nacc = { 1, 1 };
+        st1.rows = rows; st1.spar = par;
+        std::vector<uint16_t> o_t; std::vector<int8_t> q_t; std::vector<float> s_t;
+        rig.put(w0);
+        int e = rig.run(fold, st1, &o_t, &q_t, &s_t);
+        if (e != RAD_OK) { why = "tree " + std::to_string(tidx) + " rc=" + std::to_string(e); break; }
+        const World wt = rig.get();
+
+        /* Fold and pair agree byte for byte, tree or not (the had form has no pair of its own). */
+        if (!had && fold) {
+            std::vector<uint16_t> o_p;
+            rig.put(w0);
+            e = rig.run(false, st1, &o_p, nullptr, nullptr);
+            const World wp = rig.get();
+            if (e != RAD_OK) { why = "pair rc=" + std::to_string(e); break; }
+            if (o_p != o_t || wp.cs != wt.cs || wp.st != wt.st) {
+                why = "tree " + std::to_string(tidx) + ": the fold differs from the pair"; break;
+            }
+        }
+
+        /* Each row against the chain over its path. */
+        const int offs[2] = { 0, n0 };
+        for (int sq = 0; sq < 2 && why.empty(); ++sq) {
+            const std::vector<int>& pp = sq == 0 ? par0 : std::vector<int>{ -1, -2, -2 };
+            for (int r = 0; r < (int)pp.size() && why.empty(); ++r) {
+                std::vector<int> path = root_path(pp, r), idx;
+                for (int x : path) idx.push_back(offs[sq] + x);
+                Step ch;
+                ch.seq = { sq }; ch.len = { (int)path.size() }; ch.nacc = { 1 };
+                ch.rows = pick(rows, idx);
+                std::vector<uint16_t> o_c; std::vector<int8_t> q_c; std::vector<float> s_c;
+                rig.put(w0);
+                e = rig.run(fold, ch, &o_c, &q_c, &s_c);
+                if (e != RAD_OK) { why = "chain rc=" + std::to_string(e); break; }
+                const size_t row = (size_t)(offs[sq] + r), last = path.size() - 1;
+                const size_t rb = (size_t)(H * V);
+                bool same = std::memcmp(&o_t[row * rb], &o_c[last * rb], rb * 2) == 0;
+                if (had)
+                    same = same && std::memcmp(&q_t[row * rb], &q_c[last * rb], rb) == 0 &&
+                           std::memcmp(&s_t[row * (size_t)H], &s_c[last * (size_t)H],
+                                       (size_t)H * 4) == 0;
+                ++row_checks;
+                if (!same)
+                    why = "tree " + std::to_string(tidx) + " seq " + std::to_string(sq) + " row " +
+                          std::to_string(r) + " differs from its chain";
+            }
+        }
+        if (!why.empty()) break;
+
+        {
+            Step ns = st1;
+            for (size_t i = 0; i < ns.spar.size(); ++i) ns.spar[i] = -2;
+            ns.spar[0] = -1; ns.spar[(size_t)n0] = -1;
+            std::vector<uint16_t> o_n;
+            rig.put(w0);
+            e = rig.run(fold, ns, &o_n, nullptr, nullptr);
+            if (e != RAD_OK) { why = "control rc=" + std::to_string(e); break; }
+            tree_sensitive = tree_sensitive || o_n != o_t;
+        }
+
+        /* libref (the tree step itself). */
+        if (!had) {
+            std::vector<float> ro;
+            std::string rwhy;
+            if (!gdnt_libref(w0, st1, rig, &ro, &rwhy)) { why = "libref: " + rwhy; break; }
+            double en = 0.0, rn = 0.0;
+            for (size_t i = 0; i < ro.size(); ++i) {
+                const double d = h_bf16(o_t[i]) - ro[i];
+                en += d * d; rn += (double)ro[i] * ro[i];
+            }
+            mag = std::max(mag, std::sqrt(rn / (double)ro.size()));
+            worst_ref = std::max(worst_ref, std::sqrt(en / (rn > 0.0 ? rn : 1.0)));
+        }
+
+        /* Commit a path, then a step on top of it. */
+        const std::vector<std::vector<int>> accepted = {
+            root_path(par0, n0 - 1),                       /* the last node's path */
+            std::vector<int>{ 0, par0[4] == 0 ? 4 : 7 },   /* a short, non-prefix path */
+        };
+        for (const auto& P : accepted)
+            for (int variant = 0; variant < 2 && why.empty(); ++variant) {
+                const int L = (int)P.size();
+                const Rows n2 = rows_of(5);
+                std::vector<int> par2;
+                if (variant) par2 = { -1, 0, 0, -1, -2 };
+                Step s2;
+                s2.seq = { 0, 1 }; s2.len = { 3, 2 }; s2.nacc = { L, 3 };
+                s2.rows = n2; s2.spar = par2;
+                s2.spath.assign((size_t)(NS * PITCH), 0);
+                for (int i = 0; i < L; ++i) s2.spath[(size_t)i] = P[(size_t)i];
+                for (int i = 0; i < 3; ++i) s2.spath[(size_t)(PITCH + i)] = i;
+
+                std::vector<uint16_t> o2t, o2s; std::vector<int8_t> q2t, q2s; std::vector<float> d2t, d2s;
+                rig.put(wt);
+                e = rig.run(fold, s2, &o2t, &q2t, &d2t);
+                if (e != RAD_OK) { why = "commit step rc=" + std::to_string(e); break; }
+                const World w2t = rig.get();
+
+                /* The chain that decoded exactly the committed rows, then the same step with the
+                 * plain prefix contract. */
+                std::vector<int> idx;
+                for (int x : P) idx.push_back(x);
+                for (int i = 0; i < n1; ++i) idx.push_back(n0 + i);
+                Step c1;
+                c1.seq = { 0, 1 }; c1.len = { L, n1 }; c1.nacc = { 1, 1 };
+                c1.rows = pick(rows, idx);
+                rig.put(w0);
+                e = rig.run(fold, c1, nullptr, nullptr, nullptr);
+                Step s2s = s2;
+                s2s.spath.clear();
+                if (e == RAD_OK) e = rig.run(fold, s2s, &o2s, &q2s, &d2s);
+                if (e != RAD_OK) { why = "sequential rc=" + std::to_string(e); break; }
+                const World w2s = rig.get();
+
+                {
+                    Step sp = s2;
+                    for (int i = 0; i < L; ++i) sp.spath[(size_t)i] = i;
+                    std::vector<uint16_t> o2p;
+                    rig.put(wt);
+                    if (rig.run(fold, sp, &o2p, nullptr, nullptr) == RAD_OK && o2p != o2t)
+                        path_sensitive = true;
+                }
+                bool same = o2t == o2s;
+                if (had) same = same && q2t == q2s && d2t == d2s;
+                const int q2[2] = { 3, 2 };
+                for (int sl = 0; sl < NS && same; ++sl)
+                    for (int64_t c = 0; c < CD && same; ++c)
+                        for (int64_t en2 = 0; en2 < W - 2 + q2[sl]; ++en2)
+                            if (w2t.cs[(size_t)((sl * CD + c) * SL + en2)] !=
+                                w2s.cs[(size_t)((sl * CD + c) * SL + en2)]) { same = false; break; }
+                if (same)
+                    same = std::memcmp(w2t.st.data(), w2s.st.data(),
+                                       (size_t)(NS * H * V * K) * 4) == 0;
+                ++commit_checks;
+                if (!same)
+                    why = "tree " + std::to_string(tidx) + ": the step after committing a " +
+                          std::to_string(L) + "-row path (" + (variant ? "tree" : "chain") +
+                          " step) differs from the chain that decoded it";
+            }
+        if (!why.empty()) break;
+    }
+    if (why.empty() && !tree_sensitive) why = "a tree's rows equal the same rows as a chain: no tree to hold";
+    if (why.empty() && !path_sensitive) why = "a committed path equals its prefix: no path to hold";
+    char d[256];
+    std::snprintf(d, sizeof d, "%s%s%lld row checks, %lld commit checks, libref relative L2 %.3g (rms o %.3g)",
+                  why.c_str(), why.empty() ? "" : "; ", (long long)row_checks,
+                  (long long)commit_checks, worst_ref, mag);
+    if (why.empty()) std::printf("        %s\n", d);
+    ok(nm, why.empty() && (had || worst_ref < 5e-3), d);
+}
+
+/* kv_window_compact against a host walk, over the three element widths a window uses. */
+static void kv_window_compact_check(const Plugin& pl) {
+    const char* row = "kv_window_compact_any";
+    const char* nm = "kv_window_compact moves each committed row's entry down, ascending in place";
+    if (!sel(row) && !sel(nm)) return;
+    const RadKernelInfo* r = find(pl, row);
+    if (!r) { ok(nm, false, "row absent"); return; }
+    const int64_t S = 4, C = 300, E = 11, off = 2, P = 8, N = 4;
+    std::string why;
+    for (uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_I32, (uint32_t)RAD_F32 }) {
+        const size_t eb = esz(dt);
+        std::vector<uint8_t> h((size_t)(S * C * E) * eb);
+        for (size_t i = 0; i < h.size(); ++i) h[i] = (uint8_t)st_mix32((uint32_t)i * 2654435761u);
+        const std::vector<uint8_t> h0 = h;
+        const int32_t slots[N] = { 3, 0, -1, 2 }, nacc[N] = { 5, 1, 4, 3 };
+        std::vector<int32_t> path((size_t)(N * P), 0);
+        const int32_t p0[] = { 0, 2, 3, 5, 8 }, p1[] = { 0, 1 }, p2[] = { 0, 1, 2, 3 },
+                      p3[] = { 0, 4, 6 };
+        for (int i = 0; i < 5; ++i) path[(size_t)i] = p0[i];
+        for (int i = 0; i < 2; ++i) path[(size_t)(P + i)] = p1[i];
+        for (int i = 0; i < 4; ++i) path[(size_t)(2 * P + i)] = p2[i];
+        for (int i = 0; i < 3; ++i) path[(size_t)(3 * P + i)] = p3[i];
+        void* d = dalloc(h.size());
+        st_memcpy(d, h.data(), h.size(), hipMemcpyHostToDevice);
+        RadTensor tc = T(d, dt, { S, C, E });
+        RadTensor ts = TI32({ N, 2 }, { slots[0], 9, slots[1], 9, slots[2], 9, slots[3], 9 });
+        RadTensor tn = TI32({ N }, std::vector<int32_t>(nacc, nacc + N));
+        RadTensor tp = TI32({ N, P }, path);
+        std::vector<RadTensor> ts_ = { tc, ts, tn, tp };
+        std::vector<RadParam> ps = { PI("off", off) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts_.data(); a.n_t = (int)ts_.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int rc = r->launch(&a, (RadStream) nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            why = "rc=" + std::to_string(rc); break;
+        }
+        std::vector<uint8_t> got(h.size());
+        st_memcpy(got.data(), d, got.size(), hipMemcpyDeviceToHost);
+        std::vector<uint8_t> want = h0;
+        for (int64_t n = 0; n < N; ++n) {
+            const int64_t sl = slots[n];
+            if (sl < 0) continue;
+            for (int64_t t = 1; t < nacc[n]; ++t)
+                for (int64_t c = 0; c < C; ++c)
+                    std::memcpy(&want[(size_t)(((sl * C + c) * E) + off + t) * eb],
+                                &want[(size_t)(((sl * C + c) * E) + off + path[(size_t)(n * P + t)]) * eb],
+                                eb);
+        }
+        if (got != want) { why = "element width " + std::to_string(eb) + " differs from the host walk"; break; }
+        bool moved = false;
+        for (size_t i = 0; i < got.size(); ++i) moved = moved || got[i] != h0[i];
+        if (!moved) { why = "nothing moved"; break; }
+    }
+    ok(nm, why.empty(), why);
+}
+
+static void gdn_tree(const Plugin& pl) {
+    const char* nmp = "gdn tree verify (conv_update + recurrent_update): rows equal their chains, "
+                      "committed paths equal the chain, libref";
+    const char* nmf = "gdn tree verify (gdn_conv_recurrent_update): rows equal their chains, "
+                      "committed paths equal the chain, byte-identical to the pair, libref";
+    const char* nmh = "gdn tree verify (gdn_conv_recurrent_update_had): rows equal their chains "
+                      "(o, codes and scales), committed paths equal the chain";
+    if (sel("gdn_conv_update_w4_h128_bf16") || sel("gdn_recurrent_update_k128_v128_bf16_fp32state") ||
+        sel(nmp))
+        gdn_tree_check(pl, nmp, false, false);
+    if (sel("gdn_conv_recurrent_update_k128_v128_bf16") || sel(nmf))
+        gdn_tree_check(pl, nmf, true, false);
+    if (sel("gdn_conv_recurrent_update_had_k128_v128_bf16") || sel(nmh))
+        gdn_tree_check(pl, nmh, true, true);
+    kv_window_compact_check(pl);
 }
 
 /* gdn_conv_prep and gdn_conv_update over an f32 weight, as a GGUF stores ssm_conv1d, against the
@@ -23908,6 +24779,449 @@ static void qsa_work_case(const Plugin& pl) {
                    " ring_rows=" + std::to_string(ring_differs));
 }
 
+
+/* ---- QSA tree verify (docs/QSA.md, "Tree verify") ------------------------------------------------
+ *
+ * Two kinds of check, both on explicit trees.
+ *
+ *  1. EXACTNESS, device against device: a tree step (qsa_work with spec_parent, the main and the
+ *     scratch qsa_block_key, qsa_tail_store, the committed and the per-row region qsa_score,
+ *     qsa_select with the tree operands) against, for every node, the ordinary chain over the
+ *     node's root-to-node path from the same starting state. The keys the node reads (its selected
+ *     committed pages in full, its region mask's keys) must be the chain's, and the region scores
+ *     and block keys equal the chain's bit for bit. Run below and above the selection's bound (topk
+ *     3 of ~10 blocks, so contexts are far above it) with a key palette so ties decide.
+ *  2. AGAINST LIBREF, op by op, on the same inputs: qsa_tail_compact, qsa_work (tree and heal),
+ *     qsa_tail_store (tree) and qsa_select (tree), every integer output and every copied key
+ *     byte for byte.
+ *
+ * Operands live in host byte arrays (QB); each launch uploads them all, runs one row (the device's
+ * or libref's) and downloads them all, so a chain of launches is a chain of calls on the same QB
+ * objects. */
+struct QB {
+    uint32_t dt;
+    std::vector<int64_t> shape;
+    std::vector<uint8_t> h;
+    QB(uint32_t dt_, std::vector<int64_t> s) : dt(dt_), shape(s) {
+        int64_t n = 1;
+        for (int64_t e : s) n *= e;
+        h.assign((size_t)n * esz(dt_) + 8, 0);
+    }
+    int64_t numel() const { int64_t n = 1; for (int64_t e : shape) n *= e; return n; }
+    int64_t geti(int64_t i) const {
+        return dt == RAD_I64 ? ((const int64_t*)h.data())[i] : (int64_t)((const int32_t*)h.data())[i];
+    }
+    void seti(int64_t i, int64_t v) {
+        if (dt == RAD_I64) ((int64_t*)h.data())[i] = v; else ((int32_t*)h.data())[i] = (int32_t)v;
+    }
+    void setv(const std::vector<int64_t>& v) { for (size_t i = 0; i < v.size(); ++i) seti((int64_t)i, v[i]); }
+    float getf(int64_t i) const {
+        return dt == RAD_BF16 ? h_bf16(((const uint16_t*)h.data())[i]) : ((const float*)h.data())[i];
+    }
+    void setf(int64_t i, float v) {
+        if (dt == RAD_BF16) ((uint16_t*)h.data())[i] = h_to_bf16(v); else ((float*)h.data())[i] = v;
+    }
+    void fillf(float v) { for (int64_t i = 0; i < numel(); ++i) setf(i, v); }
+};
+
+static const RadKernelInfo* qsa_ref_row(const char* op) {
+    static void* ref = nullptr;
+    static int (*count)(void) = nullptr;
+    static const RadKernelInfo* (*at)(int) = nullptr;
+    if (!ref && g_plugin) {
+        std::string path(g_plugin);
+        path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+        ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (ref) {
+            count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+            at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+        }
+    }
+    if (!count || !at) return nullptr;
+    for (int i = 0; i < count(); ++i)
+        if (std::strcmp(at(i)->op, op) == 0) return at(i);
+    return nullptr;
+}
+
+/* One launch of `r` over the operands (null: an absent operand). `dev` runs it on the card. */
+static int qsa_launch(const RadKernelInfo* r, std::vector<QB*> ops, std::vector<RadParam> ps, bool dev) {
+    std::vector<void*> dp(ops.size(), nullptr);
+    std::vector<RadTensor> ts(ops.size());
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (!ops[i]) { std::memset(&ts[i], 0, sizeof(RadTensor)); continue; }
+        if (dev) {
+            dp[i] = dalloc(ops[i]->h.size());
+            st_memcpy(dp[i], ops[i]->h.data(), ops[i]->h.size(), hipMemcpyHostToDevice);
+            ts[i] = T(dp[i], ops[i]->dt, ops[i]->shape);
+        } else {
+            ts[i] = T(ops[i]->h.data(), ops[i]->dt, ops[i]->shape);
+        }
+    }
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    int64_t sb = r->scratch ? r->scratch(&a) : 0;
+    void* d_scr = nullptr;
+    std::vector<uint8_t> h_scr;
+    if (sb > 0) {
+        if (dev) d_scr = dalloc((size_t)sb); else { h_scr.assign((size_t)sb, 0); d_scr = h_scr.data(); }
+        a.scratch = d_scr; a.scratch_bytes = sb;
+    }
+    const int rc = r->launch(&a, nullptr);
+    if (dev) {
+        st_stream_sync(nullptr);
+        for (size_t i = 0; i < ops.size(); ++i)
+            if (ops[i]) st_memcpy(ops[i]->h.data(), dp[i], ops[i]->h.size(), hipMemcpyDeviceToHost);
+    }
+    return rc;
+}
+
+namespace qsat {
+constexpr int64_t n = 128, heads = 4, ratio = 4, rot = 64, ring = 16, nbmax = 64, RW = 8, work = 24;
+}
+
+struct QRows { const RadKernelInfo *work, *bkey, *tail, *compact, *score, *sel; bool dev; };
+
+struct QState {
+    QB tail{ RAD_BF16, { 1, 1, qsat::ring, qsat::n } };
+    QB bk{ RAD_BF16, { qsat::nbmax, qsat::n } };
+    QB tab{ RAD_I32, { 1, qsat::nbmax } };
+    QB wk{ RAD_F32, { qsat::n } };
+    QB sx{ RAD_I32, { 1, 1 } };
+    int64_t topk;
+    explicit QState(int64_t tk) : topk(tk) {
+        for (int64_t b = 0; b < qsat::nbmax; ++b) tab.seti(b, b);
+        wk.fillf(1.0f);
+        tail.fillf(-7.0f);
+        bk.fillf(-5.0f);
+    }
+};
+
+static std::vector<RadParam> qsa_bk_params(int64_t M) {
+    return { PI("M", M), PI("n", qsat::n), PI("ratio", qsat::ratio), PI("rotary_dim", qsat::rot),
+             PI("block_size", qsat::ratio), PF("eps", 1e-6), PF("theta", 1e6), PF("scale", 1.0),
+             PF("wadd", 0.0), PS("dtype", "bf16") };
+}
+
+/* Rows of keys: a palette of three vectors (so scores tie) or fresh ones. */
+static std::vector<float> qsa_key(uint64_t& g, bool pal) {
+    auto nx = [&] { g ^= g << 13; g ^= g >> 7; g ^= g << 17; return (uint32_t)(g >> 32); };
+    std::vector<float> v((size_t)qsat::n);
+    const int p = (int)(nx() % 3);
+    for (int64_t i = 0; i < qsat::n; ++i)
+        v[(size_t)i] = pal ? (float)(((p + 1) * (int)(i + 1)) % 5 - 2) : (float)((int)(nx() % 9) - 4) * 0.5f;
+    return v;
+}
+
+struct QOut {
+    std::vector<int64_t> sel, nsel, su, vmask;      /* per row: sel is (topk + 1) wide */
+    std::vector<std::vector<float>> rscore, score;  /* per row */
+    std::vector<int64_t> rnc, nc;
+};
+
+/* The ordinary chain over `K` at positions pos0 ..: work, block keys, tail store, then (with `Q`)
+ * score and select. */
+static bool qsa_chain(const QRows& R, QState& S, const std::vector<std::vector<float>>& K,
+                      const std::vector<std::vector<float>>& Q, int64_t pos0, QOut* out) {
+    using namespace qsat;
+    const int64_t Rn = (int64_t)K.size(), wk = (Rn + ratio - 1) / ratio + 2;
+    QB k(RAD_BF16, { Rn, n }), pos(RAD_I32, { Rn }), cu(RAD_I32, { 2 });
+    for (int64_t t = 0; t < Rn; ++t) {
+        for (int64_t d = 0; d < n; ++d) k.setf(t * n + d, K[(size_t)t][(size_t)d]);
+        pos.seti(t, pos0 + t);
+    }
+    cu.setv({ 0, Rn });
+    QB stage(RAD_BF16, { wk * ratio, n }), page(RAD_I32, { wk }), bpos(RAD_I32, { wk }), nc(RAD_I32, { 1 });
+    if (qsa_launch(R.work, { &k, &pos, &cu, &S.tail, &S.sx, &S.tab, nullptr, &stage, &page, &bpos, &nc },
+                   { PI("M", Rn), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", 1),
+                     PI("work", wk), PS("dtype", "bf16") }, R.dev) != RAD_OK) return false;
+    if (qsa_launch(R.bkey, { &stage, &S.wk, &page, &bpos, &S.bk }, qsa_bk_params(wk), R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.tail, { &k, &pos, &cu, &S.tail, &S.sx },
+                   { PI("M", Rn), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", 1),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK) return false;
+    if (!out) return true;
+    QB q(RAD_BF16, { Rn, heads * n }), sc(RAD_F32, { Rn, nbmax });
+    for (int64_t t = 0; t < Rn; ++t)
+        for (int64_t d = 0; d < heads * n; ++d) q.setf(t * heads * n + d, Q[(size_t)t][(size_t)d]);
+    if (qsa_launch(R.score, { &q, &S.bk, &S.tab, &cu, &nc, &sc },
+                   { PI("M", Rn), PI("n", n), PI("heads", heads), PI("blocks", nbmax), PI("seqs", 1),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK) return false;
+    QB se(RAD_I32, { Rn, S.topk + 1 }), ns(RAD_I32, { Rn }), su(RAD_I32, { Rn });
+    if (qsa_launch(R.sel, { &sc, &S.tab, &nc, &pos, &cu, &se, &ns, &su },
+                   { PI("M", Rn), PI("blocks", nbmax), PI("topk", S.topk), PI("ratio", ratio), PI("seqs", 1) },
+                   R.dev) != RAD_OK) return false;
+    const int64_t r = Rn - 1;
+    for (int64_t i = 0; i <= S.topk; ++i) out->sel.push_back(se.geti(r * (S.topk + 1) + i));
+    out->nsel.push_back(ns.geti(r)); out->su.push_back(su.geti(r)); out->nc.push_back(nc.geti(0));
+    std::vector<float> row;
+    for (int64_t b = 0; b < nbmax; ++b) row.push_back(sc.getf(r * nbmax + b));
+    out->score.push_back(row);
+    return true;
+}
+
+/* One tree verify step of one sequence; `na` > 0 with `path` runs the compaction first and the heal.
+ * Every operand a check wants is returned through `ops`. */
+struct QTree {
+    QB k, pos, cu, sp, nav, pth, stage, page, bpos, nc, sst, spg, sbp, rtb, rnc, rcu, skey;
+    QB se, ns, su, vm, sc, rsc, q;
+    QTree(int64_t R, int64_t tk)
+        : k(RAD_BF16, { R, qsat::n }), pos(RAD_I32, { R }), cu(RAD_I32, { 2 }), sp(RAD_I32, { R }),
+          nav(RAD_I32, { 1 }), pth(RAD_I32, { 1, 16 }),
+          stage(RAD_BF16, { qsat::work * qsat::ratio, qsat::n }), page(RAD_I32, { qsat::work }),
+          bpos(RAD_I32, { qsat::work }), nc(RAD_I32, { 1 }),
+          sst(RAD_BF16, { R * qsat::ratio, qsat::n }), spg(RAD_I32, { R }), sbp(RAD_I32, { R }),
+          rtb(RAD_I32, { R, qsat::RW }), rnc(RAD_I32, { R }), rcu(RAD_I32, { R + 1 }),
+          skey(RAD_BF16, { R, qsat::n }), se(RAD_I32, { R, tk + 1 }), ns(RAD_I32, { R }),
+          su(RAD_I32, { R }), vm(RAD_I64, { R }), sc(RAD_F32, { R, qsat::nbmax }),
+          rsc(RAD_F32, { R, qsat::RW }), q(RAD_BF16, { R, qsat::heads * qsat::n }) {}
+};
+
+static bool qsa_tree(const QRows& R, QState& S, QTree& T_, const std::vector<std::vector<float>>& K,
+                     const std::vector<std::vector<float>>& Q, const std::vector<int64_t>& par,
+                     int64_t base, int64_t na, const std::vector<int64_t>* path, bool score) {
+    using namespace qsat;
+    const int64_t Rn = (int64_t)K.size();
+    std::vector<int64_t> depth((size_t)Rn, 0);
+    for (int64_t j = 0; j < Rn; ++j) {
+        depth[(size_t)j] = j ? depth[(size_t)par[(size_t)j]] + 1 : 0;
+        T_.pos.seti(j, base + depth[(size_t)j]);
+        T_.sp.seti(j, j ? par[(size_t)j] : -1);
+        for (int64_t d = 0; d < n; ++d) T_.k.setf(j * n + d, K[(size_t)j][(size_t)d]);
+        if (score) for (int64_t d = 0; d < heads * n; ++d) T_.q.setf(j * heads * n + d, Q[(size_t)j][(size_t)d]);
+    }
+    T_.cu.setv({ 0, Rn });
+    T_.nav.seti(0, na);
+    if (path) for (size_t i = 0; i < path->size(); ++i) T_.pth.seti((int64_t)i, (*path)[i]);
+    if (path && qsa_launch(R.compact, { &T_.pos, &T_.cu, &T_.nav, &T_.pth, &S.tail, &S.sx },
+                           { PI("M", 1), PI("n", n), PI("ring", ring), PI("seqs", 1), PS("dtype", "bf16") },
+                           R.dev) != RAD_OK)
+        return false;
+    T_.skey.fillf(-3.0f);
+    if (qsa_launch(R.work, { &T_.k, &T_.pos, &T_.cu, &S.tail, &S.sx, &S.tab, nullptr, &T_.stage, &T_.page,
+                             &T_.bpos, &T_.nc, &T_.sp, path ? &T_.nav : nullptr, &T_.sst, &T_.spg, &T_.sbp,
+                             &T_.rtb, &T_.rnc, &T_.rcu },
+                   { PI("M", Rn), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", 1),
+                     PI("work", work), PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.bkey, { &T_.stage, &S.wk, &T_.page, &T_.bpos, &S.bk }, qsa_bk_params(work), R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.bkey, { &T_.sst, &S.wk, &T_.spg, &T_.sbp, &T_.skey }, qsa_bk_params(Rn), R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.tail, { &T_.k, &T_.pos, &T_.cu, &S.tail, &S.sx, &T_.sp },
+                   { PI("M", Rn), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", 1),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    if (!score) return true;
+    if (qsa_launch(R.score, { &T_.q, &S.bk, &S.tab, &T_.cu, &T_.nc, &T_.sc },
+                   { PI("M", Rn), PI("n", n), PI("heads", heads), PI("blocks", nbmax), PI("seqs", 1),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.score, { &T_.q, &T_.skey, &T_.rtb, &T_.rcu, &T_.rnc, &T_.rsc },
+                   { PI("M", Rn), PI("n", n), PI("heads", heads), PI("blocks", RW), PI("seqs", Rn),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    return qsa_launch(R.sel, { &T_.sc, &S.tab, &T_.nc, &T_.pos, &T_.cu, &T_.se, &T_.ns, &T_.su, &T_.sp,
+                               &T_.rsc, &T_.vm },
+                      { PI("M", Rn), PI("blocks", nbmax), PI("topk", S.topk), PI("ratio", ratio),
+                        PI("seqs", 1) }, R.dev) == RAD_OK;
+}
+
+static std::vector<int64_t> qsa_rand_tree(uint64_t& g, int64_t R, bool deep) {
+    auto nx = [&] { g ^= g << 13; g ^= g >> 7; g ^= g << 17; return (uint32_t)(g >> 32); };
+    std::vector<int64_t> par((size_t)R, -1), depth((size_t)R, 0);
+    for (int64_t j = 1; j < R; ++j)
+        for (int tries = 0;; ++tries) {
+            int64_t p = deep ? j - 1 - (int64_t)(nx() % (uint32_t)std::min<int64_t>(j, 3)) : (int64_t)(nx() % (uint32_t)j);
+            if (tries > 6) p = (int64_t)(nx() % (uint32_t)j);     /* a deep chain ran out of shallow parents */
+            if (depth[(size_t)p] < 6) { par[(size_t)j] = p; depth[(size_t)j] = depth[(size_t)p] + 1; break; }
+        }
+    return par;
+}
+
+static std::set<int64_t> qsa_chain_vis(const QOut& c, int64_t P) {
+    std::set<int64_t> v;
+    const bool partial = (P + 1) % qsat::ratio != 0;
+    for (int64_t e = 0; e < c.nsel[0]; ++e) {
+        const int64_t cnt = (partial && e == c.nsel[0] - 1) ? P % qsat::ratio + 1 : qsat::ratio;
+        for (int64_t i = 0; i < cnt; ++i) v.insert(c.sel[(size_t)e] * qsat::ratio + i);
+    }
+    return v;
+}
+
+static void qsa_tree_exact_case(const Plugin& pl) {
+    const char* what = "qsa tree verify vs the sequential decode of every node's path";
+    const RadKernelInfo *w = find(pl, "qsa_work_bf16"), *bk = find(pl, "qsa_block_key_bf16"),
+                        *tl = find(pl, "qsa_tail_store_bf16"), *cm = find(pl, "qsa_tail_compact_bf16"),
+                        *sc = find(pl, "qsa_score_bf16"), *se = find(pl, "qsa_select_i32");
+    if (!w || !bk || !tl || !cm || !sc || !se) { ok(what, false, "a row is absent"); return; }
+    const QRows R{ w, bk, tl, cm, sc, se, true };
+    using namespace qsat;
+    int bad = 0, nodes = 0, above = 0, sc_bad = 0;
+    for (int64_t base = 33; base <= 40 && bad < 5; ++base)
+        for (uint64_t seed = 1; seed <= 3 && bad < 5; ++seed)
+            for (int64_t topk : { 3, 5, 40 }) {
+                uint64_t g = seed * 7919 + (uint64_t)base * 31 + (uint64_t)topk;
+                const bool pal = seed != 2;
+                QState S(topk);
+                std::vector<std::vector<float>> pk, K, Qr;
+                for (int64_t t = 0; t < base; ++t) pk.push_back(qsa_key(g, pal));
+                if (!qsa_chain(R, S, pk, {}, 0, nullptr)) { ok(what, false, "prefix chain"); return; }
+                const QState S0 = S;
+                const int64_t Rn = 12;
+                for (int64_t j = 0; j < Rn; ++j) {
+                    K.push_back(qsa_key(g, pal));
+                    std::vector<float> q;
+                    for (int64_t h = 0; h < heads; ++h) { auto x = qsa_key(g, pal); q.insert(q.end(), x.begin(), x.end()); }
+                    Qr.push_back(q);
+                }
+                const std::vector<int64_t> par = qsa_rand_tree(g, Rn, seed & 1);
+                QTree T_(Rn, topk);
+                if (!qsa_tree(R, S, T_, K, Qr, par, base, 0, nullptr, true)) { ok(what, false, "tree step"); return; }
+                std::vector<int64_t> depth((size_t)Rn, 0), pos;
+                for (int64_t j = 0; j < Rn; ++j) { depth[(size_t)j] = j ? depth[(size_t)par[(size_t)j]] + 1 : 0; pos.push_back(base + depth[(size_t)j]); }
+                const int64_t rb = base / ratio * ratio;
+                for (int64_t x = 0; x < Rn; ++x) {
+                    std::vector<int64_t> rows;
+                    for (int64_t y = x;; y = par[(size_t)y]) { rows.push_back(y); if (y == 0) break; }
+                    std::reverse(rows.begin(), rows.end());
+                    std::vector<std::vector<float>> pK, pQ;
+                    for (int64_t y : rows) { pK.push_back(K[(size_t)y]); pQ.push_back(Qr[(size_t)y]); }
+                    QState C = S0;
+                    QOut co;
+                    if (!qsa_chain(R, C, pK, pQ, base, &co)) { ok(what, false, "chain"); return; }
+                    ++nodes;
+                    const int64_t P = pos[(size_t)x], ntot = (P + 1) / ratio, b0 = base / ratio;
+                    if (ntot > topk) ++above;
+                    std::set<int64_t> tv;
+                    for (int64_t e = 0; e < T_.ns.geti(x); ++e)
+                        for (int64_t i = 0; i < ratio; ++i) tv.insert(T_.se.geti(x * (topk + 1) + e) * ratio + i);
+                    for (int k2 = 0; k2 < 64; ++k2) {
+                        if (!((T_.vm.geti(x) >> k2) & 1)) continue;
+                        tv.insert(rb + k2 < base ? rb + k2 : pos[(size_t)(rb + k2 - base)]);
+                    }
+                    const std::set<int64_t> cv = qsa_chain_vis(co, P);
+                    for (int64_t i = 0; i < T_.rnc.geti(x); ++i) {
+                        const float a = T_.rsc.getf(x * RW + i), b = co.score[0][(size_t)(b0 + i)];
+                        if (std::memcmp(&a, &b, 4) != 0) ++sc_bad;
+                    }
+                    if (cv != tv || T_.su.geti(x) != T_.ns.geti(x) * ratio) {
+                        if (++bad <= 3)
+                            std::printf("        base %lld seed %llu topk %lld node %lld: chain %zu keys, tree %zu\n",
+                                        (long long)base, (unsigned long long)seed, (long long)topk, (long long)x, cv.size(), tv.size());
+                    }
+                }
+            }
+    ok(what, bad == 0 && sc_bad == 0 && above > 100,
+       fmt("%d nodes, %d above the bound, %d visible-set mismatches, %d region scores off the chain's", nodes, above, bad, sc_bad));
+}
+
+/* Op by op on the same inputs, the device's integer outputs and copied key bytes against libref's:
+ * the compaction, the tree and heal work list and the tree tail store, then the tree selection on
+ * random coarse scores. */
+static void qsa_tree_ref_case(const Plugin& pl) {
+    const char* what = "qsa tree ops vs libref (compact, work heal+tree, tail store, select)";
+    const RadKernelInfo *w = find(pl, "qsa_work_bf16"), *bk = find(pl, "qsa_block_key_bf16"),
+                        *tl = find(pl, "qsa_tail_store_bf16"), *cm = find(pl, "qsa_tail_compact_bf16"),
+                        *sc = find(pl, "qsa_score_bf16"), *se = find(pl, "qsa_select_i32");
+    const RadKernelInfo *rw = qsa_ref_row("qsa_work"), *rt = qsa_ref_row("qsa_tail_store"),
+                        *rc = qsa_ref_row("qsa_tail_compact"), *rs = qsa_ref_row("qsa_select");
+    if (!w || !bk || !tl || !cm || !sc || !se || !rw || !rt || !rc || !rs) { ok(what, false, "a row is absent"); return; }
+    using namespace qsat;
+    int bad = 0, trees = 0;
+    auto same = [&](const QB& a, const QB& b, const char* nm, int64_t seed) {
+        if (a.h == b.h) return;
+        ++bad;
+        std::printf("        seed %lld: %s differs\n", (long long)seed, nm);
+    };
+    for (int64_t seed = 1; seed <= 24; ++seed) {
+        uint64_t g = (uint64_t)seed * 104729;
+        const int64_t base = 22 + seed % 9, Rn = 4 + seed % 10, topk = 2 + seed % 4;
+        auto par = qsa_rand_tree(g, Rn, seed & 1);
+        std::vector<std::vector<float>> K, Qr;
+        for (int64_t j = 0; j < Rn; ++j) K.push_back(qsa_key(g, false));
+        /* The previous step's committed path: the deepest of an earlier tree, na tokens. */
+        const int64_t na = 1 + seed % 6;
+        std::vector<int64_t> path = { 0 };
+        for (int64_t t = 1; t < na; ++t) path.push_back(t + (int64_t)(seed % 3));
+        QState Sd(topk), Sr(topk);
+        std::vector<std::vector<float>> pk;
+        for (int64_t t = 0; t < base - na; ++t) pk.push_back(qsa_key(g, false));
+        const QRows Rd{ w, bk, tl, cm, sc, se, true }, Rr{ rw, qsa_ref_row("qsa_block_key"), rt, rc,
+                                                              qsa_ref_row("qsa_score"), rs, false };
+        qsa_chain(Rr, Sr, pk, {}, 0, nullptr);
+        Sd = Sr;
+        /* Fill the ring rows of the flat verify so the compaction has something to move. */
+        for (int64_t r = 0; r < ring; ++r)
+            for (int64_t d = 0; d < n; ++d) { const float v = (float)((r * 3 + d) % 11) - 5; Sr.tail.setf(r * n + d, v); Sd.tail.setf(r * n + d, v); }
+        QTree Td(Rn, topk), Tr(Rn, topk);
+        if (!qsa_tree(Rd, Sd, Td, K, {}, par, base, na, &path, false) ||
+            !qsa_tree(Rr, Sr, Tr, K, {}, par, base, na, &path, false)) { ok(what, false, "a launch failed"); return; }
+        ++trees;
+        same(Sd.tail, Sr.tail, "the tail after compact + store", seed);
+        same(Td.nc, Tr.nc, "nc", seed); same(Td.page, Tr.page, "page", seed); same(Td.bpos, Tr.bpos, "bpos", seed);
+        same(Td.stage, Tr.stage, "stage", seed); same(Td.spg, Tr.spg, "spage", seed);
+        same(Td.sbp, Tr.sbp, "sbpos", seed); same(Td.rtb, Tr.rtb, "rtab", seed);
+        same(Td.rnc, Tr.rnc, "rnc", seed); same(Td.rcu, Tr.rcu, "rcu", seed);
+        /* The scratch keys of the rows that complete a block; the others are unwritten. */
+        for (int64_t x = 0; x < Rn; ++x)
+            if (Td.spg.geti(x) >= 0)
+                for (int64_t i = 0; i < ratio; ++i)
+                    if (std::memcmp(Td.sst.h.data() + (size_t)((x * ratio + i) * n) * 2, Tr.sst.h.data() + (size_t)((x * ratio + i) * n) * 2, (size_t)n * 2) != 0) {
+                        ++bad; std::printf("        seed %lld: sstage row %lld\n", (long long)seed, (long long)(x * ratio + i));
+                    }
+        /* The selection on random coarse scores, identical inputs. */
+        const int64_t b0 = base / ratio;
+        QB tab(RAD_I32, { 1, nbmax });
+        for (int64_t b = 0; b < nbmax; ++b) tab.seti(b, b == 2 ? -1 : b + 100);
+        for (QTree* T_ : { &Td, &Tr }) {
+            auto gg = g;
+            for (int64_t m = 0; m < Rn; ++m) {
+                for (int64_t b = 0; b < nbmax; ++b) { gg ^= gg << 13; gg ^= gg >> 7; gg ^= gg << 17; T_->sc.setf(m * nbmax + b, (float)((gg >> 32) % 6) * 0.5f); }
+                for (int64_t i = 0; i < RW; ++i) { gg ^= gg << 13; gg ^= gg >> 7; gg ^= gg << 17; T_->rsc.setf(m * RW + i, (float)((gg >> 32) % 6) * 0.5f); }
+            }
+            T_->vm.h.assign(T_->vm.h.size(), 0x55);
+        }
+        (void)b0;
+        const std::vector<RadParam> sp = { PI("M", Rn), PI("blocks", nbmax), PI("topk", topk), PI("ratio", ratio), PI("seqs", 1) };
+        const int a1 = qsa_launch(se, { &Td.sc, &tab, &Td.nc, &Td.pos, &Td.cu, &Td.se, &Td.ns, &Td.su, &Td.sp, &Td.rsc, &Td.vm }, sp, true);
+        const int a2 = qsa_launch(rs, { &Tr.sc, &tab, &Tr.nc, &Tr.pos, &Tr.cu, &Tr.se, &Tr.ns, &Tr.su, &Tr.sp, &Tr.rsc, &Tr.vm }, sp, false);
+        if (a1 != RAD_OK || a2 != RAD_OK) { ok(what, false, fmt("select rc %d / %d", a1, a2)); return; }
+        same(Td.se, Tr.se, "sel", seed); same(Td.ns, Tr.ns, "nsel", seed);
+        same(Td.su, Tr.su, "seqused", seed); same(Td.vm, Tr.vm, "vmask", seed);
+    }
+    ok(what, bad == 0, fmt("%d trees, %d differences", trees, bad));
+}
+
+/* qsa_tail_compact against libref: three sequences (a path to move, na 1 and a slot -1) in a
+ * four-slot pool, random bf16 rows, ring 7. Every byte of the pool must equal libref's. */
+static void qsa_tail_compact_case(const Plugin& pl) {
+    const char* what = "qsa_tail_compact vs libref";
+    const RadKernelInfo* r = find(pl, "qsa_tail_compact_bf16");
+    const RadKernelInfo* ro = qsa_ref_row("qsa_tail_compact");
+    if (!r || !ro) { ok(what, false, "row absent"); return; }
+    const int64_t n = 128, ring = 7, slots = 4;
+    int bad = 0;
+    for (int it = 0; it < 12; ++it) {
+        QB st(RAD_BF16, { slots, 1, ring, n }), pos(RAD_I32, { 3 }), cu(RAD_I32, { 4 }), na(RAD_I32, { 3 });
+        QB path(RAD_I32, { 3, 6 }), sx(RAD_I32, { 3, 1 });
+        for (int64_t i = 0; i < st.numel(); ++i) st.setf(i, (float)((int)(st_mix32((uint32_t)(i + it * 977)) % 61) - 30));
+        pos.setv({ 20 + it, 9, 30 });
+        cu.setv({ 0, 1, 2, 3 });
+        na.setv({ 2 + it % 4, 1, 3 });
+        path.setv({ 0, 1 + it % 3, 3 + it % 3, 5, 6, 6,   0, 0, 0, 0, 0, 0,   0, 1, 2, 0, 0, 0 });
+        sx.setv({ 3, 1, -1 });
+        QB sr = st;
+        const std::vector<RadParam> ps = { PI("M", 3), PI("n", n), PI("ring", ring), PI("seqs", 3), PS("dtype", "bf16") };
+        const int a = qsa_launch(r, { &pos, &cu, &na, &path, &st, &sx }, ps, true);
+        const int b = qsa_launch(ro, { &pos, &cu, &na, &path, &sr, &sx }, ps, false);
+        if (a != RAD_OK || b != RAD_OK) { ok(what, false, fmt("rc %d / %d (it %d)", a, b, it)); return; }
+        if (st.h != sr.h) ++bad;
+    }
+    ok(what, bad == 0, fmt("%d of 12 pools differ", bad));
+}
+
 /* qsa_tail_store, against a token-by-token loop.
  *
  * Positions p and p + ring share a row, so a long prefill chunk has several tokens per row and
@@ -29557,6 +30871,298 @@ static void ngram_hint_case(const Plugin& pl) {
        tail == std::vector<int32_t>({ 7, 7, 7, 7, 103, 106, 103, 106, 7, 7, 7, 7, 7, 7, 7, 7 }));
 }
 
+/* The PLE ops over a verify tree (`spec_parent`, docs/OPS.md "Tree verification of the PLE
+ * windows"), on the card against libref and against themselves.
+ *
+ * For each explicit tree the device's tree launch must (1) match libref's tree launch, (2) give
+ * every node exactly what the SAME device kernel gives the last row of a chain over that node's
+ * root-to-node path against the same committed window (the exactness the design rests on), and (3)
+ * leave the window in row layout, bit for bit libref's. A host compaction along an accepted path
+ * (kv_window_compact's rule, `off` = ngram - 2 for the tokens and (width-1)*dilation - 1 for the
+ * convolution) is then read by a one-row step, which must equal a cold decode of the committed
+ * text. */
+namespace {
+
+/* Rows of `par` from the root to node r. */
+std::vector<int> ple_tree_path(const std::vector<int>& par, int r) {
+    std::vector<int> p;
+    for (int c = r; c >= 0; c = par[(size_t)c] == -2 ? c - 1 : par[(size_t)c]) p.push_back(c);
+    return std::vector<int>(p.rbegin(), p.rend());
+}
+
+/* Explicit trees, 17 rows: a fork at the root, a branch deeper than the conv's deepest tap (9
+ * levels), siblings at several depths, a star, a chain and the ordinary-row form. */
+std::vector<std::vector<int>> ple_trees() {
+    std::vector<int> deep = { -1 };
+    for (int i = 1; i < 12; ++i) deep.push_back(i - 1);              /* a chain of 12 */
+    deep.insert(deep.end(), { 3, 3, 7, 0, 11 });                     /* forks along it */
+    std::vector<int> star(17, 0), chain = { -1 }, causal(17, -2);
+    star[0] = -1;
+    for (int i = 1; i < 17; ++i) chain.push_back(i - 1);
+    causal[0] = -1;
+    return {
+        { -1, 0, 1, 1, 0, 4, 5, 6, 0, 8, 8, 2, 11, 12, 4, 0, 15 },
+        deep, star, chain, causal,
+    };
+}
+
+const RadKernelInfo* ple_ref_row(const Plugin& pl, const char* op, void** keep) {
+    *keep = nullptr;
+    if (!g_plugin) return nullptr;
+    std::string path(g_plugin);
+    path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) return nullptr;
+    auto count = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    (void)pl;
+    if (count && at)
+        for (int i = 0; i < count(); ++i)
+            if (std::strcmp(at(i)->op, op) == 0) { *keep = ref; return at(i); }
+    dlclose(ref);
+    return nullptr;
+}
+
+}  // namespace
+
+static void ple_tree_ngram_case(const Plugin& pl) {
+    if (!sel("ngram_ids_i32")) return;
+    const RadKernelInfo* r = find(pl, "ngram_ids_i32");
+    void* hold = nullptr;
+    const RadKernelInfo* ref = ple_ref_row(pl, "ngram_ids", &hold);
+    if (!r || !ref) { ok("ngram_ids_i32 tree", false, "row or libref absent"); return; }
+    const int64_t kEos = 248044, H = 16, NG = 3, CTX = 2, M = 17, W = CTX - 1 + M;
+    std::vector<int64_t> mult = { 23703573157769LL, 20109073645365LL, 8052911324071LL }, vsz, off;
+    int64_t acc = 0;
+    for (int i = 0; i < 16; ++i) { vsz.push_back(20000003 + 10 * i); off.push_back(acc); acc += vsz.back(); }
+    auto dev = [&](const void* h, size_t b) { void* d = dalloc(b); st_memcpy(d, h, b, hipMemcpyHostToDevice); return d; };
+    void* d_mult = dev(mult.data(), 3 * 8);
+    void* d_vsz  = dev(vsz.data(), 16 * 8);
+    void* d_off  = dev(off.data(), 16 * 8);
+
+    /* One sequence in slot 0 reading at entry `o`. `par` null: no spec_parent. */
+    auto launch = [&](const RadKernelInfo* k, const std::vector<int32_t>& tok,
+                      const std::vector<int>* par, std::vector<int32_t>& state, int hini, int nacc,
+                      std::vector<int32_t>* ids) {
+        const int64_t n = (int64_t)tok.size();
+        const std::vector<int32_t> cu = { 0, (int32_t)n }, ci = { 0 }, hi = { hini }, na = { nacc };
+        std::vector<int32_t> pv;
+        if (par) pv.assign(par->begin(), par->end());
+        void* d_ids = dalloc((size_t)(n * H * 4));
+        void* d_st  = dev(state.data(), state.size() * 4);
+        std::vector<RadTensor> ts = {
+            T(dev(tok.data(), tok.size() * 4), RAD_I32, { n }), T(d_st, RAD_I32, { 1, 1, W }),
+            T(dev(cu.data(), 8), RAD_I32, { 2 }), T(d_mult, RAD_I64, { 3 }),
+            T(d_vsz, RAD_I64, { 16 }), T(d_off, RAD_I64, { 16 }),
+            T(dev(ci.data(), 4), RAD_I32, { 1 }), T(dev(hi.data(), 4), RAD_I32, { 1 }),
+            T(dev(na.data(), 4), RAD_I32, { 1 }), T(d_ids, RAD_I32, { n, H }),
+            T(nullptr, RAD_I32, { 1 }), T(par ? dev(pv.data(), pv.size() * 4) : nullptr, RAD_I32, { n }) };
+        absent(ts[10]);
+        if (!par) absent(ts[11]);
+        std::vector<RadParam> ps = { PI("M", n), PI("heads", H), PI("ngram", NG), PI("eos", kEos) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (k->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return false;
+        ids->resize((size_t)(n * H));
+        st_memcpy(ids->data(), d_ids, ids->size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(state.data(), d_st, state.size() * 4, hipMemcpyDeviceToHost);
+        return true;
+    };
+
+    int bad_ref = 0, bad_path = 0, bad_state = 0, bad_next = 0, served = 1, runs = 0;
+    const auto trees = ple_trees();
+    for (size_t ti = 0; ti < trees.size(); ++ti) {
+        for (int variant = 0; variant < 3; ++variant) {
+            std::vector<int32_t> tok;
+            for (int i = 0; i < M; ++i)
+                tok.push_back(variant == 1 && (i == 1 || i == 5 || i == 9) ? (int32_t)kEos
+                                                                           : 100 + 7 * i);
+            const int hini = variant == 2 ? 0 : 1;
+            const std::vector<int32_t> st0 = { 900, 901, variant == 1 ? (int32_t)kEos : 51, 52, 902, 903,
+                                               904, 905, 906, 907, 908, 909, 910, 911, 912, 913, 914, 915 };
+            std::vector<int32_t> sd = st0, sr = st0, idd, idr;
+            served = served && launch(r, tok, &trees[ti], sd, hini, 3, &idd) &&
+                     launch(ref, tok, &trees[ti], sr, hini, 3, &idr);
+            if (!served) break;
+            ++runs;
+            if (idd != idr) ++bad_ref;
+            if (sd != sr) ++bad_state;
+            for (int n = 0; n < M && served; ++n) {
+                std::vector<int32_t> pt;
+                for (int q : ple_tree_path(trees[ti], n)) pt.push_back(tok[(size_t)q]);
+                std::vector<int32_t> sp = st0, ip;
+                served = launch(r, pt, nullptr, sp, hini, 3, &ip);
+                if (!served) break;
+                const size_t last = pt.size() - 1;
+                if (!std::equal(ip.begin() + last * H, ip.begin() + (last + 1) * H,
+                                idd.begin() + n * H))
+                    ++bad_path;
+            }
+            /* Compact along the deepest path (kv_window_compact: off = ngram - 2) and read it
+             * with a one-row step at num_accepted = k. */
+            int deepest = 0;
+            for (int n = 0; n < M; ++n)
+                if (ple_tree_path(trees[ti], n).size() > ple_tree_path(trees[ti], deepest).size())
+                    deepest = n;
+            const std::vector<int> path = ple_tree_path(trees[ti], deepest);
+            std::vector<int32_t> sc = sd;
+            for (size_t t = 1; t < path.size(); ++t) sc[(size_t)(CTX - 1) + t] = sc[(size_t)(CTX - 1) + (size_t)path[t]];
+            std::vector<int32_t> next, fresh;
+            /* The text the step committed: the window it read, the path, and the next token. A cold
+             * window is EOS, as in the cold decode below; only the last three tokens matter. */
+            std::vector<int32_t> hist;
+            hist.push_back(hini ? st0[2] : (int32_t)kEos);
+            hist.push_back(hini ? st0[3] : (int32_t)kEos);
+            for (int q : path) hist.push_back(tok[(size_t)q]);
+            hist.push_back(77);
+            hist.erase(hist.begin(), hist.end() - 6);
+            std::vector<int32_t> cold(W, 0);
+            served = served && launch(r, { 77 }, nullptr, sc, 1, (int)path.size(), &next) &&
+                     launch(r, hist, nullptr, cold, 0, 1, &fresh);
+            if (served && !std::equal(next.begin(), next.end(), fresh.end() - H)) ++bad_next;
+        }
+        if (!served) break;
+    }
+    if (!served) { ok("ngram_ids_i32 tree: served", false); dlclose(hold); return; }
+    ok(fmt("ngram_ids_i32 tree: %d launches, every node's ids are libref's (%d differ)", runs,
+           bad_ref).c_str(), bad_ref == 0);
+    ok(fmt("ngram_ids_i32 tree: every node's ids are its sequential path's (%d differ)",
+           bad_path).c_str(), bad_path == 0);
+    ok(fmt("ngram_ids_i32 tree: the window is libref's row layout (%d differ)", bad_state).c_str(),
+       bad_state == 0);
+    ok(fmt("ngram_ids_i32 tree: a compacted window reads as the committed text (%d differ)",
+           bad_next).c_str(), bad_next == 0);
+    dlclose(hold);
+}
+
+static void ple_tree_conv_case(const Plugin& pl) {
+    if (!sel("ple_conv_bf16")) return;
+    const RadKernelInfo* r = find(pl, "ple_conv_bf16");
+    void* hold = nullptr;
+    const RadKernelInfo* ref = ple_ref_row(pl, "ple_conv", &hold);
+    if (!r || !ref) { ok("ple_conv_bf16 tree", false, "row or libref absent"); return; }
+    /* The model's geometry: width 4, dilation 3 (taps 9, 6, 3, 0), over 300 channels so two
+     * channel blocks run. */
+    const int64_t N = 300, WID = 4, DIL = 3, HIST = (WID - 1) * DIL, M = 17, SL = HIST - 1 + M;
+    auto dev = [&](const void* h, size_t b) { void* d = dalloc(b); st_memcpy(d, h, b, hipMemcpyHostToDevice); return d; };
+    auto fill = [&](size_t n, uint32_t seed, float scale) {
+        std::vector<uint16_t> v(n);
+        for (size_t i = 0; i < n; ++i) v[i] = h_to_bf16(scale * (float)(((st_mix32((uint32_t)i * 2654435761u + seed) >> 8) & 1023) - 512) / 512.0f);
+        return v;
+    };
+    const std::vector<uint16_t> w = fill((size_t)(N * WID), 11, 0.7f);
+    void* d_w = dev(w.data(), w.size() * 2);
+    /* Token t's input row is a function of the token, so a path's inputs follow its tokens. */
+    const std::vector<uint16_t> xall = fill((size_t)(64 * N), 29, 2.0f);
+    const std::vector<uint16_t> rall = fill((size_t)(64 * N), 31, 1.0f);
+    auto rows_of = [&](const std::vector<uint16_t>& src, const std::vector<int>& toks) {
+        std::vector<uint16_t> o;
+        for (int t : toks) o.insert(o.end(), src.begin() + (size_t)t * N, src.begin() + (size_t)(t + 1) * N);
+        return o;
+    };
+
+    auto launch = [&](const RadKernelInfo* k, const std::vector<int>& toks,
+                      const std::vector<int>* par, std::vector<uint16_t>& state, int hini, int nacc,
+                      std::vector<uint16_t>* y) {
+        const int64_t n = (int64_t)toks.size();
+        const std::vector<uint16_t> x = rows_of(xall, toks), res = rows_of(rall, toks);
+        const std::vector<int32_t> cu = { 0, (int32_t)n }, ci = { 0 }, hi = { hini }, na = { nacc };
+        std::vector<int32_t> pv;
+        if (par) pv.assign(par->begin(), par->end());
+        void* d_y  = dalloc((size_t)(n * N * 2));
+        void* d_st = dev(state.data(), state.size() * 2);
+        std::vector<RadTensor> ts = {
+            T(dev(x.data(), x.size() * 2), RAD_BF16, { n, N }), T(d_w, RAD_BF16, { N, WID }),
+            T(d_st, RAD_BF16, { 1, N, SL }), T(dev(cu.data(), 8), RAD_I32, { 2 }),
+            T(dev(res.data(), res.size() * 2), RAD_BF16, { n, N }), T(dev(ci.data(), 4), RAD_I32, { 1 }),
+            T(dev(hi.data(), 4), RAD_I32, { 1 }), T(dev(na.data(), 4), RAD_I32, { 1 }),
+            T(d_y, RAD_BF16, { n, N }), T(par ? dev(pv.data(), pv.size() * 4) : nullptr, RAD_I32, { n }) };
+        if (!par) absent(ts[9]);
+        if (nacc < 0) absent(ts[7]);          /* the prefill form */
+        std::vector<RadParam> ps = { PI("M", n), PI("n", N), PI("width", WID), PI("dilation", DIL),
+                                     PS("dtype", "bf16") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (k->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return false;
+        y->resize((size_t)(n * N));
+        st_memcpy(y->data(), d_y, y->size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(state.data(), d_st, state.size() * 2, hipMemcpyDeviceToHost);
+        return true;
+    };
+
+    /* A warm window: nine committed inputs (tokens 40..48), as a prefill of them leaves it
+     * (the layout absent num_accepted gives: the last HIST inputs at entry 0). */
+    std::vector<uint16_t> st0((size_t)(N * SL), 0);
+    {
+        std::vector<int> committed;
+        for (int t = 40; t < 49; ++t) committed.push_back(t);
+        std::vector<uint16_t> y;
+        launch(r, committed, nullptr, st0, 0, -1, &y);
+    }
+    double worst = 0;
+    int bad_path = 0, bad_state = 0, bad_next = 0, runs = 0;
+    bool served = true;
+    const auto trees = ple_trees();
+    for (size_t ti = 0; ti < trees.size() && served; ++ti)
+        for (int hini = 0; hini <= 1 && served; ++hini) {
+            std::vector<int> toks;
+            for (int i = 0; i < M; ++i) toks.push_back(i);
+            std::vector<uint16_t> sd = st0, sr = st0, yd, yr;
+            served = launch(r, toks, &trees[ti], sd, hini, 1, &yd) &&
+                     launch(ref, toks, &trees[ti], sr, hini, 1, &yr);
+            if (!served) break;
+            ++runs;
+            for (size_t i = 0; i < yd.size(); ++i) {
+                const double a = h_bf16(yd[i]), b = h_bf16(yr[i]);
+                const double d = std::fabs(a - b) / std::max(std::fabs(b), 0.05);
+                if (d > worst) worst = d;
+            }
+            if (sd != sr) ++bad_state;
+            for (int n = 0; n < M && served; ++n) {
+                std::vector<int> pt = ple_tree_path(trees[ti], n);
+                std::vector<uint16_t> sp = st0, yp;
+                served = launch(r, pt, nullptr, sp, hini, 1, &yp);
+                if (!served) break;
+                const size_t last = pt.size() - 1;
+                if (!std::equal(yp.begin() + last * N, yp.begin() + (last + 1) * N, yd.begin() + (size_t)n * N))
+                    ++bad_path;
+            }
+            /* Compact along the deepest path (off = (width-1)*dilation - 1) and read it with a
+             * one-row step at num_accepted = k, against the same text decoded as a chain. */
+            int deepest = 0;
+            for (int n = 0; n < M; ++n)
+                if (ple_tree_path(trees[ti], n).size() > ple_tree_path(trees[ti], deepest).size())
+                    deepest = n;
+            const std::vector<int> path = ple_tree_path(trees[ti], deepest);
+            std::vector<uint16_t> sc = sd;
+            for (int64_t c = 0; c < N; ++c)
+                for (size_t t = 1; t < path.size(); ++t)
+                    sc[(size_t)(c * SL + HIST - 1) + t] = sc[(size_t)(c * SL + HIST - 1) + (size_t)path[t]];
+            std::vector<uint16_t> yn, yc, yn2;
+            std::vector<uint16_t> sch = st0;
+            /* The chain over the same path leaves the row layout the compaction reproduces. */
+            served = served && launch(r, { 50 }, nullptr, sc, 1, (int)path.size(), &yn) &&
+                     launch(r, path, nullptr, sch, hini, 1, &yc) &&
+                     launch(r, { 50 }, nullptr, sch, 1, (int)path.size(), &yn2);
+            if (!served) break;
+            if (yn != yn2) ++bad_next;
+        }
+    if (!served) { ok("ple_conv_bf16 tree: served", false); dlclose(hold); return; }
+    ok(fmt("ple_conv_bf16 tree: %d launches match libref (worst relative diff %.3g)", runs, worst).c_str(),
+       worst < 2e-2);
+    ok(fmt("ple_conv_bf16 tree: every node is its sequential path's last row, bit for bit (%d differ)",
+           bad_path).c_str(), bad_path == 0);
+    ok(fmt("ple_conv_bf16 tree: the window is libref's row layout (%d differ)", bad_state).c_str(),
+       bad_state == 0);
+    ok(fmt("ple_conv_bf16 tree: a compacted window reads as the chain's (%d differ)", bad_next).c_str(),
+       bad_next == 0);
+    dlclose(hold);
+}
+
 /* ---- Runtime LoRA: a lora_shrink row then a lora_expand row, as the engine issues them, against an
  * f64 host sum and libref's bytes.
  *
@@ -30140,6 +31746,8 @@ static void device_phase(const Plugin& pl) {
 
     ngram_ahead_case(pl);
     ngram_hint_case(pl);
+    ple_tree_ngram_case(pl);
+    ple_tree_conv_case(pl);
     embed_lookup_q_case(pl);
     lora_case(pl);
 
@@ -30406,6 +32014,9 @@ static void device_phase(const Plugin& pl) {
     attn_gq_fold_case(pl, 24, false, true, 3, true);
     attn_gq_fold_case(pl, 3, true, true, 0, true);
     attn_gq_fold_case(pl, 24, true, true, 0, true);
+    /* attn_paged_tree_sel on an explicit tree, both ratios and cache dtypes, and its gated merges. */
+    for (int64_t g : { 12, 6 })
+        for (bool bf : { true, false }) attn_tsel_case(pl, g, bf);
     if (sel("attn_vit_h72_bf16")) {
         const RadKernelInfo* r = find(pl, "attn_vit_h72_bf16");
         if (!r) ok("attn_vit_h72_bf16", false, "row absent");
@@ -31506,6 +33117,7 @@ static void device_phase(const Plugin& pl) {
         }
         gdn_recurrent_anchor(pl);
         gdn_conv_fold(pl);
+        gdn_tree(pl);
         gdn_conv_f32_weight(pl);
         if (sel("gdn_gated_rmsnorm_h128_bf16")) {
             const RadKernelInfo* r = find(pl, "gdn_gated_rmsnorm_h128_bf16");
@@ -32174,6 +33786,13 @@ static void device_phase(const Plugin& pl) {
     if (sel("qsa_work_bf16")) {
         if (!g_case) std::printf("\nthe QSA work list, against a host walk of the batch\n");
         qsa_work_case(pl);
+        qsa_tree_ref_case(pl);
+        qsa_tree_exact_case(pl);
+    }
+
+    if (sel("qsa_tail_compact_bf16")) {
+        if (!g_case) std::printf("\nthe QSA tail compaction after a tree verify, against libref\n");
+        qsa_tail_compact_case(pl);
     }
 
     if (sel("qsa_tail_store_bf16")) {

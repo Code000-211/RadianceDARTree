@@ -398,6 +398,9 @@ public:
         int32_t  card = -1;
     };
     int serial_begin(int* rounds, SerialRow* out, int max);
+    /* The deepest of a tree's first `n` nodes (parents null: a chain). Public for the engine's
+     * cross-check of a serial tree. */
+    static int tree_depth(const int32_t* parents, int n);
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
      * round 0 carries it. Call serial_end() once the step has committed. */
@@ -600,6 +603,12 @@ private:
     int32_t       serial_rot_shift_ = 0;
     /* A tree drafter (rad_drafter_tree): every trunk plan is StepPlan::spec_is_tree. */
     bool          tree_ = false;
+    /* A SERIAL head's tree (RadDrafterDecl::tree_nodes): cfg.n_spec is its node budget, the head
+     * runs `tree_rounds_` rounds (so no path is deeper), and `tree_width_` frontier rows a round
+     * when it grows the tree itself (1: the chain and the core's leaves). */
+    bool          serial_tree_ = false;
+    int32_t       tree_rounds_ = 0;
+    int32_t       tree_width_ = 1;
     BatchBuilder  builder_;
     DraftController draft_;
 

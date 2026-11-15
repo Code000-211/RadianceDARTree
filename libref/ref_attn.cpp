@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 using namespace ref;
 
@@ -353,6 +354,153 @@ int ref_attn_paged_tree(const RadArgs* a, RadStream s) {
     if (a->n_t < 9 || !t_in(a, 8)) return RAD_E_INVAL;
     if (p_int(a, "causal", 1) != 1) return RAD_E_UNSUPPORTED;
     return ref_attn_paged(a, s);
+}
+
+/* ------------------------------------------------------------------ attn_paged_tree_sel */
+/* attn_paged_tree_sel: one softmax over a QSA row's committed pages and a tree verify's region.
+ *
+ * Operands (the first eight are attn_paged's, in its order, so a sparse launch's operand list is
+ * the same one):
+ *   0 q [rows, n_head, head_dim]   1 kv_cache   2 sel [rows, pitch] i32   3 nsel [rows] i32
+ *   4-6 absent (no descales, no cu_seqlens)     7 out
+ *   8 vmask [rows] i64 (read as u64)   9 block_table [n_seq, bt_pitch] i32
+ *   10 rb [n_seq] i32   11 seq_cu [n_seq + 1] i32, optional
+ *
+ * Row r of sequence s sees, in this order: the keys of pages sel[r, 0 .. nsel[r]) (physical block
+ * ids, every one a full page), then the region keys k = 0..63 whose bit is set in vmask[r]: region
+ * key k is the sequence's logical position rb[s] + k, in physical page
+ * block_table[s, rb[s] / block_size + k / block_size], slot k % block_size. rb[s] is a multiple of
+ * block_size. Every visible key is one entry of a single softmax; the arithmetic is attn_paged's
+ * (per key f32 dot over d in ascending order, times the scale; max; exp(score - max) summed and
+ * accumulated in key order), so a row whose keys are those of an attn_paged row's table in the
+ * same order -- a plain causal prefix as vmask -- is bit-identical to it. Without seq_cu the rows
+ * split evenly over the block table's rows. A row that sees no key gives zeros. */
+int ref_attn_paged_tree_sel(const RadArgs* a, RadStream) {
+    if (a->n_t < 11) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *kv = &a->t[1], *sel = &a->t[2], *nsel = &a->t[3],
+                    *o = &a->t[7];
+    const RadTensor* vmk = t_in(a, 8);
+    const RadTensor* bt  = t_in(a, 9);
+    const RadTensor* rbt = t_in(a, 10);
+    const RadTensor* cus = t_in(a, 11);
+    if (t_in(a, 4) || t_in(a, 5) || t_in(a, 6)) return RAD_E_UNSUPPORTED;
+    if (!q->data || !kv->data || !sel->data || !nsel->data || !o->data || !vmk || !bt || !rbt)
+        return RAD_E_INVAL;
+    if (p_int(a, "causal", 1) != 1 || p_int(a, "window", 0) != 0) return RAD_E_UNSUPPORTED;
+
+    const int64_t head_dim   = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
+    const int64_t gqa        = p_int(a, "gqa", 1);
+    const int64_t block_size = p_int(a, "block_size", kv->rank == 4 ? kv->shape[2] : 0);
+    if (head_dim <= 0 || gqa <= 0 || block_size <= 0) return RAD_E_SHAPE;
+    if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
+    if (kv_heads <= 0) return RAD_E_SHAPE;
+    const int64_t q_heads = gqa * kv_heads;
+    if (q->rank >= 3 && q->shape[q->rank - 2] != q_heads) return RAD_E_SHAPE;
+    const int64_t rows = numel(q) / (q_heads * head_dim);
+    if (rows <= 0 || numel(nsel) != rows || numel(vmk) != rows) return RAD_E_SHAPE;
+    if (numel(o) < rows * q_heads * head_dim) return RAD_E_SHAPE;
+    if (kv->shape[2] != block_size || kv->shape[3] < 2 * head_dim) return RAD_E_SHAPE;
+    const bool i8 = kv->dtype == RAD_I8;
+    if (i8 && (kv->shape[3] != 2 * head_dim + 4 || kv->stride[3] != 1)) return RAD_E_SHAPE;
+    if (sel->rank < 2 || bt->rank < 2) return RAD_E_SHAPE;
+    const int64_t pitch  = sel->shape[sel->rank - 1];
+    const int64_t n_seq  = bt->shape[0];
+    const int64_t bt_p   = bt->shape[bt->rank - 1];
+    if (sel->shape[0] != rows || n_seq <= 0 || numel(rbt) != n_seq) return RAD_E_SHAPE;
+    if (cus ? numel(cus) != n_seq + 1 : rows % n_seq != 0) return RAD_E_SHAPE;
+    const int64_t sel_rs = sel->stride[sel->rank - 2], sel_cs = sel->stride[sel->rank - 1];
+    const int64_t bt_rs = bt->stride[bt->rank - 2], bt_cs = bt->stride[bt->rank - 1];
+
+    const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
+    const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
+    const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1;
+    const int64_t o_hs = o->rank >= 3 ? o->stride[o->rank - 2] : head_dim * o_ds;
+    const int64_t o_rs = row_stride(o, q_heads * head_dim);
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+
+    /* Validate and gather every row's key list once: (block, slot) per visible key. */
+    struct Key { int64_t blk, slot; };
+    std::vector<std::vector<Key>> keys((size_t)rows);
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t s = cus ? seq_of(cus, n_seq, r) : r / (rows / n_seq);
+        const int64_t ns = ld_int(nsel->dtype, nsel->data, offlin(nsel, r));
+        if (ns < 0 || ns > pitch) return RAD_E_INVAL;
+        std::vector<Key>& kl = keys[(size_t)r];
+        kl.reserve((size_t)(ns * block_size + 64));
+        for (int64_t i = 0; i < ns; ++i) {
+            const int64_t blk = ld_int(sel->dtype, sel->data, r * sel_rs + i * sel_cs);
+            if (blk < 0 || blk >= kv->shape[0]) return RAD_E_INVAL;
+            for (int64_t t = 0; t < block_size; ++t) kl.push_back({ blk, t });
+        }
+        const uint64_t m = (uint64_t)ld_int(vmk->dtype, vmk->data, offlin(vmk, r));
+        const int64_t rb = ld_int(rbt->dtype, rbt->data, offlin(rbt, s));
+        if (m && (rb < 0 || rb % block_size)) return RAD_E_INVAL;
+        for (int k = 0; k < 64; ++k) {
+            if (!((m >> k) & 1)) continue;
+            const int64_t pg = rb / block_size + k / block_size;
+            if (pg >= bt_p) return RAD_E_INVAL;
+            const int64_t blk = ld_int(bt->dtype, bt->data, s * bt_rs + pg * bt_cs);
+            if (blk < 0 || blk >= kv->shape[0]) return RAD_E_INVAL;
+            kl.push_back({ blk, k % block_size });
+        }
+    }
+
+    const int64_t total = rows * q_heads;
+    REF_PAR_REGION(total * head_dim * 64)
+    {
+        REF_FOR_DYN
+        for (int64_t idx = 0; idx < total; ++idx) {
+            auto unit = [&](auto kl) {
+                const int64_t h = idx % q_heads, tok = idx / q_heads, kh = h / gqa;
+                const std::vector<Key>& ks = keys[(size_t)tok];
+                const int64_t qb = tok * q_rs + h * q_hs, ob = tok * o_rs + h * o_hs;
+                float qf[REF_HD_MAX];
+                for (int64_t d = 0; d < head_dim; ++d) qf[d] = ldt(q, qb + d * q_ds);
+                auto base_of = [&](const Key& k) {
+                    return k.blk * kvv.sb + kh * kvv.sh + k.slot * kvv.so;
+                };
+                std::vector<float> sc(ks.size());
+                float mx = -INFINITY;
+                for (size_t j = 0; j < ks.size(); ++j) {
+                    const int64_t kb = base_of(ks[j]);
+                    const float km = i8 ? kv_i8_scale(kv->data, kb, head_dim, 0) : 1.0f;
+                    float dot = 0.0f;
+                    for (int64_t d = 0; d < head_dim; ++d)
+                        dot += qf[d] * (kl(kv->data, kb + d * kvv.sd) * km);
+                    sc[j] = dot * scale;
+                    if (sc[j] > mx) mx = sc[j];
+                }
+                if (mx == -INFINITY) {
+                    for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+                    return;
+                }
+                float acc[REF_HD_MAX];
+                for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+                float sum = 0.0f;
+                for (size_t j = 0; j < ks.size(); ++j) {
+                    const int64_t kb = base_of(ks[j]);
+                    const float w = ref_exp(sc[j] - mx);
+                    sum += w;
+                    const int64_t vb = kb + head_dim * kvv.sd;
+                    const float vm = i8 ? kv_i8_scale(kv->data, kb, head_dim, 1) : 1.0f;
+                    for (int64_t d = 0; d < head_dim; ++d)
+                        acc[d] += w * (kl(kv->data, vb + d * kvv.sd) * vm);
+                }
+                const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+            };
+            switch (kv->dtype) {
+                case RAD_F32:  unit(KvFix<RAD_F32>{}); break;
+                case RAD_BF16: unit(KvFix<RAD_BF16>{}); break;
+                case RAD_I8:   unit(KvFix<RAD_I8>{}); break;
+                default:       unit(KvDyn{ kv->dtype }); break;
+            }
+        }
+    }
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ attn_dense */

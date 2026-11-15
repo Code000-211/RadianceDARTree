@@ -202,6 +202,7 @@ private:
 
         int32_t *h_tok = nullptr, *h_pos = nullptr, *h_cu = nullptr, *h_sid = nullptr;
         int32_t *h_q = nullptr, *h_ctx = nullptr, *h_acc = nullptr, *h_parent = nullptr;
+        int32_t *h_path = nullptr, *d_path = nullptr;   /* [max_seqs][path_pitch_] */
         int32_t *h_cktok = nullptr, *h_ckslot = nullptr;
         int32_t *h_out = nullptr;      /* [n_out] which of this step's tokens want logits */
         int32_t *h_dout = nullptr;     /* [n_draft_out] a history pass's round-1 rows */
@@ -357,6 +358,8 @@ private:
     bool                   lora_on_ = false;
     /* Program::plugin_words: the words a sequence may carry, 0 for none. */
     int64_t                pw_cap_ = 0;
+    /* RadBatch::spec_path's pitch (max_spec + 1) for a tree drafter, else 0: no plane. */
+    int64_t                path_pitch_ = 0;
     int64_t                n_embd_ = 0;
     std::vector<void*>     mm_dev_;
     uint16_t*              mm_host_ = nullptr;

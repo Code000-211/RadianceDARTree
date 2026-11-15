@@ -535,6 +535,69 @@ depth, the position its token takes once its path is committed. Causal layers on
 `attn_paged_tree`; libr4d `attn_paged_qrow_tree` at h256/gqa2 on the split-KV decode kernel and at
 every geometry of the windowed kernels, to 64 rows a block.
 
+**`attn_paged_tree_sel`** is the tree form of QSA's sparse attention (`docs/QSA.md`). A QSA layer
+attends, per query row, over the committed pages its selection names and, at a tree verify, over
+the keys of the verify block (and the few committed keys sharing its pages) that lie on the row's
+path. The op takes both as one softmax.
+
+| op | params | operands |
+|---|---|---|
+| `attn_paged_tree_sel` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt `sel_pitch` | `q`, `kv_cache`, `sel`, `nsel`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `vmask`, `block_table`, `rb`, `seq_cu`? |
+
+Operands 0 to 7 are `attn_paged`'s in the order the sparse launch already issues (one row per
+launch row, `q_len` 1): `sel` `[rows, sel_pitch]` i32 stands where the block table does and `nsel`
+`[rows]` i32 where `seqused` does, and operands 4 to 6 stay absent (no descales, no `cu_seqlens`;
+an i8 cache carries its scales in its rows). The tree's own follow `out`:
+
+- `vmask` `[rows]` **i64**, read as u64: bit `k` is set when region key `k` is visible to the row.
+- `block_table` `[n_seq, bt_pitch]` i32, `rb` `[n_seq]` i32 and `seq_cu` `[n_seq + 1]` i32 (absent:
+  the rows split evenly over the table's rows): region key `k` of a row of sequence `s` is logical
+  position `rb[s] + k`, in physical page `block_table[s, rb[s] / block_size + k / block_size]`, slot
+  `k % block_size`. `rb[s]` is a multiple of `block_size` (QSA's region base,
+  `block_size * floor(base / block_size)`); the region is 64 keys, so 16 pages at the model's page
+  of 4.
+
+Row `r` sees, in this order: the keys of pages `sel[r, 0 .. nsel[r])` (physical block ids; each a
+full page, `nsel[r] <= sel_pitch`), then the region keys whose `vmask[r]` bit is set, in ascending
+`k`. They are one softmax: the arithmetic is `attn_paged`'s (libref: each score an f32 dot over `d`
+ascending times the scale, the maximum, then `exp(score - max)` summed and accumulated in key
+order), so a row whose keys are the keys of an `attn_paged` row's page list in the same order is
+that row's bytes, and in particular a **plain causal prefix as `vmask`** (`2^L - 1`) is the chain
+row: the page list `sel[r, 0 .. nsel)` followed by the region's pages, `seqused = nsel * block_size
++ L`. That is how a tree row is held to a sequential decode of its root-to-node path: lay the path's
+keys in order and run `attn_paged`. A row that sees no key gives zeros. `sel_pitch` (the page
+list's row pitch, `topk + 1` for QSA) is a parameter because libr4d sizes its scratch from it at
+declare. `causal` is 1 and `window` 0; libref serves the op on any geometry, libr4d at head_dim 256,
+gqa 12 and gqa 6, page 4, bf16 and i8 caches, on its split-KV decode kernel run over each row's key
+list: a tiny prep launch packs the row's visible region keys (ascending) behind its `nsel` pages, so
+the kernel sees exactly the row's keys at consecutive indices and masks nothing. A tree row is
+therefore byte-identical to `attn_paged` (the sparse decode row) over the sequential decode of its
+path, not merely close, and a chain row to the plain sparse row over the same pages. The split law,
+the partial buffer and the merge are the sparse `attn_paged` launch's; the op takes scratch for
+`max_seqs` rows of 66 more i32 beyond the partials. Visibility is the mask's and the page list's
+alone: the architecture states `nsel` and `vmask` per row from QSA's selection (`qsa_select`'s
+`vmask` output). Every bit's page must be mapped, and every row must see at least one key.
+
+Two issue forms cover a QSA layer at a tree step. The sparse layer issues this op where it issues
+`attn_paged` over `qsa_sel`/`qsa_sequ`, with `sel` the committed pages below the region and `vmask`
+from the selection. A layer below `qsa_exact_to` (dense) issues it too, with `sel` every committed
+page below the region and `vmask` the row's visibility.
+
+| op | params | operands |
+|---|---|---|
+**The committed path, `RadBatch::spec_path`.** After a tree verify the next step's state ops (a
+rolling window, a recurrent state's replay, a tail ring) must follow the accepted path rather than
+the first rows of the block. For a deployment whose drafter is a tree the batch carries
+`spec_path` (`[n_seq, spec_path_pitch]` i32, pitch `max_spec + 1`; null otherwise): row `s` lists the
+rows of the previous step's verify block that were committed, in order. Entry 0 is 0 (the anchor),
+entries `1 .. num_accepted[s] - 1` the accepted nodes' rows, and every later entry its own index,
+so after a chain (or a prefill handover, or a row the host staged) the whole row is the identity and
+a consumer may read it whenever it is non-null. The card writes it behind the previous step's
+acceptance (`ADV_TRUNK`), since that step's host copy is not read until after the next is issued. A
+serial draft head's tree (`RadDrafterDecl::tree_nodes`, PLUGIN.md) is verified in the same rows
+`spec_parent` describes, and its acceptance moves each accepted node's K and V into place in every
+paged group not flagged `RadKVGroupDecl::no_tree_compact`.
+
 | op | params | operands |
 |---|---|---|
 | `attn_paged_ahead` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
@@ -549,7 +612,7 @@ picture)), and the two differ only for a picture longer than the window. `window
 serves both at h256, 1 to 8 queries per kv head, on the windowed kernels; no other library
 declares them, so a plugin asking for them learns whether a card serves the geometry.
 
-Of the ops above, libref serves only `attn_paged_tree`, which is not a fusion but `attn_paged`'s
+Of the ops above, libref serves only `attn_paged_tree` and `attn_paged_tree_sel`, which are not fusions but `attn_paged`'s
 tree form. It has no row for any of the fusions, deliberately. An architecture asks for a fusion and declares
 the chain where it does not resolve (`rad_op_resolved`); a reference row would make it resolve
 everywhere, so a model loaded without the serving library would resolve to the reference and be
@@ -1176,6 +1239,20 @@ and `q8` the int8 codes of its width-128 Hadamard, one scale per 128 columns. A 
 results are the same bits whichever thread holds which index, so the merge's two thread maps and the
 standalone quantiser agree byte for byte as long as the stages run by ascending stride;
 `r4d_selftest` checks that at both merge forms over every cache layout.
+
+| op | params | operands |
+|---|---|---|
+| `attn_paged_tree_sel_gate_quant` | `q_len`(range) `head_dim` `gqa` `block_size` `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt:capacity `group` `act` `sel_pitch` | `q`, `kv_cache`, `sel`, `nsel`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `gate` → `q8`, `q8_scale`; `vmask`, `block_table`, `rb`, `seq_cu`? |
+| `attn_paged_tree_sel_gate_had_quant` | `q_len`(range) `head_dim` `gqa` `block_size` `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt:capacity `group` `act` `sel_pitch` | `q`, `kv_cache`, `sel`, `nsel`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `gate` → `q8`, `q8_scale`; `vmask`, `block_table`, `rb`, `seq_cu`? |
+
+**`attn_paged_tree_sel_gate_quant`** and **`attn_paged_tree_sel_gate_had_quant`** (device-only) are
+`attn_paged_tree_sel` followed by `gate_quant_fp8` (or `gate_had_quant_i8g`) over its output,
+finished inside the split-KV merge exactly as `attn_paged_gate_quant` and `attn_paged_gate_had_quant`
+do it (their parameters, `block_size` required, plus `sel_pitch`; their operands, the tree's four
+behind the scales: operands 11 to 14). They replace `attn_paged_gate_quant` /
+`attn_paged_gate_had_quant` on a tree step's sparse path, where each launch row is one query. Byte
+for byte the chain `attn_paged_tree_sel` then the gate quantiser, which is how `rad-kbench`'s fusion
+oracle holds them.
 
 ### The KV cache operand
 
@@ -2377,12 +2454,13 @@ wrong.
 | `kda_update` | `M`(range) `heads` `head_k` `head_v` `lower_bound`:f64 `scale`:f64 `l2_eps`:f64 `mode` `dtype` `state_form`/opt | `q`, `k`, `v`, `a`, `b`, `A_log`w, `dt_bias`w, `state`:inout, `state_idx`, `cu`, `num_accepted`?, `has_init`? → `o` |
 | `ssd_update` | `M`(range) `heads` `head_dim` `d_state` `groups` `mode` `dtype` `state_form`/opt | `x`, `B`, `C`, `dt`, `A_log`w, `dt_bias`w, `D`w, `state`:inout, `state_idx`, `cu`, `num_accepted`?, `has_init`? → `o` |
 | `gdn_conv_prep` | `M`(range) `head_k` `head_v` `chunk`/der `conv_width` `l2_eps`:f64/opt `softplus_thr`:f64/opt | `x`, `w`w, `b`w?, `A_log`w, `dt_bias`w, `conv_state`:inout, `cu`, `a`?, `b_gate`?, `cache_idx`?, `has_init`? → `q`,`k`,`v`,`g`,`beta` |
-| `gdn_conv_update` | `q_len`(range) `head_k` `head_v` `conv_width` `max_query_len`/opt | `x`, `w`w, `b`w?, `conv_state`:inout, `state_idx`, `num_accepted`, `cu` → `q`,`k`,`v` |
+| `gdn_conv_update` | `q_len`(range) `head_k` `head_v` `conv_width` `max_query_len`/opt | `x`, `w`w, `b`w?, `conv_state`:inout, `state_idx`, `num_accepted`, `cu` → `q`,`k`,`v`; `spec_parent`?, `spec_path`? |
 | `gdn_kkt_solve` | `M`(range) `head_k` `chunk`/der | `k`, `beta`, `g`, `cu` → `A` |
 | `gdn_chunk_scan` | `M`(range) `head_k` `head_v` `chunk`/der `scale`:f64/opt `state_fp16`/opt | `q`,`k`,`v`,`A`,`g`,`beta`,`h0`?,`cu` → `o`, `ht`?; `state_idx`? |
-| `gdn_recurrent_update` | `q_len`(range) `head_k` `head_v` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt | `q`,`k`,`v`,`a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`?,`norm_w`w? → `o`,`o_q`?,`o_scale`? |
-| `gdn_conv_recurrent_update` | `q_len`(range) `head_k` `head_v` `conv_width` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt | `x`, `conv_w`w, `conv_b`w?, `conv_state`:inout, `conv_idx`, `a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`,`norm_w`w → `o`,`o_q`?,`o_scale`? |
-| `gdn_conv_recurrent_update_had` | `q_len`(range) `head_k` `head_v` `conv_width` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt `group`/opt | `x`, `conv_w`w, `conv_b`w?, `conv_state`:inout, `conv_idx`, `a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`,`norm_w`w → `o`,`o_q`,`o_scale` |
+| `gdn_recurrent_update` | `q_len`(range) `head_k` `head_v` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt | `q`,`k`,`v`,`a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`?,`norm_w`w? → `o`,`o_q`?,`o_scale`?; `spec_parent`?, `spec_path`? |
+| `gdn_conv_recurrent_update` | `q_len`(range) `head_k` `head_v` `conv_width` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt | `x`, `conv_w`w, `conv_b`w?, `conv_state`:inout, `conv_idx`, `a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`,`norm_w`w → `o`,`o_q`?,`o_scale`?; `spec_parent`?, `spec_path`? |
+| `gdn_conv_recurrent_update_had` | `q_len`(range) `head_k` `head_v` `conv_width` `n_head_v`/opt `scale`:f64/opt `eps`:f64/opt `l2_eps`:f64/opt `softplus_thr`:f64/opt `act`:str/opt `state_fp16`/opt `state_form`:str/opt `group`/opt | `x`, `conv_w`w, `conv_b`w?, `conv_state`:inout, `conv_idx`, `a`,`b`,`A_log`w,`dt_bias`w,`state`:inout,`state_idx`,`num_accepted`,`cu`,`z`,`norm_w`w → `o`,`o_q`,`o_scale`; `spec_parent`?, `spec_path`? |
+| `kv_window_compact` | `off` `dtype`/opt | `cache`:inout, `state_idx`, `num_accepted`, `spec_path` |
 | `gdn_gated_rmsnorm` | `M`(range) `channels` `eps`:f64 `act`:str | `x`, `z`, `w`w → `o` |
 
 **`kda_update` is Kimi delta attention with per-channel decay.** Per token and head it
@@ -2505,6 +2583,74 @@ before the per-(token, head) amax, for an out projection stored rotated (`i8a8h`
 byte-identical to `gdn_conv_recurrent_update` followed by `had_quant_act_i8g`. `group` 256 is
 IQ8R's, one scale per two value heads (`o_scale` `[tokens, n_head_v / 2]`), each head still rotated
 on its own.
+
+### Tree verification of the delta net
+
+A tree verify (`rad_drafter_tree`: a verify block whose rows are nodes of a draft tree, not a chain)
+runs through the delta net with two optional operands on `gdn_conv_update`, `gdn_recurrent_update`,
+`gdn_conv_recurrent_update` and its `_had` form, both with the batch's own planes
+(`abi/rad_runtime.h`, `RadBatch`):
+
+- **`spec_parent`** `[T]` i32 is `RadBatch::spec_parent`: a row's parent by row within its
+  sequence's rows (`cu`), `-1` for the block's first row, `-2` for an ordinary causal row, every
+  parent before its child. For the delta net a row's parent is its entry when that names an earlier
+  row, else the row before it (nothing for a sequence's first row), so a plane of `-2` is the chain
+  and a mixed batch needs no special casing.
+- **`spec_path`** `[N, pitch]` i32 is `RadBatch::spec_path`: the rows of the PREVIOUS verify block
+  that were committed, in order, entry 0 the anchor's row (0) and entries `1 .. num_accepted - 1`
+  the accepted nodes' rows; the identity `0, 1, 2, ...` after a chain. `pitch` is at least
+  `num_accepted` of every sequence and at most the factor block's row count.
+
+Either may be given alone and both absent is today's op, bit for bit. A row of a tree is what a
+sequential decode of its root-to-row path computes, in the same kernel family, byte for byte:
+
+- **Rows.** Every row starts from its PARENT's state (`state_form` `anchor` only: a per-candidate
+  cache has one slot per row index and no tree to hang them on, and the op declines) and writes its
+  own factor record at its own row index, as a chain row does; the conv taps of row `r` are `r`'s
+  ancestors (`taps[j]` is the `width - 1 - j`-th ancestor), and past the sequence's first row the
+  committed window's newest entries (`h[width-2]` first). The raw input of row `r` still goes to
+  window entry `r + width - 2`, flat, whatever its depth.
+- **Replay.** The step replays the records of the rows `spec_path[n][0 .. num_accepted)` in that
+  order instead of rows `0 .. num_accepted - 1`; a record depends only on its own row, so the
+  committed state is the state of a sequential decode of the accepted path, bit for bit with an f32
+  state.
+- **The window.** The history read is the last `width - 1` entries of the committed sequence
+  `[e_0 .. e_{width-3}, e_{width-2 + path[0]}, e_{width-2 + path[1]}, ...]` (for the chain that is
+  the read at `num_accepted - 1`), and the rewrite leaves the buffer in the chain layout (history
+  tail, then every input at `row + width - 2`), so the NEXT step may read it through its own
+  `spec_path`. The conv ops therefore take the gather themselves and the window needs no separate
+  compaction: a caller that hands the same `spec_path` to a conv op must NOT first run
+  `kv_window_compact` on that window, or the path is applied twice. (`kv_window_compact` serves the
+  windows whose reader does not gather: PLE's token and convolution windows.)
+- **Bounds.** At most 16 rows a sequence on the pair `gdn_conv_update` + `gdn_recurrent_update`
+  (the factor block's records) and 8 on the fold (its register window; libref's 16 x 16 head holds
+  7); a longer block is refused (libref: `RAD_E_SHAPE`; libr4d: the `q_len` parameter against the
+  bound, since the device cannot refuse what it reads). A parent at or after its child is
+  `RAD_E_INVAL` in libref; libr4d reads it as the row before. A committed row at or past the number
+  of records the block holds, or past the window, is `RAD_E_SHAPE` in libref and clamped or skipped
+  on the device.
+
+libref and libavx serve all four forms (libavx for the three it has). libr4d serves the anchor form
+over an f32 state (`state_fp16` and `chain` are declined), bf16 a/b, and one workgroup a head; the
+rows are walked depth first, a leaf (a row with no children) is computed from the live state without
+advancing it, and a node's second and later non-leaf children restart from the node's state, which
+is rebuilt from the published anchor by replaying the node's ancestors' records (kept in LDS) with
+the replay's own arithmetic. The tests (`tests/ref_test.cpp` `gdn_tree_*`, `r4d_selftest`'s
+`gdn tree verify` cases) hold every row of hand-built trees (a chain, root leaves, two non-leaf
+children of the anchor, a depth-two node with two non-leaf children) to the chain decode of its path,
+and the step after a tree, given the accepted rows as `spec_path`, to the chain that decoded exactly
+those rows.
+
+**`kv_window_compact`** closes a rolling window over the rows a tree verify committed. `cache` is a
+`RAD_KV_CONV`-layout window `[slots, channels, entries]` of any 1, 2, 4 or 8 byte element (bf16, i32,
+f32), `state_idx` is `[n_seq]` or `[n_seq, W]` with the slot in column 0 (negative is padding), and
+for each sequence, for `t = 1 .. num_accepted - 1` ascending, entry `off + spec_path[t]` moves to
+entry `off + t` for every channel. `off` is the entry of the verify block's row 0 in the window's
+write layout (`width - 2` for the delta-net conv window; each window's owner states its own).
+Ascending in place is hazard free because a path's rows increase, and a chain (`path[t] = t`) moves
+nothing. A path that does not ascend is `RAD_E_INVAL` in libref and skipped on the device. The caller
+issues it at the START of a decode-half step, before the window's first reader, and only when the
+step's batch carries a `spec_path`. `dtype` only describes the cache for a generated shape.
 
 **The output gate `z` may be a column slice**, on both `gdn_recurrent_update` and
 `gdn_gated_rmsnorm`. The delta-net block projects `[q|k|v|z]` in one GEMM
@@ -2636,10 +2782,10 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 | `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
 | `logits_gemm_vocab` | `M`(range) `n_vocab` `n_embd` `dtype` `vocab_offset` `rows0` `rows1`/opt `rows2`/opt `rows3`/opt | `x`, `w0`w, `s0`w, `ids0`w, `w1`w?, `s1`w?, `ids1`w?, `w2`w?, `s2`w?, `ids2`w?, `w3`w?, `s3`w?, `ids3`w?, `vrow`w → `logits` |
-| `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
+| `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`?; `spec_parent`? |
 | `ngram_hint` | `M`(range) `heads` `ngram` `eos` `hist` | `tok`, `pos`, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `tail`:inout → `ids` |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
-| `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+| `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y`; `spec_parent`? |
 | `ple_conv_bias` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`?, `b`w → `y` |
 | `causal_conv1d` | `M`(range) `n` `width` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
 
@@ -2812,6 +2958,20 @@ prompt is already known (`RadBatch::n_ahead`, stored in `token_ids` after the st
   output depends on it, so a kernel may ignore it; libavx's row hands them to a reader thread that
   fills its row cache while the step runs.
 
+**`spec_parent` makes the rows a verify tree** (`rad_drafter_tree`; docs above for `attn_paged_tree`).
+The entry of row `t` is its parent's row within the sequence (-1 for the root, the first row; -2 an
+ordinary causal row, whose parent is the row before it), every parent before its child. The shifted
+tokens of a row are then its ancestors': `t1` is the parent's token, `t2` the grandparent's, and
+a shift that runs past the root continues into the committed window exactly where a chain's would
+(the root's own predecessors). The EOS rule is unchanged, and a chain (or all -2) hashes bit for
+bit as without the operand, so a node's ids are what a sequential decode of its root-to-node path
+computes. The window is written back in the decode layout whatever the parents, i.e. in ROW
+order: the shifted history, then the id of row `t` at entry `ngram - 2 + t`. The operand requires
+`num_accepted` (the prefill layout has no row order to compact) and excludes `ahead_ids` (a prompt
+continues a chain); both are refused as `RAD_E_INVAL`, as is a parent that does not precede its
+child. See "Tree verification of the PLE windows" under `ple_conv` for how the next step finds the
+committed ids.
+
 ### `ngram_hint`
 
 At decode with a serial draft head the same wait has another answer. A verify step's rows are the
@@ -2908,6 +3068,40 @@ prefill's question and `num_accepted` decode's.
 
 The residual add is folded in because the reference is `gv + silu(conv(gvn))` and both tensors are
 `[M, hc*n]`. `resid` absent leaves the plain convolution.
+
+### Tree verification of the PLE windows
+
+`ple_conv` takes `spec_parent` (`[rows]` i32, `RadBatch::spec_parent`; optional) beside `ngram_ids`.
+With it the rows of a sequence are the nodes of a verify tree: the entry of row `t` is its parent's
+row within the sequence (-1 the root, -2 an ordinary causal row, whose parent is the row before),
+every parent before its child (anything else is `RAD_E_INVAL`). The tap `k = (width-1-j)*dilation`
+timesteps back (9, 6, 3, 0) is the input of the row's ANCESTOR `k` levels up; an ancestor chain that
+reaches the root with `r` levels left continues into the committed window at slot
+`(width-1)*dilation - r`, where a chain row would have found it. The taps are summed in the chain's
+order, so a node's output is bit-identical to the last row of a sequential decode of its
+root-to-node path through the same kernel; a chain, or all -2, is the plain op. It requires
+`num_accepted` (a decode step). Only `ple_conv` takes it, not `ple_conv_bias` or `causal_conv1d`.
+libref, libavx and libr4d (one tile per sequence, so a node in any row may read the window) serve it.
+
+Both windows are written in ROW layout, not path order: input (token id for `ngram_ids`) `t` lands
+at entry `off + t`, whatever its parent, where `off` is the entry of row 0:
+
+| window | group | shape | dtype | `off` |
+|---|---|---|---|---|
+| `kv_ple_tok` (`ngram_ids`) | `RAD_KV_CONV`, `conv_width` = ngram | `[n_states, 1, ngram - 1 + n_spec]` | i32 | `ngram - 2` (= 1) |
+| `kv_ple_conv` (`ple_conv`) | `RAD_KV_CONV`, `conv_width` = `(width-1)*dilation + 1` | `[n_states, hc*n, (width-1)*dilation + n_spec]` | activation (bf16) | `(width-1)*dilation - 1` (= 8) |
+
+Both are the `[slots, channels, entries]` layout `kv_window_compact` takes (the token window has one
+channel); a tree of `N` nodes needs `n_spec >= N` so `off + 1 + N` entries exist (the window a
+decode step leaves is `off + rows` deep). After a step that committed `k = num_accepted` rows, the
+committed history ends at entries `off + path[t]`, `t < k`, and the next step reads at
+`num_accepted - 1`, entries `[k - 1, k - 1 + hist)`. `kv_window_compact(off)` copies entry
+`off + path[t]` to `off + t` for `t = 1 .. k - 1` ascending (in place and hazard free, since
+`path[t] >= t`), after which the layout is the chain's. The plugin issues it for both windows at the
+start of a decode-half step that follows a tree verify (`RadBatch::spec_path` non-null), before
+`ngram_ids` (which reads `kv_ple_tok` at the top of the step) and before `ple_conv`, over the
+decode sequences only (`state_index` of the window's group, `num_accepted`, `spec_path`). A chain's
+path is the identity, so it is a no-op there.
 
 ### `ple_conv_bias`
 
@@ -3085,15 +3279,18 @@ order, not a slow one.
 | `mla_attn_paged` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`?, `kv`, `block_table`, `seqused`, `cu_seqlens`, `gate`? → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
-| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused`; `spec_parent`?, `rscore`?, `vmask`? |
 | `kv_resolve` | `M`(range) `blocks` `slots` `sel_pitch` `block_bytes` | `sel`:inout, `nsel`, `res`:inout, `slot_block`:inout, `slot_state`:inout, `ctl`:inout, `host`, `kv_cache`:inout |
-| `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
-| `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
+| `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx`, `spec_parent`? |
+| `qsa_tail_compact` | `M`(range) `n` `ring` `seqs` `dtype` | `pos`, `cu`, `num_accepted`, `spec_path`, `state`:inout, `sidx` |
+| `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc`; `spec_parent`?, `num_accepted`?, `sstage`?, `spage`?, `sbpos`?, `rtab`?, `rnc`?, `rcu`? |
 
 Five ops decompose one indexer, which scores blocks of key history against the query and hands
 `attn_paged` a shorter block table. `docs/QSA.md` describes the decomposition and
 `arch/common/rad_qsa.h` issues all five. libref implements all five (the oracle for libr4d's
-kernels), and libavx all five for the host path. `kv_resolve` sits between the last of them and the
+kernels), and libavx all five for the host path. A sixth, `qsa_tail_compact`, and optional operands
+on `qsa_work`, `qsa_tail_store` and `qsa_select` serve a tree speculative verify (`docs/QSA.md`,
+"Tree verify"); with them absent every op is what it was. `kv_resolve` sits between the last of them and the
 attention when the group's KV streams; it is described below, after `qsa_select`.
 
 ### `qsa_block_key`
@@ -3216,6 +3413,35 @@ with the partial page appended.
   `nsel*ratio`, every selected page fully visible. The op emits it because it is one store off a
   number it already has.
 
+**Tree rows** (`spec_parent`, `rscore`, `vmask`, all three or none). A sequence whose first row has
+`spec_parent` -1 is a tree verify (`RadBatch::spec_parent`): its rows are the nodes of one verify
+block, `pos` holds depth positions (siblings share one), and the tree's root-to-row path is the row's
+history. For such a row the candidates are the committed blocks `[0, b0)`, `b0 = nc[seq]` (qsa_work
+sets it to `pos[cu[seq]] / ratio`, the blocks strictly below the one holding the anchor, scored in
+`score`), then the *region* blocks `b0 .. (pos + 1) / ratio - 1` that this row's own path completes,
+scored in `rscore[m][b - b0]`. The ranking is the one above over that union in block order (committed
+blocks first, so the tie rule is unchanged: a region block loses every tie to a lower block). The
+outputs differ:
+
+- `sel` holds only the committed pages taken, in take order (above the threshold in block order, then
+  the ties), `-1` padded to `topk + 1`. There is no partial page: the partial block and every region
+  block, taken or not, are read through `vmask`. `nsel` counts the pages and `seqused = nsel * ratio`
+  (every page full; 0 for none).
+- `vmask` (`i64`, one per row) has bit `k` set iff the key at flat slot `rb + k`, `rb = b0 * ratio`,
+  is the row's to read: the committed tokens at `rb .. base - 1` (`base = pos[cu[seq]]`, the anchor's
+  position) and the row's ancestors-or-self at slot `base + j` (node `j` is row `cu[seq] + j`), each
+  when its block is not complete on the row's path (the partial block, always read) or was taken.
+  `base - rb + (rows - 1)` must be below 64. Below the exactness bound every block is taken and the
+  mask is the row's whole path.
+- A row of a sequence that is not a tree (`spec_parent` -2, or `spec_parent` absent) is selected as
+  before and gets `vmask` 0.
+
+The row's table is exactly what a sequential decode of its path selects, by the keys it reads: the
+committed pages in full plus the region keys `vmask` names are the keys the chain's selection would
+make visible (tests/ref_test.cpp, `qsa_tree_rows_equal_a_sequential_decode_*`). The order of `sel`
+equals the chain's when everything is taken; above the bound it is the take order restricted to the
+committed pages, the same set.
+
 libr4d's kernel takes scratch (sized by the row's scratch hook; it is not an operand). With it, a
 launch of at most 32 query rows cuts the block list into up to 16 chunks, takes each chunk's own
 top-k and merges them, so a decode step uses more than `1 + n_spec` workgroups. The result is exact,
@@ -3282,6 +3508,28 @@ One call:
 - **The caller brings the state up**: `res` and `slot_block` filled with `-1`, `slot_state` and `ctl`
   zeroed. There is no reset op.
 
+### `qsa_tail_compact`
+
+After a tree verify the accepted path has to be where a sequential decode would have left it.
+`qsa_tail_store` stores node `j` of a tree sequence at the *flat* ring row `(base + j) % ring`
+(below); the core accepts a path of rows `0 = path[0], path[1], ..` (`RadBatch::spec_path`,
+`num_accepted` of them), which belong at the depth rows `(base_prev + t) % ring`, `base_prev`
+the previous step's anchor position, `pos[cu[s]] - num_accepted[s]` (this step's anchor is the token
+after the last committed one). For `t = 1 .. num_accepted[s] - 1` in ascending order:
+
+```
+state[slot][0][(base_prev + t) % ring] = state[slot][0][(base_prev + spec_path[s][t]) % ring]
+```
+
+in place, which is hazard free (`spec_path[s][t] >= t`, and the ring is wider than any node index so
+a destination is never a later source). One workgroup a sequence in libr4d. A sequence with
+`num_accepted < 2`, no rows, no slot (`sidx[s][0] < 0`) or a negative `base_prev` is skipped, an
+identity path moves nothing, and a path entry outside `[t, ring)` is refused (libref). The op is
+**not idempotent** for a general path: it runs once per step, before `qsa_work` and
+`qsa_tail_store`, on every layer whose tail a tree verify wrote (not the MTP head's, whose history
+pass stores committed positions directly). `pos` is read only at each sequence's first row. `M` is
+the sequence count; `seqs` is the declared height.
+
 ### `qsa_tail_store`
 
 Parks the raw index keys of the tokens that have not completed a block yet:
@@ -3312,6 +3560,10 @@ so at decode most of a block's keys come from earlier steps and something must c
   loop leaves.
 - **`state` is inout, and rows nothing targets keep what they held**: at decode a handful of rows
   are written and the rest are what the next block key needs.
+- **`spec_parent` (a tree verify) stores each row at its flat slot.** A row of a sequence whose first
+  row has parent -1 goes to `(pos[cu[s]] + row index) % ring`, not to its depth position: siblings
+  share a depth, and the verify block is at most `ring` rows, so every slot has one writer.
+  `qsa_tail_compact` moves the accepted path to depth order at the start of the next step.
 
 ### `qsa_work`
 
@@ -3338,6 +3590,33 @@ block-key kernel with two sources, a per-key source selector and a tail layout.
 - **`nc` is complete blocks per sequence**, `(last position + 1) / ratio`, which the scorer and the
   selection both need and this op computes on the way. It is not the number of blocks that completed
   this step; the two agree only for a sequence that starts at zero.
+- **Heal (`num_accepted`).** A sequence that committed `na >= 2` tokens last step (the anchor and
+  `na - 1` accepted nodes, at positions `p0 - na .. p0 - 1`, `p0` this step's anchor position) owes
+  the blocks whose last token is one of the `na - 1` non-anchor committed positions: a tree verify
+  never writes those (below). They are rebuilt from the tail, which `qsa_tail_compact` has already put
+  in depth order, as ordinary work items ahead of the sequence's own, all keys from the ring. Exact
+  and idempotent (a block whose keys are all committed has one value). The anchor of the previous
+  step completed its own block then, so a prefill chunk or a plain decode (`na` 1, or the operand
+  absent) heals nothing. `work` must bound `ceil(T / ratio)` plus, per sequence, `ceil(max_spec /
+  ratio) + 1`.
+- **Tree (`spec_parent`).** A sequence whose first row has parent -1 completes, among its own rows,
+  only the block its *anchor* ends (`(p0 + 1) % ratio == 0`): a node's block may never be committed, so
+  the verify writes no other committed page. `nc[s]` is then `p0 / ratio`, the committed blocks
+  strictly below the anchor's block. Each row `x` whose own position completes a block gets a
+  **scratch** block instead: its `ratio` keys are the ancestors' (a key at position `q >= p0` is the
+  row's ancestor at that position, an older one is tail row `q % ring`), staged at `sstage[x * ratio
+  ..]`, `spage[x] = x` (else -1) and `sbpos[x]` its first token's position, so
+  `qsa_block_key(sstage, page = spage, pos = sbpos, out = skey [T, n])` writes row `x`'s key at
+  `skey[x]`. The scratch items are launched as `M` more workgroups after the `work` ones, in the
+  same launch. The same pass writes the *region tables* for the second, per-row `qsa_score`:
+  `rtab[x][i]` is the `skey` row holding the key of region block `b0 + i` on row `x`'s path
+  (`i < rnc[x] = (pos[x] + 1) / ratio - b0`), -1 past it, and `rcu[w] = w` for `w` in `0 .. M`. With
+  `bk = skey`, `bt = rtab`, `cu = rcu`, `nc = rnc` and `seqs = M` that score op scores every region
+  block of every row with the committed score kernel's arithmetic, one row a sequence, into
+  `rscore [M, RW]`; `RW` (`rtab`'s width) must cover `(max node depth + ratio) / ratio + 1`. Not
+  supported with `rope` (M-RoPE planes). The six outputs go together and with `spec_parent`;
+  `num_accepted` is independent of it. The two stages of one tree row (committed and scratch) are
+  bit-identical to a sequential decode's: the same staged keys through the same block-key kernel.
 
 ### GLM-5.3's indexer and latent attention
 

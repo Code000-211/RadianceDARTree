@@ -127,6 +127,7 @@ struct RadBuilder {
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
     /* A tree drafter's parents buffer (rad_drafter_tree), 0 for a chain. */
     rad_buf        drafter_parents = 0;
+    bool           drafter_tree = false;      /* rad_drafter_tree was called (a serial tree may pass 0) */
     /* The routing counts' table (rad_route_table), 0 when the plugin declared none. */
     rad_buf        route_table = 0;
 
@@ -430,8 +431,14 @@ extern "C" int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
     b->drafter_pos = pos_offset;
     return RAD_OK;
 }
+/* As the builder: a BLOCK drafter's tree has a parents buffer; a SERIAL one (tree_nodes > 0) only
+ * when it grows the tree itself (tree_width > 1), stage 1 being the core's alone. */
 extern "C" int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
-    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK || parents == 0) return RAD_E_STATE;
+    if (!b) return RAD_E_STATE;
+    const bool serial = b->drafter.kind == RAD_DRAFT_SERIAL && b->drafter.tree_nodes > 0;
+    if (b->drafter.kind != RAD_DRAFT_BLOCK && !serial) return RAD_E_STATE;
+    if (parents == 0 && !(serial && b->drafter.tree_width <= 1)) return RAD_E_STATE;
+    b->drafter_tree = true;
     b->drafter_parents = parents;
     return RAD_OK;
 }

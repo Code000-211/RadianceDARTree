@@ -118,10 +118,60 @@ struct ConvIO {
     int64_t xrow, xcol, Hg, H, K, V, width;
 };
 
+/* ------------------------------------------------------------------ tree verify (spec_parent)
+ *
+ * The decode ops take two optional operands that make a verify block a tree and let the next step
+ * commit a path through it (docs/OPS.md, "Tree verification of the delta net"):
+ *
+ *   spec_parent  [T] i32     RadBatch::spec_parent: the row's parent by row within its sequence's
+ *                            rows (cu), -1 for the block's first row, -2 for an ordinary causal
+ *                            row. Every parent precedes its child.
+ *   spec_path    [N, P] i32  RadBatch::spec_path: the rows of the PREVIOUS verify block that were
+ *                            committed, in order, entry 0 the anchor's row.
+ *
+ * A row's parent for the delta net is its entry when that names a row, else the row before it (an
+ * ordinary row, or the anchor of a block that follows earlier rows), and the committed state for a
+ * sequence's first row. A tree step therefore runs every row from the state its parent left and
+ * convolves along the ancestor chain, which makes each row what a sequential decode of its
+ * root-to-row path computes; with every entry -2 it is the chain, bit for bit. */
+static inline int64_t spec_parent_of(const RadTensor* sp, int64_t bos, int64_t r) {
+    const int64_t v = sp ? ld_int(sp->dtype, sp->data, offlin(sp, bos + r)) : -2;
+    if (v >= 0 && v < r) return v;
+    return r > 0 ? r - 1 : -1;
+}
+/* A parent at or after its child is a caller bug. */
+static bool spec_parents_ok(const RadTensor* sp, const RadTensor* cu, int64_t N) {
+    if (!sp) return true;
+    for (int64_t n = 0; n < N; ++n) {
+        const int64_t bos = cu_at(cu, n), len = cu_at(cu, n + 1) - bos;
+        for (int64_t r = 0; r < len; ++r) {
+            const int64_t v = ld_int(sp->dtype, sp->data, offlin(sp, bos + r));
+            if (v >= r) return false;
+        }
+    }
+    return true;
+}
+static inline int64_t spec_pitch(const RadTensor* sp, int64_t N) {
+    return sp->rank >= 2 ? sp->shape[sp->rank - 1] : (N > 0 ? numel(sp) / N : 0);
+}
+static inline int64_t spec_path_at(const RadTensor* sp, int64_t n, int64_t t, int64_t pitch) {
+    const int64_t off = sp->rank >= 2 ? n * sp->stride[sp->rank - 2] + t * sp->stride[sp->rank - 1]
+                                      : n * pitch + t;
+    return ld_int(sp->dtype, sp->data, off);
+}
+/* The optional spec_parent / spec_path at operand slots i, i + 1 (absent: a short list or a null
+ * data pointer). */
+static inline const RadTensor* spec_opt(const RadArgs* a, int i) {
+    return (a->n_t > i && a->t[i].data) ? &a->t[i] : nullptr;
+}
+
 /* Channel `c` of the depthwise causal convolution with silu over one sequence's `slen` tokens
  * from row `bos`, `hist` holding its width - 1 entries of history. Channels are grouped in whole
- * heads, so a group never straddles the q/k/v boundaries at any tensor-parallel width. */
-static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen, const float* hist) {
+ * heads, so a group never straddles the q/k/v boundaries at any tensor-parallel width. With `sp`
+ * (spec_parent) tap j reads the ancestor `width - 1 - j` steps up the row's chain, and past the
+ * sequence's first row the window's newest entry first (hist[width - 2]). */
+static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen, const float* hist,
+                         const RadTensor* sp = nullptr) {
     const int64_t Hg = io.Hg, K = io.K, V = io.V, width = io.width;
     const RadTensor* out;
     V3 ov;
@@ -137,10 +187,23 @@ static void conv_channel(const ConvIO& io, int64_t c, int64_t bos, int64_t slen,
     const float bs = io.bias ? ldt(io.bias, c * laststride(io.bias)) : 0.0f;
     for (int64_t t = 0; t < slen; ++t) {
         float acc = bs;
+        int64_t anc[REF_CONV_HIST_MAX + 1];
+        if (sp) {
+            anc[0] = t;
+            for (int64_t m = 1; m < width; ++m)
+                anc[m] = anc[m - 1] >= 0 ? spec_parent_of(sp, bos, anc[m - 1]) : anc[m - 1] - 1;
+        }
         for (int64_t j = 0; j < width; ++j) {
-            const int64_t src = t - (width - 1) + j;
-            const float val = src >= 0 ? ldt(io.x, (bos + src) * io.xrow + c * io.xcol)
-                                       : hist[src + width - 1];
+            float val;
+            if (sp) {
+                const int64_t an = anc[width - 1 - j];
+                val = an >= 0 ? ldt(io.x, (bos + an) * io.xrow + c * io.xcol)
+                              : hist[width - 2 + (an + 1)];
+            } else {
+                const int64_t src = t - (width - 1) + j;
+                val = src >= 0 ? ldt(io.x, (bos + src) * io.xrow + c * io.xcol)
+                               : hist[src + width - 1];
+            }
             acc += val * ldt(io.w, at2(wv, c, j));
         }
         stt(out, at3(ov, bos + t, oh, od), act_silu(acc));
@@ -312,6 +375,10 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
     const RadTensor* bias = t_in(a, 2);
     const RadTensor* sidx = t_in(a, 4);
     const RadTensor* nacc = t_in(a, 5);
+    /* Tree verify: the block's parents (every row convolves along its ancestor chain) and the
+     * previous block's committed rows (the window's history is gathered through them). */
+    const RadTensor* spar = spec_opt(a, 10);
+    const RadTensor* spath = spec_opt(a, 11);
     if (!x->data || !w->data || !cs->data || !cu->data || !q->data || !k->data || !v->data)
         return RAD_E_INVAL;
 
@@ -337,11 +404,23 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
 
     /* Check (not clamp) the read window and the last write slot against the state depth; a too
      * shallow cache is a caller bug that would otherwise silently truncate history. */
+    if (!spec_parents_ok(spar, cu, N)) return RAD_E_INVAL;
+    const int64_t pitch = spath ? spec_pitch(spath, N) : 0;
+    const int64_t woff = width > 1 ? width - 2 : 0;   /* entries before the first row's input */
     for (int64_t n = 0; n < N; ++n) {
         const int64_t slen = cu_at(cu, n + 1) - cu_at(cu, n);
         const int64_t off = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) - 1 : 0;
         if (off < 0) return RAD_E_INVAL;
-        if (off + width - 1 > state_len) return RAD_E_SHAPE;
+        if (spath) {
+            /* The committed rows live at woff + path[t]; each must be a stored entry. */
+            if (off + 1 > pitch) return RAD_E_SHAPE;
+            for (int64_t t = 0; t <= off; ++t) {
+                const int64_t pe = spec_path_at(spath, n, t, pitch);
+                if (pe < 0 || woff + pe >= state_len) return RAD_E_SHAPE;
+            }
+        } else if (off + width - 1 > state_len) {
+            return RAD_E_SHAPE;
+        }
         if (width > 1 && (width - 2) + slen > state_len) return RAD_E_SHAPE;
     }
 
@@ -357,8 +436,16 @@ int ref_gdn_conv_update(const RadArgs* a, RadStream) {
         const int64_t off = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) - 1 : 0;
 
         float hist[REF_CONV_HIST_MAX];
-        for (int64_t i = 0; i < width - 1; ++i) hist[i] = ldt(cs, at3(cvs, slot, c, off + i));
-        conv_channel(io, c, bos, slen, hist);
+        /* The window's committed history. The buffer holds the previous block's inputs at
+         * woff + row, so the committed sequence is [e_0 .. e_{woff-1}, e_{woff + path[0]}, ...]
+         * and the history is its last width - 1 entries; for the chain (path[t] = t) that is
+         * the read at `off` and nothing else. */
+        for (int64_t i = 0; i < width - 1; ++i) {
+            int64_t e = off + i;
+            if (spath && e >= woff) e = woff + spec_path_at(spath, n, e - woff, pitch);
+            hist[i] = ldt(cs, at3(cvs, slot, c, e));
+        }
+        conv_channel(io, c, bos, slen, hist, spar);
 
         /* Shift down by one: the tail of the old history, then this step's tokens. Safe in place
          * because the history was read into `hist` first. */
@@ -678,6 +765,10 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
      * r4d_rows.cpp for why the group is the row. */
     const RadTensor* oq  = (a->n_t > 14 && a->t[14].data) ? &a->t[14] : nullptr;
     const RadTensor* osc = (a->n_t > 15 && a->t[15].data) ? &a->t[15] : nullptr;
+    /* Tree verify (see "tree verify" above): each row starts from its parent's state, and the
+     * replay commits the previous block's rows named by spec_path instead of its first ones. */
+    const RadTensor* spar = spec_opt(a, 16);
+    const RadTensor* spath = spec_opt(a, 17);
     if (!q->data || !k->data || !v->data || !av->data || !bvt->data || !state->data || !o->data ||
         !cu) return RAD_E_INVAL;
 
@@ -727,6 +818,11 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
     /* The anchor form keeps its replay factors inside a head's [V, K] block of a state slot, at
      * libr4d's offsets (AnchorLayout), so the block must be dense and hold every token's factors. */
     const AnchorLayout al(K, V);
+    /* A tree names rows whose states exist only for this step, and a path names the previous
+     * step's records: both are the anchor form's (per_candidate keeps a state per row index). */
+    if ((spar || spath) && !anchor) return RAD_E_UNSUPPORTED;
+    if (!spec_parents_ok(spar, cu, n_seq)) return RAD_E_INVAL;
+    const int64_t pitch = spath ? spec_pitch(spath, n_seq) : 0;
     if (anchor) {
         if (!sidx || sw < 6) return RAD_E_SHAPE;
         if (stv.s3 != 1 || stv.s2 != K) return RAD_E_STRIDE;
@@ -734,6 +830,15 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
         for (int64_t n = 0; n < n_seq; ++n) {
             const int64_t na = nacc ? ld_int(nacc->dtype, nacc->data, offlin(nacc, n)) : 1;
             if (cu_at(cu, n + 1) - cu_at(cu, n) > al.tmax || na > al.tmax) return RAD_E_SHAPE;
+            if (spath) {
+                /* The records replayed are the named rows of the previous block, which held at
+                 * most tmax. */
+                if (na > pitch) return RAD_E_SHAPE;
+                for (int64_t t = 0; t < na; ++t) {
+                    const int64_t pe = spec_path_at(spath, n, t, pitch);
+                    if (pe < 0 || pe >= al.tmax) return RAD_E_SHAPE;
+                }
+            }
         }
     }
 
@@ -766,7 +871,10 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
                                  anchor ? at4(stv, col[5], h, 0, 0) : 0 };
         const bool dup_f = anchor && (col[3] != col[4] || col[5] != col[4]);
 
-        const size_t need = (size_t)(V * K + 2 * K + 3 * V);
+        /* A tree keeps the state each row left, root first: slot 0 the committed state, slot r + 1
+         * row r's. */
+        const size_t tree_n = spar ? (size_t)(q_len + 1) * (size_t)(V * K) : 0;
+        const size_t need = (size_t)(V * K + 2 * K + 3 * V) + tree_n;
         float* wsp = ws_get(need);
         float* St = wsp;                       /* [K, V] */
         float* qn = St + V * K;
@@ -774,6 +882,7 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
         float* uu = kn + K;
         float* orow = uu + V;
         float* sk2 = orow + V;
+        float* Sall = sk2 + V;                 /* [q_len + 1, K, V], tree only */
 
         for (int64_t e = 0; e < V; ++e)
             for (int64_t d = 0; d < K; ++d) St[d * V + e] = ldt(state, at4(stv, slot_in, h, e, d));
@@ -808,7 +917,9 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
             /* Replay the previous step's accepted tokens from their factors, publish the advanced
              * anchor at column 2, and stamp each factor copy with the column it sits in. */
             for (int64_t t = 0; t < na; ++t) {
-                const int64_t f = fb + t * al.fstr;
+                /* The record of the t-th committed row: row t of a chain, spec_path[t] of a tree. */
+                const int64_t rec = spath ? spec_path_at(spath, n, t, pitch) : t;
+                const int64_t f = fb + rec * al.fstr;
                 /* Each 32-row group of V replays from its own copy of k and its own (g, beta),
                  * as libr4d's kernel reads them. Every writer stores equal copies, so on a block
                  * a step wrote this is the same as reading one copy for all rows. */
@@ -824,9 +935,14 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
                     stt(state, at4(stv, col[2], h, e, d), St[d * V + e]);
             for (int c = 0; c < 3; ++c) stt(state, fbs[c] + al.mark, (float)(c + 1));
         }
+        if (spar) std::memcpy(Sall, St, sizeof(float) * (size_t)(V * K));
 
         for (int64_t t = 0; t < q_len; ++t) {
             const int64_t tok = bos + t;
+            /* A tree row starts from the state its parent left. */
+            if (spar)
+                std::memcpy(St, Sall + (spec_parent_of(spar, bos, t) + 1) * (V * K),
+                            sizeof(float) * (size_t)(V * K));
             const float gv = -ref_exp(alog) *
                              act_softplus(ldt(av, at2(a2, tok, h)) + dtb, spthr);
             const float bt = act_sigmoid(ldt(bvt, at2(b2, tok, h)));
@@ -845,6 +961,8 @@ int ref_gdn_recurrent_update(const RadArgs* a, RadStream) {
             }
 
             update(gv, bt, [&](int64_t e) { return ldt(v, at3(vv, tok, h, e)); }, 0, V);
+            if (spar)
+                std::memcpy(Sall + (t + 1) * (V * K), St, sizeof(float) * (size_t)(V * K));
             for (int64_t e = 0; e < V; ++e) orow[e] = 0.0f;
             for (int64_t d = 0; d < K; ++d) {
                 const float* sr = St + d * V;
@@ -980,20 +1098,77 @@ int ref_gdn_conv_recurrent_update(const RadArgs* a, RadStream st) {
         if (!f) return RAD_E_INVAL;
         cp[i] = *f;
     }
-    /* x, w, b, conv_state, state_idx, num_accepted, cu, q, k, v */
-    RadTensor ct[10] = { a->t[0], a->t[1], a->t[2], a->t[3], a->t[4], a->t[11], a->t[12], tq, tk,
-                         tv };
+    /* x, w, b, conv_state, state_idx, num_accepted, cu, q, k, v, spec_parent, spec_path: the
+     * tree operands are the fold's 18 and 19 and go to both halves. */
+    RadTensor none{};
+    RadTensor ct[12] = { a->t[0], a->t[1], a->t[2], a->t[3], a->t[4], a->t[11], a->t[12], tq, tk,
+                         tv, a->n_t > 18 ? a->t[18] : none, a->n_t > 19 ? a->t[19] : none };
     RadArgs ca = *a;
-    ca.t = ct; ca.n_t = 10; ca.p = cp; ca.n_p = 4;
+    ca.t = ct; ca.n_t = 12; ca.p = cp; ca.n_p = 4;
     int rc = ref_gdn_conv_update(&ca, st);
     if (rc != RAD_OK) return rc;
 
     /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
      * o_scale. The parameters pass as they are: the recurrence reads its own by name. */
-    RadTensor rt[16] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
+    RadTensor rt[18] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
                          a->t[11], a->t[12], a->t[13], a->t[14], a->t[15],
-                         a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17] : RadTensor{} };
+                         a->n_t > 16 ? a->t[16] : none, a->n_t > 17 ? a->t[17] : none,
+                         ct[10], ct[11] };
     RadArgs ra = *a;
-    ra.t = rt; ra.n_t = 16;
+    ra.t = rt; ra.n_t = 18;
     return ref_gdn_recurrent_update(&ra, st);
+}
+
+/* ------------------------------------------------------------------ kv_window_compact */
+/* Closes a rolling window over the rows a tree verify committed, so a reader of the chain layout
+ * (a step reading at `num_accepted - 1`) sees them as the prefix a sequential decode would have
+ * left. The window is [slots, channels, entries]; the verify block's row r wrote its entry at
+ * `off + r`, and the committed rows are spec_path[n][0..num_accepted), so entry off + t takes the
+ * entry of row path[t] for t = 1..num_accepted-1, ascending. Ascending in place is hazard free
+ * because a path's rows increase (path[t] >= t): the source of step t is never one an earlier step
+ * overwrote. The entries are moved whole, so any element type serves, and a chain (path[t] = t) is
+ * a no-op. gdn_conv_update and the folded convolution take `spec_path` and gather as they read, so
+ * they do not need this; it serves the windows whose readers do not (PLE's token and conv
+ * windows). A caller must not both compact a window and hand the same `spec_path` to a reader that
+ * gathers: the path would be applied twice. */
+int ref_kv_window_compact(const RadArgs* a, RadStream) {
+    if (a->n_t < 4) return RAD_E_INVAL;
+    const RadTensor* cache = &a->t[0];
+    const RadTensor* sidx = t_in(a, 1);
+    const RadTensor* nacc = t_in(a, 2);
+    const RadTensor* spath = t_in(a, 3);
+    if (!cache->data || !sidx || !nacc || !spath) return RAD_E_INVAL;
+    if (cache->rank != 3) return RAD_E_SHAPE;
+    const int64_t off = p_int(a, "off", -1);
+    if (off < 0) return RAD_E_INVAL;
+    const int64_t slots = cache->shape[0], C = cache->shape[1], E = cache->shape[2];
+    const int64_t N = numel(nacc);
+    if (N <= 0) return RAD_E_SHAPE;
+    /* state_idx is [n_seq] or [n_seq, W]: column 0 is the slot (the same read as the gdn ops'). */
+    if (sidx->rank < 1 || sidx->shape[0] < N) return RAD_E_SHAPE;
+    const int64_t pitch = spec_pitch(spath, N);
+    const int64_t eb = rad_dtype_bytes(cache->dtype, 1);
+    if (eb <= 0) return RAD_E_DTYPE;
+    uint8_t* base = (uint8_t*)cache->data;
+
+    for (int64_t n = 0; n < N; ++n) {
+        const int64_t slot = ld_int(sidx->dtype, sidx->data, n * sidx->stride[0]);
+        if (slot < 0) continue;                       /* padding */
+        if (slot >= slots) return RAD_E_SHAPE;
+        const int64_t na = ld_int(nacc->dtype, nacc->data, offlin(nacc, n));
+        if (na < 1) return RAD_E_INVAL;
+        if (na > pitch) return RAD_E_SHAPE;
+        for (int64_t t = 1; t < na; ++t) {
+            const int64_t src = spec_path_at(spath, n, t, pitch);
+            if (src < t) return RAD_E_INVAL;          /* not an ascending path: unsafe in place */
+            if (off + src >= E) return RAD_E_SHAPE;
+            if (src == t) continue;
+            for (int64_t c = 0; c < C; ++c) {
+                const int64_t b = slot * cache->stride[0] + c * cache->stride[1];
+                std::memmove(base + (b + (off + t) * cache->stride[2]) * eb,
+                             base + (b + (off + src) * cache->stride[2]) * eb, (size_t)eb);
+            }
+        }
+    }
+    return RAD_OK;
 }

@@ -111,6 +111,36 @@ static inline V3 conv_state_view(const RadTensor* cs, int64_t conv_dim, int64_t 
     return view3(cs, conv_dim, *state_len);
 }
 
+/* Tree verification (RadBatch::spec_parent / spec_path; libref/ref_gdn.cpp "tree verify" and
+ * docs/OPS.md): a row's parent is its spec_parent entry when that names an earlier row, else the
+ * row before it, and nothing for a sequence's first row; spec_path lists the previous block's
+ * committed rows. */
+static inline int64_t spec_parent_of(const RadTensor* sp, int64_t bos, int64_t r) {
+    const int64_t v = sp ? ldi(sp, offlin(sp, bos + r)) : -2;
+    if (v >= 0 && v < r) return v;
+    return r > 0 ? r - 1 : -1;
+}
+static bool spec_parents_ok(const RadTensor* sp, const RadTensor* cu, int64_t N) {
+    if (!sp) return true;
+    for (int64_t n = 0; n < N; ++n) {
+        const int64_t bos = cu_at(cu, n), len = cu_at(cu, n + 1) - bos;
+        for (int64_t r = 0; r < len; ++r)
+            if (ldi(sp, offlin(sp, bos + r)) >= r) return false;
+    }
+    return true;
+}
+static inline int64_t spec_pitch(const RadTensor* sp, int64_t N) {
+    return sp->rank >= 2 ? sp->shape[sp->rank - 1] : (N > 0 ? numel(sp) / N : 0);
+}
+static inline int64_t spec_path_at(const RadTensor* sp, int64_t n, int64_t t, int64_t pitch) {
+    const int64_t off = sp->rank >= 2 ? n * sp->stride[sp->rank - 2] + t * sp->stride[sp->rank - 1]
+                                      : n * pitch + t;
+    return ldi(sp, off);
+}
+static inline const RadTensor* spec_opt(const RadArgs* a, int i) {
+    return (a->n_t > i && a->t[i].data) ? &a->t[i] : nullptr;
+}
+
 /* Two-sided softplus with FLA's and libr4d's large-x cutoff: above the threshold log1p(e^x) equals
  * x in f32, and evaluating it would overflow. */
 static inline float softplus(float x, float thr) {
@@ -469,6 +499,9 @@ AVX_KERNEL(gdn_conv_update) {
     const RadTensor* bias = rad_arg_in(a, 2);
     const RadTensor* sidx = rad_arg_in(a, 4);
     const RadTensor* nacc = rad_arg_in(a, 5);
+    /* Tree verify: the block's parents and the previous block's committed rows (see spec_parent_of). */
+    const RadTensor* spar = spec_opt(a, 10);
+    const RadTensor* spath = spec_opt(a, 11);
     if (!x->data || !w->data || !cs->data || !cu->data || !q->data || !k->data || !v->data)
         return RAD_E_INVAL;
 
@@ -494,11 +527,22 @@ AVX_KERNEL(gdn_conv_update) {
 
     /* A state too shallow for this step's offset is refused, not clamped (that would silently
      * truncate history). Checked before the loop; an OpenMP body cannot return. */
+    if (!spec_parents_ok(spar, cu, N)) return RAD_E_INVAL;
+    const int64_t pitch = spath ? spec_pitch(spath, N) : 0;
+    const int64_t woff = width > 1 ? width - 2 : 0;   /* entries before the first row's input */
     for (int64_t n = 0; n < N; ++n) {
         const int64_t slen = cu_at(cu, n + 1) - cu_at(cu, n);
         const int64_t off = nacc ? ldi(nacc, offlin(nacc, n)) - 1 : 0;
         if (off < 0) return RAD_E_INVAL;
-        if (off + width - 1 > state_len) return RAD_E_SHAPE;
+        if (spath) {
+            if (off + 1 > pitch) return RAD_E_SHAPE;
+            for (int64_t t = 0; t <= off; ++t) {
+                const int64_t pe = spec_path_at(spath, n, t, pitch);
+                if (pe < 0 || woff + pe >= state_len) return RAD_E_SHAPE;
+            }
+        } else if (off + width - 1 > state_len) {
+            return RAD_E_SHAPE;
+        }
         if (width > 1 && (width - 2) + slen > state_len) return RAD_E_SHAPE;
     }
 
@@ -537,20 +581,36 @@ AVX_KERNEL(gdn_conv_update) {
         } else {
             for (int64_t c = 0; c < cbw; ++c) bs[c] = 0.0f;
         }
+        /* The window's entry that holds the e-th entry of the committed sequence: entry e itself for a
+         * chain, and after a tree the entry of the row spec_path names (the previous block's row r
+         * sits at woff + r). */
+        auto entry = [&](int64_t e) -> int64_t {
+            if (spath && e >= woff) return woff + spec_path_at(spath, n, e - woff, pitch);
+            return e;
+        };
         for (int64_t i = 0; i < width - 1; ++i) {
+            const int64_t e = entry(off + i);
             if (cvs.s1 == 1)
-                row_to_f32(cs->dtype, byte_at(cs->data, cs->dtype, at3(cvs, slot, c0, off + i)),
+                row_to_f32(cs->dtype, byte_at(cs->data, cs->dtype, at3(cvs, slot, c0, e)),
                            hseg + i * cbw, cbw);
             else
                 for (int64_t c = 0; c < cbw; ++c)
-                    hseg[i * cbw + c] = ldt(cs, at3(cvs, slot, c0 + c, off + i));
+                    hseg[i * cbw + c] = ldt(cs, at3(cvs, slot, c0 + c, e));
         }
         for (int64_t t = 0; t < slen; ++t) {
             int64_t c = 0;
             for (; c + VF_N <= cbw; c += VF_N) vf_storeu(acc + c, vf_loadu(bs + c));
             for (; c < cbw; ++c) acc[c] = bs[c];
+            /* Tree verify: tap j reads the ancestor `width - 1 - j` steps up the row's chain, and
+             * past the sequence's first row the window's newest entry first. */
+            int64_t anc[AVX_CONV_HIST_MAX + 1];
+            if (spar) {
+                anc[0] = t;
+                for (int64_t m = 1; m < width; ++m)
+                    anc[m] = anc[m - 1] >= 0 ? spec_parent_of(spar, bos, anc[m - 1]) : anc[m - 1] - 1;
+            }
             for (int64_t j = 0; j < width; ++j) {
-                const int64_t src = t - (width - 1) + j;
+                const int64_t src = spar ? anc[width - 1 - j] : t - (width - 1) + j;
                 if (src >= 0) {
                     if (xcol == 1)
                         row_to_f32(x->dtype,
@@ -560,8 +620,9 @@ AVX_KERNEL(gdn_conv_update) {
                         for (int64_t c = 0; c < cbw; ++c)
                             xr[c] = ldt(x, (bos + src) * xrow + (c0 + c) * xcol);
                 } else {
-                    /* src + width - 1 is in [0, width - 2]: the history segment. */
-                    const float* hs = hseg + (src + width - 1) * cbw;
+                    /* The history segment: src + width - 1 is in [0, width - 2] for a chain, and
+                     * a tree's src = -1 - e names the window's e-th newest entry. */
+                    const float* hs = hseg + (spar ? width - 1 + src : src + width - 1) * cbw;
                     for (int64_t c = 0; c < cbw; ++c) xr[c] = hs[c];
                 }
                 /* Separate mul and add, not FMA, to match the reference's two roundings. */
@@ -588,7 +649,7 @@ AVX_KERNEL(gdn_conv_update) {
                 for (int64_t i = 0; i + 1 < width - 1; ++i)
                     std::memmove((char*)cs->data + (at3(cvs, slot, c0, i) * (int64_t)elbytes),
                                  (const char*)cs->data +
-                                     (at3(cvs, slot, c0, off + i + 1) * (int64_t)elbytes),
+                                     (at3(cvs, slot, c0, entry(off + i + 1)) * (int64_t)elbytes),
                                  (size_t)cbw * elbytes);
                 for (int64_t t = 0; t < slen; ++t)
                     std::memmove((char*)cs->data +
@@ -600,7 +661,7 @@ AVX_KERNEL(gdn_conv_update) {
                 for (int64_t c = 0; c < cbw; ++c) {
                     for (int64_t i = 0; i + 1 < width - 1; ++i)
                         stt(cs, at3(cvs, slot, c0 + c, i),
-                            ldt(cs, at3(cvs, slot, c0 + c, off + i + 1)));
+                            ldt(cs, at3(cvs, slot, c0 + c, entry(off + i + 1))));
                     for (int64_t t = 0; t < slen; ++t)
                         stt(cs, at3(cvs, slot, c0 + c, t + width - 2),
                             ldt(x, (bos + t) * xrow + (c0 + c) * xcol));
@@ -953,6 +1014,10 @@ AVX_KERNEL(gdn_recurrent_update) {
     /* Optional fused quantiser for the out projection (o_q and o_scale). */
     const RadTensor* oq = (a->n_t > 14 && a->t[14].data) ? &a->t[14] : nullptr;
     const RadTensor* osc = (a->n_t > 15 && a->t[15].data) ? &a->t[15] : nullptr;
+    /* Tree verify (libref's "tree verify"): each row starts from its parent's state, and the replay
+     * applies the previous block's committed rows named by spec_path. */
+    const RadTensor* spar = spec_opt(a, 16);
+    const RadTensor* spath = spec_opt(a, 17);
     if (!q->data || !k->data || !v->data || !av->data || !bvt->data || !state->data || !o->data ||
         !cu) return RAD_E_INVAL;
 
@@ -997,6 +1062,10 @@ AVX_KERNEL(gdn_recurrent_update) {
     /* The anchor form keeps its factors inside a head's [V, K] block of a state slot, at libr4d's
      * offsets, so the block must be dense and large enough. Checked before any write. */
     const AnchorLayout al(K, V);
+    /* A tree names rows whose states exist only for this step; the per-candidate form has none. */
+    if ((spar || spath) && !anchor) return RAD_E_UNSUPPORTED;
+    if (!spec_parents_ok(spar, cu, n_seq)) return RAD_E_INVAL;
+    const int64_t pitch = spath ? spec_pitch(spath, n_seq) : 0;
     if (anchor) {
         if (!sidx || sw < 6) return RAD_E_SHAPE;
         if (state->rank >= 4 && (state->stride[3] != 1 || state->stride[2] != K))
@@ -1005,6 +1074,13 @@ AVX_KERNEL(gdn_recurrent_update) {
         for (int64_t n = 0; n < n_seq; ++n) {
             const int64_t na = nacc ? ldi(nacc, offlin(nacc, n)) : 1;
             if (cu_at(cu, n + 1) - cu_at(cu, n) > al.tmax || na > al.tmax) return RAD_E_SHAPE;
+            if (spath) {
+                if (na > pitch) return RAD_E_SHAPE;
+                for (int64_t t = 0; t < na; ++t) {
+                    const int64_t pe = spec_path_at(spath, n, t, pitch);
+                    if (pe < 0 || pe >= al.tmax) return RAD_E_SHAPE;
+                }
+            }
         }
     }
 
@@ -1041,8 +1117,10 @@ AVX_KERNEL(gdn_recurrent_update) {
                                  anchor ? col[5] * sstride + h * hstride : 0 };
         const bool dup_f = anchor && (col[3] != col[4] || col[5] != col[4]);
 
-        /* vrow/zrow hold the per-token value and gate rows, widened once. */
-        const size_t need = (size_t)(V * K + 2 * K + 5 * V) + 16;
+        /* vrow/zrow hold the per-token value and gate rows, widened once. A tree also keeps the state
+         * each row left, root first (slot 0 the committed state, slot r + 1 row r's). */
+        const size_t tree_n = spar ? (size_t)(q_len + 1) * (size_t)(V * K) : 0;
+        const size_t need = (size_t)(V * K + 2 * K + 5 * V) + 16 + tree_n;
         float* wsp = scratch_f32(need);
         float* S = wsp;
         float* qn = S + V * K;
@@ -1052,6 +1130,7 @@ AVX_KERNEL(gdn_recurrent_update) {
         float* gainv = orow + V;
         float* vrow = gainv + V;
         float* zrow = vrow + V;
+        float* Sall = zrow + V + 16;       /* [q_len + 1, V, K], tree only */
 
         /* Widen the state a row at a time (one dtype switch per row, avx_vec.h). */
         if (dstride == 1) {
@@ -1081,7 +1160,9 @@ AVX_KERNEL(gdn_recurrent_update) {
              * loop's own arithmetic, so the replayed state is the one per_candidate would hold.
              * Then publish it at column 2 and stamp each factor copy with its column. */
             for (int64_t t = 0; t < na; ++t) {
-                const int64_t f = fb + t * al.fstr;
+                /* The record of the t-th committed row: row t of a chain, spec_path[t] of a tree. */
+                const int64_t rec = spath ? spec_path_at(spath, n, t, pitch) : t;
+                const int64_t f = fb + rec * al.fstr;
                 for (int64_t e = 0; e < V; ++e) vrow[e] = ldt(state, f + al.vb + e);
                 /* Each 32-row group of V replays from its own copy of k and its own (g, beta), as
                  * libr4d's kernel and libref read them; writers store equal copies. */
@@ -1110,9 +1191,14 @@ AVX_KERNEL(gdn_recurrent_update) {
                              K);
             for (int c = 0; c < 3; ++c) stt(state, fbs[c] + al.mark, (float)(c + 1));
         }
+        if (spar) std::memcpy(Sall, S, sizeof(float) * (size_t)(V * K));
 
         for (int64_t t = 0; t < q_len; ++t) {
             const int64_t tok = bos + t;
+            /* A tree row starts from the state its parent left. */
+            if (spar)
+                std::memcpy(S, Sall + (spec_parent_of(spar, bos, t) + 1) * (V * K),
+                            sizeof(float) * (size_t)(V * K));
             const float gval = negexp * softplus(ldt(av, at2(a2, tok, h)) + dtb, spthr);
             const float bt = 1.0f / (1.0f + sc_exp(-ldt(bvt, at2(b2, tok, h))));
 
@@ -1158,6 +1244,8 @@ AVX_KERNEL(gdn_recurrent_update) {
                 axpy(Se, kn, uu[e], K);
                 orow[e] = dot2(Se, qn, K);
             }
+            if (spar)
+                std::memcpy(Sall + (t + 1) * (V * K), S, sizeof(float) * (size_t)(V * K));
 
             /* This token's factors, for the next step to replay: the normalised k once per
              * 32-row group, v, then the decay exponent and beta once per group. */
@@ -1292,21 +1380,24 @@ AVX_KERNEL(gdn_conv_recurrent_update) {
         if (!f) return RAD_E_INVAL;
         cp[i] = *f;
     }
-    /* x, w, b, conv_state, state_idx, num_accepted, cu, q, k, v */
-    RadTensor ct[10] = { a->t[0], a->t[1], a->t[2], a->t[3], a->t[4], a->t[11], a->t[12], tq, tk,
-                         tv };
+    /* x, w, b, conv_state, state_idx, num_accepted, cu, q, k, v, spec_parent, spec_path: the tree
+     * operands are the fold's 18 and 19 and go to both halves. */
+    RadTensor none{};
+    RadTensor ct[12] = { a->t[0], a->t[1], a->t[2], a->t[3], a->t[4], a->t[11], a->t[12], tq, tk,
+                         tv, a->n_t > 18 ? a->t[18] : none, a->n_t > 19 ? a->t[19] : none };
     RadArgs ca = *a;
-    ca.t = ct; ca.n_t = 10; ca.p = cp; ca.n_p = 4;
+    ca.t = ct; ca.n_t = 12; ca.p = cp; ca.n_p = 4;
     const int rc = AVX_FN(avx_gdn_conv_update)(&ca, stream);
     if (rc != RAD_OK) return rc;
 
     /* q, k, v, a, b, A_log, dt_bias, state, state_idx, num_accepted, cu, z, norm_w, o, o_q,
      * o_scale. The parameters pass as they are: the recurrence reads its own by name. */
-    RadTensor rt[16] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
+    RadTensor rt[18] = { tq, tk, tv, a->t[5], a->t[6], a->t[7], a->t[8], a->t[9], a->t[10],
                          a->t[11], a->t[12], a->t[13], a->t[14], a->t[15],
-                         a->n_t > 16 ? a->t[16] : RadTensor{}, a->n_t > 17 ? a->t[17] : RadTensor{} };
+                         a->n_t > 16 ? a->t[16] : none, a->n_t > 17 ? a->t[17] : none,
+                         ct[10], ct[11] };
     RadArgs ra = *a;
-    ra.t = rt; ra.n_t = 16;
+    ra.t = rt; ra.n_t = 18;
     return AVX_FN(avx_gdn_recurrent_update)(&ra, stream);
 }
 
@@ -1372,6 +1463,53 @@ AVX_KERNEL(gdn_gated_rmsnorm) {
         }
         if (os == 1) out_row(o, ob, ch, obuf);
         else for (int64_t j = 0; j < ch; ++j) stt(o, ob + j * os, obuf[j]);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ kv_window_compact */
+/* Closes a rolling window over the rows a tree verify committed (libref's ref_kv_window_compact,
+ * docs/OPS.md): entry off + t takes the entry of row spec_path[t], for t = 1..num_accepted-1
+ * ascending, for every channel of the sequence's slot. Ascending in place is hazard free because a
+ * path's rows increase; the entries are moved whole, so any element width serves. */
+AVX_KERNEL(kv_window_compact) {
+    if (a->n_t < 4) return RAD_E_INVAL;
+    const RadTensor* cache = &a->t[0];
+    const RadTensor* sidx = rad_arg_in(a, 1);
+    const RadTensor* nacc = rad_arg_in(a, 2);
+    const RadTensor* spath = rad_arg_in(a, 3);
+    if (!cache->data || !sidx || !nacc || !spath) return RAD_E_INVAL;
+    if (cache->rank != 3) return RAD_E_SHAPE;
+    const int64_t off = p_int(a, "off", -1);
+    if (off < 0) return RAD_E_INVAL;
+    const int64_t slots = cache->shape[0], C = cache->shape[1], E = cache->shape[2];
+    const int64_t N = numel(nacc);
+    if (N <= 0) return RAD_E_SHAPE;
+    if (sidx->rank < 1 || sidx->shape[0] < N) return RAD_E_SHAPE;
+    const int64_t pitch = spec_pitch(spath, N);
+    const uint32_t bits = rad_dtype_bits(cache->dtype);
+    if (bits == 0 || bits % 8) return RAD_E_DTYPE;
+    const size_t eb = (size_t)bits / 8;
+    char* base = (char*)cache->data;
+
+    for (int64_t n = 0; n < N; ++n) {
+        const int64_t slot = ldi(sidx, n * sidx->stride[0]);
+        if (slot < 0) continue;                       /* padding */
+        if (slot >= slots) return RAD_E_SHAPE;
+        const int64_t na = ldi(nacc, offlin(nacc, n));
+        if (na < 1) return RAD_E_INVAL;
+        if (na > pitch) return RAD_E_SHAPE;
+        for (int64_t t = 1; t < na; ++t) {
+            const int64_t src = spec_path_at(spath, n, t, pitch);
+            if (src < t) return RAD_E_INVAL;          /* not an ascending path: unsafe in place */
+            if (off + src >= E) return RAD_E_SHAPE;
+            if (src == t) continue;
+            for (int64_t c = 0; c < C; ++c) {
+                const int64_t b = slot * cache->stride[0] + c * cache->stride[1];
+                std::memmove(base + (size_t)(b + (off + t) * cache->stride[2]) * eb,
+                             base + (size_t)(b + (off + src) * cache->stride[2]) * eb, eb);
+            }
+        }
     }
     return RAD_OK;
 }

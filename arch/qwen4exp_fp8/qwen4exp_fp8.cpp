@@ -1350,7 +1350,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * Declared only when the checkpoint carries a head and the deployment speculates; at
      * max_spec 0 the weights stay off the card (the container still carries them, since
      * rad-convert declares at a non-zero max_spec). */
-    const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
+    /* Local debug switch: RAD_DEBUG_NO_MTP=1 leaves the head undeclared, so --spec-ngram with
+     * --debug-draft-oracle can test the verify path on this container. */
+    const int64_t nextn = std::getenv("RAD_DEBUG_NO_MTP") ? 0
+                        : meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
                                     "mtp_num_hidden_layers", 0);
     if (nextn > 0 && g.max_spec > 0) {
         const char* mpre = "mtp";

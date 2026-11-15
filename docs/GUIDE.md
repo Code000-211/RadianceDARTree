@@ -1622,6 +1622,16 @@ nodes, grown over the block the drafter was trained at. A request with a grammar
 tools) speculates on a tree too: each row is masked against the grammar after its own ancestors.
 `draft-coupling: on` samples one path, so a coupled drafter proposes the chain.
 
+A serial draft head (the MTP of Qwen3.8-Flash-Next) takes a tree too, where its plugin states one
+(`draft-tree`, `draft-tree-leaves`, `draft-tree-nodes`, `draft-tree-width`). With a serial head
+`num-speculative-tokens` counts the head's rounds, as for a chain; the verify carries that chain
+plus up to `draft-tree-leaves` runner-up candidates of the first round as siblings of the chain's first
+token, so a step lands a token whenever the target agrees with the chain or with one of them. The
+text is unchanged. The core refuses a serial tree on a model whose recurrent state does not follow
+the accepted path, and with `draft-coupling: on`; `draft-window: adaptive` stays fixed under one. The
+metrics count a tree's acceptance by depth: `radiance:draft_tokens_total` counts every node (each is
+a verify row), the per-position acceptance the depths.
+
 **A shorter block under load: `draft-short-from: N`.** A block drafter's block is paid for by
 every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
 drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
@@ -2369,6 +2379,10 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `spec-ngram-min: N`, `spec-ngram-max: N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `draft-window: MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
 | `draft-short-from: N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
+| `draft-tree: MODE` | auto | `auto`: verify a draft head's proposals as a tree where the model's plugin measured a gain; `off` keeps the chain; `on` asks for a tree and warns when the model declares none (§4.6) |
+| `draft-tree-leaves: L` | 3 | a serial head's tree (Qwen3.8-Flash-Next's MTP): runner-up siblings of the chain's first token, 0 to 7 |
+| `draft-tree-nodes: N` | auto | a serial head's tree: the most nodes one verify carries (default the plugin's budget, at least `num-speculative-tokens`, which counts the head's rounds) |
+| `draft-tree-width: W` | 1 | a serial head's tree: frontier rows the plugin's head grows a round; 1 is the chain with its leaves, more asks the plugin for a deeper tree |
 | `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
 

@@ -157,7 +157,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (pc) pc->set_drafter_floor(draft_refill_);
 
     /* A tree drafter (rad_drafter_tree): every trunk step verifies its proposals as trees. */
-    tree_ = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter_tree;
+    tree_ = cfg.n_spec > 0 && prog.drafter_tree &&
+            (prog.drafter.kind == RAD_DRAFT_BLOCK ||
+             (prog.drafter.kind == RAD_DRAFT_SERIAL && prog.drafter.tree_nodes > 0));
+    /* A serial head's tree: `n_spec` is the node budget (the verify's rows), the head runs
+     * `depth` rounds, and no path is deeper than that, which bounds what its history pass owes
+     * and what prompt lookup may chain beside it. */
+    serial_tree_  = tree_ && prog.drafter.kind == RAD_DRAFT_SERIAL;
+    tree_rounds_  = serial_tree_ ? prog.drafter.depth : 0;
+    tree_width_   = serial_tree_ ? std::max(1, prog.drafter.tree_width) : 1;
     serial_shared_    = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_SERIAL &&
                         prog.drafter_shared_kv;
     serial_rot_shift_ = serial_shared_ ? prog.drafter_pos_offset : 0;
@@ -206,7 +214,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         if (cfg.n_spec <= 0)
             RAD_WARN("--draft-window adaptive: this deployment does not speculate "
                      "(--num-speculative-tokens %d), so there is no window to adapt", cfg.n_spec);
-        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0) {
+        else if (serial_tree_) {
+            /* The window prices a chain's next draft by its own acceptance; a tree's rows are
+             * leaves and branches, each with its own, and the sequence verifies the whole tree. */
+            RAD_WARN("--draft-window adaptive: this deployment's draft head proposes a tree, which "
+                     "every sequence verifies whole; the window stays fixed");
+        } else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0) {
             dp.adapt = true;
             lookup_adapt_ = true;
             RAD_INFO("--draft-window adaptive with prompt lookup only: each sequence verifies its "
@@ -475,6 +488,22 @@ bool Scheduler::committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const {
             return true;
         }
     return false;
+}
+
+/* The deepest node of a tree's first `n` nodes, parents null for a chain (node j under j - 1). */
+int Scheduler::tree_depth(const int32_t* parents, int n) {
+    if (n <= 0) return 0;
+    if (!parents) return n;
+    int dep[RAD_SCHED_MAX_SPEC + 1];
+    int best = 0;
+    dep[0] = 0;
+    for (int j = 1; j <= n && j <= RAD_SCHED_MAX_SPEC; ++j) {
+        int p = parents[j - 1];
+        if (p < 0 || p >= j) p = j - 1;
+        dep[j] = dep[p] + 1;
+        if (dep[j] > best) best = dep[j];
+    }
+    return best;
 }
 
 int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents) {
@@ -2012,8 +2041,11 @@ const RadBatch* Scheduler::step() {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
                 int match = -1;
-                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window(),
-                                                 &match);
+                int ng_cap = lookup_adapt_ ? cap : draft_.step_window();
+                /* Beside a serial tree the lookup is a chain no deeper than the head's rounds:
+                 * the history pass owes only as many rows as a path can be deep. */
+                if (serial_tree_ && ng_cap > tree_rounds_) ng_cap = tree_rounds_;
+                s.n_draft = (int32_t)draft_ngram(s, ng_cap, &match);
                 ngram = s.n_draft > 0;
                 /* The verify gate (lookup.h). Every proposal is offered, so a held one is still
                  * scored against the text; the --debug-draft-oracle harness (match < 0) is a
@@ -2808,7 +2840,10 @@ int Scheduler::commit(StepResult& res) {
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
-                draft_.observe(e.n_spec, a);
+                /* A serial tree's positions are depths: its rows beyond the first path are leaves,
+                 * which are not a deeper draft. */
+                draft_.observe(serial_tree_ && !e.ngram ? tree_depth(e.draft_parent, e.n_spec)
+                                                        : e.n_spec, a);
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
@@ -3031,7 +3066,11 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * committed one, which depends on acceptance the card knows and the host does not yet,
          * so the host bounds it by all of them. A mid-prompt chunk verified nothing. */
         const int64_t vstart = (int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec;
-        const int64_t head_max = vstart + e.n_spec;
+        /* A path is at most as deep as the head's rounds: after a serial tree's verify the
+         * furthest committed position is that far, not n_spec nodes on. */
+        const int64_t acc_max = serial_tree_ ? std::min<int64_t>(e.n_spec, tree_rounds_)
+                                             : (int64_t)e.n_spec;
+        const int64_t head_max = vstart + acc_max;
         /* A runtime-window (R-SWA) sequence is never drafted for: its rollback refuses (the ring
          * rewrites slots KVManager::rollback cannot unwind), so a rejected draft would only warn
          * and waste the draft compute. This is the gate kv.cpp's rollback comment states. */
@@ -3042,8 +3081,12 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * writes the trunk's K and V there, so it would reserve them anyway. A row refused
          * lookahead (or too near the context end) still owes its history, which writes positions
          * it already has blocks for; skipping it would leave them unwritten in the head's layer. */
-        if (can_draft && ctx_limit_ > 0 && head_max + *rounds > ctx_limit_) can_draft = false;
-        if (can_draft && kv_->ensure_from(r.id, head_max + *rounds, r.n_computed) < 0)
+        /* A tree grown by the head (width > 1) stores its in-flight rows at flat slots up to the
+         * node budget past the head. */
+        const int64_t look = serial_tree_ && tree_width_ > 1
+                           ? std::max<int64_t>(*rounds, (int64_t)cfg_.n_spec + 1) : (int64_t)*rounds;
+        if (can_draft && ctx_limit_ > 0 && head_max + look > ctx_limit_) can_draft = false;
+        if (can_draft && kv_->ensure_from(r.id, head_max + look, r.n_computed) < 0)
             can_draft = false;
 
         /* The history this step owes: first the positions whose next token the host holds (a
@@ -3060,7 +3103,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         int64_t hs = s.draft_filled > e.ctx_len ? s.draft_filled : (int64_t)e.ctx_len;
         if (hs > owed_end) hs = owed_end;
         int64_t lead = owed_end - hs;
-        const int64_t verified = e.produces_token ? e.n_spec + 1 : 0;
+        const int64_t verified = e.produces_token ? acc_max + 1 : 0;
         int64_t hist_n = lead + verified;
 
         /* A head with no cache of its own owes no history (rad_drafter_shared_kv). Its one row is
@@ -3120,6 +3163,9 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
      * to decide whether the pass ends in the lm_head (rad_runtime.h). */
     serial_plan_.draft_pass = round == 0 ? -1 : round;
     serial_plan_.tok_shift  = 1;           /* the head's own indexing; see StepPlan::tok_shift */
+    /* A head that grows its tree carries spec_parent through the round passes: the card names each
+     * frontier row's parent node there (ADV_ROUND_TREE). */
+    serial_plan_.spec_is_tree = serial_tree_ && tree_width_ > 1 && round >= 2;
     serial_plan_.e.reserve(serial_.size());
 
     /* Drafting sequences first, in draft order, then history-only ones. Every round's rows are
@@ -3142,7 +3188,7 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         e.seq      = m.seq;
         e.slot     = m.slot;
         e.card     = m.card;
-        e.n_tokens = round == 0 ? m.hist_n : 1;
+        e.n_tokens = round == 0 ? m.hist_n : (serial_tree_ && tree_width_ > 1 ? tree_width_ : 1);
         /* A round's position is the card's; the host stages the furthest it can be, which every
          * host-side ceiling reads. History positions are exact. A head with no cache of its own
          * does not step forward, so neither does its ceiling. */

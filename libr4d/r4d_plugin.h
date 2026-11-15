@@ -448,6 +448,26 @@ int     r4d_rad_attn_decode_h256_gqa6_i8(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa6_i8(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_ghq_h256_gqa6_i8(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa6_i8_scratch(const RadArgs*);
+/* attn_paged_tree_sel and its two gated merges (docs/OPS.md), at the QSA ratios and page of 4
+ * (R4D_ATTN_GQA / G8_TSEL in r4d_attn_paged_gqa8.hip): the split-KV decode kernel over
+ * each row's key list (its pages, then its visible region keys packed). `_gq` is gate_quant_fp8's merge,
+ * `_ghq` gate_had_quant_i8g's. One scratch hook a cache dtype. */
+int     r4d_rad_attn_tsel_h256_gqa12_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_gq_h256_gqa12_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_ghq_h256_gqa12_bf16(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_tsel_h256_gqa12_bf16_scratch(const RadArgs*);
+int     r4d_rad_attn_tsel_h256_gqa12_i8(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_gq_h256_gqa12_i8(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_ghq_h256_gqa12_i8(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_tsel_h256_gqa12_i8_scratch(const RadArgs*);
+int     r4d_rad_attn_tsel_h256_gqa6_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_gq_h256_gqa6_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_ghq_h256_gqa6_bf16(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_tsel_h256_gqa6_bf16_scratch(const RadArgs*);
+int     r4d_rad_attn_tsel_h256_gqa6_i8(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_gq_h256_gqa6_i8(const RadArgs*, RadStream);
+int     r4d_rad_attn_tsel_ghq_h256_gqa6_i8(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_tsel_h256_gqa6_i8_scratch(const RadArgs*);
 int     r4d_rad_attn_prefill_h256_gqa8_i8(const RadArgs*, RadStream);
 int64_t r4d_rad_attn_prefill_h256_gqa8_i8_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_gqa8_i8(const RadArgs*, RadStream);
@@ -465,6 +485,8 @@ int r4d_rad_gdn_recurrent_update(const RadArgs*, RadStream);
  * never written (r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip). */
 int r4d_rad_gdn_conv_recurrent_update(const RadArgs*, RadStream);
 int r4d_rad_gdn_conv_recurrent_update_had(const RadArgs*, RadStream);
+/* A rolling window closed over a tree verify's committed rows (r4d_kv_window_compact.hip). */
+int r4d_rad_kv_window_compact(const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_rmsnorm   (const RadArgs*, RadStream);
 int r4d_rad_dflash_conv         (const RadArgs*, RadStream);
 int r4d_rad_dflash_select       (const RadArgs*, RadStream);
@@ -669,6 +691,7 @@ int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
 int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
 int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
+int r4d_rad_qsa_tail_compact(const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_sample_chain    (const RadArgs*, RadStream);
 
@@ -971,6 +994,7 @@ int r4d_shape_sample_chain     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged_sink   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_attn_paged_gate_quant(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_attn_paged_tree_sel(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qkv_norm_rope     (const RadParam*, int, int operand, RadOpdDesc*);
@@ -1031,6 +1055,7 @@ int r4d_shape_qsa_score          (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qsa_tail_compact   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
@@ -1069,6 +1094,8 @@ int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_had_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_attn_paged_tree_sel_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_attn_paged_tree_sel_gate_had_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 
 }  /* extern "C" */
 

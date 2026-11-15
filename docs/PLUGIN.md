@@ -409,6 +409,33 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   depth (a row holds the whole block's proposals and a short block fills its front) and is refused
   below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
   step (`rad_block_dflash2.h` does). Appended in ABI 27.
+- **A serial head may propose a tree.** Declare `RadDrafterDecl::depth` = the head's rounds R,
+  `tree_nodes` = N (the most nodes a verify carries, which must equal `RadBuildCtx::max_spec`; R <= N),
+  `tree_leaves` = L (the first round's runner-up candidates, columns `1..L` of the proposal row, whose
+  `proposal_pitch` must hold `1 + L`; at most 7) and `tree_width` = W, then call `rad_drafter_tree(b,
+  0)`. Stage 1 (W = 1) needs nothing else from the plugin: the core takes the first round's
+  runners-up before round 2 overwrites them and verifies the chain 1..R plus up to L depth-1 leaves
+  hanging off the anchor, in the rows `RadBatch::spec_parent` describes (node `j` at row `j`, rotated
+  at the anchor plus its depth, its K and V at the flat slot anchor + `j`). The node count a step
+  verifies is fixed by N alone (a candidate list that came up short is padded with a copy of the
+  chain's first token, a sibling the walk never takes), since the step issued ahead is planned
+  before the card chooses. Stage 2 (W > 1, `rad_drafter_tree(b, parents)` with an i32 buffer at the
+  proposal's pitch) has the head grow the tree itself: each pass ends by writing, per sequence, the
+  frontier it wants embedded next -- tokens at `proposal[i * pitch + w]` and their parents as node ids
+  (0 = the bonus token) at `parents[i * pitch + w]`, a negative token ending the list, nodes numbered on
+  from the last round's in order -- and the next round's pass then carries W rows a sequence
+  (`ADV_ROUND_TREE`): row `w` is a frontier node at head index head + its depth, its K and V at the
+  flat slot head + its node id, `RadBatch::spec_parent[row]` its parent's node id, and a row past the
+  list inert (token 0, slot -1, `spec_parent` -2). After the last round the plugin writes the final
+  tree, exactly N nodes, as a block drafter does (`ADV_BTAKE`); no path may be deeper than R.
+  `RadBuildCtx::draft_rounds`, `draft_tree_leaves` and `draft_tree_width` carry the core's choice
+  (`--draft-tree-*`) where `RadArchProbe::tree_nodes` was nonzero and the engine asked for a tree.
+  Requirements: the plugin's trunk honours `spec_parent` on every decode row, and its recurrent
+  (`RAD_KV_LINEAR`) and rolling-window (`RAD_KV_CONV`) state follows `RadBatch::spec_path`
+  (`RadArchProbe::tree_linear_ok`; a program with such a group is refused without it, as is
+  `--draft-coupling`). A paged group whose entries are not one per token slot (QSA's block keys) sets
+  `RadKVGroupDecl::no_tree_compact`, which the acceptance's K/V move skips. The history pass follows
+  the accepted path: its row `t` is path node `t`'s hidden row and its token the target's pick there.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
   expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
   GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`

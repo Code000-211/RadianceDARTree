@@ -987,6 +987,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.max_ctx    = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     bc.max_spec   = cfg_.n_spec;
     bc.draft_tree = draft_tree_ ? 1 : 0;
+    /* A serial tree's shape (RadBuildCtx::draft_rounds): max_spec above is its node budget. */
+    if (serial_tree_) {
+        bc.draft_rounds      = draft_rounds_;
+        bc.draft_tree_leaves = tree_leaves_;
+        bc.draft_tree_width  = tree_width_;
+    }
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
      * other callers and means the plugin's default. */
@@ -1286,11 +1292,41 @@ int Engine::declare() {
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
-        draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        draft_tree_ = cfg_.n_spec > 0 && cfg_.draft_tree != 0 &&
+                      (cfg_.draft_tree > 0 || pb.tree_pays != 0);
+        tree_linear_ok_ = pb.tree_linear_ok != 0;
         if (draft_tree_) {
-            const char* why = "the model's plugin measured a gain with them";
+            const char* why = cfg_.draft_tree > 0 ? "--draft-tree on"
+                                                  : "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
             decide("draft trees", "asked", why);
+        }
+        /* A serial head's tree (RadArchProbe::tree_nodes): the head's rounds R are what the depth
+         * above resolved to, and the verify carries up to N nodes, which is what every consumer
+         * of `n_spec` (buffers, the rings and windows sized by max_spec, the scheduler's window)
+         * then sees. */
+        serial_tree_ = false;
+        if (draft_tree_ && pb.tree_nodes > 0) {
+            const int rounds = cfg_.n_spec;
+            const int nodes = cfg_.draft_tree_nodes > 0 ? cfg_.draft_tree_nodes : pb.tree_nodes;
+            if (nodes < rounds || nodes > RAD_SCHED_MAX_SPEC) {
+                RAD_ERR("--draft-tree-nodes %d: a serial head's tree carries its %d round(s) of "
+                        "greedy chain and at most %d nodes in all", nodes, rounds,
+                        (int)RAD_SCHED_MAX_SPEC);
+                return RAD_E_INVAL;
+            }
+            serial_tree_   = true;
+            draft_rounds_  = rounds;
+            tree_leaves_   = std::min(cfg_.draft_tree_leaves, nodes - rounds);
+            tree_width_    = std::max(1, std::min(cfg_.draft_tree_width, nodes));
+            cfg_.n_spec    = nodes;
+            RAD_INFO("draft trees: a serial head -- %d round(s) of greedy chain, %d runner-up "
+                     "leaf(s), width %d, up to %d node(s) a verify", rounds, tree_leaves_,
+                     tree_width_, nodes);
+        } else if (cfg_.draft_tree > 0 && cfg_.n_spec > 0 && pb.tree_pays == 0 &&
+                   pb.tree_nodes == 0) {
+            RAD_WARN("--draft-tree on: this model's plugin states no tree to grow (neither a block "
+                     "drafter's nor a serial head's); it proposes a chain");
         }
     }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
@@ -1533,8 +1569,48 @@ int Engine::declare() {
     drafter_.name  = drafter_name_.c_str();
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
-    tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
+    tree_         = (drafter_.kind == RAD_DRAFT_BLOCK || (drafter_.kind == RAD_DRAFT_SERIAL &&
+                                                          drafter_.tree_nodes > 0)) &&
+                    drafter_.depth > 0 && p0.drafter_tree;
+    serial_tree_  = tree_ && drafter_.kind == RAD_DRAFT_SERIAL;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    if (serial_tree_) {
+        draft_rounds_ = drafter_.depth;
+        tree_leaves_  = std::min<int>(drafter_.tree_leaves, drafter_.tree_nodes - drafter_.depth);
+        tree_width_   = std::max<int>(1, drafter_.tree_width);
+        /* Every node is a row a verify carries, so the budget the plugin declared must be the
+         * max_spec this engine staged its planes for. */
+        if (drafter_.tree_nodes != cfg_.n_spec) {
+            RAD_ERR("speculation: '%s' declares a tree of %d node(s) but this engine verifies %d "
+                    "(max_spec)", drafter_.name, drafter_.tree_nodes, cfg_.n_spec);
+            return RAD_E_STATE;
+        }
+        if (cfg_.draft_coupling) {
+            RAD_ERR("--draft-coupling on with a serial head's tree: coupling is defined on a "
+                    "linear chain of draws (one per round); serve it with --draft-tree off");
+            return RAD_E_UNSUPPORTED;
+        }
+    } else if (cfg_.draft_tree > 0 && cfg_.n_spec > 0 && !tree_ && draft_tree_) {
+        RAD_WARN("--draft-tree on: '%s' declared no tree, so it proposes a chain",
+                 drafter_.name ? drafter_.name : "(none)");
+    }
+    /* A tree's acceptance by path against state that cannot follow a path is silent corruption:
+     * recurrent and rolling-window state would absorb the rows in row order and replay a prefix of
+     * them. Refused here rather than served. */
+    if (tree_ && !tree_linear_ok_) {
+        for (size_t g = 1; g < p0.kv_groups.size(); ++g) {
+            const int kind = p0.kv_groups[g].decl.kind;
+            if (kind == RAD_KV_LINEAR || kind == RAD_KV_CONV) {
+                RAD_ERR("speculation: '%s' proposes a tree, but KV group %zu (%s) is %s state, "
+                        "which a tree's rows would enter in row order and a replay would take as "
+                        "a prefix; the plugin has not said its ops follow a path "
+                        "(RadArchProbe::tree_linear_ok). Serve it with --draft-tree off",
+                        drafter_.name, g, p0.kv_groups[g].name.c_str(),
+                        kind == RAD_KV_LINEAR ? "recurrent" : "rolling-window");
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+    }
     /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
      * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
      * wide tree's extra nodes repay at one sequence and not at many. */
@@ -1562,7 +1638,12 @@ int Engine::declare() {
                  (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block
                                                                    : drafter_.depth + 1) -
                                                drafter_.depth)));
-    if (tree_)
+    if (serial_tree_)
+        RAD_INFO("speculation: '%s' proposes a tree of up to %d node(s) over %d round(s): its "
+                 "greedy chain and %d runner-up leaf(s) at depth 1; each verify follows the "
+                 "deepest path the target agrees with, and that path's K and V move into place",
+                 drafter_.name, drafter_.tree_nodes, drafter_.depth, (int)tree_leaves_);
+    else if (tree_)
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",
                  drafter_.name, drafter_.depth);

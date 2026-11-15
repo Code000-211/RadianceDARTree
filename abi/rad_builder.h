@@ -283,6 +283,16 @@ typedef struct RadBuildCtx {
      * rank: one engine in a process, or a test driving a plugin alone. Two engines may serve the
      * same plugin at once only when it says so (rad_arch_multi_instance). */
     int      slot_base;
+
+    /* ---- appended (tree verification of a serial drafter) */
+    /* Set with `draft_tree` where the plugin's probe gave a serial tree (RadArchProbe::tree_nodes
+     * > 0): `max_spec` is then the node budget N and `draft_rounds` the head's round count R <=
+     * N, which the plugin declares as RadDrafterDecl::depth. `draft_tree_leaves` (--draft-tree-
+     * leaves, default 3) and `draft_tree_width` (--draft-tree-width, default 1) are the stage-1
+     * leaf count and the stage-2 frontier width. All 0 for a chain, where depth == max_spec. */
+    int      draft_rounds;
+    int      draft_tree_leaves;
+    int      draft_tree_width;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
@@ -468,6 +478,12 @@ typedef struct RadKVGroupDecl {
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
     int64_t  conv_width;      /* RAD_KV_CONV */
+    /* ---- appended (tree verification of a serial drafter) */
+    /* Nonzero: a paged group whose entries are not one per token slot (the QSA block keys are one
+     * per block of tokens, filled by the committed positions). A tree's acceptance moves each
+     * accepted node's K and V to its depth in every paged group (ADV_COMPACT); it leaves this one
+     * alone, and the plugin heals it from RadBatch::spec_path. */
+    int32_t  no_tree_compact;
     /* Block size is not declared. It is taken from the resolved attention kernel's constraints at
      * declare, so the core needs no edit when a kernel changes (spec §7.2). Read it back with
      * rad_kv_block_size() after declaring the attention op that consumes this group. */
@@ -746,7 +762,8 @@ typedef enum {
 typedef struct RadDrafterDecl {
     const char* name;            /* "mtp", "dflash2" -- for messages and the graph dump */
     int         kind;            /* RAD_DRAFT_* */
-    int         depth;           /* tokens proposed a step; must equal RadBuildCtx::max_spec */
+    int         depth;           /* tokens proposed a step; must equal RadBuildCtx::max_spec (a
+                                      * SERIAL tree: the head's rounds, at most max_spec) */
 
     /* Where a pass leaves its proposal. 0 = the sampler's token buffer. */
     rad_buf     proposal;
@@ -776,6 +793,22 @@ typedef struct RadDrafterDecl {
      * stays correct, but the proposals shift by one position and acceptance drops to about chance.
      * Hence it is declared by the plugin, which knows how the checkpoint was trained. */
     int64_t     block;
+
+    /* ---- appended (a serial drafter's tree, rad_drafter_tree) */
+    /* SERIAL tree only; all 0 for a chain. `depth` is then the number of head rounds R, and
+     * RadBuildCtx::max_spec the most nodes a verify carries (>= depth).
+     *   tree_nodes   N: the node budget of one verify (the rows beyond the anchor), > 0 marks a
+     *                tree. At most max_spec.
+     *   tree_leaves  L: stage 1, how many extra depth-1 siblings of the greedy chain the first
+     *                round's runner-up candidates (columns 1..L of the proposal row, whose pitch
+     *                must be >= 1 + L) add. 0 for none.
+     *   tree_width   W: stage 2, how many frontier rows the plugin's head grows each round
+     *                (core ADV_ROUND_TREE); 1 is stage 1 (a chain frontier plus the leaves).
+     * A serial tree's node order is the plugin's for stage 2 (parents precede children); stage 1's
+     * is the chain 1..R then the leaves, which hang off the anchor. */
+    int32_t     tree_nodes;
+    int32_t     tree_leaves;
+    int32_t     tree_width;
 } RadDrafterDecl;
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
@@ -821,6 +854,18 @@ int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
  * rejected ones at slot -1); and the step is issued ahead, behind which the block driver queues
  * the drafter's passes (the KL mode drafts nothing, so trees do not apply there). */
 int rad_drafter_tree(RadBuilder* b, rad_buf parents);
+/* A SERIAL drafter may be a tree too (RadDrafterDecl::tree_nodes > 0, declared first): its R =
+ * `depth` rounds each take the previous round's column-0 pick as before, so the greedy chain is
+ * nodes 1..R, and the core adds up to `tree_leaves` depth-1 siblings from the first round's
+ * runner-up columns (columns 1..L of the proposal row, which the pitch must hold) -- stage 1, no
+ * plugin op needed. A plugin that grows a deeper tree (stage 2, `tree_width` > 1) writes the
+ * frontier rows it wants each round and, after the last, the final tree: tokens and `parents`
+ * (this buffer, same pitch) for up to `tree_nodes` nodes, as a BLOCK drafter does. The serial
+ * driver then publishes the nodes with their parents, verifies them in the rows of RadBatch::
+ * spec_parent, and after the acceptance moves every accepted node's K and V into place in every
+ * paged group not flagged RadKVGroupDecl::no_tree_compact. A program with RAD_KV_LINEAR or
+ * RAD_KV_CONV groups is refused unless RadArchProbe::tree_linear_ok; --draft-coupling is refused.
+ * Additive; RAD_ABI_VERSION does not move. */
 
 /* The model's routing counts live in `table`: an i32 RAD_BUF_PERSIST device buffer of at least
  * [layers, n_expert], one row per layer that reports (rad_route_report's `layer`, so a head past
@@ -1718,6 +1763,17 @@ typedef struct RadArchProbe {
      * `gen_rows` (its largest pass: a step's two branches, or a query pass's points). It keeps no
      * KV. */
     int32_t gen_shape;
+
+    /* ---- appended (tree verification of a serial drafter) */
+    /* Nonzero when this plugin's recurrent (RAD_KV_LINEAR) and rolling-window (RAD_KV_CONV) state
+     * is correct under a tree verify: its ops read RadBatch::spec_parent and commit by
+     * RadBatch::spec_path. The core refuses to run a tree on a program with such a group
+     * otherwise, since the state would absorb the rows in row order and replay a prefix of them. */
+    int64_t tree_linear_ok;     /* 64-bit: it starts past the older struct's tail padding */
+    /* The node budget N of the plugin's SERIAL-drafter tree at its operating point (0: it has
+     * none), which the engine then uses as RadBuildCtx::max_spec when it runs a tree, with the
+     * probe's `draft_depth` as the head's round count. */
+    int32_t tree_nodes;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

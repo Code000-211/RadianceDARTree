@@ -137,6 +137,65 @@ is the completing block at decode but not within a prefill chunk.
 row `p % ring`. The work list has `ceil(T / ratio) + n_seq` items; items past the real count get
 `page = -1` and are skipped, so it is one launch per layer per step.
 
+## Tree verify
+
+A tree speculative verify (`rad_drafter_tree`; the verify block's rows are the nodes of a tree, row 0
+the anchor, `RadBatch::spec_parent` naming each parent) runs the QSA ops with optional extra operands
+(`docs/OPS.md`, "Sparse attention (QSA)"). A node must read what a sequential decode of its
+root-to-node path would read, and the committed state after acceptance must be that decode's. Every
+operand is optional; with them absent each op is bit-identical to the chain path.
+
+The difficulty is that `positions` are *depths* (siblings share one) while the K/V and tail entries of
+node `j` sit at the *flat* slot `base + j`, and a block key completed by a node that is later
+rejected must never become permanent. So:
+
+- **A verify commits no block key but the anchor's.** The anchor is the last committed token, so the
+  block it ends (`(base + 1) % ratio == 0`) is final and `qsa_work` writes it. Every other row that
+  completes a block gets a *scratch* key (`skey [T, n]`), computed from the row's ancestors and the
+  ring, for this step's scoring only.
+- **The next step heals.** `qsa_tail_compact` moves the accepted path's raw keys from their flat ring
+  rows `(base_prev + path[t]) % ring` to depth order `(base_prev + t) % ring`, then `qsa_work` with
+  `num_accepted` rebuilds from the ring every block the previous step's non-anchor committed tokens
+  completed. Exact and idempotent; a prefill or plain decode (`num_accepted` 1) heals nothing.
+- **Scoring is two launches.** The committed blocks `[0, b0)`, `b0 = base / ratio`, are scored by the
+  ordinary `qsa_score` (`nc` = `b0` for a tree sequence). The *region* blocks (index `>= b0`) a row's
+  own path completes are scored by a second `qsa_score` over the scratch keys, each row its own
+  one-row sequence (`bk = skey`, `bt = rtab`, `cu = rcu`, `nc = rnc`, all from `qsa_work`), into
+  `rscore`. Both are the committed score kernel, so a region score is the bit pattern a sequential
+  decode computes for the same block.
+- **`qsa_select` ranks the union** (the existing tie rule: the lower block wins, committed blocks are
+  lower than region blocks) and outputs the committed pages taken (`sel`, `nsel`, `seqused = nsel *
+  ratio`) and `vmask`, a 64-bit mask over the *region keys* `[rb, rb + 64)`, `rb = b0 * ratio`, naming
+  which of the flat slots `base - rb + j` (node `j`) and the committed in-region tokens the row's
+  attention may read. The attention (WS-ATTN's `attn_paged_tree_sel`) reads the pages of `sel` plus
+  the masked region keys in one softmax. Below `budget + ratio - 1` tokens every block is taken and
+  the mask is the whole path: dense tree attention.
+
+Issue order per QSA layer, tree step (`batch->spec_parent`; every op takes the batch's arrays):
+
+```
+qsa_tail_compact(pos, cu, num_accepted, spec_path, tail, sidx)          only when spec_path != null
+qsa_work(.., spec_parent, num_accepted?, sstage, spage, sbpos, rtab, rnc, rcu)
+qsa_block_key(stage, w, page, bpos, kv_bk[layer])                        the committed and healed blocks
+qsa_block_key(sstage, w, spage, sbpos, skey)                             the scratch keys (M = T)
+qsa_tail_store(k, pos, cu, tail, sidx, spec_parent)
+qsa_score(q, kv_bk, bt_bk, cu, nc, score)                                committed blocks
+qsa_score(q, skey, rtab, rcu, rnc, rscore)                               region blocks, one row a sequence
+qsa_select(score, bt_attn, nc, pos, cu, sel, nsel, seqused, spec_parent, rscore, vmask)
+```
+
+A step after a tree verify that is not itself a tree (a plain decode, a prefill) still issues
+`qsa_tail_compact` and passes `num_accepted` to `qsa_work`. The MTP head's own tail is stored
+committed-order by its history pass and needs neither.
+
+Sizes: `skey [T, n]` and `sstage [T * ratio, n]` bf16, `spage`, `sbpos`, `rnc` `[T]`, `rcu`
+`[T + 1]`, `rtab [T, RW]` i32, `rscore [T, RW]` f32, `vmask [T]` i64, with `RW >= (max node depth +
+ratio) / ratio + 1` (8 covers depth 28); the score plane must be at least `b0 + RW` wide, which the
+caller's `reach` bound (`max_ctx_len + n_tok + n_spec + ratio`) already gives. A verify block is at
+most `ring - ratio + 1` rows and at most `64 - (ratio - 1)` (the mask), and `work` must also cover
+the heal blocks. Each tree row costs a scratch launch item and a block-key launch row even when it
+completes no block; verify steps are decode-sized.
+
 ## Per-query selection (prefill)
 
 At prefill every query in a chunk selects its own set from one shared history. Both scoring ops

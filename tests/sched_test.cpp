@@ -7659,6 +7659,247 @@ TEST(a_wider_state_index_row_is_the_managers_row_on_every_build) {
     CHECK(checked > 100);
 }
 
+/* ================================================================== a serial head's tree */
+
+namespace {
+/* A serial head that runs 3 rounds and verifies up to 6 nodes: the chain 1..3 then three leaves
+ * under the bonus token (RadDrafterDecl::tree_nodes). */
+void serial_tree_setup(Fixture& f, int rounds = 3, int nodes = 6, int leaves = 3) {
+    f.build(4096, 64);
+    f.cfg.n_spec = nodes;
+    f.prog.drafter.kind       = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth      = rounds;
+    f.prog.drafter.tree_nodes = nodes;
+    f.prog.drafter.tree_leaves = leaves;
+    f.prog.drafter.tree_width = 1;
+    f.prog.drafter_tree       = true;
+}
+const int32_t kTreeDraft[6] = { 21, 22, 23, 31, 32, 33 };
+const int32_t kTreePar[6]   = { 0, 1, 2, 0, 0, 0 };    /* node j + 1's parent */
+}  /* namespace */
+
+/* The three tree gates open for a serial head: the trunk step carries spec_parent (the bonus
+ * token's -1, each node's parent row), the draft's parents reach the request (the sampler walks
+ * them) and RadBatch::spec_path is staged as the identity for a row the host built. */
+TEST(a_serial_trees_verify_rows_carry_spec_parent_and_the_identity_path) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 6);
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK(f.sch.plan().e[0].draft_parent != nullptr);
+    REQUIRE(b->spec_parent != nullptr);
+    const int32_t want[7] = { -1, 0, 1, 2, 0, 0, 0 };
+    for (int j = 0; j < 7; ++j) CHECK_EQ(b->spec_parent[j], want[j]);
+    /* the leaves rotate one past the anchor, the chain at its depth */
+    const int32_t depth[7] = { 0, 1, 2, 3, 1, 1, 1 };
+    for (int j = 0; j < 7; ++j) CHECK_EQ(b->positions[j], 160 + depth[j]);
+    REQUIRE(b->spec_path != nullptr);
+    CHECK_EQ(b->spec_path_pitch, 7);
+    for (int t = 0; t < 7; ++t) CHECK_EQ(b->spec_path[t], t);
+}
+
+/* A chain deployment stages no path plane and no parents: bit-identical to before. */
+TEST(a_serial_chain_stages_no_path_plane) {
+    Fixture f;
+    f.build(4096, 64);
+    f.cfg.n_spec = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 4;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(b->spec_parent == nullptr);
+    CHECK(b->spec_path == nullptr);
+    CHECK_EQ(b->spec_path_pitch, 0);
+}
+
+/* The history pass owes only as many rows as a path can be deep: 1 + min(nodes, rounds), not
+ * 1 + nodes, and prompt lookup beside the head chains no deeper than the head's rounds. */
+TEST(a_serial_trees_history_pass_is_capped_by_the_rounds_not_the_nodes) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    int rounds = 3;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 3);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK_EQ(hb->n_tok, 4);                 /* the anchor and a path of 3, not 7 rows */
+    CHECK_EQ(hb->n_draft_out, 1);
+    CHECK_EQ(hb->draft_out_ids[0], 3);
+    for (int rd = 2; rd <= 3; ++rd) {
+        const RadBatch* rb = f.sch.serial_batch(rd, 1);
+        REQUIRE(rb != nullptr);
+        CHECK_EQ(rb->n_tok, 1);
+        CHECK(rb->spec_parent == nullptr);  /* width 1: chain rounds */
+    }
+    f.sch.serial_end(3);
+}
+
+/* A head that grows its tree stages `width` frontier rows a round, with spec_parent through the
+ * round passes for the card to fill, and reserves the flat slots of its in-flight nodes. */
+TEST(a_serial_tree_of_width_three_stages_three_rows_a_round) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.prog.drafter.tree_width = 3;
+    f.prog.drafter.tree_leaves = 0;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    int rounds = 3;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
+    const RadBatch* r2 = f.sch.serial_batch(2, 1);
+    REQUIRE(r2 != nullptr);
+    CHECK_EQ(r2->n_tok, 3);
+    CHECK(r2->spec_parent != nullptr);
+    f.sch.serial_end(3);
+}
+
+/* A step issued ahead behind a serial tree: the host plans the node count the engine expects,
+ * the card restages the rows from its StepSlot (tokens, parents, depth positions, flat slots, the
+ * path plane) and the draft published afterwards, parents with it, is the one verified: after the
+ * promote the plan carries the parents the sampler needs (scheduler.cpp's third gate). */
+TEST(a_step_issued_ahead_behind_a_serial_tree_verifies_the_cards_tree_and_path) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    auto r = f.request(160, 64);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    /* the card's acceptance: the target picks leaf node 5 (row 5) after the bonus token */
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    std::vector<int32_t> y(16, -1);
+    const StepEntry& e0 = f.sch.plan().e[0];
+    REQUIRE(e0.dev_out >= 0);
+    for (int j = 0; j <= 6; ++j) y[(size_t)(e0.dev_out + j)] = 900 + j;
+    y[(size_t)e0.dev_out + 0] = 32;     /* node 5's token (kTreeDraft[4]) */
+    AdvanceArgs acc = f.sch.advance_args(0);
+    acc.mode = ADV_ACCEPT;
+    acc.st = slots.data();
+    acc.src = y.data();
+    for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+    const StepSlot& S0 = slots[(size_t)e0.card];
+    CHECK_EQ(S0.acc, 1);
+    CHECK_EQ(S0.npath, 1);
+    CHECK_EQ(S0.path[0], 5);
+    CHECK_EQ(S0.tok[0], 905);
+
+    /* what the head proposed for the next verify: written as ADV_TAKE leaves it */
+    StepSlot& S = slots[(size_t)e0.card];
+    S.ntree = 6;
+    for (int j = 0; j < 6; ++j) { S.tok[1 + j] = kTreeDraft[j]; S.par[j] = kTreePar[j]; }
+
+    f.sch.expect_draft(a, 6);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 6);
+    AdvanceArgs tr = f.sch.advance_args(0);
+    tr.mode = ADV_TRUNK;
+    tr.st = slots.data();
+    for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+    const int32_t want[7] = { -1, 0, 1, 2, 0, 0, 0 };
+    for (int j = 0; j < 7; ++j) CHECK_EQ(nb->spec_parent[j], want[j]);
+    CHECK_EQ(nb->num_accepted[0], 2);
+    CHECK_EQ(nb->spec_path[0], 0);
+    CHECK_EQ(nb->spec_path[1], 5);
+    for (int t = 2; t < 7; ++t) CHECK_EQ(nb->spec_path[t], t);
+    CHECK_EQ(nb->positions[0], 162);           /* the committed end: anchor 160, the leaf at 161 */
+    CHECK_EQ(nb->positions[4], 163);           /* a depth-1 node */
+    CHECK_EQ(nb->positions[3], 165);           /* the chain's depth 3 */
+
+    /* commit the leaf's path, publish the next draft, promote */
+    {
+        const StepPlan& p = f.sch.plan();
+        int32_t acc_n = 1, tok = 905;
+        uint8_t eos = 0;
+        int32_t path[RAD_SCHED_MAX_SPEC] = { 5 };
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = &acc_n;
+        res.token = &tok;
+        res.eos = &eos;
+        res.path = path;
+        CHECK_OK(f.sch.commit(res));
+    }
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    f.sch.promote_next();
+    const StepEntry& n0 = f.sch.plan().e[0];
+    CHECK_EQ(n0.n_spec, 6);
+    CHECK(n0.draft_parent != nullptr);
+    CHECK_EQ(n0.draft_parent[3], 0);
+    CHECK(f.sch.plan().spec_is_tree);
+    /* the leaf's token, then 905, were emitted in path order */
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq->output.size() >= 3);
+    CHECK_EQ(rq->output[rq->output.size() - 2], 32);
+    CHECK_EQ(rq->output[rq->output.size() - 1], 905);
+}
+
+/* The metrics count depth: a chain of 3 and three leaves is a tree of depth 3, so a verify that
+ * accepts the whole chain accepts 3 of 3, not 3 of 6. */
+TEST(a_serial_trees_acceptance_is_counted_by_depth) {
+    CHECK_EQ(Scheduler::tree_depth(kTreePar, 6), 3);
+    CHECK_EQ(Scheduler::tree_depth(kTreePar, 2), 2);
+    CHECK_EQ(Scheduler::tree_depth(nullptr, 5), 5);
+    CHECK_EQ(Scheduler::tree_depth(kTreePar, 0), 0);
+    const int32_t deep[5] = { 0, 1, 2, 3, 4 };
+    CHECK_EQ(Scheduler::tree_depth(deep, 5), 5);
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    int32_t path[RAD_SCHED_MAX_SPEC] = { 1, 2, 3 };
+    int32_t acc_n = 3, tok = 77;
+    uint8_t eos = 0;
+    Scheduler::StepResult res;
+    res.n_seq = 1;
+    res.n_accepted = &acc_n;
+    res.token = &tok;
+    res.eos = &eos;
+    res.path = path;
+    CHECK_OK(f.sch.commit(res));
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_tokens, (int64_t)6);       /* every node was a verify row */
+    CHECK_EQ(m.draft_accepted, (int64_t)3);
+    CHECK_EQ(m.draft_acceptance, 1.0f);         /* 3 of a depth of 3 */
+    CHECK_EQ(m.draft_pos_reached[0], (int64_t)1);
+    CHECK_EQ(m.draft_pos_accepted[2], (int64_t)1);
+    CHECK_EQ(m.draft_depth_seen, 3);
+}
+
 RAD_TEST_MAIN()
 
 /* ================================================================== the plan without a span */

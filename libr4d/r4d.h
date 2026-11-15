@@ -87,6 +87,12 @@ struct R4DArgs {
     // row, -2 for an ordinary causal row, else the row's parent's index within its sequence's rows
     // (-1 for the block's first). Read only by the O_TREE instances; null elsewhere.
     const int* spec_parent;
+    // attn_paged_tree_sel (docs/OPS.md), read only by the O_TSEL instances; null elsewhere. A
+    // launch row's keys are `tsel_nkeys[row]` keys of its block table row (whole pages), then single
+    // keys: tsel_slots[row * 64 + i] is the flat cache slot (block * block_size + slot) of key
+    // tsel_nkeys[row] + i. seqused_k is the row's key total.
+    const int* tsel_nkeys;
+    const int* tsel_slots;
 };
 
 // Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook

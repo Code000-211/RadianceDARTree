@@ -218,4 +218,26 @@ TEST(rad_yarn_is_the_same_function_in_c_and_cpp) {
     }
 }
 
+/* The fields a serial drafter's tree appends sit past each struct's old end (the table above is the
+ * ABI 39 snapshot, which allows exactly that), at the offsets a plugin built against these headers
+ * reads them from: RadBatch::spec_path and its pitch, RadDrafterDecl's tree shape, the KV group's
+ * no_tree_compact, the probe's tree_linear_ok and tree_nodes, the build context's rounds, leaves
+ * and width. */
+TEST(the_serial_tree_fields_are_appended_past_the_old_ends) {
+    CHECK_EQ(offsetof(RadBatch, spec_path), (size_t)480);
+    CHECK_EQ(offsetof(RadBatch, spec_path_pitch), (size_t)488);
+    CHECK_EQ(sizeof(RadBatch), (size_t)496);
+    CHECK_EQ(offsetof(RadDrafterDecl, tree_nodes), (size_t)56);
+    CHECK_EQ(offsetof(RadDrafterDecl, tree_leaves), (size_t)60);
+    CHECK_EQ(offsetof(RadDrafterDecl, tree_width), (size_t)64);
+    CHECK_EQ(sizeof(RadDrafterDecl), (size_t)72);
+    CHECK_EQ(offsetof(RadKVGroupDecl, no_tree_compact), (size_t)56);
+    CHECK_EQ(offsetof(RadArchProbe, tree_linear_ok), (size_t)128);
+    CHECK_EQ(offsetof(RadArchProbe, tree_nodes), (size_t)136);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)144);
+    CHECK_EQ(offsetof(RadBuildCtx, draft_rounds), (size_t)200);
+    CHECK_EQ(offsetof(RadBuildCtx, draft_tree_leaves), (size_t)204);
+    CHECK_EQ(offsetof(RadBuildCtx, draft_tree_width), (size_t)208);
+}
+
 RAD_TEST_MAIN()

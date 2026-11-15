@@ -107,6 +107,33 @@ RAD_ADV_FN void adv_pos(const AdvanceArgs& a, int32_t* pos, int32_t row, int32_t
     r[2 * a.rope_pitch + row] = p + shift;
 }
 
+/* The node the (t)-th committed position of the last verify came from, in that verify's row order:
+ * 0 for the bonus token (t = 0), path[t - 1] for t >= 1 after a tree verify, the row t itself for
+ * a chain (npath 0) -- the identity RadBatch::spec_path carries. */
+RAD_ADV_FN int32_t adv_path_node(const StepSlot& S, int32_t t) {
+    if (t <= 0) return 0;
+    /* An npath outside what a verify writes (a slot no acceptance has filled) is a chain. */
+    if (S.npath <= 0 || S.npath > RAD_SCHED_MAX_SPEC) return t;
+    return t <= S.npath ? S.path[t - 1] : t;
+}
+
+/* A serial tree's stage 1: the proposal row's runner-up columns into S.alt, before the next pass
+ * overwrites them. Column 0 is the greedy pick (chain node 1), so a leaf equal to it is no
+ * sibling; an id out of range would index the embedding out of bounds; a repeat adds nothing.
+ * Filtered here so every rank, which holds the same row, keeps the same list. */
+RAD_ADV_FN void adv_capture(const AdvanceArgs& a, StepSlot& S, const int32_t* row) {
+    S.nalt = 0;
+    if (a.leaves <= 0) return;
+    const int32_t pick = row[0];
+    for (int64_t c = 1; c < a.src_pitch && S.nalt < a.leaves && S.nalt < kAdvMaxLeaves; ++c) {
+        const int32_t id = row[c];
+        if (id < 0 || (a.vocab > 0 && id >= a.vocab) || id == pick) continue;
+        bool dup = false;
+        for (int32_t q = 0; q < S.nalt; ++q) dup = dup || S.alt[q] == id;
+        if (!dup) S.alt[S.nalt++] = id;
+    }
+}
+
 RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     const int32_t* rows = adv_i32(a, a.row_off);
     const int32_t rtok = rows[a.row_pitch + i];
@@ -177,6 +204,15 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     }
     case ADV_TRUNK: {
         const int32_t base = S.ctx;
+        /* RadBatch::spec_path: the rows of the previous verify that were committed, from the
+         * acceptance the card just wrote (the host has not read it yet, the step is issued
+         * ahead). The identity past num_accepted and for a chain. */
+        if (a.path_off >= 0) {
+            int32_t* sp = adv_i32(a, a.path_off) + (int64_t)i * a.path_pitch;
+            for (int32_t t = 0; t < a.path_pitch; ++t) sp[t] = t;
+            const int32_t np = S.npath < S.acc ? S.npath : S.acc;
+            for (int32_t t = 1; t <= np && t < a.path_pitch; ++t) sp[t] = S.path[t - 1];
+        }
         if (a.parent_off >= 0) {
             int32_t* par = adv_i32(a, a.parent_off);
             /* A row verifying fewer nodes than the drafter proposed (a window cut it) verifies
@@ -239,9 +275,10 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
              * holds K/V of rejected drafts. The host staged the run's first trunk row; the card
              * adds the accepted drafts. */
             int32_t* out = adv_i32(a, a.out_off);
-            tok[k] = a.src[rout + S.acc];
+            const int32_t nd = adv_path_node(S, S.acc);   /* the last committed node's row */
+            tok[k] = a.src[rout + nd];
             adv_pos(a, pos, k, S.head + a.rot_shift);
-            out[k] += S.acc;
+            out[k] += nd;
             ctx[i] = S.head;
             adv_groups(a, i, k, S.head, 1);
             return;
@@ -256,11 +293,18 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         const int32_t last = aux + S.acc;
         int32_t* out = adv_i32(a, a.out_off);
         const int32_t row0 = out[k];
+        /* After a tree verify the committed positions are the accepted path's nodes, not the
+         * first rows of the block: committed position t (past the `aux` host-known ones) is node
+         * path[t - 1]'s, whose hidden row is the node's row and whose next token is the target's
+         * pick at that row. A chain (npath 0) is the identity, as before. The run is capped by the
+         * deepest path a tree has (the scheduler sizes the pass by it), so a node past `n` rows
+         * is never needed. */
         for (int32_t j = 0; j < n; ++j) {
             const int32_t jj = j < last ? j : last;
-            if (jj >= aux) tok[k + j] = a.src[rout + jj - aux];
+            const int32_t nd = jj >= aux ? adv_path_node(S, jj - aux) : 0;
+            if (jj >= aux) tok[k + j] = a.src[rout + nd];
             adv_pos(a, pos, k + j, base + jj);
-            out[k + j] = row0 + jj;
+            out[k + j] = row0 + (jj >= aux ? aux + nd : jj);
         }
         ctx[i] = base;
         /* The context ends at the last committed position, not at the run's end. Attention places
@@ -280,14 +324,85 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         const int32_t base = a.shared_kv ? S.head : S.head + a.round - 1;
         const int32_t t = a.src[(int64_t)i * a.src_pitch];
         S.tok[a.round - 1] = t;
+        /* A serial tree's leaves: round 1's candidates are in the proposal row right now, and this
+         * round's pass overwrites them. */
+        if (a.round == 2 && a.tree_nodes > 0) adv_capture(a, S, a.src + (int64_t)i * a.src_pitch);
         tok[k] = t;
         adv_pos(a, pos, k, a.shared_kv ? base + a.rot_shift : base);
         ctx[i] = base;
         adv_groups(a, i, k, base, 1);
         return;
     }
+    case ADV_ROUND_TREE: {
+        /* A serial head that grows a tree (stage 2): the pass before this one left, per sequence,
+         * the children it wants embedded next as tokens (src) with their parents as node ids
+         * (par), node 0 the bonus token, at most `width` of them and a negative token ends the
+         * list. They become nodes numbered on from the last round's, which the plugin knows by
+         * the same rule. Node n's token is embedded at the head index S.head + its depth (the
+         * chain's round r sits at head + r - 1: depth r - 1), its K and V stored at the flat slot
+         * S.head + n -- siblings share a depth -- and the pass sees the keys [0, head + nodes so
+         * far], inside which the plugin's attention keeps a row to its ancestors (spec_parent
+         * names the row's parent node). With width 1 this is ADV_ROUND to the bit. A row beyond
+         * the list stays inert: token 0, no slot. */
+        const int32_t* prow = a.src + (int64_t)i * a.src_pitch;
+        const int32_t* qrow = a.par + (int64_t)i * a.src_pitch;
+        if (a.round == 2) S.ntree = 0;
+        const int32_t first = S.ntree + 1;
+        const int32_t room = a.tree_nodes - S.ntree;
+        int32_t cnt = 0;
+        for (int32_t w = 0; w < a.width && cnt < room && w < n; ++w) {
+            if (prow[w] < 0) break;
+            int32_t par = qrow[w];
+            if (par < 0 || par > S.ntree) par = 0;      /* a parent not made yet: the root */
+            const int32_t node = S.ntree + 1;
+            S.tok[node] = prow[w];
+            S.par[node - 1] = par;
+            S.ntree = node;
+            ++cnt;
+        }
+        int32_t at[1 + RAD_SCHED_MAX_SPEC];
+        int32_t* pp = a.parent_off >= 0 ? adv_i32(a, a.parent_off) : nullptr;
+        for (int32_t w = 0; w < n; ++w) {
+            if (w < cnt) {
+                const int32_t node = first + w;
+                int32_t dep = 0;
+                for (int32_t x = node; x > 0; x = S.par[x - 1]) ++dep;
+                tok[k + w] = S.tok[node];
+                adv_pos(a, pos, k + w, S.head + dep);
+                at[w] = S.head + node;
+                if (pp) pp[k + w] = S.par[node - 1];
+            } else {
+                tok[k + w] = 0;
+                adv_pos(a, pos, k + w, S.head);
+                at[w] = -1;
+                if (pp) pp[k + w] = -2;
+            }
+        }
+        ctx[i] = S.head + first;
+        adv_groups(a, i, k, S.head, n, S.ntree + 1, at);
+        return;
+    }
     case ADV_TAKE:
         S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
+        if (a.tree_nodes > 0) {
+            /* A serial head with one round: its candidates are still in the row (ADV_ROUND would
+             * have taken them at round 2). */
+            if (a.round == 1) adv_capture(a, S, a.src + (int64_t)i * a.src_pitch);
+            /* The chain, node j + 1 under node j, then up to `leaves` siblings of node 1 under the
+             * bonus token. The count is fixed by the budget alone (a short list is padded with
+             * node 1's token, a sibling the walk never takes: the lowest-index child wins), since
+             * the host planned the step issued ahead by it before the card chose. */
+            const int32_t done = a.round;
+            for (int32_t j = 0; j < done; ++j) S.par[j] = j;
+            int32_t nl = a.tree_nodes - done;
+            if (nl > a.leaves) nl = a.leaves;
+            if (nl < 0) nl = 0;
+            for (int32_t q = 0; q < nl; ++q) {
+                S.tok[done + 1 + q] = q < S.nalt ? S.alt[q] : S.tok[1];
+                S.par[done + q] = 0;
+            }
+            S.ntree = done + nl;
+        }
         return;
     case ADV_BLOCK: {
         /* A block drafter's query row: the anchor (the token the verify just chose) at the

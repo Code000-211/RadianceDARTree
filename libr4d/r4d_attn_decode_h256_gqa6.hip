@@ -72,6 +72,14 @@
 // sees, inside its sequence's query block, only itself and its ancestors, and its window is
 // measured from the block's first position plus its depth. Compiled in only where a row asks.
 #define O_TREE  536870912
+// TSEL: attn_paged_tree_sel (R4DArgs::tsel_nkeys, tsel_slots). Each launch row is one query of
+// q_len 1 over a key list of `seqused` keys: the first tsel_nkeys[row] are the pages of its block
+// table row in order, the rest are single keys, tsel_slots[row * 64 + i] the flat cache slot of key
+// tsel_nkeys + i (r4d_tsel_prep packs a row's visible region keys there, ascending). Nothing is
+// masked: every key of the list is visible, so the row is the plain sparse row over the same keys
+// in the same order, tile for tile, whatever pages those keys sit in. Compiled in only where a row
+// asks.
+#define O_TSEL 4194304
 __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
 __host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
     int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
@@ -142,6 +150,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
     constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
     constexpr int TREE  = (OPT & O_TREE)  ? 1 : 0;
+    constexpr int TSEL  = (OPT & O_TSEL)  ? 1 : 0;
+    static_assert(!(TREE && TSEL), "a tree verify's mask and a region list are two readings");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
 
@@ -224,6 +234,20 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     const int qhead = kvh * GQA + hi;
 
     const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
+    // TSEL: the keys from the block table, and the row's packed single keys behind them.
+    const int  tsn = TSEL ? a.tsel_nkeys[seq] : 0;
+    const int* __restrict__ tss = TSEL ? a.tsel_slots + (size_t)seq * 64 : nullptr;
+    // Key kk's block and slot in it. `blks` is the tile's block ids when BTS holds them (entries
+    // past the page keys are unused), else the table is read.
+    auto locate = [&](int kk, int k0, const int* blks, int& bk, int& sl) {
+        if (TSEL && kk >= tsn) {
+            const int fs = tss[kk - tsn];
+            bk = fs / BS; sl = fs % BS;
+        } else {
+            bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+            sl = kk % BS;
+        }
+    };
     const float kdesc = a.k_descale
                       ? a.k_descale[seq * (KVREP ? a.kv_heads / a.kv_rep : a.kv_heads) + kvc]
                       : 1.0f;
@@ -311,9 +335,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 for (int j = 0; j < 2; ++j) {
                     int kk = min(k0 + 2 * kp + j, ctx - 1);
                     if (WIN && kk < wlo0) kk = wlo0;
-                    const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                    int bk, sl;
+                    locate(kk, k0, blks, bk, sl);
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
-                                        + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                                        + (size_t)kvc * a.kv_head_stride + (size_t)sl * ROWB;
                     if constexpr (I8) {
                         const uint2 cw = *(const uint2*)(base + VOFF + o * 8);
                         v4c[r][2 * j]     = cw.x;
@@ -379,10 +404,11 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 int kk = min(k0 + kg * 8 + vj, ctx - 1);
                 if (WIN && kk < wlo0) kk = wlo0;
                 const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
-                const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                int blk, sl;
+                locate(kk, k0, blks, blk, sl);
                 const size_t o = (size_t)blk * a.kv_block_stride
                                + (size_t)kvc * a.kv_head_stride
-                               + (size_t)(kk % BS) * ROWB + HEAD_DIM + d0;
+                               + (size_t)sl * ROWB + HEAD_DIM + d0;
                 const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
                                     : (const void*)((const uint8_t*)a.kv + o);
                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
@@ -429,7 +455,8 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
     // block (on the last row, past the end of the table). Keys are clamped to ctx - 1, so entries
     // past lastb are never used; only tiles reaching past lastb take the clamped load, and the
     // rest keep one wide scalar load. With NB == 1 the test folds away.
-    const int lastb = (ctx - 1) / BS;
+    // TSEL: the table holds only the page keys; its entries past them are never used.
+    const int lastb = TSEL ? (tsn > 0 ? (tsn - 1) / BS : 0) : (ctx - 1) / BS;
     auto load_bt = [&](int t0, int* out) {
         if (NB > 1 && t0 + NB - 1 > lastb) {
             #pragma unroll
@@ -457,9 +484,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                 const int key = i / (HEAD_DIM / 8), ch = i - key * (HEAD_DIM / 8);
                 int kk = min(k0 + key, ctx - 1);
                 if (WIN && kk < wlo0) kk = wlo0;
-                const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
+                int kb, sl;
+                locate(kk, k0, blk, kb, sl);
                 const size_t o = (size_t)kb * a.kv_block_stride
-                               + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                               + (size_t)kvc * a.kv_head_stride + (size_t)sl * ROWB;
                 uint16_t* kd = &sK[key * KSTR];
                 uint32_t w4[4];
                 if (KVP) {
@@ -484,9 +512,10 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
             if (!KLDS) {
                 int kk = min(k0 + mt * 16 + c, ctx - 1);
                 if (WIN && kk < wlo0) kk = wlo0;
-                const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
+                int kb, sl;
+                locate(kk, k0, blk, kb, sl);
                 grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
-                     + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB)
+                     + (size_t)kvc * a.kv_head_stride + (size_t)sl * ROWB)
                      * (KVP ? 2 : 1);
             }
             // i8: the key's one K scale, read once an m-tile.

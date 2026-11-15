@@ -158,11 +158,13 @@ struct ConvOps {
     const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
     bool silu;
     const RadTensor* b;   /* per-channel bias inside the activation (Mamba-2's conv1d), or null */
+    const RadTensor* par = nullptr;   /* spec_parent: the rows are a verify tree (libref), or null */
 };
 
 static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
     const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
     const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y, *b = o.b;
+    const RadTensor* par = o.par;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n = p_int(a, "n", 0);
@@ -182,6 +184,9 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
     if (numel(x) < M * n || numel(y) < M * n || numel(w) < n * wid) return RAD_E_SHAPE;
     if (resid && numel(resid) < M * n) return RAD_E_SHAPE;
     if (b && numel(b) != n) return RAD_E_SHAPE;
+    /* A tree verify (libref/ref_ple.cpp): a decode step, whose parents precede their children. */
+    if (par && !nacc) return RAD_E_INVAL;
+    if (par && numel(par) < M) return RAD_E_SHAPE;
 
     const int64_t state_len = cs->rank >= 3 ? cs->shape[cs->rank - 1] : hist_len;
     if (cs->data && state_len < hist_len) return RAD_E_SHAPE;
@@ -195,6 +200,11 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
         const int64_t slen = ldi(cu, offlin(cu, s + 1)) - ldi(cu, offlin(cu, s));
         if (nacc && cs->data && hist_len > 0 && slen > 0 && hist_len - 1 + slen > state_len)
             return RAD_E_SHAPE;
+        const int64_t bos = ldi(cu, offlin(cu, s));
+        for (int64_t t = 0; par && t < slen; ++t) {
+            const int64_t v = ldi(par, offlin(par, bos + t));
+            if (v < -2 || v >= t) return RAD_E_INVAL;
+        }
     }
 
     const int64_t xrow = rowoff(x, 1, n), xcol = laststride(x);
@@ -229,7 +239,20 @@ static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
         for (int64_t t = 0; t < slen; ++t) {
             float acc = bias;
             for (int64_t j = 0; j < wid; ++j) {
-                const int64_t src = t - hist_len + j * dil;
+                int64_t src = t - hist_len + j * dil;
+                if (par) {
+                    /* The ancestor (wid-1-j)*dil levels up, or the window slot a chain would
+                     * read past the root (ref_ple.cpp). */
+                    int64_t cur = t, rem = (wid - 1 - j) * dil;
+                    while (rem > 0) {
+                        const int64_t v = ldi(par, offlin(par, bos + cur));
+                        const int64_t p = v == -2 ? cur - 1 : v;
+                        if (p < 0) break;
+                        cur = p;
+                        --rem;
+                    }
+                    src = rem == 0 ? cur : -rem;
+                }
                 const float vv = src >= 0 ? ldt(x, (bos + src) * xrow + c * xcol)
                                           : hist[src + hist_len];
                 acc += vv * tap[j];
@@ -277,7 +300,8 @@ AVX_KERNEL(ple_conv) {
     if (a->n_t < 9) return RAD_E_INVAL;
     return depthwise_causal_conv(a, { rad_arg_in(a, 0), rad_arg_in(a, 1), rad_arg_in(a, 2),
                                       rad_arg_in(a, 3), rad_arg_in(a, 4), rad_arg_in(a, 5),
-                                      rad_arg_in(a, 6), rad_arg_in(a, 7), rad_arg_in(a, 8), true });
+                                      rad_arg_in(a, 6), rad_arg_in(a, 7), rad_arg_in(a, 8), true,
+                                      nullptr, a->n_t > 9 ? rad_arg_in(a, 9) : nullptr });
 }
 
 /* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`: Mamba-2's
@@ -334,6 +358,8 @@ AVX_KERNEL(ngram_ids) {
     /* Optional ids for the prompt that follows: `tok` holds that many more tokens after the
      * step's, continuing the last sequence. The state window is still the step's own. */
     const RadTensor* ahead = a->n_t > 10 ? rad_arg_in(a, 10) : nullptr;
+    /* A tree verify (libref/ref_ngram.cpp): the shifted tokens are the row's ancestors'. */
+    const RadTensor* spar = a->n_t > 11 ? rad_arg_in(a, 11) : nullptr;
     if (!tok || !st || !cu || !mult || !vsz || !off_ || !ids) return RAD_E_INVAL;
 
     const int64_t heads = p_int(a, "heads", 0);
@@ -349,6 +375,7 @@ AVX_KERNEL(ngram_ids) {
     const int64_t per = heads / (ngram - 1);
     const int64_t ctx = ngram - 1;
     if (ngram > 8) return RAD_E_UNSUPPORTED;      /* the shift window is a stack array */
+    if (spar && (!nacc || ahead)) return RAD_E_INVAL;
 
     if (numel(mult) < ngram || numel(vsz) < heads || numel(off_) < heads) return RAD_E_SHAPE;
     if (numel(tok) < M + A || numel(ids) < M * heads) return RAD_E_SHAPE;
@@ -365,6 +392,12 @@ AVX_KERNEL(ngram_ids) {
         if (o + ctx > W) return RAD_E_SHAPE;
         const int64_t T = ldi(cu, offlin(cu, s + 1)) - ldi(cu, offlin(cu, s));
         if (nacc && T > 0 && ctx - 1 + T > W) return RAD_E_SHAPE;
+        const int64_t b0 = ldi(cu, offlin(cu, s));
+        if (spar && b0 + T > numel(spar)) return RAD_E_SHAPE;
+        for (int64_t t = 0; spar && t < T; ++t) {
+            const int64_t v = ldi(spar, offlin(spar, b0 + t));
+            if (v < -2 || v >= t) return RAD_E_INVAL;
+        }
     }
 
     const int64_t ids_ld = rowoff(ids, 1, heads);
@@ -403,6 +436,19 @@ AVX_KERNEL(ngram_ids) {
             return p < ctx ? prev[p] : ldi(tok, offlin(tok, bos + p - ctx));
         };
 
+        /* The token k shifts back along row t's ancestors, past the root into the window. */
+        auto anc = [&](int64_t t, int64_t k) -> int64_t {
+            int64_t cur = t, rem = k;
+            while (rem > 0) {
+                const int64_t v = ldi(spar, offlin(spar, bos + cur));
+                const int64_t p = v == -2 ? cur - 1 : v;
+                if (p < 0) break;
+                cur = p;
+                --rem;
+            }
+            return rem == 0 ? ldi(tok, offlin(tok, bos + cur)) : prev[ctx - rem];
+        };
+
         const int64_t reach = T + (ahead && s + 1 == n_seq ? A : 0);
         for (int64_t t = 0; t < reach; ++t) {
             const int64_t p = ctx + t;
@@ -411,7 +457,7 @@ AVX_KERNEL(ngram_ids) {
             bool cut = false;
             for (int64_t k = 1; k < ngram; ++k) {
                 if (cut || sh[k - 1] == eos) { cut = true; sh[k] = eos; continue; }
-                sh[k] = hist(p - k);
+                sh[k] = spar ? anc(t, k) : hist(p - k);
             }
 
             /* Mixes are extended in place: the (b+2)-gram's is the (b+1)-gram's XOR one more

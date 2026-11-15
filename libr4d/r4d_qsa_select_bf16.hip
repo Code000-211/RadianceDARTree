@@ -308,6 +308,225 @@ void qsa_select_kernel(QSA_SELECT_PARAMS) {
 }
 #undef QSA_SELECT_PARAMS
 
+/* ===================================================== tree rows (tree verify, docs/QSA.md)
+ *
+ * With `spec_parent`, `rscore` and `vmask` the launch is this kernel, one workgroup a row. A row of
+ * a tree sequence (first row's parent -1) selects over the union of the committed blocks [0, b0),
+ * b0 = pos[cu[seq]] / ratio, scored in `score`, and the region blocks b0 .. (pos + 1) / ratio - 1
+ * its own path completes, scored in rscore[m][b - b0] (qsa_work builds the tables, a second
+ * qsa_score the plane). The ranking is the single-workgroup kernel's over that union in block
+ * order, so the threshold, the tie rule and the keys are the same code; the output differs:
+ *   sel    the committed pages taken: those above the threshold in block order, then the ties in
+ *          block order, contiguous from slot 0 (the union's taken set minus its region blocks),
+ *          -1 padded; no partial page;
+ *   nsel   their count, seqused = nsel * ratio;
+ *   vmask  bit k set iff the key at flat slot rb + k (rb = b0 * ratio) is the row's to read: the
+ *          committed tokens rb .. base - 1, and the row's ancestors-or-self at slot base + j (node j),
+ *          each when its block is complete on no part of the row's path (the partial block) or was
+ *          taken.
+ * A row of any other sequence is selected exactly as the single-workgroup kernel does (the partial
+ * page, seqused as before) and gets vmask 0; there is no region (nR = 0) and the code below reduces
+ * to that kernel's global-memory path. A region wider than rscore's columns, or one that does not
+ * fit the 64-bit mask, is clamped (libref refuses it). The keys are read from global memory every
+ * pass: a tree launch is decode-sized. */
+constexpr int kTreeRegMax = 32;     /* region blocks the mask walk keeps flags for */
+
+#define QSA_SELECT_TREE_PARAMS                                                                  \
+    const float* __restrict__ score, const int32_t* __restrict__ bt,                            \
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,                            \
+    const int32_t* __restrict__ cu, const int32_t* __restrict__ sp,                             \
+    const float* __restrict__ rs, int32_t* __restrict__ sel, int32_t* __restrict__ nsel,        \
+    int32_t* __restrict__ seqused, int64_t* __restrict__ vmask, int nb, int topk, int ratio,    \
+    int nseq, int s_ld, int t_ld, int o_ld, int rs_ld, int rs_cols
+template <bool Signed>
+__device__ __forceinline__ void qsa_select_tree_body(QSA_SELECT_TREE_PARAMS) {
+
+    __shared__ uint32_t hist[kBins];
+    __shared__ uint32_t suf[kBins];
+    __shared__ uint32_t wsum[kWaves];
+    __shared__ uint32_t sh_T, sh_need, sh_out, sh_hic, sh_eqc;
+    __shared__ int      sh_seq;
+
+    const int m = blockIdx.x;
+    const int t = threadIdx.x;
+    const int lane = t & (kWave - 1), wave = t >> 5;
+
+    if (t == 0) sh_seq = 0;
+    __syncthreads();
+    for (int i = t; i < nseq; i += kThreads)
+        if (m >= cu[i] && m < cu[i + 1]) sh_seq = i;
+    __syncthreads();
+    const int seq = sh_seq;
+    const int p   = pos[m];
+    const int own = (p + 1) / ratio;
+    const int t0  = cu[seq];
+    const bool tree = sp && m >= t0 && m < cu[seq + 1] && sp[t0] == -1;
+    const int base = tree ? pos[t0] : 0;
+    const int b0   = base / ratio;
+    int nC, nR = 0;
+    if (tree) {
+        nC = b0 < nb ? b0 : nb;
+        nR = own - b0;
+        if (nR > rs_cols) nR = rs_cols;
+        if (nR > kTreeRegMax) nR = kTreeRegMax;
+        if (nR < 0) nR = 0;
+    } else {
+        nC = nc[seq] < nb ? nc[seq] : nb;
+        if (own < nC) nC = own;
+    }
+    const int n = nC + nR;
+
+    const float*   sc = score + (size_t)m * s_ld;
+    const float*   rr = rs + (size_t)m * rs_ld;
+    const int32_t* tb = bt    + (size_t)seq * t_ld;
+    int32_t*       ou = sel   + (size_t)m * o_ld;
+    auto keyat = [&](int u) -> uint32_t {
+        return u < nC ? keyof<Signed>(sc[u], tb[u]) : keyof<Signed>(rr[u - nC], 0);
+    };
+
+    /* ---- the threshold, as the single-workgroup kernel's, over the union. */
+    uint32_t T = 0, need = 0;
+    if (n > topk) {
+        uint32_t fixed = 0, want = (uint32_t)topk;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (int i = t; i < kBins; i += kThreads) hist[i] = 0;
+            __syncthreads();
+            const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
+            for (int b = t; b < n; b += kThreads) {
+                const uint32_t k = keyat(b);
+                if (k != 0u && (k & mask) == (fixed & mask))
+                    atomicAdd(&hist[(k >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            bin_suffix<kThreads>(hist, suf, wsum);
+            if (t == 0) { sh_T = fixed; sh_need = want - suf[0]; }
+            __syncthreads();
+            {
+                const uint32_t after = (t + 1 < kBins) ? suf[t + 1] : 0u;
+                if (suf[t] >= want && after < want) {
+                    sh_T    = fixed | ((uint32_t)t << shift);
+                    sh_need = want - after;
+                }
+            }
+            __syncthreads();
+            const bool every = shift == 24 && suf[0] <= want;
+            fixed = every ? 0u : sh_T;
+            want  = sh_need;
+            if (every) break;
+        }
+        T = fixed; need = want;
+    }
+    __syncthreads();
+    if (t == 0) { sh_out = 0; sh_hic = 0; sh_eqc = 0; }
+    __syncthreads();
+
+    /* ---- how many committed blocks lie above the threshold and how many tie with it: the ties
+     * start after the former, so the taken committed pages are contiguous from slot 0. */
+    {
+        uint32_t hc = 0, ec = 0;
+        for (int b = t; b < nC; b += kThreads) {
+            const uint32_t k = keyat(b);
+            hc += (k != 0u && (n <= topk || k > T)) ? 1u : 0u;
+            ec += (k != 0u && n > topk && k == T) ? 1u : 0u;
+        }
+        atomicAdd(&sh_hic, hc);
+        atomicAdd(&sh_eqc, ec);
+    }
+    __syncthreads();
+    const uint32_t n_hi_c = sh_hic, n_eq_c = sh_eqc;
+
+    /* ---- the emit, committed blocks only (the single-workgroup kernel's loop). */
+    uint32_t taken_eq = 0;
+    for (int b0_ = 0; b0_ < nC; b0_ += kThreads) {
+        const int b = b0_ + t;
+        uint32_t k = 0;
+        if (b < nC) k = keyat(b);
+        const bool hi = k != 0u && (n <= topk || k > T);
+        const bool eq = k != 0u && n > topk && k == T;
+        const unsigned long long mh = __ballot(hi), me = __ballot(eq);
+        const uint32_t rh = (uint32_t)__popcll(mh & ((1ull << lane) - 1ull));
+        const uint32_t re = (uint32_t)__popcll(me & ((1ull << lane) - 1ull));
+        if (lane == 0) wsum[wave] = (uint32_t)__popcll(mh);
+        __syncthreads();
+        uint32_t before_h, tot_h;
+        counts_before<kWaves>(wsum, lane, wave, &before_h, &tot_h);
+        const uint32_t base_h = sh_out + before_h;
+        __syncthreads();
+        if (lane == 0) wsum[wave] = (uint32_t)__popcll(me);
+        __syncthreads();
+        uint32_t before_e, tot_e;
+        counts_before<kWaves>(wsum, lane, wave, &before_e, &tot_e);
+        const uint32_t base_e = taken_eq + before_e;
+        if (hi) {
+            const uint32_t slot = base_h + rh;
+            if (slot < (uint32_t)topk) ou[slot] = tb[b];
+        }
+        if (eq) {
+            const uint32_t rank = base_e + re;
+            if (rank < need) ou[n_hi_c + rank] = tb[b];
+        }
+        __syncthreads();
+        if (t == 0) sh_out += tot_h;
+        taken_eq += tot_e;
+        __syncthreads();
+    }
+
+    if (t != 0) return;
+    /* ---- one thread finishes the row. */
+    const bool all = n <= topk || T == 0u;
+    uint32_t out = n_hi_c + (all ? 0u : (n_eq_c < need ? n_eq_c : need));
+    if (!tree) {
+        /* The partial page and seqused, exactly as the single-workgroup kernel. */
+        const int32_t part = (nC < nb && (p + 1) % ratio != 0) ? tb[nC] : -1;
+        if (part >= 0) ou[out++] = part;
+        for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+        nsel[m] = (int32_t)out;
+        seqused[m] = (int32_t)((out == 0) ? 0 : (out - 1) * (uint32_t)ratio + (uint32_t)(p % ratio) + 1u);
+        vmask[m] = 0;
+        return;
+    }
+    for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
+    nsel[m] = (int32_t)out;
+    seqused[m] = (int32_t)(out * (uint32_t)ratio);
+    /* Which region blocks were taken: above the threshold, or among the first `need` ties in block
+     * order (the committed ties come first). */
+    bool taken[kTreeRegMax];
+    uint32_t ties = n_eq_c;
+    for (int r = 0; r < nR; ++r) {
+        const uint32_t k = keyat(nC + r);
+        const bool hi = k != 0u && (n <= topk || k > T);
+        const bool eq = k != 0u && n > topk && k == T;
+        taken[r] = hi || (eq && ties < need);
+        if (eq) ++ties;
+    }
+    /* A key is visible when its block is not complete on this row's path or was taken. */
+    const int rb = b0 * ratio;
+    uint64_t bits = 0;
+    for (int q = rb; q < base; ++q) {
+        const int c = q / ratio;
+        if (c >= own || (c - b0 < nR && taken[c - b0])) bits |= 1ull << (q - rb);
+    }
+    int y = m;
+    for (int g = 0; g < 64; ++g) {
+        const int c = pos[y] / ratio;
+        const int k = base - rb + (y - t0);
+        if (k < 64 && (c >= own || (c - b0 < nR && c >= b0 && taken[c - b0]))) bits |= 1ull << k;
+        const int pj = sp[y];
+        if (pj < 0) break;
+        y = t0 + pj;
+    }
+    vmask[m] = (int64_t)bits;
+}
+template <bool Signed, class CH>
+__global__ __launch_bounds__(kThreads)
+void qsa_select_tree_kernel(QSA_SELECT_TREE_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    qsa_select_tree_body<Signed>(score, bt, nc, pos, cu, sp, rs, sel, nsel, seqused, vmask, nb,
+                                 topk, ratio, nseq, s_ld, t_ld, o_ld, rs_ld, rs_cols);
+    if (CH::on) r4d_chain_done();
+}
+#undef QSA_SELECT_TREE_PARAMS
+
 /* ===================================================== the wide-launch path, for a prefill chunk
  *
  * Without the key cache the kernel above reads every key from global memory five times, and its
@@ -1242,6 +1461,32 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     return rc;
 }
 
+/* A tree launch (`spec_parent`, `rscore`, `vmask`): one workgroup a row, no split or wide form. */
+template <bool Signed>
+static int r4d_qsa_select_tree_emit(long score, long bt, long nc, long pos, long cu, long sp,
+                                    long rs, long sel, long nsel, long seqused, long vmask, int M,
+                                    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld,
+                                    int o_ld, int rs_ld, int rs_cols, RadStream stream,
+                                    bool chain) {
+    if (!score || !bt || !nc || !pos || !cu || !sp || !rs || !sel || !nsel || !seqused || !vmask)
+        return R4D_NO(RAD_E_INVAL);
+    if (M <= 0 || nb <= 0 || topk <= 0 || ratio <= 0 || nseq <= 0 || rs_cols <= 0)
+        return R4D_NO(RAD_E_SHAPE);
+    if (!s_ld) s_ld = nb;
+    if (!t_ld) t_ld = nb;
+    if (!o_ld) o_ld = topk + 1;
+    /* Each form named at its own launch: a test reads the kernel a launch site names. */
+#define R4D_QSELT(CH_)                                                                          \
+    R4D_EMIT(stream, (qsa_select_tree_kernel<Signed, CH_>), dim3((unsigned)M), dim3(kThreads),  \
+             0, (const float*)score, (const int32_t*)bt, (const int32_t*)nc,                    \
+             (const int32_t*)pos, (const int32_t*)cu, (const int32_t*)sp, (const float*)rs,     \
+             (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused, (int64_t*)vmask, nb, topk,       \
+             ratio, nseq, s_ld, t_ld, o_ld, rs_ld, rs_cols)
+    const int rc = chain ? R4D_QSELT(r4dchain) : R4D_QSELT(R4dUnchained);
+#undef R4D_QSELT
+    return rc;
+}
+
 extern "C" void r4d_qsa_select_pin_form(int form) { g_qsa_select_form = form; }
 
 /* Split-path scratch, called at declare (parameters only), so it depends on topk alone. */
@@ -1252,7 +1497,7 @@ extern "C" int64_t r4d_rad_qsa_select_scratch(const RadArgs* a) {
 // ============================================================== the plugin ABI entry point
 
 enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL_NSEL = 6,
-       QL_SEQ = 7 };
+       QL_SEQ = 7, QL_SP = 8, QL_RS = 9, QL_VM = 10 };
 
 extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const RadTensor* sc = r4d_opt(a, QL_SCORE);
@@ -1263,6 +1508,9 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const RadTensor* se = r4d_opt(a, QL_SEL);
     const RadTensor* ns = r4d_opt(a, QL_NSEL);
     const RadTensor* su = r4d_opt(a, QL_SEQ);
+    const RadTensor* tsp = r4d_opt(a, QL_SP);     /* optional, all three or none: tree verify */
+    const RadTensor* trs = r4d_opt(a, QL_RS);
+    const RadTensor* tvm = r4d_opt(a, QL_VM);
     if (!sc || !bt || !nc || !po || !cu || !se || !ns || !su) return R4D_NO(RAD_E_INVAL);
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long topk  = r4d_geti_or(a, "topk", 0);
@@ -1284,6 +1532,23 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     if (r4d_numel(po) < M || r4d_numel(su) < M) return R4D_NO(RAD_E_SHAPE);
     const long long sp = r4d_row_pitch(sc), tp = r4d_row_pitch(bt), op = r4d_row_pitch(se);
     if (sp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
+    if ((tsp != nullptr) != (trs != nullptr) || (tsp != nullptr) != (tvm != nullptr))
+        return R4D_NO(RAD_E_INVAL);
+    if (tsp) {
+        if (trs->rank != 2 || trs->shape[0] < M || r4d_numel(tvm) < M || r4d_numel(tsp) < M)
+            return R4D_NO(RAD_E_SHAPE);
+        if (trs->dtype != RAD_F32 || tsp->dtype != RAD_I32 || tvm->dtype != RAD_I64 ||
+            !r4d_contig(tsp) || !r4d_contig(tvm))
+            return R4D_NO(RAD_E_DTYPE);
+        const long long rp = r4d_row_pitch(trs);
+        if (rp < 0 || trs->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
+        auto* const temit = sgn ? r4d_qsa_select_tree_emit<true> : r4d_qsa_select_tree_emit<false>;
+        return temit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po), r4d_addr(cu),
+                     r4d_addr(tsp), r4d_addr(trs), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
+                     r4d_addr(tvm), (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq, (int)sp,
+                     (int)tp, (int)op, (int)rp, (int)trs->shape[1], stream,
+                     r4d_geti_or(a, "chain", 0) != 0);
+    }
     /* Scratch is optional: without enough, the non-split kernels run. */
     auto* const emit = sgn ? r4d_qsa_select_bf16_emit<true> : r4d_qsa_select_bf16_emit<false>;
     return emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),

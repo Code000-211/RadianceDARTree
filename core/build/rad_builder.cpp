@@ -2055,7 +2055,53 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
                          "declared at all -- leave the call out.", nm, d->depth);
         return RAD_E_INVAL;
     }
-    if (prog_.ctx.max_spec > 0 && d->depth != prog_.ctx.max_spec) {
+    /* A serial tree (tree_nodes > 0) runs `depth` rounds and verifies up to `tree_nodes` nodes, so
+     * its buffers are sized with max_spec = the node count and the rounds may be fewer; every
+     * other drafter's depth is the verify's. */
+    const bool serial_tree = d->kind == RAD_DRAFT_SERIAL && d->tree_nodes > 0;
+    if (d->tree_nodes < 0 || d->tree_leaves < 0 || d->tree_width < 0 ||
+        (d->kind != RAD_DRAFT_SERIAL &&
+         (d->tree_nodes != 0 || d->tree_leaves != 0 || d->tree_width != 0)) ||
+        (!serial_tree && (d->tree_leaves != 0 || d->tree_width > 1))) {
+        err(RAD_E_INVAL, "declare_drafter '%s': tree_nodes %d, tree_leaves %d, tree_width %d. A "
+                         "tree's shape is declared on a SERIAL drafter with tree_nodes > 0 (a "
+                         "BLOCK drafter's tree is rad_drafter_tree alone); none is negative.",
+            nm, d->tree_nodes, d->tree_leaves, d->tree_width);
+        return RAD_E_INVAL;
+    }
+    if (serial_tree) {
+        if (d->depth > d->tree_nodes || d->tree_leaves > d->tree_nodes ||
+            d->tree_width > d->tree_nodes ||
+            (prog_.ctx.max_spec > 0 && d->tree_nodes != prog_.ctx.max_spec)) {
+            err(RAD_E_INVAL, "declare_drafter '%s': a serial tree of %d node(s) over %d round(s), "
+                             "%d leaf(s), width %d, in a program declared with max_spec %d. The "
+                             "node budget is the verify's rows (max_spec), the rounds, leaves and "
+                             "width each fit in it.",
+                nm, d->tree_nodes, d->depth, d->tree_leaves, d->tree_width, prog_.ctx.max_spec);
+            return RAD_E_INVAL;
+        }
+        if (d->tree_leaves > 7) {
+            err(RAD_E_INVAL, "declare_drafter '%s': tree_leaves %d. The leaves are the first "
+                             "round's runner-up columns of one proposal row, at most 7 of the "
+                             "top-8 the head ranks.", nm, d->tree_leaves);
+            return RAD_E_INVAL;
+        }
+        if (d->tree_leaves > 0 &&
+            (d->proposal == RAD_NULL_HANDLE || d->proposal_pitch < 1 + (int64_t)d->tree_leaves)) {
+            err(RAD_E_INVAL, "declare_drafter '%s': %d leaf(s) need a proposal buffer whose rows "
+                             "hold 1 + %d candidates (proposal_pitch %lld)", nm, d->tree_leaves,
+                d->tree_leaves, (long long)d->proposal_pitch);
+            return RAD_E_INVAL;
+        }
+        if (d->tree_width > 1 &&
+            (d->proposal == RAD_NULL_HANDLE || d->proposal_pitch < d->tree_nodes)) {
+            err(RAD_E_INVAL, "declare_drafter '%s': a tree of width %d writes its frontier and "
+                             "its final tree into the proposal buffer, whose rows must hold the "
+                             "%d nodes (proposal_pitch %lld)", nm, d->tree_width, d->tree_nodes,
+                (long long)d->proposal_pitch);
+            return RAD_E_INVAL;
+        }
+    } else if (prog_.ctx.max_spec > 0 && d->depth != prog_.ctx.max_spec) {
         err(RAD_E_INVAL, "declare_drafter '%s': depth %d, but this program was declared with "
                          "max_spec %d. The plugin sized its own buffers with max_spec and the "
                          "engine drives this depth; they cannot differ.",
@@ -2257,12 +2303,21 @@ int Builder::drafter_tree(rad_buf parents) {
         err(RAD_E_STATE, "drafter_tree after declare finished");
         return RAD_E_STATE;
     }
-    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+    const bool serial_tree = prog_.drafter.kind == RAD_DRAFT_SERIAL && prog_.drafter.tree_nodes > 0;
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK && !serial_tree) {
         err(RAD_E_STATE, "drafter_tree: %s. Only a BLOCK drafter's one pass proposes every node at "
-                         "once; declare it with rad_declare_drafter first.",
+                         "once, and a SERIAL one declares its tree (RadDrafterDecl::tree_nodes); "
+                         "declare the drafter with rad_declare_drafter first.",
             prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
-                                                 : "the declared drafter is a SERIAL head");
+                                                 : "the declared drafter is a SERIAL chain");
         return RAD_E_STATE;
+    }
+    /* Stage 1 of a serial tree (the first round's runners-up as leaves) is the core's alone: it
+     * has no parents plane to read. */
+    if (serial_tree && prog_.drafter.tree_width <= 1 && parents == RAD_NULL_HANDLE) {
+        prog_.drafter_tree    = true;
+        prog_.drafter_parents = 0;
+        return RAD_OK;
     }
     if (parents == RAD_NULL_HANDLE || (size_t)parents >= prog_.buffers.size()) {
         err(RAD_E_INVAL, "drafter_tree '%s': parents buffer %u is not a declared buffer",
@@ -2666,6 +2721,14 @@ int Builder::finish() {
                     w.source.c_str(), rad_dtype_name(w.decl.dtype));
         }
 
+    if (prog_.drafter.tree_nodes > 0 && !prog_.drafter_tree)
+        err(RAD_E_STATE, "declare_drafter '%s': tree_nodes %d, but rad_drafter_tree was never "
+                         "called; a serial tree is declared by both.", prog_.drafter_name.c_str(),
+            prog_.drafter.tree_nodes);
+    if (prog_.drafter.tree_width > 1 && prog_.drafter_parents == 0)
+        err(RAD_E_STATE, "declare_drafter '%s': tree_width %d grows the tree in the plugin, which "
+                         "needs rad_drafter_tree's parents buffer", prog_.drafter_name.c_str(),
+            prog_.drafter.tree_width);
     if (prog_.drafter.kind == RAD_DRAFT_BLOCK && !prog_.drafter_tree &&
         (prog_.drafter.block < prog_.drafter.depth ||
          prog_.drafter.block > (int64_t)prog_.drafter.depth + 1))

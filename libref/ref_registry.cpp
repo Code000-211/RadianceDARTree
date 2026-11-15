@@ -97,7 +97,7 @@ static const RadOperandSpec oNgramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"
                                            WGT("vocab_sizes"), WGT("offsets"),
                                            OPD_O("cache_idx"), OPD_O("has_init"),
                                            OPD_O("num_accepted"), OUT("ids"),
-                                           OUT_O("ahead_ids") };
+                                           OUT_O("ahead_ids"), OPD_O("spec_parent") };
 /* PLE's gate. `k` and `q` arrive un-normed; the op owns all three norms, since the third is over
  * bytes the op itself wrote. */
 static const RadParamSpec pPleGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
@@ -111,7 +111,7 @@ static const RadParamSpec pPleConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
                                          P_INT("dilation"), P_STR("dtype") };
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                           OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
-                                          OPD_O("num_accepted"), OUT("y") };
+                                          OPD_O("num_accepted"), OUT("y"), OPD_O("spec_parent") };
 /* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
 static const RadOperandSpec oPleConvBias[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                               OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
@@ -433,6 +433,21 @@ static const RadOperandSpec oAttnPagedTree[] = {
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
 };
 
+/* attn_paged_tree_sel (docs/OPS.md): attn_paged's parameters plus `sel_pitch`, the page list's row
+ * pitch, which libr4d's scratch hook needs at declare. Operands 0-7 are attn_paged's with the
+ * block table read as the row's page list (`sel`) and `seqused` as its page count (`nsel`); the
+ * tree's own follow. */
+static const RadParamSpec pAttnPagedTreeSel[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8"), P_INT("sel_pitch")
+};
+static const RadOperandSpec oAttnPagedTreeSel[] = {
+    OPD("q"), OPD("kv_cache"), OPD("sel"), OPD("nsel"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"),
+    OPD("vmask"), OPD("block_table"), OPD("rb"), OPD_O("seq_cu")
+};
+
 /* attn_paged with a learned sink logit a query head (gpt-oss, LiLiCorr's drafter). A name of its
  * own, so no attn_paged kernel that does not know the operand can be chosen for it. */
 static const RadOperandSpec oAttnPagedSink[] = {
@@ -544,18 +559,31 @@ static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD(
                                             OUT("score") };
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
                                            P_INT("ratio"), P_INT("seqs"), P_INTO("signed") };
+/* Tree verify (docs/QSA.md, "Tree verify"): `spec_parent`, `rscore` and `vmask` go together. */
 static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
-                                             OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
+                                             OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused"),
+                                             OPD_O("spec_parent"), OPD_O("rscore"),
+                                             OUT_O("vmask") };
 static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                               P_INT("seqs"), P_STR("dtype") };
 static const RadOperandSpec oQsaTailStore[] = { OPD("k"), OPD("pos"), OPD("cu"), INOUT("state"),
-                                                OPD("sidx") };
+                                                OPD("sidx"), OPD_O("spec_parent") };
+/* The tree verify's accepted path, moved to the depth layout (docs/QSA.md, "Tree verify"). */
+static const RadParamSpec pQsaTailCompact[] = { P_INT("M"), P_INT("n"), P_INT("ring"),
+                                                P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oQsaTailCompact[] = { OPD("pos"), OPD("cu"), OPD("num_accepted"),
+                                                  OPD("spec_path"), INOUT("state"), OPD("sidx") };
 /* `work` bounds the blocks that can complete; slots past the real count get page -1. */
 static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
                                          P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
-                                           OUT("page"), OUT("bpos"), OUT("nc") };
+                                           OUT("page"), OUT("bpos"), OUT("nc"),
+                                           /* Tree verify and heal; the six outputs go with
+                                            * `spec_parent`. */
+                                           OPD_O("spec_parent"), OPD_O("num_accepted"),
+                                           OUT_O("sstage"), OUT_O("spage"), OUT_O("sbpos"),
+                                           OUT_O("rtab"), OUT_O("rnc"), OUT_O("rcu") };
 /* The residency map of a streamed group (ref_kvstream.cpp says why it takes no `block_size`). */
 static const RadParamSpec pKvResolve[] = { P_INT("M"), P_INT("blocks"), P_INT("slots"),
                                            P_INT("sel_pitch"), P_INT("block_bytes") };
@@ -714,9 +742,12 @@ static const RadOperandSpec oConvPrep[] = {
 
 static const RadParamSpec pConvUpdate[] = { P_INT("q_len"), P_INT("head_k"), P_INT("head_v"),
                                             P_INT("conv_width"), P_INTO("max_query_len") };
+/* Tree verification (docs/OPS.md, "Tree verification of the delta net"): `spec_parent` is
+ * RadBatch::spec_parent and `spec_path` RadBatch::spec_path, both optional so every other caller
+ * is unchanged. */
 static const RadOperandSpec oConvUpdate[] = {
     OPD("x"), WGT("w"), WGT_O("b"), INOUT("conv_state"), OPD("state_idx"), OPD("num_accepted"),
-    OPD("cu"), OUT("q"), OUT("k"), OUT("v")
+    OPD("cu"), OUT("q"), OUT("k"), OUT("v"), OPD_O("spec_parent"), OPD_O("spec_path")
 };
 
 static const RadParamSpec pKkt[] = { P_INT("M"), P_INT("head_k"), P_CHUNK("chunk") };
@@ -737,7 +768,8 @@ static const RadParamSpec pRecurrent[] = { P_INT("q_len"), P_INT("head_k"), P_IN
 static const RadOperandSpec oRecurrent[] = {
     OPD("q"), OPD("k"), OPD("v"), OPD("a"), OPD("b"), WGT("A_log"), WGT("dt_bias"),
     INOUT("state"), OPD("state_idx"), OPD("num_accepted"), OPD("cu"), OPD_O("z"),
-    WGT_O("norm_w"), OUT("o"), OUT_O("o_q"), OUT_O("o_scale")
+    WGT_O("norm_w"), OUT("o"), OUT_O("o_q"), OUT_O("o_scale"),
+    OPD_O("spec_parent"), OPD_O("spec_path")
 };
 
 /* gdn_conv_update folded into gdn_recurrent_update: the convolution's inputs, then the
@@ -751,7 +783,14 @@ static const RadOperandSpec oConvRecurrent[] = {
     OPD("x"), WGT("conv_w"), WGT_O("conv_b"), INOUT("conv_state"), OPD("conv_idx"), OPD("a"),
     OPD("b"), WGT("A_log"), WGT("dt_bias"), INOUT("state"), OPD("state_idx"),
     OPD("num_accepted"), OPD("cu"), OPD("z"), WGT("norm_w"), OUT("o"), OUT_O("o_q"),
-    OUT_O("o_scale")
+    OUT_O("o_scale"), OPD_O("spec_parent"), OPD_O("spec_path")
+};
+
+/* Closes a rolling window over a tree verify's committed rows. `dtype` only describes the cache for
+ * a shape draw; the kernel moves entries whole whatever the element is. */
+static const RadParamSpec pKvWindowCompact[] = { P_INT("off"), P_STRO("dtype") };
+static const RadOperandSpec oKvWindowCompact[] = {
+    INOUT("cache"), OPD("state_idx"), OPD("num_accepted"), OPD("spec_path")
 };
 
 static const RadParamSpec pGatedNorm[] = { P_INT("M"), P_INT("channels"), P_F64("eps"),
@@ -1388,7 +1427,10 @@ static const RadOpSchema kSchemas[] = {
   "step's tokens reads at k - 1 and finds the history ending at the k-th; it needs "
   "(width-1)*dilation - 1 slots plus one a token. Absent, every token commits: the read is at "
   "offset zero and the last (width-1)*dilation inputs land at offset zero, which is the prefill "
-  "chunk. `resid` absent drops the add and leaves the plain convolution." },
+  "chunk. `resid` absent drops the add and leaves the plain convolution. `spec_parent` (a tree "
+  "verify, decode half, needs `num_accepted`) makes the taps those of the row's ANCESTORS -- k "
+  "levels up, continuing into the committed window past the root -- and leaves the window in "
+  "row layout (input t at slot (width-1)*dilation - 1 + t) for kv_window_compact." },
 { "ple_conv_bias", ARR(pPleConv), ARR(oPleConvBias),
   "ple_conv with `b`, a per-channel bias added inside the silu: y[t] = resid[t] + silu(b[c] + "
   "sum_j w[c][j] * x[t - (width-1-j)*dilation]). At dilation one with no `resid` it is Mamba-2's "
@@ -1406,8 +1448,11 @@ static const RadOpSchema kSchemas[] = {
   "EOS reads the EOS instead, and so does every deeper shift. `state` is a rolling window of the "
   "committed ids in front of the step -- ple_conv's contract exactly, read at `num_accepted - 1` "
   "and rewritten in the decode layout when `num_accepted` is present and the prefill layout when "
-  "it is not -- except that a cold window is EOS and not zero, because zero is a real token. The "
-  "gather that follows is `embed_lookup_q` over M * heads indices." },
+  "it is not -- except that a cold window is EOS and not zero, because zero is a real token. "
+  "`spec_parent` (a tree verify, needs `num_accepted`, excludes `ahead_ids`) hashes each row's "
+  "ANCESTORS' tokens -- parent, grandparent -- continuing into the committed window past the "
+  "root, and leaves the window in row layout (token t at entry ngram - 2 + t) for "
+  "kv_window_compact. The gather that follows is `embed_lookup_q` over M * heads indices." },
 { "gather_rows", ARR(pMnD), ARR(oGather),
   "y[i, :] = x[idx[i], :]. `M` is a RANGE, so the rows gathered are `y`'s extent and not the "
   "declared worst case. A negative index writes a zero row, as embed_lookup's padding does; an "
@@ -1560,6 +1605,13 @@ static const RadOpSchema kSchemas[] = {
   "causal row, else the row's parent's index within its sequence's rows (-1 for the block's "
   "first row). Inside the block such a row sees itself and its ancestors only, and its window is "
   "measured from the block's first position plus its depth." },
+{ "attn_paged_tree_sel", ARR(pAttnPagedTreeSel), ARR(oAttnPagedTreeSel),
+  "attn_paged over a QSA tree verify's keys: per query row one softmax over the pages sel[row, "
+  "0..nsel[row]) (physical block ids, full pages) followed by the region keys 0..63 whose bit is "
+  "set in vmask[row] (i64 read as u64), region key k being logical position rb[seq] + k in the "
+  "sequence's block_table. A row of a plain causal prefix is bit-identical to attn_paged over the "
+  "same pages in order. Operands 4-6 (descales, cu_seqlens) stay absent; seq_cu [n_seq + 1] maps "
+  "rows to block_table rows, absent meaning an even split." },
 { "attn_paged_sink", ARR(pAttnPaged), ARR(oAttnPagedSink),
   "attn_paged with `sinks` [n_head] f32, one logit a query head in the scaled-score domain: it "
   "joins the softmax's maximum and denominator, contributes no value, and so only shrinks the "
@@ -1622,14 +1674,25 @@ static const RadOpSchema kSchemas[] = {
   "The topk highest-scoring complete blocks a query has passed, as page ids: ties to the lower block "
   "index, the blocks above the threshold first and the tied ones after, then the partial page when "
   "(pos + 1) % ratio != 0, then -1 to topk + 1. nsel counts the entries and seqused is the "
-  "attention's length over them." },
+  "attention's length over them. With spec_parent, rscore and vmask a tree row ranks the "
+  "committed blocks and its own path's region blocks together and outputs the taken committed "
+  "pages and a 64-bit mask over the region's keys." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
-  "rows of the tail keep what they held." },
+  "rows of the tail keep what they held. With spec_parent a tree sequence's row j goes to the flat "
+  "row (pos[cu[s]] + j) % ring." },
+{ "qsa_tail_compact", ARR(pQsaTailCompact), ARR(oQsaTailCompact),
+  "After a tree verify: for t = 1 .. num_accepted-1 ascending, tail row (base_prev + t) % ring = "
+  "row (base_prev + spec_path[s][t]) % ring, base_prev = pos[cu[s]] - num_accepted[s]; the accepted "
+  "path moves to the depth layout. Runs once a step, before qsa_work." },
 { "qsa_work", ARR(pQsaWork), ARR(oQsaWork),
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
-  "past the count get page -1. nc is each sequence's complete-block count." },
+  "past the count get page -1. nc is each sequence's complete-block count. With num_accepted the "
+  "blocks the previous step's non-anchor committed tokens completed are rebuilt from the tail first "
+  "(heal); with spec_parent a tree sequence completes only its anchor's block, nc is the committed "
+  "blocks below the anchor's, and each row completing a block gets a scratch item (sstage, spage, "
+  "sbpos) plus the per-row tables rtab, rnc and rcu that a second qsa_score reads." },
 { "kv_resolve", ARR(pKvResolve), ARR(oKvResolve),
   "Makes every block the selections name resident and rewrites them as ring slots: an epoch bump, "
   "a hit or a single claim per distinct block, a free slot before any resident one and otherwise "
@@ -1753,7 +1816,11 @@ static const RadOpSchema kSchemas[] = {
   "The same convolution for a decode step against the rolling window: reads at num_accepted-1 and "
   "rewrites the buffer shifted down by one, so a speculative rejection is a change of read offset "
   "rather than a recompute. `num_accepted` is REQUIRED, because an op that lets the caller omit it "
-  "is an op whose rollback contract is optional (spec §10); a non-speculative decode passes ones." },
+  "is an op whose rollback contract is optional (spec §10); a non-speculative decode passes ones. "
+  "`spec_parent` (RadBatch::spec_parent) makes each row's taps follow its ancestor chain, falling "
+  "back to the committed window past the block's first row; `spec_path` (RadBatch::spec_path) says "
+  "which rows of the previous block were committed, so the window's history is gathered through "
+  "them and the buffer is left in the chain layout." },
 { "gdn_kkt_solve", ARR(pKkt), ARR(oKkt),
   "A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1 per chunk, by forward substitution in "
   "f32. The decay is applied per element, which cannot overflow at any gate span." },
@@ -1778,11 +1845,21 @@ static const RadOpSchema kSchemas[] = {
   "declared rather than inferred from the index row's width. ref serves per_candidate and "
   "DECLINES anchor; libr4d serves both. "
   "`cu` bounds the sequences exactly as it does on the sibling "
-  "gdn_conv_update, which runs off the same tensor on the same step." },
+  "gdn_conv_update, which runs off the same tensor on the same step. "
+  "`spec_parent` / `spec_path` (anchor form only) verify a tree: every row starts from its "
+  "parent's state, and the replay commits the previous block's rows named by `spec_path` in path "
+  "order." },
 { "gdn_conv_recurrent_update", ARR(pConvRecurrent), ARR(oConvRecurrent),
   "gdn_conv_update followed by gdn_recurrent_update, with q, k and v never written: the operands "
   "are the convolution's (`conv_idx` is its state_idx) and then the recurrence's without those "
   "three. The rolling-window and state contracts are the two ops' own." },
+{ "kv_window_compact", ARR(pKvWindowCompact), ARR(oKvWindowCompact),
+  "Closes a RAD_KV_CONV-layout window [slots, channels, entries] over the rows a tree verify "
+  "committed: for t = 1..num_accepted-1, ascending, entry off + spec_path[t] moves to entry off + "
+  "t, for every channel of the sequence's state_idx[0] slot. `off` is the entry of the verify "
+  "block's row 0 (the window's write layout). Ascending in place is hazard free because a path's "
+  "rows increase; a chain is a no-op. The elements are moved whole, so bf16, i32 and f32 windows "
+  "all serve." },
 { "gdn_gated_rmsnorm", ARR(pGatedNorm), ARR(oGatedNorm),
   "o = x * rsqrt(mean_channels(x^2) + eps) * w * act(z). `act` is \"silu\" or \"sigmoid\"." },
 
@@ -2550,6 +2627,11 @@ ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged_tree, nullptr),
+ROW("ref_attn_paged_tree_sel", "attn_paged_tree_sel", "attn",
+    "paged attention over a row's selected pages plus a vmask-selected region of the sequence",
+    "any q and out dtype; f32 / bf16 / i8 kv cache; i32 sel, nsel, block table, rb; i64 vmask",
+    nullptr, 0,
+    nullptr, nullptr, ref_attn_paged_tree_sel, nullptr),
 ROW("ref_attn_paged_sink", "attn_paged_sink", "attn",
     "paged causal / sliding-window attention with a sink logit a head, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; f32 sinks",
@@ -2618,6 +2700,9 @@ SIMPLE("ref_qsa_select", "qsa_select", "attn",
 SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
        "QSA tail: the raw keys of open blocks into a per-sequence ring", DT_FLOAT,
        ref_qsa_tail_store),
+SIMPLE("ref_qsa_tail_compact", "qsa_tail_compact", "attn",
+       "QSA tail after a tree verify: the accepted path moved to the depth layout", DT_FLOAT,
+       ref_qsa_tail_compact),
 SIMPLE("ref_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, ref_qsa_work),
 SIMPLE("ref_kv_resolve", "kv_resolve", "attn",
@@ -2650,6 +2735,9 @@ SIMPLE("ref_gdn_conv_recurrent_update", "gdn_conv_recurrent_update", "gdn",
        ref_gdn_conv_recurrent_update),
 SIMPLE("ref_gdn_gated_rmsnorm", "gdn_gated_rmsnorm", "gdn", "gated RMS norm over a head", DT_FLOAT,
        ref_gdn_gated_rmsnorm),
+SIMPLE("ref_kv_window_compact", "kv_window_compact", "gdn",
+       "close a rolling window over a tree verify's committed rows", DT_ANY,
+       ref_kv_window_compact),
 
 ROW("ref_all_reduce", "all_reduce", "ar", "sum across ranks, f32, ascending rank order", DT_FLOAT,
     nullptr, 0, ref_collective_init, ref_collective_fini, ref_all_reduce, ref_all_reduce_scratch),

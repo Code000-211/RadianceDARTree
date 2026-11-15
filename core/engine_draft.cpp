@@ -158,6 +158,12 @@ bool Engine::serial_drafting() const {
     return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
 }
 
+int Engine::serial_nodes(int done) const {
+    if (!serial_tree_) return done;
+    if (tree_width_ > 1) return cfg_.n_spec;   /* the head's own tree: its whole budget */
+    return std::min(cfg_.n_spec, done + tree_leaves_);
+}
+
 /* One advance on every rank against the scheduler's latest build, over its first `rows` rows
  * when given, else all. */
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
@@ -170,13 +176,22 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.st    = rk.step_slots;
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
+        /* A serial head's tree (advance.h): the budget, the leaves ADV_ROUND / ADV_TAKE take from
+         * the first round's candidates (none when the head grows the tree itself), the ids a
+         * candidate may be, and the frontier width. */
+        if (serial_tree_) {
+            a.tree_nodes = cfg_.n_spec;
+            a.leaves     = tree_width_ > 1 ? 0 : tree_leaves_;
+            a.vocab      = (int32_t)meta_.n_vocab;
+            a.width      = tree_width_;
+        }
         if (from_proposal) {
             a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
                                                                   : rk.ctx.buf_ptr(rk.tok_buf));
             a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
                               ? drafter_.proposal_pitch : 1;
             /* A tree drafter's parents, at the proposal's pitch (rad_drafter_tree). */
-            if (tree_ && mode == ADV_BTAKE) {
+            if (tree_ && (mode == ADV_BTAKE || mode == ADV_ROUND_TREE)) {
                 a.par = static_cast<const int32_t*>(rk.ctx.buf_ptr(tree_parents_));
                 if (!a.par) {
                     RAD_ERR("drafter '%s': rank %zu has no parents buffer", drafter_.name, i);
@@ -209,6 +224,9 @@ int Engine::tree_compact(int rows) {
         for (size_t g = 1; g < p.kv_groups.size() && (int)g < a.n_groups; ++g) {
             const int kind = p.kv_groups[g].decl.kind;
             if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) continue;
+            /* A paged group whose entries are not one per token slot (the QSA block keys) is not
+             * K and V to move: the plugin heals it from the accepted path instead. */
+            if (p.kv_groups[g].decl.no_tree_compact) continue;
             const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
             if (!b || !b->base || b->rank != 4) continue;   /* a zero group on this rank */
             const int bits = rad_dtype_bits(b->dtype);
@@ -255,6 +273,10 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     }
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+    /* A serial tree's accepted path into place in the trunk's cache, against the build just
+     * accepted and before the history pass or anything else reads it (a path that follows the
+     * chain moves nothing: its nodes are already at their depth). */
+    if (tree_) RAD_TRY(tree_compact(-1));
     RAD_TRY(collect_issue(so, /*fence=*/true));
 
     int rounds = drafter_.depth;
@@ -286,7 +308,11 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
          * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
          * round r-1's proposal, which the advance takes from the proposal buffer on the card. */
         const int drafted = rd == 0 ? (int)db->n_draft_out : n;
-        RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
+        /* A head that grows the tree itself stages each round's frontier rows (ADV_ROUND_TREE);
+         * every other head, a tree's chain included, the round's one. */
+        RAD_TRY(advance_all(rd == 0 ? ADV_HIST
+                                    : (serial_tree_ && tree_width_ > 1 ? ADV_ROUND_TREE : ADV_ROUND),
+                            rd, rd > 0));
         const auto tB = std::chrono::steady_clock::now();
 
         /* Greedy, not the request's sampler: the target verifies against its own draw
@@ -336,7 +362,10 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     /* The last round's proposal into the slots, then rank 0's slots back to the host. Only the
      * drafting rows: at depth 1 the last pass is the history pass, whose later rows only carried
      * history (Scheduler::serial_batch). */
-    RAD_TRY(advance_all(ADV_TAKE, serial_done_, true, n));
+    if (serial_tree_ && tree_width_ > 1)
+        RAD_TRY(advance_all(ADV_BTAKE, cfg_.n_spec, true, n));   /* the plugin's final tree */
+    else
+        RAD_TRY(advance_all(ADV_TAKE, serial_done_, true, n));
     Rank& r0 = *ranks_[0];
     if (mtp_couple_) {
         /* Rounds 1..done of the drafting rows, on the same stream as the slots below. */
@@ -370,6 +399,21 @@ int Engine::finish_serial_drafter(const StepOut& so) {
                         (unsigned long long)e.seq, so.accepted[i], so.token[i]);
                 return RAD_E_STATE;
             }
+            /* A tree's walk is the same rule on both sides (accept_tree, ADV_ACCEPT), so the nodes
+             * must be too: the history pass, the compaction and the recurrent state's replay all
+             * follow the card's path, and the committed tokens the host's. */
+            if (tree_ && !so.path.empty() && so.accepted[i] > 0) {
+                for (int32_t t = 0; t < S.acc && t < RAD_SCHED_MAX_SPEC; ++t) {
+                    const int32_t card = t < S.npath ? S.path[t] : t + 1;
+                    if (card != so.path[(size_t)i * RAD_SCHED_MAX_SPEC + (size_t)t]) {
+                        RAD_ERR("drafter '%s': sequence %llu's accepted path differs at step %d: "
+                                "node %d on the card, %d on the host", drafter_.name,
+                                (unsigned long long)e.seq, (int)t, (int)card,
+                                (int)so.path[(size_t)i * RAD_SCHED_MAX_SPEC + (size_t)t]);
+                        return RAD_E_STATE;
+                    }
+                }
+            }
         }
     }
     sched_.serial_end(serial_done_);
@@ -377,18 +421,31 @@ int Engine::finish_serial_drafter(const StepOut& so) {
 
     Rank& r0 = *ranks_[0];
     const int rounds = serial_rounds_, done = serial_done_;
-    draft_out_.assign((size_t)serial_rows_ * (size_t)rounds, 0);
+    /* A serial tree publishes its nodes (the chain, then the leaves, or the plugin's own tree), a
+     * row each at the node budget's pitch, with the parents the card staged beside them. */
+    const int nodes = serial_tree_ ? serial_nodes(done) : done;
+    const int pitch = serial_tree_ ? std::max(nodes, 1) : rounds;
+    draft_out_.assign((size_t)serial_rows_ * (size_t)pitch, 0);
     for (int i = 0; i < serial_rows_; ++i) {
         const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
-        for (int rd = 1; rd <= done; ++rd)
-            draft_out_[(size_t)i * (size_t)rounds + (size_t)(rd - 1)] = S.tok[rd];
+        if (serial_tree_ && S.ntree != nodes) {
+            RAD_ERR("drafter '%s': the card built a tree of %d node(s) for sequence %llu and the "
+                    "host planned %d; the step issued ahead verifies the host's count",
+                    drafter_.name, (int)S.ntree, (unsigned long long)serial_row_[(size_t)i].seq,
+                    nodes);
+            return RAD_E_STATE;
+        }
+        for (int rd = 1; rd <= nodes; ++rd)
+            draft_out_[(size_t)i * (size_t)pitch + (size_t)(rd - 1)] = S.tok[rd];
     }
     for (int i = 0; i < serial_rows_; ++i) {
         /* No draft for a request the sampler will not speculate on (a constraining grammar that
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
+        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)pitch], nodes,
+                                        serial_tree_ ? S.par : nullptr);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }

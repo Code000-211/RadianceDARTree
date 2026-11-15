@@ -25,7 +25,9 @@
 #include "avx_common.h"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
+#include <vector>
 #include <type_traits>
 
 using namespace avx;
@@ -64,6 +66,30 @@ void seq_rows(const RadTensor* cu, int64_t n_seq, int64_t M, int64_t none, int64
     }
     for (int64_t m = 0; m < M; ++m)
         if (seq[m] == unset) seq[m] = none;
+}
+
+/* Tree verify (libref/ref_qsa.cpp has the contract): a sequence whose first row has spec_parent -1
+ * is a tree of depth positions; node j's parent is row cu[s] + spec_parent. */
+bool tree_seq(const RadTensor* sp, const RadTensor* cu, int64_t s) {
+    if (!sp) return false;
+    const int64_t t0 = cu_at(cu, s);
+    return cu_at(cu, s + 1) > t0 && ldi(sp, offlin(sp, t0)) == -1;
+}
+
+int tree_check(const RadTensor* sp, const RadTensor* po, const RadTensor* cu, int64_t s) {
+    const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+    if (numel(sp) < t1) return RAD_E_SHAPE;
+    for (int64_t j = 1; j < t1 - t0; ++j) {
+        const int64_t par = ldi(sp, offlin(sp, t0 + j));
+        if (par < 0 || par >= j) return RAD_E_INVAL;
+        if (ldi(po, offlin(po, t0 + j)) != ldi(po, offlin(po, t0 + par)) + 1) return RAD_E_INVAL;
+    }
+    return RAD_OK;
+}
+
+int64_t tree_parent(const RadTensor* sp, int64_t t0, int64_t y) {
+    const int64_t par = ldi(sp, offlin(sp, y));
+    return par < 0 ? -1 : t0 + par;
 }
 
 /* `n` elements of `t` from `base`, `st` apart, as f32, and back. Whole-byte dtypes convert a row
@@ -298,6 +324,7 @@ enum { kBins = 1024, kBinShift = 21, kBinShiftSigned = 22 };
 struct SelJob {
     const RadTensor *sc, *bt, *nc, *po, *se, *ns, *su;
     const int64_t* seq;
+    const RadTensor *sp, *rs, *vm, *cu;   /* the tree operands, null for none */
     int64_t nb, topk, ratio;
     int64_t s_rs, s_cs, bt_rs, bt_cs, o_rs, o_cs;
     bool sgn;                          /* the `signed` order */
@@ -473,9 +500,70 @@ static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, uin
     for (; b < n && (og < gt || ot < ties); ++b) one(b);
 }
 
+/* A tree row (libref's ref_qsa_select, "TREE ROWS"): the committed blocks and the row's own region
+ * blocks ranked together, the committed pages taken out as `sel`, the region as a 64-bit mask. Scalar
+ * work over at most a few dozen union candidates beyond the committed scan. */
+static void tree_select_row(const SelJob& j, int64_t m, int64_t s, int64_t p) {
+    const int64_t t0 = cu_at(j.cu, s), base = ldi(j.po, offlin(j.po, t0));
+    const int64_t b0 = base / j.ratio, ntot = (p + 1) / j.ratio, topk = j.topk;
+    std::vector<float> val((size_t)ntot);
+    std::vector<int64_t> live;
+    for (int64_t u = 0; u < ntot; ++u) {
+        float v;
+        if (u < b0) {
+            v = ldt(j.sc, m * j.s_rs + u * j.s_cs);
+            if (ldi(j.bt, s * j.bt_rs + u * j.bt_cs) < 0) continue;
+        } else {
+            v = ldt(j.rs, m * j.rs->stride[0] + (u - b0) * j.rs->stride[1]);
+        }
+        if (j.sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+        val[(size_t)u] = j.sgn ? v : v > 0.0f ? v : 0.0f;
+        live.push_back(u);
+    }
+    std::vector<int64_t> take;
+    if ((int64_t)live.size() <= topk) {
+        take = live;
+    } else {
+        std::vector<float> ord;
+        for (int64_t u : live) ord.push_back(val[(size_t)u]);
+        std::nth_element(ord.begin(), ord.begin() + (topk - 1), ord.end(), std::greater<float>());
+        const float thr = ord[(size_t)(topk - 1)];
+        for (int64_t u : live)
+            if (val[(size_t)u] > thr) take.push_back(u);
+        for (int64_t u : live)
+            if ((int64_t)take.size() < topk && val[(size_t)u] == thr) take.push_back(u);
+    }
+    std::vector<char> taken((size_t)ntot, 0);
+    int64_t out = 0;
+    const int64_t ob = m * j.o_rs;
+    for (int64_t u : take) {
+        taken[(size_t)u] = 1;
+        if (u < b0)
+            st_int_dt(j.se->dtype, j.se->data, ob + (out++) * j.o_cs,
+                      ldi(j.bt, s * j.bt_rs + u * j.bt_cs));
+    }
+    for (int64_t i = out; i <= topk; ++i) st_int_dt(j.se->dtype, j.se->data, ob + i * j.o_cs, -1);
+    st_int_dt(j.ns->dtype, j.ns->data, offlin(j.ns, m), out);
+    st_int_dt(j.su->dtype, j.su->data, offlin(j.su, m), out * j.ratio);
+    const int64_t rb = b0 * j.ratio;
+    auto vis = [&](int64_t c) { return c >= ntot || taken[(size_t)c] != 0; };
+    uint64_t bits = 0;
+    for (int64_t q = rb; q < base; ++q)
+        if (vis(q / j.ratio)) bits |= 1ull << (q - rb);
+    for (int64_t y = m; y >= 0; y = tree_parent(j.sp, t0, y)) {
+        const int64_t c = ldi(j.po, offlin(j.po, y)) / j.ratio;
+        if (vis(c)) bits |= 1ull << (base - rb + (y - t0));
+    }
+    st_int_dt(j.vm->dtype, j.vm->data, offlin(j.vm, m), (int64_t)bits);
+}
+
 static void select_row(const SelJob& j, int64_t m) {
     const int64_t s = j.seq[m];
     const int64_t p = ldi(j.po, offlin(j.po, m));
+    if (j.sp && m >= cu_at(j.cu, s) && m < cu_at(j.cu, s + 1) && tree_seq(j.sp, j.cu, s)) {
+        tree_select_row(j, m, s, p);
+        return;
+    }
     const int64_t n = std::min(std::min(ldi(j.nc, offlin(j.nc, s)), j.nb), (p + 1) / j.ratio);
     const int64_t topk = j.topk;
     uint32_t* key = (uint32_t*)scratch_f32((size_t)std::max<int64_t>(n, 1));
@@ -509,6 +597,7 @@ static void select_row(const SelJob& j, int64_t m) {
     st_int_dt(j.ns->dtype, j.ns->data, offlin(j.ns, m), out);
     st_int_dt(j.su->dtype, j.su->data, offlin(j.su, m),
               out == 0 ? 0 : (out - 1) * j.ratio + p % j.ratio + 1);
+    if (j.vm) st_int_dt(j.vm->dtype, j.vm->data, offlin(j.vm, m), 0);
 }
 
 }  /* namespace */
@@ -524,6 +613,7 @@ AVX_KERNEL(qsa_select) {
     if (!rad_args_have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
+    const RadTensor *sp = rad_arg_in(a, 8), *rs = rad_arg_in(a, 9), *vm = rad_arg_in(a, 10);
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
     const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
@@ -539,10 +629,27 @@ AVX_KERNEL(qsa_select) {
         if (ldi(nc, offlin(nc, s)) < 0) return RAD_E_INVAL;
     for (int64_t m = 0; m < M; ++m)
         if (ldi(po, offlin(po, m)) < 0) return RAD_E_INVAL;
+    if ((sp != nullptr) != (rs != nullptr) || (sp != nullptr) != (vm != nullptr)) return RAD_E_INVAL;
+    if (sp) {
+        if (rs->rank != 2 || rs->shape[0] < M || numel(vm) < M || numel(sp) < M) return RAD_E_SHAPE;
+        for (int64_t s = 0; s < n_seq; ++s) {
+            if (!tree_seq(sp, cu, s)) continue;
+            const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+            if (t1 > M) return RAD_E_SHAPE;
+            const int rc = tree_check(sp, po, cu, s);
+            if (rc < 0) return rc;
+            const int64_t base = ldi(po, offlin(po, t0)), b0 = base / ratio;
+            if (ldi(nc, offlin(nc, s)) != b0 || b0 > nb) return RAD_E_INVAL;
+            if (base - b0 * ratio + (t1 - t0 - 1) > 63) return RAD_E_SHAPE;
+            for (int64_t m = t0; m < t1; ++m)
+                if ((ldi(po, offlin(po, m)) + 1) / ratio - b0 > rs->shape[1]) return RAD_E_SHAPE;
+        }
+    }
 
     int64_t* seq = (int64_t*)scratch_raw((size_t)M * sizeof(int64_t) + 64);
     seq_rows(cu, n_seq, M, 0, seq);
     SelJob j{};
+    j.sp = sp; j.rs = rs; j.vm = vm; j.cu = cu;
     j.sc = sc; j.bt = bt; j.nc = nc; j.po = po; j.se = se; j.ns = ns; j.su = su;
     j.seq = seq; j.nb = nb; j.topk = topk; j.ratio = ratio;
     j.s_rs = sc->stride[0]; j.s_cs = sc->stride[1];
@@ -562,17 +669,18 @@ AVX_KERNEL(qsa_select) {
 AVX_KERNEL(qsa_tail_store) {
     if (!rad_args_have(a, 5)) return RAD_E_INVAL;
     const RadTensor *k = &a->t[0], *po = &a->t[1], *cu = &a->t[2], *st = &a->t[3];
-    const RadTensor *sx = &a->t[4];
+    const RadTensor *sx = &a->t[4], *sp = rad_arg_in(a, 5);
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
     if (k->rank != 2 || st->rank != 4 || st->shape[1] != 1) return RAD_E_SHAPE;
     const int64_t T = k->shape[0], slots = st->shape[0], n_seq = numel(cu) - 1;
     if (T <= 0 || k->shape[1] != n || st->shape[2] < ring || st->shape[3] != n) return RAD_E_SHAPE;
     if (n_seq <= 0 || numel(po) < T) return RAD_E_SHAPE;
+    if (sp && numel(sp) < T) return RAD_E_SHAPE;
     if ((sx->rank >= 2 ? sx->shape[0] : numel(sx)) < n_seq) return RAD_E_SHAPE;
 
     /* The rows that write, as (row, slot), validated before any write. */
-    int64_t* seq = (int64_t*)scratch_raw((size_t)T * 3 * sizeof(int64_t) + 64);
+    int64_t* seq = (int64_t*)scratch_raw((size_t)T * 4 * sizeof(int64_t) + 64);
     int64_t* w = seq + T;
     seq_rows(cu, n_seq, T, -1, seq);
     int64_t nw = 0;
@@ -581,17 +689,63 @@ AVX_KERNEL(qsa_tail_store) {
         if (s < 0 || t < cu_at(cu, s + 1) - ring) continue;
         const int64_t si = ldi(sx, col0(sx, s));
         if (si < 0) continue;
-        if (si >= slots || ldi(po, offlin(po, t)) < 0) return RAD_E_INVAL;
-        w[2 * nw] = t;
-        w[2 * nw + 1] = si;
+        /* A tree row's ring row is its flat slot: the anchor's position plus the row's index. */
+        const int64_t p = tree_seq(sp, cu, s)
+                              ? ldi(po, offlin(po, cu_at(cu, s))) + (t - cu_at(cu, s))
+                              : ldi(po, offlin(po, t));
+        if (si >= slots || p < 0) return RAD_E_INVAL;
+        w[3 * nw] = t;
+        w[3 * nw + 1] = si;
+        w[3 * nw + 2] = p % ring;
         ++nw;
     }
     float* buf = scratch_f32((size_t)n);
     for (int64_t i = 0; i < nw; ++i) {
-        const int64_t t = w[2 * i], si = w[2 * i + 1];
-        const int64_t row = ldi(po, offlin(po, t)) % ring;
+        const int64_t t = w[3 * i], si = w[3 * i + 1];
+        const int64_t row = w[3 * i + 2];
         widen(k, t * k->stride[0], k->stride[1], n, buf);
         narrow(st, si * st->stride[0] + row * st->stride[2], st->stride[3], n, buf);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_tail_compact */
+/* After a tree verify: tail rows (base_prev + t) % ring = (base_prev + spec_path[s][t]) % ring for
+ * t = 1 .. num_accepted - 1 ascending, base_prev = pos[cu[s]] - num_accepted[s] (libref's
+ * ref_qsa_tail_compact has the full statement, including what is skipped and refused). The moves
+ * are validated first and run serially in libref's order, so an in-place chain reads what it
+ * must. */
+AVX_KERNEL(qsa_tail_compact) {
+    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *po = &a->t[0], *cu = &a->t[1], *na = &a->t[2], *pa = &a->t[3];
+    const RadTensor *st = &a->t[4], *sx = &a->t[5];
+    const int64_t n = p_int(a, "n", 0), ring = p_int(a, "ring", 0);
+    if (n <= 0 || ring <= 0) return RAD_E_INVAL;
+    if (pa->rank != 2 || st->rank != 4 || st->shape[1] != 1) return RAD_E_SHAPE;
+    const int64_t slots = st->shape[0], n_seq = numel(cu) - 1;
+    if (n_seq <= 0 || st->shape[2] < ring || st->shape[3] != n) return RAD_E_SHAPE;
+    if (numel(na) < n_seq || pa->shape[0] < n_seq) return RAD_E_SHAPE;
+    if ((sx->rank >= 2 ? sx->shape[0] : numel(sx)) < n_seq) return RAD_E_SHAPE;
+    struct Mv { int64_t slot, from, to; };
+    std::vector<Mv> mv;
+    for (int64_t s = 0; s < n_seq; ++s) {
+        const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+        const int64_t acc = ldi(na, offlin(na, s)), si = ldi(sx, col0(sx, s));
+        if (t1 <= t0 || acc < 2 || si < 0) continue;
+        if (si >= slots || t0 < 0 || t0 >= numel(po)) return RAD_E_INVAL;
+        const int64_t bp = ldi(po, offlin(po, t0)) - acc;
+        if (bp < 0) continue;
+        if (acc > pa->shape[1]) return RAD_E_SHAPE;
+        for (int64_t t = 1; t < acc; ++t) {
+            const int64_t pt = ldi(pa, s * pa->stride[0] + t * pa->stride[1]);
+            if (pt < t || pt >= ring) return RAD_E_INVAL;
+            if (pt != t) mv.push_back({ si, (bp + pt) % ring, (bp + t) % ring });
+        }
+    }
+    float* buf = scratch_f32((size_t)n);
+    for (const Mv& e : mv) {
+        widen(st, e.slot * st->stride[0] + e.from * st->stride[2], st->stride[3], n, buf);
+        narrow(st, e.slot * st->stride[0] + e.to * st->stride[2], st->stride[3], n, buf);
     }
     return RAD_OK;
 }
@@ -609,6 +763,9 @@ AVX_KERNEL(qsa_work) {
     const RadTensor *tl = rad_arg_in(a, 3), *sx = rad_arg_in(a, 4), *bt = rad_arg_in(a, 5);
     const RadTensor *rp = rad_arg_in(a, 6), *stg = rad_arg_in(a, 7), *pg = rad_arg_in(a, 8);
     const RadTensor *bp = rad_arg_in(a, 9), *nc = rad_arg_in(a, 10);
+    const RadTensor *sp = rad_arg_in(a, 11), *na = rad_arg_in(a, 12), *sst = rad_arg_in(a, 13);
+    const RadTensor *spg = rad_arg_in(a, 14), *sbp = rad_arg_in(a, 15), *rtb = rad_arg_in(a, 16);
+    const RadTensor *rnc = rad_arg_in(a, 17), *rcu = rad_arg_in(a, 18);
     if (!k || !po || !cu || !tl || !sx || !bt || !stg || !pg || !bp || !nc) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
     if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
@@ -632,6 +789,18 @@ AVX_KERNEL(qsa_work) {
         return RAD_E_SHAPE;
     }
     if (rp && (rp->rank != 2 || rp->shape[0] < 3 || rp->shape[1] < T)) return RAD_E_SHAPE;
+    if (na && numel(na) < n_seq) return RAD_E_SHAPE;
+    const bool scr = sp != nullptr;
+    if (scr != (sst && spg && sbp && rtb && rnc && rcu) ||
+        (!scr && (sst || spg || sbp || rtb || rnc || rcu)))
+        return RAD_E_INVAL;
+    if (scr) {
+        if (rp) return RAD_E_UNSUPPORTED;
+        if (numel(sp) < T || sst->rank != 2 || sst->shape[0] < T * ratio || sst->shape[1] != n ||
+            numel(spg) < T || numel(sbp) < T || rtb->rank != 2 || rtb->shape[0] < T ||
+            numel(rnc) < T || numel(rcu) < T + 1)
+            return RAD_E_SHAPE;
+    }
     for (int64_t t = 0; t < T; ++t)
         if (ldi(po, offlin(po, t)) < 0) return RAD_E_INVAL;
 
@@ -642,8 +811,25 @@ AVX_KERNEL(qsa_work) {
         const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
         if (t1 <= t0) continue;
         if (t0 < 0 || t1 > T) return RAD_E_SHAPE;
-        const int64_t p0 = ldi(po, offlin(po, t0)), p1 = ldi(po, offlin(po, t1 - 1));
-        for (int64_t b = p0 / ratio; b <= (p1 + 1) / ratio - 1; ++b) {
+        const bool tree = tree_seq(sp, cu, s);
+        if (tree) {
+            const int rc = tree_check(sp, po, cu, s);
+            if (rc < 0) return rc;
+        }
+        const int64_t p0 = ldi(po, offlin(po, t0));
+        const int64_t p1 = tree ? p0 : ldi(po, offlin(po, t1 - 1));
+        int64_t lo = p0 / ratio;
+        if (na && ldi(na, offlin(na, s)) >= 2) {
+            const int64_t x = p0 - ldi(na, offlin(na, s)) - ratio + 2;
+            lo = std::min(lo, x <= 0 ? (int64_t)0 : (x + ratio - 1) / ratio);
+        }
+        if (tree) {
+            const int64_t b0 = p0 / ratio;
+            for (int64_t x = t0; x < t1; ++x)
+                if ((ldi(po, offlin(po, x)) + 1) / ratio - b0 > rtb->shape[1]) return RAD_E_SHAPE;
+            if (ldi(sx, col0(sx, s)) >= slots) return RAD_E_INVAL;
+        }
+        for (int64_t b = lo; b <= (p1 + 1) / ratio - 1; ++b) {
             if (ni >= mw) break;
             if (b >= bt->shape[1]) return RAD_E_SHAPE;
             const int64_t si = ldi(sx, col0(sx, s));
@@ -661,7 +847,9 @@ AVX_KERNEL(qsa_work) {
     for (int64_t s = 0; s < n_seq; ++s) {
         const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
         st_int_dt(nc->dtype, nc->data, offlin(nc, s),
-                  t1 > t0 ? (ldi(po, offlin(po, t1 - 1)) + 1) / ratio : 0);
+                  t1 <= t0 ? 0
+                  : tree_seq(sp, cu, s) ? ldi(po, offlin(po, t0)) / ratio
+                                        : (ldi(po, offlin(po, t1 - 1)) + 1) / ratio);
     }
     const int ncomp = rp ? 3 : 1;
     AVX_PARALLEL_FOR_IF(mw * ratio * n >= AVX_PAR_MIN)
@@ -694,6 +882,45 @@ AVX_KERNEL(qsa_work) {
             if (q >= p0) widen(k, (t0 + q - p0) * k->stride[0], k->stride[1], n, buf);
             else widen(tl, si * tl->stride[0] + (q % ring) * tl->stride[2], tl->stride[3], n, buf);
             narrow(stg, (w * ratio + i) * stg->stride[0], stg->stride[1], n, buf);
+        }
+    }
+    if (!scr) return RAD_OK;
+
+    /* The scratch items and the region tables, one per row (libref's ref_qsa_work, "TREE"). */
+    for (int64_t x = 0; x <= T; ++x) st_int_dt(rcu->dtype, rcu->data, offlin(rcu, x), x);
+    for (int64_t x = 0; x < T; ++x) {
+        st_int_dt(spg->dtype, spg->data, offlin(spg, x), -1);
+        st_int_dt(sbp->dtype, sbp->data, offlin(sbp, x), 0);
+        st_int_dt(rnc->dtype, rnc->data, offlin(rnc, x), 0);
+        for (int64_t i = 0; i < rtb->shape[1]; ++i)
+            st_int_dt(rtb->dtype, rtb->data, x * rtb->stride[0] + i * rtb->stride[1], -1);
+    }
+    float* sbuf = scratch_f32((size_t)n);
+    for (int64_t s = 0; s < n_seq; ++s) {
+        if (!tree_seq(sp, cu, s)) continue;
+        const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+        const int64_t p0 = ldi(po, offlin(po, t0)), si = ldi(sx, col0(sx, s)), b0 = p0 / ratio;
+        for (int64_t x = t0; x < t1; ++x) {
+            const int64_t px = ldi(po, offlin(po, x));
+            auto anc = [&](int64_t q) {
+                int64_t y = x;
+                while (ldi(po, offlin(po, y)) > q) y = tree_parent(sp, t0, y);
+                return y;
+            };
+            const int64_t nr = (px + 1) / ratio - b0;
+            st_int_dt(rnc->dtype, rnc->data, offlin(rnc, x), nr);
+            for (int64_t i = 0; i < nr; ++i)
+                st_int_dt(rtb->dtype, rtb->data, x * rtb->stride[0] + i * rtb->stride[1],
+                          anc((b0 + i) * ratio + ratio - 1));
+            if ((px + 1) % ratio != 0 || si < 0) continue;
+            st_int_dt(spg->dtype, spg->data, offlin(spg, x), x);
+            st_int_dt(sbp->dtype, sbp->data, offlin(sbp, x), px - ratio + 1);
+            for (int64_t i = 0; i < ratio; ++i) {
+                const int64_t q = px - ratio + 1 + i;
+                if (q >= p0) widen(k, anc(q) * k->stride[0], k->stride[1], n, sbuf);
+                else widen(tl, si * tl->stride[0] + (q % ring) * tl->stride[2], tl->stride[3], n, sbuf);
+                narrow(sst, (x * ratio + i) * sst->stride[0], sst->stride[1], n, sbuf);
+            }
         }
     }
     return RAD_OK;

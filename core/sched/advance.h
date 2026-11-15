@@ -27,6 +27,9 @@
 
 namespace rad {
 
+/* The most leaves a serial tree adds (the first round's top-8 minus its pick). */
+enum { kAdvMaxLeaves = 8 };
+
 /* One sequence slot's state between passes. The accept step writes it; every later pass reads it. */
 struct StepSlot {
     int32_t ctx;      /* the next verify step's first position: tokens committed so far */
@@ -53,6 +56,12 @@ struct StepSlot {
      * (RadBatch::anchor_rows): LiLiCorr's correlator reads the context state there. */
     int32_t hrow;
     int32_t pad[1];
+    /* A serial head's tree, stage 1 (RadDrafterDecl::tree_leaves): the first round's runner-up
+     * candidates, taken by ADV_ROUND (round 2) or ADV_TAKE (one round) before the next pass
+     * overwrites the proposal buffer, already filtered (in range, not the pick, no duplicates).
+     * `nalt` of them; ADV_TAKE hangs them off the bonus token behind the chain. */
+    int32_t nalt;
+    int32_t alt[kAdvMaxLeaves];
 };
 
 enum AdvMode : int32_t {
@@ -67,6 +76,9 @@ enum AdvMode : int32_t {
     /* A tree drafter (rad_drafter_tree), whose verify rows are a tree rather than a chain: */
     ADV_CTXTREE = 8,  /* before the context pass: the accepted path's rows at their depth, the
                        * rejected rows stored nowhere */
+    /* A serial drafter's tree (RadDrafterDecl::tree_nodes), grown by the plugin's head (stage 2,
+     * tree_width > 1): */
+    ADV_ROUND_TREE = 9, /* before draft round `round` >= 2: the frontier rows the last pass chose */
 };
 
 /* The most paged KV groups one ADV_COMPACT moves (the trunk's sliding and global groups and a
@@ -151,7 +163,8 @@ struct AdvanceArgs {
     int32_t shared_kv = 0;
     int32_t rot_shift = 0;
     /* A tree drafter (rad_drafter_tree). ADV_BTAKE: the proposal's parents plane, row i's from
-     * i * src_pitch as the tokens are; null for a chain drafter. */
+     * i * src_pitch as the tokens are; null for a chain drafter. ADV_ROUND_TREE: the parents of
+     * the frontier rows the last pass chose, as node ids, from the same row of the plane. */
     const int32_t* par = nullptr;
     /* ADV_TRUNK: RadBatch::spec_parent [n_tok] in the slab, or -1 when the build stages none.
      * A tree row's entry is its parent's row within the sequence's block (-1 for the bonus
@@ -160,6 +173,23 @@ struct AdvanceArgs {
     /* ADV_COMPACT: every paged group's cache on this rank. */
     AdvPool pool[kAdvMaxPools] = {};
     int32_t n_pool = 0;
+    /* A serial drafter's tree (RadDrafterDecl::tree_nodes; 0 for every other drafter, and then
+     * every field below is unused):
+     *   tree_nodes  N, the verify's node budget. ADV_TAKE (after round `round`) publishes the
+     *               chain 1..round and min(leaves, N - round) leaves hanging off node 0.
+     *   leaves      L: ADV_ROUND (round 2) / ADV_TAKE (round 1) capture the proposal row's
+     *               columns 1..pitch-1 into StepSlot::alt until L valid ones are held; ADV_TAKE
+     *               pads a short list with copies of the chain's first token (a sibling the walk
+     *               never takes, so the node count stays the one the host planned the step by).
+     *   vocab       an id at or past it is not a candidate.
+     *   width       ADV_ROUND_TREE: the frontier rows a sequence's pass carries. */
+    int32_t tree_nodes = 0;
+    int32_t leaves = 0;
+    int32_t vocab = 0;
+    int32_t width = 1;
+    /* ADV_TRUNK: RadBatch::spec_path, [n_seq, path_pitch] in the slab (-1: none staged). */
+    int64_t path_off = -1;
+    int32_t path_pitch = 0;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */

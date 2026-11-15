@@ -111,6 +111,7 @@ set(R4D_UNITS
   "r4d_gdn_conv_w4_h128_bf16|"
   "r4d_gdn_kkt_solve_k128_c64_bf16|"
   "r4d_gdn_recurrent_update_k128_v128_bf16_fp32state|"
+  "r4d_kv_window_compact|"
   "r4d_gdn_gated_rmsnorm_h128_bf16|"
   # The hyper-connection gated residual (in place of pre-norm plus residual add). hc_read is two
   # launches behind one entry point: the mix depends on every column of the low-rank waist, so it

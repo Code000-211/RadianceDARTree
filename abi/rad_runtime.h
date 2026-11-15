@@ -363,6 +363,18 @@ typedef struct RadBatch {
      * context state at the anchor (LiLiCorr) gathers it there; the query rows themselves sit past
      * that position. Null on every other pass. */
     const int32_t* anchor_rows;
+    /* ---- appended (tree verification of a serial drafter) */
+    /* [n_seq, spec_path_pitch] device; null when no sequence of this step follows a tree verify.
+     * Row s lists the rows of the PREVIOUS step's verify block that were committed, in order:
+     * entry 0 is 0 (the anchor), entries 1..num_accepted[s]-1 are the accepted nodes' rows. For
+     * a chain (or a prefill handover) it is the identity 0, 1, 2, ... so a consumer may always
+     * read it when it is non-null. Entries from num_accepted[s] on are the identity too, and mean
+     * nothing. The core writes it on the card (ADV_TRUNK, from the acceptance of the step before,
+     * which the host has not read yet) and stages the identity for a row the host built.
+     * Consumers: the linear state's replay and window commit, the QSA tail's compaction and block
+     * key heal, a rolling token window. */
+    const int32_t* spec_path;
+    int32_t        spec_path_pitch;   /* >= max_spec + 1 */
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

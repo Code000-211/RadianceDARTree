@@ -137,6 +137,64 @@ static const RadOperandSpec oAttnPagedTree[] = {
     { "spec_parent", RAD_OPD_IN,  0 },
 };
 
+/* attn_paged_tree_sel (docs/OPS.md): attn_paged's parameters plus `sel_pitch`, then its eight
+ * operands with the block table read as the row's page list (`sel`) and `seqused` as its page
+ * count (`nsel`), then the tree's own. libref's schema field for field. The gated forms follow
+ * attn_paged_gate_quant's parameters (pAttnPagedGq) and operands, the tree's behind the scales. */
+static const RadParamSpec pAttnPagedTreeSel[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8"), P_INT("sel_pitch"),
+};
+static const RadOperandSpec oAttnPagedTreeSel[] = {
+    { "q",           RAD_OPD_IN,  0 },
+    { "kv_cache",    RAD_OPD_IN,  0 },
+    { "sel",         RAD_OPD_IN,  0 },
+    { "nsel",        RAD_OPD_IN,  0 },
+    { "k_descale",   RAD_OPD_IN,  1 },
+    { "v_descale",   RAD_OPD_IN,  1 },
+    { "cu_seqlens",  RAD_OPD_IN,  1 },
+    { "out",         RAD_OPD_OUT, 0 },
+    { "vmask",       RAD_OPD_IN,  0 },
+    { "block_table", RAD_OPD_IN,  0 },
+    { "rb",          RAD_OPD_IN,  0 },
+    { "seq_cu",      RAD_OPD_IN,  1 },
+};
+static const RadParamSpec pAttnPagedTreeSelGq[] = {
+    P_INT("q_len"),
+    P_INT("head_dim"),
+    P_INT("gqa"),
+    P_INT("block_size"),
+    P_INT("causal"),
+    P_INT("window"),
+    P_STR("q_dtype"),
+    P_STR("kv_dtype"),
+    P_F64O("scale"),
+    P_INTO("max_ctx"),
+    P_INTO("n_head"),
+    { "max_seqs", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
+    P_INT("group"),
+    P_STR("act"),
+    P_INT("sel_pitch"),
+};
+static const RadOperandSpec oAttnPagedTreeSelGq[] = {
+    { "q",           RAD_OPD_IN,  0 },
+    { "kv_cache",    RAD_OPD_IN,  0 },
+    { "sel",         RAD_OPD_IN,  0 },
+    { "nsel",        RAD_OPD_IN,  0 },
+    { "k_descale",   RAD_OPD_IN,  1 },
+    { "v_descale",   RAD_OPD_IN,  1 },
+    { "cu_seqlens",  RAD_OPD_IN,  1 },
+    { "out",         RAD_OPD_OUT, 0 },
+    { "gate",        RAD_OPD_IN,  0 },
+    { "q8",          RAD_OPD_OUT, 0 },
+    { "q8_scale",    RAD_OPD_OUT, 0 },
+    { "vmask",       RAD_OPD_IN,  0 },
+    { "block_table", RAD_OPD_IN,  0 },
+    { "rb",          RAD_OPD_IN,  0 },
+    { "seq_cu",      RAD_OPD_IN,  1 },
+};
+
 /* attn_paged with a sink logit a query head, its own name so no kernel ignorant of it is chosen. */
 static const RadOperandSpec oAttnPagedSink[] = {
     { "q",           RAD_OPD_IN,     0 },
@@ -414,6 +472,10 @@ static const RadOperandSpec oGdnConvUpdate[] = {
     { "q",            RAD_OPD_OUT,    0 },
     { "k",            RAD_OPD_OUT,    0 },
     { "v",            RAD_OPD_OUT,    0 },
+    /* Tree verification (docs/OPS.md, "Tree verification of the delta net"): RadBatch::spec_parent
+     * and RadBatch::spec_path, optional so every other caller is unchanged. */
+    { "spec_parent",  RAD_OPD_IN,     1 },
+    { "spec_path",    RAD_OPD_IN,     1 },
 };
 
 static const RadParamSpec pGdnKktSolve[] = {
@@ -503,6 +565,10 @@ static const RadOperandSpec oGdnRecurrentUpdate[] = {
      * caller quantises separately (the prefill path). */
     { "o_q",          RAD_OPD_OUT,    1 },
     { "o_scale",      RAD_OPD_OUT,    1 },
+    /* Tree verification (docs/OPS.md, "Tree verification of the delta net"): RadBatch::spec_parent
+     * and RadBatch::spec_path, optional so every other caller is unchanged. */
+    { "spec_parent",  RAD_OPD_IN,     1 },
+    { "spec_path",    RAD_OPD_IN,     1 },
 };
 
 /* The decode convolution folded into the recurrent update. gdn_recurrent_update is the only
@@ -559,6 +625,10 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
     { "o",            RAD_OPD_OUT,    0 },
     { "o_q",          RAD_OPD_OUT,    1 },
     { "o_scale",      RAD_OPD_OUT,    1 },
+    /* Tree verification (docs/OPS.md, "Tree verification of the delta net"): RadBatch::spec_parent
+     * and RadBatch::spec_path, optional so every other caller is unchanged. */
+    { "spec_parent",  RAD_OPD_IN,     1 },
+    { "spec_path",    RAD_OPD_IN,     1 },
 };
 
 /* gdn_conv_recurrent_update with had_quant_act_i8g's codes of `o` (a rotated int8 out projection's
@@ -582,6 +652,22 @@ static const RadOperandSpec oGdnConvRecurrentUpdateHad[] = {
     { "o",            RAD_OPD_OUT,    0 },
     { "o_q",          RAD_OPD_OUT,    0 },
     { "o_scale",      RAD_OPD_OUT,    0 },
+    /* Tree verification (docs/OPS.md, "Tree verification of the delta net"): RadBatch::spec_parent
+     * and RadBatch::spec_path, optional so every other caller is unchanged. */
+    { "spec_parent",  RAD_OPD_IN,     1 },
+    { "spec_path",    RAD_OPD_IN,     1 },
+};
+
+/* Closes a rolling window over a tree verify's committed rows (r4d_kv_window_compact.hip). */
+static const RadParamSpec pKvWindowCompact[] = {
+    P_INT("off"),
+    P_STRO("dtype"),
+};
+static const RadOperandSpec oKvWindowCompact[] = {
+    { "cache",        RAD_OPD_INOUT,  0 },
+    { "state_idx",    RAD_OPD_IN,     0 },
+    { "num_accepted", RAD_OPD_IN,     0 },
+    { "spec_path",    RAD_OPD_IN,     0 },
 };
 
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
@@ -1371,8 +1457,23 @@ static const RadOperandSpec oQsaWork[] = {
     { "page",  RAD_OPD_OUT, 0 },
     { "bpos",  RAD_OPD_OUT, 0 },
     /* Complete blocks per sequence, needed by the scorer and the selection and computed here on
-     * the way, which saves a launch per layer per step. */
+     * the way, which saves a launch per layer per step. A tree sequence's is the committed
+     * blocks below the one holding its anchor. */
     { "nc",    RAD_OPD_OUT, 0 },
+    /* Tree verify and heal (docs/QSA.md, "Tree verify"). `spec_parent` (RadBatch::spec_parent)
+     * marks a sequence whose first row has parent -1 as a tree: it completes only its anchor's
+     * block, and every row gets a scratch block key and region tables, the six outputs below,
+     * which go together with it. `num_accepted` alone is the heal: the blocks the previous step's
+     * non-anchor committed tokens completed are rebuilt from the compacted tail first. The scratch
+     * items are launched after the `work` ones. */
+    { "spec_parent",  RAD_OPD_IN,  1 },
+    { "num_accepted", RAD_OPD_IN,  1 },
+    { "sstage",       RAD_OPD_OUT, 1 },   /* [T * ratio, n]: row x's scratch block's raw keys */
+    { "spage",        RAD_OPD_OUT, 1 },   /* [T]: x if row x completes a block, else -1 */
+    { "sbpos",        RAD_OPD_OUT, 1 },   /* [T]: that block's first token's position */
+    { "rtab",         RAD_OPD_OUT, 1 },   /* [T, RW]: scratch row of row x's region block i, or -1 */
+    { "rnc",          RAD_OPD_OUT, 1 },   /* [T]: how many region blocks row x's path completes */
+    { "rcu",          RAD_OPD_OUT, 1 },   /* [T + 1]: rcu[w] = w, for the per-row qsa_score */
 };
 
 /* `qsa_tail_store`, a new op whose schema this plugin fixes: it keeps the raw index keys of
@@ -1396,6 +1497,29 @@ static const RadOperandSpec oQsaTailStore[] = {
     { "cu",    RAD_OPD_IN,    0 },
     { "state", RAD_OPD_INOUT, 0 },
     { "sidx",  RAD_OPD_IN,    0 },
+    /* Optional: a tree verify. A row of a sequence whose first row has parent -1 is stored at its
+     * FLAT slot (pos[cu[s]] + row index) % ring, since siblings share a depth position. */
+    { "spec_parent", RAD_OPD_IN,  1 },
+};
+
+/* `qsa_tail_compact`, new: after a tree verify the accepted path moves from the flat ring rows the
+ * verify stored it at to the depth layout a sequential decode would have left, once a step before
+ * `qsa_work`. `num_accepted` and `spec_path` are the batch's (RadBatch::num_accepted, ::spec_path),
+ * `pos` the step's positions of which only each sequence's first row is read. */
+static const RadParamSpec pQsaTailCompact[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "ring",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",  RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaTailCompact[] = {
+    { "pos",          RAD_OPD_IN,    0 },
+    { "cu",           RAD_OPD_IN,    0 },
+    { "num_accepted", RAD_OPD_IN,    0 },
+    { "spec_path",    RAD_OPD_IN,    0 },
+    { "state",        RAD_OPD_INOUT, 0 },
+    { "sidx",         RAD_OPD_IN,    0 },
 };
 
 /* `qsa_select`, a new op whose schema this plugin fixes: it turns the scores into the page-id
@@ -1430,6 +1554,14 @@ static const RadOperandSpec oQsaSelect[] = {
      * per-sequence length as ordinary operands, so the sparse attention is the same op issued with
      * `sel` and this. Emitted here because it is one store of a value this kernel has. */
     { "seqused", RAD_OPD_OUT, 0 },
+    /* A tree verify (docs/QSA.md, "Tree verify"), all three together: a row of a sequence whose
+     * first row has parent -1 ranks the committed blocks and the region blocks its own path
+     * completes (`rscore`, [M, RW], from a second qsa_score over the scratch keys) as one list;
+     * `sel` then holds the committed pages taken and `vmask` bit k says whether the key at flat
+     * slot rb + k, rb = nc * ratio, is the row's to read. */
+    { "spec_parent", RAD_OPD_IN,  1 },
+    { "rscore",      RAD_OPD_IN,  1 },
+    { "vmask",       RAD_OPD_OUT, 1 },
 };
 
 /* `kv_resolve`: the residency map of a streamed KV group, between `qsa_select` and the attention
@@ -2324,6 +2456,7 @@ static const RadOperandSpec oPleConv[] = {
     { "has_init",     RAD_OPD_IN,     1 },
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
+    { "spec_parent",  RAD_OPD_IN,     1 },
 };
 /* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
 static const RadOperandSpec oPleConvBias[] = {
@@ -2377,6 +2510,7 @@ static const RadOperandSpec oNgramIds[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "ids",          RAD_OPD_OUT,    0 },
     { "ahead_ids",    RAD_OPD_OUT,    1 },
+    { "spec_parent",  RAD_OPD_IN,     1 },
 };
 
 /* ngram_ids' hash for each sequence's newest token on a draft head's pass (r4d_ngram_ids.hip). */
@@ -3348,7 +3482,11 @@ static const RadOpSchema kSchemas[] = {
            "then every input of the step -- so a next step that kept k tokens reads at k - 1. "
            "Absent, every token commits: the read is at offset zero and the last "
            "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
-           "`resid` absent drops the add and leaves the plain convolution."),
+           "`resid` absent drops the add and leaves the plain convolution. `spec_parent` (a tree "
+           "verify, decode half, needs `num_accepted`) makes the taps those of the row's "
+           "ANCESTORS -- k levels up, continuing into the committed window past the root -- and "
+           "leaves the window in row layout (input t at slot (width-1)*dilation - 1 + t) for "
+           "kv_window_compact."),
     SCHEMA("ple_conv_bias", pPleConv, oPleConvBias,
            "ple_conv with `b`, a per-channel bias added inside the silu: y[t] = resid[t] + "
            "silu(b[c] + sum_j w[c][j] * x[t - (width-1-j)*dilation]). At dilation one with no "
@@ -3375,7 +3513,10 @@ static const RadOpSchema kSchemas[] = {
            "prefill layout when it is not; a cold window is EOS and not zero. `ahead_ids` "
            "present: `tok` holds its row count more tokens after the step's, continuing the LAST "
            "sequence, and their ids -- as the step that runs them will compute them -- go there; "
-           "the window is the step's own."),
+           "the window is the step's own. `spec_parent` (a tree verify, needs `num_accepted`, "
+           "excludes `ahead_ids`) hashes each row's ANCESTORS' tokens -- parent, grandparent -- "
+           "continuing into the committed window past the root, and leaves the window in row "
+           "layout (token t at entry ngram - 2 + t) for kv_window_compact."),
     SCHEMA("logits_gemm_vocab", pLogitsVocab, oLogitsVocab,
            "logits[M, n_vocab] = x[M, n_embd] @ lm_head^T over a head stored as width classes of "
            "the vocabulary's rows: class i is a weight of rows<i> rows on this rank (w<i> its "
@@ -3460,6 +3601,18 @@ static const RadOpSchema kSchemas[] = {
            "ordinary causal row, else the row's parent's index within its sequence's rows (-1 for "
            "the block's first row). Inside the block such a row sees itself and its ancestors "
            "only, and its window is measured from the block's first position plus its depth."),
+    SCHEMA("attn_paged_tree_sel", pAttnPagedTreeSel, oAttnPagedTreeSel,
+           "attn_paged over a QSA tree verify's keys: per query row one softmax over the pages sel[row, "
+           "0..nsel[row]) (physical block ids, full pages) followed by the region keys 0..63 whose bit is "
+           "set in vmask[row] (i64 read as u64), region key k being logical position rb[seq] + k in the "
+           "sequence's block_table. A row of a plain causal prefix is bit-identical to attn_paged over the "
+           "same pages in order. Operands 4-6 (descales, cu_seqlens) stay absent; seq_cu [n_seq + 1] maps "
+           "rows to block_table rows, absent meaning an even split."),
+    SCHEMA("attn_paged_tree_sel_gate_quant", pAttnPagedTreeSelGq, oAttnPagedTreeSelGq,
+           "attn_paged_tree_sel followed by gate_quant_fp8 over its output, in the split-KV merge: "
+           "attn_paged_gate_quant's merge over attn_paged_tree_sel's rows."),
+    SCHEMA("attn_paged_tree_sel_gate_had_quant", pAttnPagedTreeSelGq, oAttnPagedTreeSelGq,
+           "attn_paged_tree_sel_gate_quant with gate_had_quant_i8g as the quantiser."),
     SCHEMA("attn_paged_gate_quant", pAttnPagedGq, oAttnPagedGq,
            "attn_paged followed by gate_quant_fp8 over its output, in the split-KV merge: each "
            "merged (token, head) row is gated, rounded, written to `out` and quantised to E4M3 "
@@ -3512,14 +3665,23 @@ static const RadOpSchema kSchemas[] = {
            "gating and the per-chunk gate cumsum."),
     SCHEMA("gdn_conv_update", pGdnConvUpdate, oGdnConvUpdate,
            "the same convolution for a decode step: a rolling speculative window over the conv "
-           "state cache, read at the slot the last ACCEPTED token left."),
+           "state cache, read at the slot the last ACCEPTED token left. spec_parent makes each "
+           "row's taps follow its ancestor chain; spec_path gathers the window's history through "
+           "the previous block's committed rows."),
     SCHEMA("gdn_kkt_solve", pGdnKktSolve, oGdnKktSolve,
            "A = (I + strict_lower(diag(beta) K K^T e^dg))^-1 per chunk."),
     SCHEMA("gdn_chunk_scan", pGdnChunkScan, oGdnChunkScan,
            "gated delta net chunked scan: WY recompute, state recurrence and output."),
     SCHEMA("gdn_recurrent_update", pGdnRecurrentUpdate, oGdnRecurrentUpdate,
            "gdn decode recurrent update against the paged state cache, one state written per "
-           "candidate token."),
+           "candidate token. spec_parent / spec_path (anchor form) verify a tree: every row "
+           "starts from its parent's state and the replay applies the previous block's committed "
+           "rows in path order."),
+    SCHEMA("kv_window_compact", pKvWindowCompact, oKvWindowCompact,
+           "closes a RAD_KV_CONV-layout window [slots, channels, entries] over the rows a tree "
+           "verify committed: for t = 1..num_accepted-1, ascending, entry off + spec_path[t] "
+           "moves to entry off + t for every channel of the sequence's slot; a chain is a "
+           "no-op."),
     SCHEMA("gdn_conv_recurrent_update", pGdnConvRecurrentUpdate, oGdnConvRecurrentUpdate,
            "gdn_conv_update followed by gdn_recurrent_update, with the convolution computed in "
            "the recurrent update's prologue: q, k and v never reach memory. Byte-identical to "
@@ -3809,6 +3971,15 @@ static const RadOpSchema kSchemas[] = {
            "has already passed, and a ring of `ratio` has overwritten the row it still owes. "
            "`state` is INOUT -- rows nothing targets keep what they held, which is the whole "
            "point across steps."),
+    SCHEMA("qsa_tail_compact", pQsaTailCompact, oQsaTailCompact,
+           "after a tree verify, put the accepted path where a sequential decode would have left "
+           "it: for t = 1 .. num_accepted-1 ascending, tail row (base_prev + t) % ring = row "
+           "(base_prev + spec_path[s][t]) % ring, base_prev = pos[cu[s]] - num_accepted[s]. A "
+           "verify stores node j at the FLAT row (base + j) % ring; siblings share a depth, so the "
+           "depth layout exists only for the path the core accepted. In place and ascending is "
+           "hazard free (path[t] >= t); NOT idempotent for a general path, so it runs once a step, "
+           "before qsa_work and qsa_tail_store. num_accepted < 2, no slot or no rows move "
+           "nothing."),
     SCHEMA("qsa_select", pQsaSelect, oQsaSelect,
            "the `topk` highest-scoring blocks of a query's history, as a PAGE-ID table the paged "
            "attention reads directly. The PARTIAL page -- `bt[nc]`, the tokens after the last "
@@ -4417,6 +4588,26 @@ static const RadConstraint cAttnDecodeGqH256G6Bs4Bf16[] = {
     C_GE("causal", 0), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
     C_EQ("group", 128), C_IN("act", "sigmoid"),
 };
+/* attn_paged_tree_sel, at the QSA layers' two ratios and page of 4 (r4d_attn_paged_gqa8.hip,
+ * G8_TSEL). One query row a launch row (q_len 1): the rows of a step each carry their own page
+ * list and mask, so there is no band. */
+#define R4D_TSEL_C(NAME, G, KV)                                                                \
+    static const RadConstraint NAME[] = {                                                      \
+        C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", G), C_EQ("block_size", 4),       \
+        C_EQ("causal", 1), C_LE("q_len", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),    \
+    };
+#define R4D_TSEL_GC(NAME, G, KV)                                                               \
+    static const RadConstraint NAME[] = {                                                      \
+        C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", G), C_EQ("block_size", 4),       \
+        C_EQ("causal", 1), C_LE("q_len", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),    \
+        C_EQ("group", 128), C_IN("act", "sigmoid"),                                            \
+    };
+R4D_TSEL_C(cTselG12Bf16, 12, "bf16") R4D_TSEL_C(cTselG12I8, 12, "i8")
+R4D_TSEL_C(cTselG6Bf16, 6, "bf16")   R4D_TSEL_C(cTselG6I8, 6, "i8")
+R4D_TSEL_GC(cTselGcG12Bf16, 12, "bf16") R4D_TSEL_GC(cTselGcG12I8, 12, "i8")
+R4D_TSEL_GC(cTselGcG6Bf16, 6, "bf16")   R4D_TSEL_GC(cTselGcG6I8, 6, "i8")
+#undef R4D_TSEL_C
+#undef R4D_TSEL_GC
 /* The i8 cache (int8 K and V, an f16 scale each per token and head) on the QSA layers' two ratios
  * and at gqa 8 with 16-token pages. */
 static const RadConstraint cAttnPrefillH256G12I8[] = {
@@ -5256,6 +5447,9 @@ static const RadConstraint cQsaWork[] = {
 
 static const RadConstraint cQsaTailStore[] = {
     C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cQsaTailCompact[] = {
+    C_GE("n", 1), C_GE("ring", 1), C_GE("seqs", 1), C_IN("dtype", "bf16"),
 };
 
 /* No dtype: every operand is f32 or i32. */
@@ -7542,6 +7736,140 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 /* The int8 cache on Flash-Next's QSA layers (gqa12 at one and two ranks, gqa6 with 4-token pages
  * at four) and at gqa 8: a token's row is 516 bytes (abi/rad_builder.h). */
+/* attn_paged_tree_sel and its gated merges (r4d_attn_paged_gqa8.hip, G8_TSEL): the QSA layers of a
+ * tree verify at both ratios and both cache dtypes. */
+{ "attn_tsel_h256_gqa12_bf16kv", "attn_paged_tree_sel", "attn",
+  "paged attention over each row's selected pages plus a vmask-selected region (a tree verify on a QSA layer), split-KV",
+  "head_dim 256, 12 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; no descales, no cu_seqlens",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselG12Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_h256_gqa12_bf16, r4d_rad_attn_tsel_h256_gqa12_bf16_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged_tree_sel },
+
+{ "attn_tsel_gq_h256_gqa12_bf16kv", "attn_paged_tree_sel_gate_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the fp8 quantiser in the merge",
+  "head_dim 256, 12 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, bf16 kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG12Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_gq_h256_gqa12_bf16, r4d_rad_attn_tsel_h256_gqa12_bf16_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_quant },
+
+{ "attn_tsel_ghq_h256_gqa12_bf16kv", "attn_paged_tree_sel_gate_had_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the rotated int8 quantiser in the merge",
+  "head_dim 256, 12 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, bf16 kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG12Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_ghq_h256_gqa12_bf16, r4d_rad_attn_tsel_h256_gqa12_bf16_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_had_quant },
+
+{ "attn_tsel_h256_gqa12_i8", "attn_paged_tree_sel", "attn",
+  "paged attention over each row's selected pages plus a vmask-selected region (a tree verify on a QSA layer), split-KV",
+  "head_dim 256, 12 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; no descales, no cu_seqlens",
+  "bf16 query, int8 (an f16 scale of K and of V per token and head) kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselG12I8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_h256_gqa12_i8, r4d_rad_attn_tsel_h256_gqa12_i8_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_tsel_gq_h256_gqa12_i8", "attn_paged_tree_sel_gate_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the fp8 quantiser in the merge",
+  "head_dim 256, 12 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, int8 (an f16 scale of K and of V per token and head) kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG12I8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_gq_h256_gqa12_i8, r4d_rad_attn_tsel_h256_gqa12_i8_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_quant },
+
+{ "attn_tsel_ghq_h256_gqa12_i8", "attn_paged_tree_sel_gate_had_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the rotated int8 quantiser in the merge",
+  "head_dim 256, 12 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, int8 (an f16 scale of K and of V per token and head) kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG12I8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_ghq_h256_gqa12_i8, r4d_rad_attn_tsel_h256_gqa12_i8_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_had_quant },
+
+{ "attn_tsel_h256_gqa6_bf16kv", "attn_paged_tree_sel", "attn",
+  "paged attention over each row's selected pages plus a vmask-selected region (a tree verify on a QSA layer), split-KV",
+  "head_dim 256, 6 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; no descales, no cu_seqlens",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselG6Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_h256_gqa6_bf16, r4d_rad_attn_tsel_h256_gqa6_bf16_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged_tree_sel },
+
+{ "attn_tsel_gq_h256_gqa6_bf16kv", "attn_paged_tree_sel_gate_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the fp8 quantiser in the merge",
+  "head_dim 256, 6 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, bf16 kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG6Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_gq_h256_gqa6_bf16, r4d_rad_attn_tsel_h256_gqa6_bf16_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_quant },
+
+{ "attn_tsel_ghq_h256_gqa6_bf16kv", "attn_paged_tree_sel_gate_had_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the rotated int8 quantiser in the merge",
+  "head_dim 256, 6 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, bf16 kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG6Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_ghq_h256_gqa6_bf16, r4d_rad_attn_tsel_h256_gqa6_bf16_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_had_quant },
+
+{ "attn_tsel_h256_gqa6_i8", "attn_paged_tree_sel", "attn",
+  "paged attention over each row's selected pages plus a vmask-selected region (a tree verify on a QSA layer), split-KV",
+  "head_dim 256, 6 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; no descales, no cu_seqlens",
+  "bf16 query, int8 (an f16 scale of K and of V per token and head) kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselG6I8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_h256_gqa6_i8, r4d_rad_attn_tsel_h256_gqa6_i8_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_tsel_gq_h256_gqa6_i8", "attn_paged_tree_sel_gate_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the fp8 quantiser in the merge",
+  "head_dim 256, 6 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, int8 (an f16 scale of K and of V per token and head) kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG6I8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_gq_h256_gqa6_i8, r4d_rad_attn_tsel_h256_gqa6_i8_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_quant },
+
+{ "attn_tsel_ghq_h256_gqa6_i8", "attn_paged_tree_sel_gate_had_quant", "attn",
+  "attn_paged_tree_sel with the output gate and the rotated int8 quantiser in the merge",
+  "head_dim 256, 6 queries per kv head, paged block 4, one query row a launch row, causal, no window; "
+  "sel pages then up to 64 region keys under a per-row u64 mask; sigmoid only, group 128, the gate 16-byte aligned with a pitch of 8, the codes 8-byte aligned",
+  "bf16 query, int8 (an f16 scale of K and of V per token and head) kv cache, bf16 out, quantised codes with an f32 scale per 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cTselGcG6I8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_tsel_ghq_h256_gqa6_i8, r4d_rad_attn_tsel_h256_gqa6_i8_scratch,
+  nullptr, nullptr,
+  nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_had_quant },
+
 { "attn_prefill_h256_gqa12_i8", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
   "head_dim 256, 12 queries per kv head, paged block 4, varlen",
@@ -8005,6 +8333,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGdnConvRecurrentUpdate), NOTUNE,
   nullptr, nullptr, r4d_rad_gdn_conv_recurrent_update_had },
+
+{ "kv_window_compact_any", "kv_window_compact", "gdn",
+  "a rolling conv-layout window closed over a tree verify's committed rows: entry off + t takes "
+  "the entry of row spec_path[t], ascending in place, one thread a (sequence, channel)",
+  "any window [slots, channels, entries] whose element is 1, 2, 4 or 8 bytes",
+  "i32 state_idx, num_accepted and spec_path; the entries are moved whole",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_window_compact },
 
 { "kda_update_k128_v128_bf16", "kda_update", "gdn", "per-channel KDA recurrence and candidate rollback",
   "heads 1..65535, K=V=128, prefill and verify", "bf16 activations, f32 gates and state",
@@ -9075,6 +9412,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaTailStore), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
   r4d_shape_qsa_tail_store },
+
+/* One workgroup per sequence; a thread owns whole columns, so the in-place ascending moves need no
+ * barrier. */
+{ "qsa_tail_compact_bf16", "qsa_tail_compact", "attn",
+  "after a tree verify, move the accepted path's raw index keys to the depth-ordered ring rows",
+  "any sequence count, any width and ring; the count comes off cu_seqlens at run time",
+  "i32 positions, cu_seqlens, num_accepted and spec_path; the bf16 tail updated in place",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaTailCompact), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_tail_compact, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_tail_compact },
 
 /* A four-digit radix select, one workgroup per query. Not a sort: attention is a softmax over a
  * set, and sorting 65536 scores per query per layer per step is too costly. The set is exact and
@@ -10905,7 +11253,8 @@ extern "C" int rad_kernel_chain(int i) {
         /* the sparse-attention layers' selection: the pages' work list and tail store, the block
          * keys, the WMMA score, the per-query select (its split forms stay plain), and the
          * norm-rope-gate producers in front of the selection and of the attention */
-        "qsa_work_bf16", "qsa_tail_store_bf16", "qsa_block_key_bf16", "qsa_score_bf16",
+        "qsa_work_bf16", "qsa_tail_store_bf16", "qsa_tail_compact_bf16", "qsa_block_key_bf16",
+        "qsa_score_bf16",
         "qsa_select_i32", "qk_norm_rope_gate",
         "qk_norm_rope_gate_kv_store_i8", "qk_norm_rope_gate_kv_store_bf16",
         /* ...and those layers' decode attention and its merge at Flash-Next's two geometries,

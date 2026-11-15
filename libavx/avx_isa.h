@@ -112,7 +112,7 @@ int         avx_par_force(int threads);
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_paged_sink)      X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
-    X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
+    X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           X(qsa_tail_compact)   \
     X(sam_attn)             \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
@@ -122,6 +122,7 @@ int         avx_par_force(int threads);
     /* ---- gated delta net */                                                                    \
     X(gdn_conv_prep)        X(gdn_conv_update)      X(gdn_kkt_solve)        X(gdn_chunk_scan)     \
     X(gdn_recurrent_update) X(gdn_conv_recurrent_update)                X(gdn_gated_rmsnorm)  \
+    X(kv_window_compact)                                                                          \
     /* ---- collectives */                                                                        \
     X(all_reduce)           X(all_gather)                                                         \
     /* ---- image generation */                                                                   \
@@ -154,7 +155,7 @@ int         avx_par_force(int threads);
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
     X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)          \
-    X(dflash_tree)          X(attn_paged_tree)      X(attn_paged_anchor_window)                   \
+    X(dflash_tree)          X(attn_paged_tree) X(attn_paged_tree_sel)      X(attn_paged_anchor_window)                   \
     X(dflash_markov_greedy) X(dflash_markov_greedy_f32)
 
 /* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link

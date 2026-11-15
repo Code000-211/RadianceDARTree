@@ -510,6 +510,215 @@ extern "C" int r4d_gdn_conv_update_w4_h128_bf16_f32wgt(
                                  N, H, Hg, K, V, width, max_query_len, stream);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tree verification (RadBatch::spec_parent / spec_path; docs/OPS.md, "Tree verification of the
+// delta net"). The sliding-window kernel above reads a row's three predecessors as the three rows
+// before it, which is a chain; a tree row's taps are its ancestors, and the committed window's
+// newest entries past the sequence's first row. So this kernel takes a row's window from its
+// ancestor chain, and reads the window's history through the previous step's committed rows:
+//
+//     spec_parent[row]   parent row within the sequence, -1 / -2 / anything not before the row
+//                        meaning "the row before it" (nothing for row 0): a row with no entry is
+//                        a chain row, so an all -2 plane is the chain.
+//     spec_path[n][t]    row of the previous block committed t-th. The buffer holds that block's
+//                        inputs at entry (width-2) + row, so the committed sequence is
+//                        [e_0 .. e_{width-3}, e_{width-2+path[0]}, e_{width-2+path[1]}, ...] and
+//                        the history is its last width-1 entries: for the chain (path[t] = t) the
+//                        read at num_accepted-1 and nothing else.
+//
+// The rewrite is the chain's (history tail, then this step's inputs at entry row + width-2), taken
+// from the gathered history, so the buffer is left in the chain layout whatever the tree was and
+// the next step may read it through spec_path again. Same arithmetic per output as the kernel
+// above (taps in order, cp_silu, bf16 rounding): a tree row is bit-identical to the same row of a
+// chain over its path. One tap load per row and tap: the rows are independent, so there is no
+// sliding register window, and the kernel is for the verify steps only (the chain keeps its own).
+// ---------------------------------------------------------------------------------------------
+__device__ __forceinline__ int cu_tree_parent(const int* __restrict__ spar, int bos, int r) {
+  const int p = spar ? spar[bos + r] : -2;
+  return (p >= 0 && p < r) ? p : (r > 0 ? r - 1 : -1);
+}
+
+template <int HPB, typename WT>
+__global__ __launch_bounds__(HPB * 32)
+void r4d_gdn_conv_update_tree_kernel(const unsigned short* __restrict__ x, long xpitch,
+                                     const WT* __restrict__ wgt,
+                                     const unsigned short* __restrict__ bias,
+                                     unsigned short* __restrict__ cstate,
+                                     long cs_seq, long cs_dim, long cs_tok, int state_len_max,
+                                     const int* __restrict__ cache_idx, long ci_stride,
+                                     const int* __restrict__ naccept,
+                                     const int* __restrict__ spar, const int* __restrict__ spath,
+                                     int ppitch,
+                                     unsigned short* __restrict__ q, unsigned short* __restrict__ k,
+                                     unsigned short* __restrict__ v,
+                                     const int* __restrict__ cu, int H, int Hg, int maxq)
+{
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int n = blockIdx.x;
+  const int bos = cu[n], slen = cu[n + 1] - bos;
+  if (slen <= 0) return;
+  const int slot = cache_idx[(size_t)n * ci_stride];
+  if (slot < 0) return;
+
+  const int off = naccept ? (naccept[n] - 1) : 0;
+  const int slen_eff = state_len_max - (maxq - slen);
+  const int unit = blockIdx.y * HPB + warp;
+  const int d0 = unit * CP_HD + lane * CP_DPL;
+
+  float wt[CP_W][CP_DPL], bs[CP_DPL];
+#pragma unroll
+  for (int c = 0; c < CP_DPL; ++c) {
+    const cp_taps<WT> w4 = *(const cp_taps<WT>*)(wgt + (size_t)(d0 + c) * CP_W);
+    const WT* ws = (const WT*)&w4;
+#pragma unroll
+    for (int i = 0; i < CP_W; ++i) wt[i][c] = cp_tap(ws[i]);
+    bs[c] = bias ? bf2f(bias[d0 + c]) : 0.0f;
+  }
+
+  const int csd = (int)cs_dim, cst = (int)cs_tok, xpi = (int)xpitch;
+  unsigned short* const sp = cstate + (size_t)slot * cs_seq + (size_t)d0 * cs_dim;
+  const unsigned short* const xrow = x + (size_t)bos * xpitch + d0;
+
+  // The committed history, gathered through spec_path (entries before the first row's input are
+  // read as they lie). Read before any write: the rewrite below is in place.
+  constexpr int VAL = CP_W - 2;
+  ushort4 hv[CP_ST];
+#pragma unroll
+  for (int i = 0; i < CP_ST; ++i) {
+    int e = off + i;
+    if (spath && e >= VAL) {
+      int pi = e - VAL;
+      pi = pi < ppitch ? pi : ppitch - 1;
+      e = VAL + spath[(size_t)n * ppitch + pi];
+    }
+    const unsigned short* hp = sp + (size_t)e * cst;
+    hv[i] = make_ushort4(hp[0], hp[csd], hp[2 * csd], hp[3 * csd]);
+  }
+
+  const int hq = unit, hk = unit - Hg, hvh = unit - 2 * Hg;
+  const int region = (unit < Hg) ? 0 : ((unit < 2 * Hg) ? 1 : 2);
+  unsigned short* op = (region == 2)
+      ? (v + ((size_t)bos * H + hvh) * CP_HD + lane * CP_DPL)
+      : ((region ? k : q) + ((size_t)bos * Hg + (region ? hk : hq)) * CP_HD + lane * CP_DPL);
+  const int ostep = (region == 2) ? H * CP_HD : Hg * CP_HD;
+
+  for (int t = 0; t < slen; ++t) {
+    // The ancestor chain of row t: tap CP_W-1-m reads the m-th ancestor; below the first row the
+    // chain runs into the window, newest history first (encoded -1 - e).
+    ushort4 raw[CP_W];
+    int a = t;
+#pragma unroll
+    for (int m = 0; m < CP_W; ++m) {
+      if (m) a = a >= 0 ? cu_tree_parent(spar, bos, a) : a - 1;
+      ushort4 r4;
+      if (a >= 0) {
+        r4 = *(const ushort4*)(xrow + (size_t)a * xpi);
+      } else {
+        // hv[CP_ST + a]: a static select over the history entries (a register array under a
+        // runtime index would go to scratch).
+        r4 = hv[0];
+#pragma unroll
+        for (int j = 1; j < CP_ST; ++j)
+          if (CP_ST + a == j) r4 = hv[j];
+      }
+      raw[CP_W - 1 - m] = r4;
+    }
+    unsigned short out[CP_DPL];
+#pragma unroll
+    for (int c = 0; c < CP_DPL; ++c) {
+      float acc = bs[c];
+#pragma unroll
+      for (int i = 0; i < CP_W; ++i) {
+        const ushort4 rv = raw[i];
+        const unsigned short u = (c == 0) ? rv.x : (c == 1) ? rv.y : (c == 2) ? rv.z : rv.w;
+        acc += wt[i][c] * bf2f(u);
+      }
+      out[c] = f2bf(cp_silu(acc));
+    }
+    *(ushort4*)op = make_ushort4(out[0], out[1], out[2], out[3]);
+    op += ostep;
+  }
+
+  // Rewrite the buffer in the chain layout: the gathered history's tail, then every input at entry
+  // row + VAL.
+  const int nh = slen_eff - slen < 0 ? 0 : (slen_eff - slen);
+#pragma unroll
+  for (int c = 0; c < CP_DPL; ++c) {
+    unsigned short* dst = sp + c * csd;
+#pragma unroll
+    for (int i = 0; i + 1 < CP_ST; ++i) {
+      const ushort4 hh = hv[i + 1];
+      if (i < nh && i < slen_eff)
+        dst[i * cst] = (c == 0) ? hh.x : (c == 1) ? hh.y : (c == 2) ? hh.z : hh.w;
+    }
+    for (int t = 0; t < slen; ++t) {
+      const int i = t + VAL;
+      if (i >= nh && i < slen_eff) dst[i * cst] = xrow[(size_t)t * xpi + c];
+    }
+  }
+}
+
+template <typename WT>
+static int cu_update_tree_launch(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+    long ci_stride, const void* num_accepted, const void* spec_parent, const void* spec_path,
+    int path_pitch, void* q, void* k, void* v, const void* cu,
+    int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream)
+{
+  if (K != CP_HD || V != CP_HD || width != CP_W) return -1;
+  const int units = 2 * Hg + H;
+  int hpb = 8;
+  while (hpb > 1 && (Hg % hpb || H % hpb)) hpb >>= 1;
+  while (hpb > 1 && (long)N * (units / hpb) < 256) hpb >>= 1;
+  dim3 grid(N, units / hpb), blk(hpb * 32);
+#define CUT_LAUNCH(P)                                                                         \
+  hipLaunchKernelGGL((r4d_gdn_conv_update_tree_kernel<P, WT>), grid, blk, 0,                  \
+                     (hipStream_t)stream,                                                     \
+                     (const unsigned short*)x, xpitch, (const WT*)wgt,                        \
+                     (const unsigned short*)bias, (unsigned short*)cstate, cs_seq, cs_dim,    \
+                     cs_tok, state_len_max, (const int*)cache_idx, ci_stride,                 \
+                     (const int*)num_accepted, (const int*)spec_parent, (const int*)spec_path,\
+                     path_pitch, (unsigned short*)q, (unsigned short*)k, (unsigned short*)v,  \
+                     (const int*)cu, H, Hg, max_query_len)
+  switch (hpb) {
+    case 8: CUT_LAUNCH(8); break;
+    case 4: CUT_LAUNCH(4); break;
+    case 2: CUT_LAUNCH(2); break;
+    default: CUT_LAUNCH(1); break;
+  }
+#undef CUT_LAUNCH
+  return (int)hipGetLastError();
+}
+
+// The tree/path form of r4d_gdn_conv_update_w4_h128_bf16 (a null spec_parent is the chain, a null
+// spec_path the identity); a separate entry so the shipped kernel's code is untouched.
+extern "C" int r4d_gdn_conv_update_tree_w4_h128_bf16(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+    long ci_stride, const void* num_accepted, const void* spec_parent, const void* spec_path,
+    int path_pitch, void* q, void* k, void* v, const void* cu,
+    int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream)
+{
+  return cu_update_tree_launch<unsigned short>(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim, cs_tok,
+                                               state_len_max, cache_idx, ci_stride, num_accepted,
+                                               spec_parent, spec_path, path_pitch, q, k, v, cu, N,
+                                               H, Hg, K, V, width, max_query_len, stream);
+}
+
+extern "C" int r4d_gdn_conv_update_tree_w4_h128_bf16_f32wgt(
+    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
+    long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
+    long ci_stride, const void* num_accepted, const void* spec_parent, const void* spec_path,
+    int path_pitch, void* q, void* k, void* v, const void* cu,
+    int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream)
+{
+  return cu_update_tree_launch<float>(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim, cs_tok,
+                                      state_len_max, cache_idx, ci_stride, num_accepted,
+                                      spec_parent, spec_path, path_pitch, q, k, v, cu, N, H, Hg, K,
+                                      V, width, max_query_len, stream);
+}
+
 // ============================================================== the plugin ABI entry points
 // Shared operand helpers: r4d_gdn_args.h. Operand enums use an OPD_ prefix because CP_W and CP_ST
 // are already kernel constants in this unit.
@@ -608,7 +817,8 @@ extern "C" int r4d_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
 
 /* ------------------------------------------------------------------ conv update */
 
-enum { CUP_X = 0, CUP_W, CUP_B, CUP_CSTATE, CUP_SIDX, CUP_NACC, CUP_CU, CUP_Q, CUP_K, CUP_V };
+enum { CUP_X = 0, CUP_W, CUP_B, CUP_CSTATE, CUP_SIDX, CUP_NACC, CUP_CU, CUP_Q, CUP_K, CUP_V,
+       CUP_SPAR, CUP_SPATH };
 
 extern "C" int r4d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
     if (gdn_dims_ok() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
@@ -649,6 +859,27 @@ extern "C" int r4d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
     if (w->dtype != RAD_BF16 && w->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     const auto update = w->dtype == RAD_F32 ? r4d_gdn_conv_update_w4_h128_bf16_f32wgt
                                             : r4d_gdn_conv_update_w4_h128_bf16;
+    const auto update_tree = w->dtype == RAD_F32 ? r4d_gdn_conv_update_tree_w4_h128_bf16_f32wgt
+                                                 : r4d_gdn_conv_update_tree_w4_h128_bf16;
+    /* Tree verification: `spec_parent` [T] makes every row convolve along its ancestor chain, and
+     * `spec_path` [N, pitch] gathers the window's history through the previous step's committed
+     * rows (see the tree kernel). Either alone is served; both absent is the chain, on the shipped
+     * kernel. The device cannot refuse what it reads, so the host bounds what it can (the planes'
+     * dtype and extents) and the kernel clamps a path index to the plane's pitch; a committed row
+     * beyond the window's depth is the caller's bug, as an out-of-range num_accepted is. */
+    const RadTensor* spar  = r4d_opt(a, CUP_SPAR);
+    const RadTensor* spath = r4d_opt(a, CUP_SPATH);
+    if (spar) {
+        R4D_DT(spar, RAD_I32);
+        if (spar->rank != 1 || spar->shape[0] < T) return R4D_NO(RAD_E_SHAPE);
+        if (!r4d_contig(spar)) return R4D_NO(RAD_E_STRIDE);
+    }
+    if (spath) {
+        R4D_DT(spath, RAD_I32);
+        if (spath->rank != 2 || spath->shape[0] < N || spath->shape[1] < 1)
+            return R4D_NO(RAD_E_SHAPE);
+        if (spath->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
+    }
 
     const int width = (int)r4d_geti_or(a, "conv_width", 4);
     /* state_len_max and max_query_len describe one window, so only one is free. The state cache
@@ -664,6 +895,15 @@ extern "C" int r4d_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
     const long long mql = state_len_max - (width - 2);
     if (width < 2 || mql < 1) return R4D_NO(RAD_E_SHAPE);
 
+    if (spar || spath)
+        return R4D_RAW(update_tree(
+            x->data, (long)xpitch, w->data, b ? b->data : nullptr, cst->data,
+            (long)cst->stride[0], (long)cst->stride[1], (long)cst->stride[2],
+            (int)state_len_max, sidx->data, (long)sidx->stride[0],
+            nacc ? nacc->data : nullptr, spar ? spar->data : nullptr,
+            spath ? spath->data : nullptr, spath ? (int)spath->stride[0] : 0,
+            q->data, k->data, v->data, cu->data,
+            N, (int)H, (int)Hg, (int)K, (int)V, width, (int)mql, s));
     return R4D_RAW(update(
         x->data, (long)xpitch, w->data, b ? b->data : nullptr, cst->data,
         (long)cst->stride[0], (long)cst->stride[1], (long)cst->stride[2],

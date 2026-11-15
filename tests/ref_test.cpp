@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1255,19 +1256,21 @@ TEST(op_vocabulary) {
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa", "grid_embed_cpe",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
-        "attn_paged_sink",
+        "attn_paged_sink", "attn_paged_tree_sel",
         "qk_norm_rope", "qsa_block_key",
         /* libr4d's row-form names, served by the base op's row. */
         "rmsnorm_rows", "rope_rows",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
-        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
+        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_tail_compact", "qsa_work", "kv_resolve",
+        "dflash_conv",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
         "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
+        "kv_window_compact",
         "all_reduce", "all_gather",
         "embed_lookup", "logits_gemm",
         "sample_penalties", "sample_dry", "sample_ngram_ban", "sample_temp", "sample_topk",
@@ -2685,6 +2688,272 @@ TEST(ple_conv_window_follows_the_committed_history) {
     }
 }
 
+/* ============================================================ the PLE ops over a verify tree
+ *
+ * Definition (docs/OPS.md, "Tree verification of the PLE ops"): a node's row is what a sequential
+ * decode of its root-to-node path computes in the same kernel. So every node of an explicit tree is
+ * compared, bit for bit, against the last row of a chain over that path run against a copy of the
+ * same committed window; and the window the tree step leaves is compacted by hand along an
+ * accepted path (what kv_window_compact does, `off` = ngram - 2 for the token window and
+ * (width-1)*dilation - 1 for the convolution's) and read by a following step, which must equal a
+ * fresh decode of the committed history. */
+namespace {
+
+/* Rows of `par` from the root to node r, in order. */
+std::vector<int64_t> tree_path(const std::vector<int64_t>& par, int64_t r) {
+    std::vector<int64_t> p;
+    for (int64_t c = r; c >= 0; c = par[(size_t)c] == -2 ? c - 1 : par[(size_t)c]) p.push_back(c);
+    return std::vector<int64_t>(p.rbegin(), p.rend());
+}
+
+T clone_t(const T& s) {
+    T c(s.t.dtype, std::vector<int64_t>(s.t.shape, s.t.shape + s.t.rank));
+    c.mem = s.mem;
+    return c;
+}
+
+/* Trees over a block of nine rows: a fork at the root, a three-deep branch, siblings at every
+ * depth, and a deep chain beyond the dilated conv's deepest tap (4 rows at width 3, dilation 2). */
+const std::vector<std::vector<int64_t>>& tree_shapes() {
+    static const std::vector<std::vector<int64_t>> v = {
+        { -1, 0, 1, 1, 0, 4, 5, 6, 0 },
+        { -1, 0, 0, 0, 0, 0, 0, 0, 0 },                 /* a star: every leaf at depth 1 */
+        { -1, 0, 1, 2, 3, 4, 5, 6, 7 },                 /* a chain: the plain op */
+        { -1, 0, 1, 2, 3, 4, 5, 3, 7 },                 /* deep, with a fork at 3 */
+        { -1, -2, -2, -2, -2, -2, -2, -2, -2 },         /* ordinary causal rows: a chain */
+    };
+    return v;
+}
+
+int ng_tree_launch(const NgK& K, const std::vector<int64_t>& tok, const std::vector<int64_t>* par,
+                   T& state, int64_t hini, int64_t nacc, T& ids) {
+    const int64_t M = (int64_t)tok.size();
+    T tt(RAD_I32, {M}); tt.n(tok);
+    T tc(RAD_I32, {2}); tc.n({ 0, M });
+    T ci(RAD_I32, {1}); ci.n({ 0 });
+    T hi(RAD_I32, {1}); hi.n({ hini });
+    T na(RAD_I32, {1}); na.n({ nacc });
+    T sp(RAD_I32, {M});
+    A b; b.t(tt).t(state).t(tc).t(K.tm).t(K.tv).t(K.to).t(ci).t(hi).t(na).t(ids).tnull();
+    if (par) { sp.n(*par); b.t(sp); }
+    b.i("M", M).i("heads", NgK::kHeads).i("ngram", NgK::kNgram).i("eos", NgK::kEos);
+    return run("ngram_ids", b);
+}
+
+std::vector<int64_t> ng_row2(const T& ids, int64_t r) {
+    std::vector<int64_t> row((size_t)NgK::kHeads);
+    for (int64_t h = 0; h < NgK::kHeads; ++h) row[(size_t)h] = ids.iat(r * NgK::kHeads + h);
+    return row;
+}
+
+}  /* namespace */
+
+TEST(ngram_ids_tree_rows_equal_their_sequential_paths) {
+    const NgK K;
+    const int64_t M = 9, W = NgK::kCtx - 1 + M;
+    /* Token streams: plain, and with the EOS inside the tree. */
+    const std::vector<std::vector<int64_t>> toks = {
+        { 100, 101, 102, 103, 104, 105, 106, 107, 108 },
+        { 100, NgK::kEos, 102, 103, 104, NgK::kEos, 106, 107, 108 },
+    };
+    const std::vector<std::vector<int64_t>> prevs = { { 51, 52 }, { 51, NgK::kEos } };
+    for (const auto& par : tree_shapes())
+        for (const auto& tok : toks)
+            for (const auto& pv : prevs)
+                for (int64_t hini = 0; hini <= 1; ++hini) {
+                    /* Read at entry 2 (num_accepted = 3) of a window with stale slack around it. */
+                    T st(RAD_I32, {1, W});
+                    st.n({ 900, 901, pv[0], pv[1], 902, 903, 904, 905, 906, 907 });
+                    const T st0 = clone_t(st);
+                    T ids(RAD_I32, {M, NgK::kHeads});
+                    CHECK_OK(ng_tree_launch(K, tok, &par, st, hini, 3, ids));
+
+                    for (int64_t r = 0; r < M; ++r) {
+                        std::vector<int64_t> pt;
+                        for (int64_t q : tree_path(par, r)) pt.push_back(tok[(size_t)q]);
+                        T sc = clone_t(st0);
+                        T pids(RAD_I32, {(int64_t)pt.size(), NgK::kHeads});
+                        CHECK_OK(ng_tree_launch(K, pt, nullptr, sc, hini, 3, pids));
+                        CHECK(ng_row2(ids, r) == ng_row2(pids, (int64_t)pt.size() - 1));
+                    }
+
+                    /* The window is in row layout: the history shifted by one, then token t at
+                     * ctx - 1 + t whatever its parent. */
+                    CHECK_EQ(st.iat(0), hini ? pv[1] : NgK::kEos);
+                    for (int64_t t = 0; t < M; ++t)
+                        CHECK_EQ(st.iat(NgK::kCtx - 1 + t), tok[(size_t)t]);
+                }
+
+    /* An absent spec_parent and a chain one are the same op, bit for bit. */
+    for (const int shape : { 2, 4 }) {
+        const std::vector<int64_t> tok = toks[0];
+        T s0(RAD_I32, {1, W}), s1(RAD_I32, {1, W});
+        s0.n({ 900, 901, 51, 52, 1, 2, 3, 4, 5, 6 });
+        s1.mem = s0.mem;
+        T i0(RAD_I32, {M, NgK::kHeads}), i1(RAD_I32, {M, NgK::kHeads});
+        CHECK_OK(ng_tree_launch(K, tok, nullptr, s0, 1, 3, i0));
+        CHECK_OK(ng_tree_launch(K, tok, &tree_shapes()[(size_t)shape], s1, 1, 3, i1));
+        CHECK(i0.mem == i1.mem);
+        CHECK(s0.mem == s1.mem);
+    }
+}
+
+TEST(ngram_ids_tree_window_compacts_to_the_committed_path) {
+    const NgK K;
+    const int64_t M = 9, W = NgK::kCtx - 1 + M, off = NgK::kNgram - 2;
+    const std::vector<int64_t> par = tree_shapes()[0];
+    const std::vector<int64_t> tok = { 100, 101, 102, 103, 104, 105, 106, 107, 108 };
+    /* Accept every root-to-node path, including the bare anchor (k = 1). */
+    for (int64_t last = 0; last < M; ++last) {
+        const std::vector<int64_t> path = tree_path(par, last);
+        const int64_t k = (int64_t)path.size();
+        T st(RAD_I32, {1, W});
+        st.n({ 900, 901, 51, 52, 1, 2, 3, 4, 5, 6 });
+        T ids(RAD_I32, {M, NgK::kHeads});
+        CHECK_OK(ng_tree_launch(K, tok, &par, st, 1, 3, ids));
+        /* kv_window_compact: entry off + path[t] -> off + t, ascending. */
+        for (int64_t t = 1; t < k; ++t)
+            st_int(st.t.dtype, st.t.data, off + t, st.iat(off + path[(size_t)t]));
+
+        /* The next step: one token, read at num_accepted = k. */
+        std::vector<int64_t> hist = { 51, 52 };
+        for (int64_t q : path) hist.push_back(tok[(size_t)q]);
+        hist.push_back(77);
+        T nid(RAD_I32, {1, NgK::kHeads});
+        CHECK_OK(ng_tree_launch(K, { 77 }, nullptr, st, 1, k, nid));
+        CHECK(ng_row2(nid, 0) == ng_fresh(K, hist));
+    }
+}
+
+TEST(ngram_ids_tree_refuses_what_it_cannot_serve) {
+    const NgK K;
+    const int64_t M = 4, W = NgK::kCtx - 1 + M;
+    const std::vector<int64_t> tok = { 1, 2, 3, 4 };
+    T ids(RAD_I32, {M, NgK::kHeads});
+    {   /* a child before its parent */
+        T st(RAD_I32, {1, W});
+        const std::vector<int64_t> bad = { -1, 2, 0, 0 };
+        CHECK_EQ(ng_tree_launch(K, tok, &bad, st, 1, 1, ids), RAD_E_INVAL);
+    }
+    {   /* without num_accepted there is no row layout to compact */
+        T st(RAD_I32, {1, W});
+        const std::vector<int64_t> good = { -1, 0, 0, 1 };
+        T tt(RAD_I32, {M}); tt.n(tok);
+        T tc(RAD_I32, {2}); tc.n({ 0, M });
+        T ci(RAD_I32, {1}); ci.n({ 0 });
+        T hi(RAD_I32, {1}); hi.n({ 1 });
+        T sp(RAD_I32, {M}); sp.n(good);
+        A a; a.t(tt).t(st).t(tc).t(K.tm).t(K.tv).t(K.to).t(ci).t(hi).tnull().t(ids).tnull().t(sp)
+             .i("M", M).i("heads", NgK::kHeads).i("ngram", NgK::kNgram).i("eos", NgK::kEos);
+        CHECK_EQ(run("ngram_ids", a), RAD_E_INVAL);
+    }
+}
+
+namespace {
+
+int pc_tree_launch(const PcK& K, const std::vector<int64_t>& tok, const std::vector<int64_t>* par,
+                   T& state, int64_t hini, int64_t nacc, T& y) {
+    const int64_t M = (int64_t)tok.size();
+    std::vector<float> xv;
+    for (int64_t t : tok)
+        for (int64_t c = 0; c < PcK::kN; ++c) xv.push_back(pc_x(t, c));
+    T x(RAD_F32, {M, PcK::kN}); x.f(xv);
+    T tc(RAD_I32, {2}); tc.n({ 0, M });
+    T ci(RAD_I32, {1}); ci.n({ 0 });
+    T hi(RAD_I32, {1}); hi.n({ hini });
+    T na(RAD_I32, {1}); na.n({ nacc });
+    T sp(RAD_I32, {M});
+    A a; a.t(x).t(K.w).t(state).t(tc).tnull().t(ci).t(hi).t(na).t(y);
+    if (par) { sp.n(*par); a.t(sp); }
+    a.i("M", M).i("n", PcK::kN).i("width", PcK::kWid).i("dilation", PcK::kDil).s("dtype", "f32");
+    return run("ple_conv", a);
+}
+
+}  /* namespace */
+
+TEST(ple_conv_tree_rows_equal_their_sequential_paths) {
+    const PcK K;
+    const int64_t M = 9, W = PcK::kHist - 1 + M;
+    /* A warm window from a committed prefill of six tokens, or a cold one. */
+    for (const auto& par : tree_shapes())
+        for (int64_t hini = 0; hini <= 1; ++hini) {
+            T st(RAD_F32, {1, PcK::kN, W});
+            {
+                T y0(RAD_F32, {6, PcK::kN});
+                CHECK_OK(pc_launch(K, { { 11, 12, 13, 14, 15, 16 } }, st, { 0 }, { 0 }, nullptr, y0));
+            }
+            const T st0 = clone_t(st);
+            const std::vector<int64_t> tok = { 21, 22, 23, 24, 25, 26, 27, 28, 29 };
+            T y(RAD_F32, {M, PcK::kN});
+            CHECK_OK(pc_tree_launch(K, tok, &par, st, hini, 1, y));
+
+            for (int64_t r = 0; r < M; ++r) {
+                std::vector<int64_t> pt;
+                for (int64_t q : tree_path(par, r)) pt.push_back(tok[(size_t)q]);
+                T sc = clone_t(st0);
+                T py(RAD_F32, {(int64_t)pt.size(), PcK::kN});
+                CHECK_OK(pc_tree_launch(K, pt, nullptr, sc, hini, 1, py));
+                CHECK(pc_row(y, r) == pc_row(py, (int64_t)pt.size() - 1));
+            }
+            /* Row layout: input t at slot hist - 1 + t of every channel. */
+            for (int64_t c = 0; c < PcK::kN; ++c)
+                for (int64_t t = 0; t < M; ++t)
+                    CHECK_EQ(st.at(c * W + PcK::kHist - 1 + t), pc_x(tok[(size_t)t], c));
+        }
+}
+
+TEST(ple_conv_tree_window_compacts_to_the_committed_path) {
+    const PcK K;
+    const int64_t M = 9, W = PcK::kHist - 1 + M, off = PcK::kHist - 1;
+    const std::vector<int64_t> par = tree_shapes()[0];
+    const std::vector<int64_t> tok = { 21, 22, 23, 24, 25, 26, 27, 28, 29 };
+    const std::vector<int64_t> committed = { 11, 12, 13, 14, 15, 16 };
+    for (int64_t last = 0; last < M; ++last) {
+        const std::vector<int64_t> path = tree_path(par, last);
+        const int64_t k = (int64_t)path.size();
+        T st(RAD_F32, {1, PcK::kN, W});
+        T y0(RAD_F32, {6, PcK::kN});
+        CHECK_OK(pc_launch(K, { committed }, st, { 0 }, { 0 }, nullptr, y0));
+        T y(RAD_F32, {M, PcK::kN});
+        CHECK_OK(pc_tree_launch(K, tok, &par, st, 1, 1, y));
+        /* kv_window_compact: entry off + path[t] -> off + t, every channel, ascending. */
+        for (int64_t c = 0; c < PcK::kN; ++c)
+            for (int64_t t = 1; t < k; ++t)
+                st_dt(st.t.dtype, st.t.data, c * W + off + t, st.at(c * W + off + path[(size_t)t]));
+
+        std::vector<int64_t> hist = committed;
+        for (int64_t q : path) hist.push_back(tok[(size_t)q]);
+        hist.push_back(77);
+        T ny(RAD_F32, {1, PcK::kN});
+        CHECK_OK(pc_tree_launch(K, { 77 }, nullptr, st, 1, k, ny));
+        CHECK(pc_row(ny, 0) == pc_fresh(K, hist));
+    }
+}
+
+TEST(ple_conv_tree_refuses_what_it_cannot_serve) {
+    const PcK K;
+    const int64_t M = 4, W = PcK::kHist - 1 + M;
+    const std::vector<int64_t> tok = { 1, 2, 3, 4 };
+    T y(RAD_F32, {M, PcK::kN});
+    {
+        T st(RAD_F32, {1, PcK::kN, W});
+        const std::vector<int64_t> bad = { -1, 2, 0, 0 };
+        CHECK_EQ(pc_tree_launch(K, tok, &bad, st, 1, 1, y), RAD_E_INVAL);
+    }
+    {   /* no num_accepted */
+        T st(RAD_F32, {1, PcK::kN, W});
+        const std::vector<int64_t> good = { -1, 0, 0, 1 };
+        std::vector<float> xv((size_t)(M * PcK::kN), 1.0f);
+        T x(RAD_F32, {M, PcK::kN}); x.f(xv);
+        T tc(RAD_I32, {2}); tc.n({ 0, M });
+        T sp(RAD_I32, {M}); sp.n(good);
+        A a; a.t(x).t(K.w).t(st).t(tc).tnull().tnull().tnull().tnull().t(y).t(sp)
+             .i("M", M).i("n", PcK::kN).i("width", PcK::kWid).i("dilation", PcK::kDil)
+             .s("dtype", "f32");
+        CHECK_EQ(run("ple_conv", a), RAD_E_INVAL);
+    }
+}
+
 TEST(op_cast) {
     T x(RAD_F32, {4}); x.f({2.5f, -1.5f, 200.0f, 1.4f});
     T y(RAD_I8, {4});
@@ -3466,6 +3735,191 @@ TEST(op_attn_paged_rows_before_the_context) {
     CHECK_NEAR(out.at(6), w0 / sum, 1e-6);
     CHECK_NEAR(out.at(7), 1.0f / sum, 1e-6);
 }
+
+/* attn_paged_tree_sel on an explicit tree. Five rows of one sequence over two kv heads (gqa 2,
+ * head_dim 8, page 4):
+ *
+ *   committed pages  physical blocks 3 and 5   (row 2 selected only block 3)
+ *   region           rb = 8, block table entries 2 and 3 -> physical blocks 1 and 0, so region
+ *                    key k lives in block (k < 4 ? 1 : 0), slot k % 4
+ *
+ *   row 0 anchor              vmask 0b00001   sees region key 0
+ *   row 1 child of 0          vmask 0b00011   0, 1
+ *   row 2 child of 0          vmask 0b00101   0, 2            (a sibling of row 1)
+ *   row 3 child of 1          vmask 0b01011   0, 1, 3
+ *   row 4 child of 3          vmask 0b11011   0, 1, 3, 4      (the path crosses a page)
+ *
+ * Two oracles. The test's own double-precision softmax over each row's explicit key list, and
+ * the claim the op exists for: a row computes what a sequential decode of its root->node path
+ * computes. The second is built by laying the path's keys contiguously in a fresh page and
+ * running attn_paged on a one-row sequence of (selected pages, that page), compared bit for bit.
+ * Keys are filled from a fixed stream, V included, so a wrong key or an off-by-one slot moves
+ * the output. */
+static void tree_sel_case(uint32_t kvdt) {
+    const int64_t HD = 8, G = 2, KVH = 2, NH = G * KVH, BS = 4, NB = 6, R = 5, PITCH = 3;
+    const bool i8 = kvdt == RAD_I8;
+    const int64_t row_el = i8 ? 2 * HD + 4 : 2 * HD;
+    const int64_t esz = i8 ? 1 : (int64_t)dt_bytes(kvdt, 1);
+    uint32_t rng = 12345u;
+    auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return ((rng >> 9) & 0x7fff) / 16384.0f - 1.0f; };
+
+    T kv(kvdt, {NB, KVH, BS, row_el});
+    for (int64_t tok = 0; tok < NB * KVH * BS; ++tok) {
+        if (i8) {
+            int8_t* c = (int8_t*)kv.t.data + tok * row_el;
+            for (int64_t d = 0; d < 2 * HD; ++d) c[d] = (int8_t)(int)std::lround(rnd() * 100.0f);
+            for (int h = 0; h < 2; ++h) {
+                const uint16_t s = f32_to_f16(0.01f + 0.01f * (rnd() + 1.0f));
+                std::memcpy((uint8_t*)c + 2 * HD + 2 * h, &s, 2);
+            }
+        } else {
+            for (int64_t d = 0; d < row_el; ++d) st_dt(kvdt, kv.t.data, tok * row_el + d, rnd());
+        }
+    }
+    T q(RAD_F32, {R, NH, HD});
+    for (int64_t i = 0; i < R * NH * HD; ++i) st_dt(RAD_F32, q.t.data, i, rnd() * 2.0f);
+
+    const int64_t selv[R][PITCH] = { {3, 5, 0}, {3, 5, 0}, {3, 0, 0}, {3, 5, 0}, {5, 3, 0} };
+    const int64_t nsv[R] = { 2, 2, 1, 2, 2 };
+    const int64_t vmv[R] = { 0x01, 0x03, 0x05, 0x0b, 0x1b };
+    T sel(RAD_I32, {R, PITCH}), nsel(RAD_I32, {R}), vm(RAD_I64, {R});
+    for (int r = 0; r < R; ++r) {
+        for (int i = 0; i < PITCH; ++i) st_int(RAD_I32, sel.t.data, r * PITCH + i, selv[r][i]);
+        st_int(RAD_I32, nsel.t.data, r, nsv[r]);
+        st_int(RAD_I64, vm.t.data, r, vmv[r]);
+    }
+    T bt(RAD_I32, {1, 4}); bt.n({0, 0, 1, 0});
+    T rb(RAD_I32, {1});    rb.n({8});
+    T out(RAD_F32, {R, NH, HD});
+    auto params = [&](A& a, int64_t qlen, bool tree) {
+        a.i("q_len", qlen).i("head_dim", HD).i("gqa", G).i("block_size", BS).i("causal", 1)
+         .i("window", 0).s("q_dtype", "f32").s("kv_dtype", kvdt == RAD_F32 ? "f32" : i8 ? "i8" : "bf16")
+         .i("n_head", NH);
+        if (tree) a.i("sel_pitch", PITCH);
+    };
+    A a; a.t(q).t(kv).t(sel).t(nsel).tnull().tnull().tnull().t(out).t(vm).t(bt).t(rb);
+    params(a, R, true);
+    REQUIRE_EQ(run("attn_paged_tree_sel", a), RAD_OK);
+
+    auto key_base = [&](int64_t blk, int64_t kh, int64_t slot) { return ((blk * KVH + kh) * BS + slot); };
+    auto kval = [&](int64_t tok, int64_t d, int half) -> double {
+        if (i8) {
+            const int8_t* c = (const int8_t*)kv.t.data + tok * row_el;
+            uint16_t s; std::memcpy(&s, (const uint8_t*)c + 2 * HD + 2 * half, 2);
+            return (double)c[half * HD + d] * (double)f16_to_f32(s);
+        }
+        return (double)kv.at(tok * row_el + half * HD + d);
+    };
+    /* Region key k's physical (block, slot). */
+    auto region = [&](int k) { return std::pair<int64_t, int64_t>(k < 4 ? 1 : 0, k % 4); };
+
+    for (int r = 0; r < R; ++r) {
+        std::vector<std::pair<int64_t, int64_t>> keys;
+        for (int i = 0; i < nsv[r]; ++i)
+            for (int t = 0; t < BS; ++t) keys.push_back({ selv[r][i], t });
+        for (int k = 0; k < 8; ++k) if ((vmv[r] >> k) & 1) keys.push_back(region(k));
+        for (int h = 0; h < NH; ++h) {
+            const int64_t kh = h / G;
+            std::vector<double> sc;
+            double mx = -1e300;
+            for (auto& kk : keys) {
+                double dot = 0;
+                for (int d = 0; d < HD; ++d)
+                    dot += (double)q.at((r * NH + h) * HD + d) * kval(key_base(kk.first, kh, kk.second), d, 0);
+                sc.push_back(dot / std::sqrt((double)HD));
+                mx = std::max(mx, sc.back());
+            }
+            double sum = 0;
+            std::vector<double> acc(HD, 0.0);
+            for (size_t j = 0; j < keys.size(); ++j) {
+                const double w = std::exp(sc[j] - mx);
+                sum += w;
+                for (int d = 0; d < HD; ++d)
+                    acc[d] += w * kval(key_base(keys[j].first, kh, keys[j].second), d, 1);
+            }
+            for (int d = 0; d < HD; ++d)
+                CHECK_NEAR(out.at((r * NH + h) * HD + d), acc[d] / sum, 2e-5);
+        }
+    }
+
+    /* The sequential decode of each row's root->node path: the path's region keys laid in order in
+     * block 4 (the cache's spare page), the selected pages before it, one query row, causal. */
+    for (int r = 0; r < R; ++r) {
+        T kv2(kvdt, {NB, KVH, BS, row_el});
+        std::memcpy(kv2.t.data, kv.t.data, (size_t)(NB * KVH * BS * row_el * esz));
+        int slot = 0;
+        for (int k = 0; k < 8; ++k) {
+            if (!((vmv[r] >> k) & 1)) continue;
+            const auto rk = region(k);
+            for (int64_t kh = 0; kh < KVH; ++kh)
+                std::memcpy((uint8_t*)kv2.t.data + (size_t)(key_base(4, kh, slot) * row_el * esz),
+                            (const uint8_t*)kv.t.data +
+                                (size_t)(key_base(rk.first, kh, rk.second) * row_el * esz),
+                            (size_t)(row_el * esz));
+            ++slot;
+        }
+        T tab(RAD_I32, {1, PITCH + 1}), su(RAD_I32, {1});
+        for (int i = 0; i < nsv[r]; ++i) st_int(RAD_I32, tab.t.data, i, selv[r][i]);
+        st_int(RAD_I32, tab.t.data, nsv[r], 4);
+        su.n({ nsv[r] * BS + slot });
+        T q1(RAD_F32, {1, NH, HD}), o1(RAD_F32, {1, NH, HD});
+        std::memcpy(q1.t.data, (const float*)q.t.data + r * NH * HD, sizeof(float) * NH * HD);
+        A b; b.t(q1).t(kv2).t(tab).t(su).tnull().tnull().tnull().t(o1);
+        params(b, 1, false);
+        REQUIRE_EQ(run("attn_paged", b), RAD_OK);
+        for (int e = 0; e < NH * HD; ++e) CHECK_EQ(o1.at(e), out.at(r * NH * HD + e));
+    }
+
+    /* Per-sequence rows: the same rows split over two sequences by seq_cu, the second with its own
+     * region base and table, give the same answers for the rows they share. */
+    {
+        T bt2(RAD_I32, {2, 4}); bt2.n({0, 0, 1, 0, 0, 0, 1, 0});
+        T rb2(RAD_I32, {2});    rb2.n({8, 8});
+        T cu(RAD_I32, {3});     cu.n({0, 2, 5});
+        T out2(RAD_F32, {R, NH, HD});
+        A c; c.t(q).t(kv).t(sel).t(nsel).tnull().tnull().tnull().t(out2).t(vm).t(bt2).t(rb2).t(cu);
+        params(c, R, true);
+        REQUIRE_EQ(run("attn_paged_tree_sel", c), RAD_OK);
+        for (int e = 0; e < R * NH * HD; ++e) CHECK_EQ(out2.at(e), out.at(e));
+        /* A region base of 4 shifts which block-table entries the bits name: key 0 is now entry 1
+         * (physical block 0), so row 0 no longer reads block 1. */
+        T rb3(RAD_I32, {2}); rb3.n({4, 8});
+        T out3(RAD_F32, {R, NH, HD});
+        A d; d.t(q).t(kv).t(sel).t(nsel).tnull().tnull().tnull().t(out3).t(vm).t(bt2).t(rb3).t(cu);
+        params(d, R, true);
+        REQUIRE_EQ(run("attn_paged_tree_sel", d), RAD_OK);
+        bool moved = false, same = true;
+        for (int e = 0; e < NH * HD; ++e) moved |= out3.at(e) != out.at(e);
+        for (int e = 2 * NH * HD; e < R * NH * HD; ++e) same &= out3.at(e) == out.at(e);
+        CHECK(moved);
+        CHECK(same);
+    }
+
+    /* Refusals: descales, a page count past the pitch, an unaligned region base, a bit past the
+     * table. */
+    {
+        T ds(RAD_F32, {1, KVH});
+        A e1; e1.t(q).t(kv).t(sel).t(nsel).t(ds).tnull().tnull().t(out).t(vm).t(bt).t(rb);
+        params(e1, R, true);
+        CHECK_EQ(run("attn_paged_tree_sel", e1), RAD_E_UNSUPPORTED);
+        T ns2(RAD_I32, {R}); ns2.n({2, 2, 4, 2, 2});
+        A e2; e2.t(q).t(kv).t(sel).t(ns2).tnull().tnull().tnull().t(out).t(vm).t(bt).t(rb);
+        params(e2, R, true);
+        CHECK_EQ(run("attn_paged_tree_sel", e2), RAD_E_INVAL);
+        T rb4(RAD_I32, {1}); rb4.n({6});
+        A e3; e3.t(q).t(kv).t(sel).t(nsel).tnull().tnull().tnull().t(out).t(vm).t(bt).t(rb4);
+        params(e3, R, true);
+        CHECK_EQ(run("attn_paged_tree_sel", e3), RAD_E_INVAL);
+        T vm2(RAD_I64, {R}); vm2.n({1, 1, 1, 1, (int64_t)1 << 20});
+        A e4; e4.t(q).t(kv).t(sel).t(nsel).tnull().tnull().tnull().t(out).t(vm2).t(bt).t(rb);
+        params(e4, R, true);
+        CHECK_EQ(run("attn_paged_tree_sel", e4), RAD_E_INVAL);
+    }
+}
+
+TEST(op_attn_paged_tree_sel_f32) { tree_sel_case(RAD_F32); }
+TEST(op_attn_paged_tree_sel_bf16) { tree_sel_case(RAD_BF16); }
+TEST(op_attn_paged_tree_sel_i8) { tree_sel_case(RAD_I8); }
 
 TEST(op_attn_dense) {
     const float sc = 1.0f / 1.41421356f;
@@ -9152,6 +9606,470 @@ TEST(qsa_work_gathers_completing_blocks_from_the_tail_and_the_batch) {
     for (int c = 0; c < 3; ++c) CHECK_EQ(bp3.iat(1 * 3 + c), 1000LL * (c + 1) + 1);
 }
 
+/* ================================================================== QSA tree verify
+ *
+ * A tree verify's rows must select what a sequential decode of their own root-to-node path selects
+ * (docs/QSA.md, "Tree verify"), and the committed state it leaves must be the sequential decode's.
+ * These tests build explicit trees and run the real op chain twice: once as a tree (qsa_tail_compact,
+ * qsa_work, the main and the scratch qsa_block_key, qsa_tail_store, the committed and the region
+ * qsa_score, qsa_select with the tree operands) and, per node, once as the ordinary chain over the
+ * node's path from the same starting state. Visible key sets are compared, not table order: a tree
+ * row names its committed pages in `sel` and its region keys in `vmask`, a chain row names all of
+ * them as pages. The block keys the two ways produce and the scores they give are compared bit for
+ * bit. The tree op parameters (topk, ratio) are small so contexts of a few dozen tokens are far
+ * above the exactness bound, and a key palette makes equal scores common so the tie rule decides. */
+namespace {
+
+struct Rng {
+    uint64_t s;
+    explicit Rng(uint64_t seed) : s(seed * 0x9E3779B97F4A7C15ull + 1) {}
+    uint32_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)(s >> 32); }
+    int below(int n) { return (int)(next() % (uint32_t)n); }
+};
+
+struct QWorld {
+    int64_t n = 8, heads = 2, ratio = 4, ring = 0, topk = 4, nbmax = 40, rot = 0, RW = 8;
+    int64_t work = 24;                       /* a launch's work-list capacity */
+    T tail, bkp, tab, wk;
+    QWorld(int64_t ring_, int64_t topk_, int64_t rot_)
+        : ring(ring_), topk(topk_), rot(rot_), tail(RAD_BF16, { 1, 1, ring_, 8 }),
+          bkp(RAD_BF16, { 40, 8 }), tab(RAD_I32, { 1, 40 }), wk(RAD_F32, { 8 }) {
+        std::vector<int64_t> id;
+        for (int64_t b = 0; b < nbmax; ++b) id.push_back(b);
+        tab.n(id);                           /* page id == block index, for both groups */
+        wk.f({ 1, 1, 1, 1, 1, 1, 1, 1 });
+        /* Unwritten pages and ring rows are recognisable. */
+        tail.f(std::vector<float>((size_t)(ring * n), -77.0f));
+        bkp.f(std::vector<float>((size_t)(nbmax * n), -55.0f));
+    }
+
+    A bkey(const T& k, const T& page, const T& bpos, T& out, int64_t M) const {
+        A a; a.t(k).t(wk).t(page).t(bpos).t(out).i("M", M).i("n", n).i("ratio", ratio)
+              .i("rotary_dim", rot).d("eps", 1e-6).d("theta", 1e4).d("scale", 1).d("wadd", 0)
+              .s("dtype", "bf16");
+        return a;
+    }
+};
+
+/* A key row from a palette of five vectors, or a fresh one. */
+std::vector<float> qkey(Rng& r, int64_t n, bool palette) {
+    std::vector<float> v((size_t)n);
+    if (palette) {
+        const int p = r.below(3);
+        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = (float)(((p + 1) * (int)(i + 1)) % 5 - 2);
+    } else {
+        for (int64_t i = 0; i < n; ++i) v[(size_t)i] = (float)(r.below(9) - 4) * 0.5f;
+    }
+    return v;
+}
+
+/* The ordinary chain over `K` (rows at consecutive positions from pos0): work, block keys, tail
+ * store, then score and select for every row. `Q` may be empty (no scoring). Returns the last
+ * row's selection. */
+struct ChainOut { std::vector<int64_t> sel; int64_t nsel = 0, su = 0; std::vector<float> score; int64_t nc = 0; };
+
+void qsa_chain(QWorld& w, const std::vector<std::vector<float>>& K,
+               const std::vector<std::vector<float>>& Q, int64_t pos0, bool score, ChainOut* outp) {
+    const int64_t R = (int64_t)K.size(), n = w.n, ratio = w.ratio;
+    const int64_t work = (R + ratio - 1) / ratio + 2;
+    T k(RAD_BF16, { R, n }), pos(RAD_I32, { R }), cu(RAD_I32, { 2 }), sx(RAD_I32, { 1, 1 });
+    std::vector<float> kv;
+    std::vector<int64_t> pv;
+    for (int64_t t = 0; t < R; ++t) { kv.insert(kv.end(), K[(size_t)t].begin(), K[(size_t)t].end()); pv.push_back(pos0 + t); }
+    k.f(kv); pos.n(pv); cu.n({ 0, R }); sx.n({ 0 });
+    T stage(RAD_BF16, { work * ratio, n }), page(RAD_I32, { work }), bpos(RAD_I32, { work }), nc(RAD_I32, { 1 });
+    A a; a.t(k).t(pos).t(cu).t(w.tail).t(sx).t(w.tab).tnull().t(stage).t(page).t(bpos).t(nc)
+          .i("M", R).i("n", n).i("ratio", ratio).i("ring", w.ring).i("seqs", 1).i("work", work)
+          .s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_work", a), RAD_OK);
+    A b = w.bkey(stage, page, bpos, w.bkp, work);
+    REQUIRE_EQ(run("qsa_block_key", b), RAD_OK);
+    A c; c.t(k).t(pos).t(cu).t(w.tail).t(sx).i("M", R).i("n", n).i("ratio", ratio).i("ring", w.ring)
+          .i("seqs", 1).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_tail_store", c), RAD_OK);
+    if (!score) return;
+    ChainOut& o = *outp;
+    o.nc = nc.iat(0);
+    T q(RAD_BF16, { R, w.heads * n }), sc(RAD_F32, { R, w.nbmax });
+    std::vector<float> qv;
+    for (int64_t t = 0; t < R; ++t) qv.insert(qv.end(), Q[(size_t)t].begin(), Q[(size_t)t].end());
+    q.f(qv);
+    A d; d.t(q).t(w.bkp).t(w.tab).t(cu).t(nc).t(sc).i("M", R).i("n", n).i("heads", w.heads)
+          .i("blocks", w.nbmax).i("seqs", 1).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_score", d), RAD_OK);
+    T se(RAD_I32, { R, w.topk + 1 }), ns(RAD_I32, { R }), su(RAD_I32, { R });
+    A e; e.t(sc).t(w.tab).t(nc).t(pos).t(cu).t(se).t(ns).t(su).i("M", R).i("blocks", w.nbmax)
+          .i("topk", w.topk).i("ratio", ratio).i("seqs", 1);
+    REQUIRE_EQ(run("qsa_select", e), RAD_OK);
+    const int64_t r = R - 1;
+    for (int64_t i = 0; i <= w.topk; ++i) o.sel.push_back(se.iat(r * (w.topk + 1) + i));
+    o.nsel = ns.iat(r); o.su = su.iat(r);
+    for (int64_t bk = 0; bk < w.nbmax; ++bk) o.score.push_back(sc.at(r * w.nbmax + bk));
+}
+
+/* Everything a tree step leaves for the attention and the checks. */
+struct TreeOut {
+    std::vector<std::vector<int64_t>> sel;      /* per row, topk + 1 */
+    std::vector<int64_t> nsel, su, vmask, nc;
+    std::vector<std::vector<float>> rscore;     /* per row, RW */
+    std::vector<int64_t> rnc;
+    std::vector<std::vector<float>> skey;       /* per row, n */
+    std::vector<int64_t> spage;
+};
+
+/* One tree verify step of one sequence: rows are nodes (row 0 the anchor), par[j] the parent,
+ * positions base + depth. `na`/`path` (null when absent) run the compaction first. */
+void qsa_tree_step(QWorld& w, const std::vector<std::vector<float>>& K,
+                   const std::vector<std::vector<float>>& Q, const std::vector<int64_t>& par,
+                   int64_t base, int64_t na, const std::vector<int64_t>* path, bool score,
+                   TreeOut* outp, int64_t work_cap = 0) {
+    const int64_t R = (int64_t)K.size(), n = w.n, ratio = w.ratio, RW = w.RW;
+    const int64_t work = work_cap ? work_cap : w.work;
+    std::vector<int64_t> depth((size_t)R, 0), pv, sv;
+    for (int64_t j = 0; j < R; ++j) {
+        depth[(size_t)j] = j ? depth[(size_t)par[(size_t)j]] + 1 : 0;
+        pv.push_back(base + depth[(size_t)j]);
+        sv.push_back(j ? par[(size_t)j] : -1);
+    }
+    T k(RAD_BF16, { R, n }), pos(RAD_I32, { R }), cu(RAD_I32, { 2 }), sx(RAD_I32, { 1, 1 }), sp(RAD_I32, { R });
+    std::vector<float> kv;
+    for (int64_t t = 0; t < R; ++t) kv.insert(kv.end(), K[(size_t)t].begin(), K[(size_t)t].end());
+    k.f(kv); pos.n(pv); cu.n({ 0, R }); sx.n({ 0 }); sp.n(sv);
+    T nav(RAD_I32, { 1 }); nav.n({ na });
+    T pth(RAD_I32, { 1, 16 });
+    if (path) { std::vector<int64_t> pp = *path; pp.resize(16, 0); pth.n(pp); }
+    if (path) {
+        A cmp; cmp.t(pos).t(cu).t(nav).t(pth).t(w.tail).t(sx).i("M", 1).i("n", n).i("ring", w.ring)
+                  .i("seqs", 1).s("dtype", "bf16");
+        REQUIRE_EQ(run("qsa_tail_compact", cmp), RAD_OK);
+    }
+    T stage(RAD_BF16, { work * ratio, n }), page(RAD_I32, { work }), bpos(RAD_I32, { work }), nc(RAD_I32, { 1 });
+    T sst(RAD_BF16, { R * ratio, n }), spg(RAD_I32, { R }), sbp(RAD_I32, { R });
+    T rtb(RAD_I32, { R, RW }), rnc(RAD_I32, { R }), rcu(RAD_I32, { R + 1 });
+    A a; a.t(k).t(pos).t(cu).t(w.tail).t(sx).t(w.tab).tnull().t(stage).t(page).t(bpos).t(nc)
+          .t(sp).t(nav).t(sst).t(spg).t(sbp).t(rtb).t(rnc).t(rcu)
+          .i("M", R).i("n", n).i("ratio", ratio).i("ring", w.ring).i("seqs", 1).i("work", work)
+          .s("dtype", "bf16");
+    if (!path) a.ts[12] = RadTensor{};            /* num_accepted absent: no heal */
+    REQUIRE_EQ(run("qsa_work", a), RAD_OK);
+    A b = w.bkey(stage, page, bpos, w.bkp, work);
+    REQUIRE_EQ(run("qsa_block_key", b), RAD_OK);
+    T skey(RAD_BF16, { R, n });
+    skey.f(std::vector<float>((size_t)(R * n), -33.0f));
+    A b2 = w.bkey(sst, spg, sbp, skey, R);
+    REQUIRE_EQ(run("qsa_block_key", b2), RAD_OK);
+    A c; c.t(k).t(pos).t(cu).t(w.tail).t(sx).t(sp).i("M", R).i("n", n).i("ratio", ratio)
+          .i("ring", w.ring).i("seqs", 1).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_tail_store", c), RAD_OK);
+    TreeOut& o = *outp;
+    o.nc.push_back(nc.iat(0));
+    for (int64_t j = 0; j < R; ++j) {
+        o.spage.push_back(spg.iat(j));
+        o.rnc.push_back(rnc.iat(j));
+        std::vector<float> sk;
+        for (int64_t d = 0; d < n; ++d) sk.push_back(skey.at(j * n + d));
+        o.skey.push_back(sk);
+    }
+    if (!score) return;
+    T q(RAD_BF16, { R, w.heads * n }), sc(RAD_F32, { R, w.nbmax }), rsc(RAD_F32, { R, RW });
+    std::vector<float> qv;
+    for (int64_t t = 0; t < R; ++t) qv.insert(qv.end(), Q[(size_t)t].begin(), Q[(size_t)t].end());
+    q.f(qv);
+    A d; d.t(q).t(w.bkp).t(w.tab).t(cu).t(nc).t(sc).i("M", R).i("n", n).i("heads", w.heads)
+          .i("blocks", w.nbmax).i("seqs", 1).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_score", d), RAD_OK);
+    A d2; d2.t(q).t(skey).t(rtb).t(rcu).t(rnc).t(rsc).i("M", R).i("n", n).i("heads", w.heads)
+            .i("blocks", RW).i("seqs", R).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_score", d2), RAD_OK);
+    T se(RAD_I32, { R, w.topk + 1 }), ns(RAD_I32, { R }), su(RAD_I32, { R }), vm(RAD_I64, { R });
+    A e; e.t(sc).t(w.tab).t(nc).t(pos).t(cu).t(se).t(ns).t(su).t(sp).t(rsc).t(vm)
+          .i("M", R).i("blocks", w.nbmax).i("topk", w.topk).i("ratio", ratio).i("seqs", 1);
+    REQUIRE_EQ(run("qsa_select", e), RAD_OK);
+    for (int64_t j = 0; j < R; ++j) {
+        std::vector<int64_t> s;
+        for (int64_t i = 0; i <= w.topk; ++i) s.push_back(se.iat(j * (w.topk + 1) + i));
+        o.sel.push_back(s);
+        o.nsel.push_back(ns.iat(j)); o.su.push_back(su.iat(j)); o.vmask.push_back(vm.iat(j));
+        std::vector<float> rs;
+        for (int64_t i = 0; i < RW; ++i) rs.push_back(rsc.at(j * RW + i));
+        o.rscore.push_back(rs);
+    }
+}
+
+/* A random tree of `R` rows. */
+std::vector<int64_t> qsa_rand_tree(Rng& r, int64_t R, int deep) {
+    std::vector<int64_t> par((size_t)R, -1);
+    std::vector<int64_t> depth((size_t)R, 0);
+    for (int64_t j = 1; j < R; ++j) {
+        for (int tries = 0;; ++tries) {
+            int64_t p = deep ? (j - 1 - r.below((int)std::min<int64_t>(j, 3))) : r.below((int)j);
+            if (tries > 6) p = r.below((int)j);          /* a deep chain ran out of shallow parents */
+            if (depth[(size_t)p] < 6) { par[(size_t)j] = p; depth[(size_t)j] = depth[(size_t)p] + 1; break; }
+        }
+    }
+    return par;
+}
+
+/* The tokens a chain row at `P` reads: its table's pages in full and the partial one up to P % ratio. */
+std::set<int64_t> qsa_chain_visible(const ChainOut& c, int64_t P, int64_t ratio) {
+    std::set<int64_t> v;
+    const bool partial = (P + 1) % ratio != 0;
+    for (int64_t e = 0; e < c.nsel; ++e) {
+        const int64_t pg = c.sel[(size_t)e];
+        const int64_t cnt = (partial && e == c.nsel - 1) ? P % ratio + 1 : ratio;
+        for (int64_t i = 0; i < cnt; ++i) v.insert(pg * ratio + i);
+    }
+    return v;
+}
+
+/* The tokens a tree row reads: its committed pages in full, then the region keys its mask names. */
+std::set<int64_t> qsa_tree_visible(const TreeOut& o, int64_t row, const std::vector<int64_t>& pos,
+                                   int64_t base, int64_t ratio) {
+    std::set<int64_t> v;
+    for (int64_t e = 0; e < o.nsel[(size_t)row]; ++e)
+        for (int64_t i = 0; i < ratio; ++i) v.insert(o.sel[(size_t)row][(size_t)e] * ratio + i);
+    const int64_t rb = base / ratio * ratio;
+    for (int k = 0; k < 64; ++k) {
+        if (!((o.vmask[(size_t)row] >> k) & 1)) continue;
+        if (rb + k < base) v.insert(rb + k);
+        else v.insert(pos[(size_t)(rb + k - base)]);   /* node j's position */
+    }
+    return v;
+}
+
+/* One scenario: a prefix of `base` tokens, a random tree, every node against its sequential path. */
+void qsa_tree_scenario(uint64_t seed, int64_t base, int64_t R, int64_t topk, int64_t rot, bool palette,
+                       int64_t ratio_unused, const char* tag, int* ties_seen) {
+    (void)ratio_unused;
+    Rng r(seed);
+    const int64_t ring = 4 + 12;
+    QWorld w(ring, topk, rot);
+    const int64_t n = w.n;
+    std::vector<std::vector<float>> pk;
+    for (int64_t t = 0; t < base; ++t) pk.push_back(qkey(r, n, palette));
+    qsa_chain(w, pk, {}, 0, false, nullptr);            /* the prefix, as a prefill */
+    const std::vector<uint8_t> tail0 = w.tail.mem, bk0 = w.bkp.mem;
+
+    std::vector<std::vector<float>> K, Q;
+    for (int64_t j = 0; j < R; ++j) {
+        K.push_back(qkey(r, n, palette));
+        std::vector<float> q;
+        for (int64_t h = 0; h < w.heads; ++h) { auto x = qkey(r, n, palette); q.insert(q.end(), x.begin(), x.end()); }
+        Q.push_back(q);
+    }
+    const std::vector<int64_t> par = qsa_rand_tree(r, R, seed & 1);
+    TreeOut o;
+    qsa_tree_step(w, K, Q, par, base, 0, nullptr, true, &o);
+
+    /* The verify wrote no committed page but the anchor's block. */
+    const int64_t first_open = base / w.ratio;
+    for (int64_t b = first_open + 1; b < w.nbmax; ++b)
+        CHECK_EQ(w.bkp.at(b * n), -55.0f);
+    CHECK_EQ(o.nc[0], first_open);
+
+    std::vector<int64_t> pos, depth((size_t)R, 0);
+    for (int64_t j = 0; j < R; ++j) {
+        depth[(size_t)j] = j ? depth[(size_t)par[(size_t)j]] + 1 : 0;
+        pos.push_back(base + depth[(size_t)j]);
+    }
+    for (int64_t x = 0; x < R; ++x) {
+        std::vector<int64_t> rows;
+        for (int64_t y = x; y >= 0; y = par[(size_t)y]) { rows.push_back(y); if (y == 0) break; }
+        std::reverse(rows.begin(), rows.end());
+        std::vector<std::vector<float>> pK, pQ;
+        for (int64_t y : rows) { pK.push_back(K[(size_t)y]); pQ.push_back(Q[(size_t)y]); }
+        std::memcpy(w.tail.mem.data(), tail0.data(), tail0.size());
+        std::memcpy(w.bkp.mem.data(), bk0.data(), bk0.size());
+        ChainOut c;
+        qsa_chain(w, pK, pQ, base, true, &c);
+        const int64_t P = pos[(size_t)x];
+        const int64_t ntot = (P + 1) / w.ratio;
+        const std::string what = std::string(tag) + " seed " + std::to_string(seed) + " node " + std::to_string(x);
+        /* The scratch block keys are the chain's committed ones. */
+        for (int64_t i = 0; i < o.rnc[(size_t)x]; ++i) {
+            const int64_t blk = first_open + i;
+            CHECK(o.rscore[(size_t)x][(size_t)i] == c.score[(size_t)blk]);
+            if (o.rscore[(size_t)x][(size_t)i] != c.score[(size_t)blk])
+                fprintf(stderr, "    %s: region score %lld differs\n", what.c_str(), (long long)blk);
+        }
+        CHECK_EQ(o.rnc[(size_t)x], ntot - first_open);
+        const auto cv = qsa_chain_visible(c, P, w.ratio);
+        const auto tv = qsa_tree_visible(o, x, pos, base, w.ratio);
+        CHECK(cv == tv);
+        if (cv != tv) fprintf(stderr, "    %s: visible sets differ (chain %zu tree %zu)\n", what.c_str(), cv.size(), tv.size());
+        /* Below the bound everything is selected. */
+        if (ntot <= topk) CHECK_EQ(o.nsel[(size_t)x] + (ntot - first_open), (int64_t)ntot);
+        else if (ties_seen) ++*ties_seen;
+        CHECK_EQ(o.su[(size_t)x], o.nsel[(size_t)x] * w.ratio);
+    }
+    /* A node whose block completes has a scratch key equal to the chain's committed page. */
+    for (int64_t x = 0; x < R; ++x) {
+        if ((pos[(size_t)x] + 1) % w.ratio != 0) { CHECK_EQ(o.spage[(size_t)x], -1LL); continue; }
+        CHECK_EQ(o.spage[(size_t)x], x);
+    }
+}
+
+}  /* namespace */
+
+/* Below the bound (every complete block fits in topk) a tree row's committed pages and region mask
+ * together are exactly what its sequential path reads, for every base alignment and tree shape. */
+TEST(qsa_tree_rows_equal_a_sequential_decode_below_the_bound) {
+    int tag = 0;
+    for (int64_t base = 17; base <= 22; ++base)        /* every alignment, anchor on a block end too */
+        for (uint64_t seed = 1; seed <= 3; ++seed)
+            qsa_tree_scenario(seed * 10 + (uint64_t)base, base, 11, 40, tag++ % 2 ? 4 : 0, false, 4,
+                              "below", nullptr);
+}
+
+/* Above it (topk 3 of ~10 blocks) the sets differ per row; ties are common with the palette (no
+ * rotation), and the tie rule, the union ranking and the region mask must still agree with the
+ * sequential decode's choice for every node. */
+TEST(qsa_tree_rows_equal_a_sequential_decode_above_the_bound) {
+    int above = 0;
+    for (int64_t base = 31; base <= 38; ++base)
+        for (uint64_t seed = 1; seed <= 4; ++seed)
+            for (int64_t topk : { 2, 3, 5 })
+                qsa_tree_scenario(seed * 100 + (uint64_t)base, base, 12, topk, seed % 2 ? 0 : 4,
+                                  seed % 2 == 1, 4, "above", &above);
+    CHECK(above > 100);
+}
+
+/* A chain through qsa_tree is the ordinary decode: parents j - 1, every row's vmask is its prefix. */
+TEST(qsa_tree_chain_rows_see_their_prefix_of_the_region) {
+    Rng r(5);
+    QWorld w(16, 64, 0);
+    std::vector<std::vector<float>> pk, K, Q;
+    for (int t = 0; t < 22; ++t) pk.push_back(qkey(r, w.n, false));
+    qsa_chain(w, pk, {}, 0, false, nullptr);
+    std::vector<int64_t> par = { -1, 0, 1, 2, 3, 4 };
+    for (int j = 0; j < 6; ++j) {
+        K.push_back(qkey(r, w.n, false));
+        std::vector<float> q;
+        for (int64_t h = 0; h < w.heads; ++h) { auto x = qkey(r, w.n, false); q.insert(q.end(), x.begin(), x.end()); }
+        Q.push_back(q);
+    }
+    TreeOut o;
+    qsa_tree_step(w, K, Q, par, 22, 0, nullptr, true, &o);
+    /* base 22: b0 = 5, region keys start at 20; row j reads slots 20, 21 and 22 .. 22 + j; every
+     * block is selected below the bound. */
+    for (int j = 0; j < 6; ++j) CHECK_EQ(o.vmask[(size_t)j], (int64_t)((1ull << (3 + j)) - 1));
+    CHECK_EQ(o.nsel[0], 5LL);
+}
+
+/* The heal: after a verify that accepted a path, the next step rebuilds the blocks the path's
+ * non-anchor tokens completed from the compacted tail, equal to what a sequential decode of the
+ * accepted tokens wrote (block keys and ring rows), and a verify itself commits nothing but its
+ * anchor's block. */
+TEST(qsa_tree_heal_rebuilds_the_accepted_paths_blocks_from_the_compacted_tail) {
+    for (int64_t base = 18; base <= 25; ++base)
+        for (uint64_t seed = 1; seed <= 4; ++seed) {
+            Rng r(seed * 7 + (uint64_t)base);
+            QWorld w(16, 4, 4);
+            const int64_t n = w.n;
+            std::vector<std::vector<float>> pk;
+            for (int64_t t = 0; t < base; ++t) pk.push_back(qkey(r, n, false));
+            qsa_chain(w, pk, {}, 0, false, nullptr);
+            const std::vector<uint8_t> tail0 = w.tail.mem, bk0 = w.bkp.mem;
+
+            const int64_t R = 12;
+            std::vector<std::vector<float>> K, Q;
+            for (int64_t j = 0; j < R; ++j) { K.push_back(qkey(r, n, false)); Q.push_back(std::vector<float>((size_t)(w.heads * n), 1.0f)); }
+            const std::vector<int64_t> par = qsa_rand_tree(r, R, 1);
+            /* The deepest node's path is accepted. */
+            std::vector<int64_t> depth((size_t)R, 0);
+            int64_t best = 0;
+            for (int64_t j = 1; j < R; ++j) { depth[(size_t)j] = depth[(size_t)par[(size_t)j]] + 1; if (depth[(size_t)j] > depth[(size_t)best]) best = j; }
+            std::vector<int64_t> path;
+            for (int64_t y = best; y >= 0; y = par[(size_t)y]) { path.push_back(y); if (y == 0) break; }
+            std::reverse(path.begin(), path.end());
+            const int64_t na = (int64_t)path.size();
+            TreeOut v1;
+            qsa_tree_step(w, K, Q, par, base, 0, nullptr, false, &v1);   /* the verify */
+
+            /* Sequential decode of the accepted tokens from the same starting state. */
+            const std::vector<uint8_t> tail1 = w.tail.mem, bk1 = w.bkp.mem;
+            std::memcpy(w.tail.mem.data(), tail0.data(), tail0.size());
+            std::memcpy(w.bkp.mem.data(), bk0.data(), bk0.size());
+            std::vector<std::vector<float>> PK;
+            for (int64_t y : path) PK.push_back(K[(size_t)y]);
+            qsa_chain(w, PK, {}, base, false, nullptr);
+            const std::vector<uint8_t> tailS = w.tail.mem, bkS = w.bkp.mem;
+
+            /* The next step: a tree of a bonus anchor and two children at base + na. */
+            std::memcpy(w.tail.mem.data(), tail1.data(), tail1.size());
+            std::memcpy(w.bkp.mem.data(), bk1.data(), bk1.size());
+            std::vector<std::vector<float>> K2, Q2;
+            for (int j = 0; j < 3; ++j) { K2.push_back(qkey(r, n, false)); Q2.push_back(std::vector<float>((size_t)(w.heads * n), 1.0f)); }
+            std::vector<int64_t> pth = path;
+            TreeOut v2;
+            qsa_tree_step(w, K2, Q2, { -1, 0, 0 }, base + na, na, &pth, false, &v2);
+
+            const std::string what = "heal base " + std::to_string(base) + " seed " + std::to_string(seed);
+            /* Every block complete below the new anchor equals the sequential decode's page. */
+            const int64_t last_blk = (base + na - 1 + 1) / w.ratio;       /* blocks [0, last_blk) */
+            for (int64_t b = 0; b < last_blk; ++b)
+                for (int64_t d = 0; d < n; ++d) {
+                    const float want = bf16_to_f32(((const uint16_t*)bkS.data())[b * n + d]);
+                    CHECK(w.bkp.at(b * n + d) == want);
+                    if (w.bkp.at(b * n + d) != want) {
+                        fprintf(stderr, "    %s: block %lld lane %lld\n", what.c_str(), (long long)b, (long long)d);
+                        break;
+                    }
+                }
+            /* The committed positions' ring rows hold the accepted tokens' raw keys. */
+            for (int64_t t = 0; t < na; ++t)
+                for (int64_t d = 0; d < n; ++d) {
+                    const int64_t row = (base + t) % w.ring;
+                    const float want = bf16_to_f32(((const uint16_t*)tailS.data())[row * n + d]);
+                    CHECK(w.tail.at(row * n + d) == want);
+                }
+        }
+}
+
+/* qsa_tail_compact by hand: node rows stored flat at (base_prev + j) % ring move to depth order,
+ * ascending in place; an identity path, a one-token commit and a sequence with no slot change
+ * nothing. */
+TEST(qsa_tail_compact_moves_the_accepted_path_to_depth_order) {
+    const int64_t n = 2, ring = 7, slots = 3;
+    std::vector<float> init;
+    for (int64_t s = 0; s < slots; ++s)
+        for (int64_t r = 0; r < ring; ++r) { init.push_back((float)(100 * s + r)); init.push_back((float)(-r)); }
+    T st(RAD_BF16, { slots, 1, ring, n }); st.f(init);
+    /* Sequence 0: slot 2, previous anchor at 9 (ring row 2), na 3, path 0, 2, 4: tail rows
+     * (9 + 2) % 7 = 4 -> (9 + 1) % 7 = 3, then (9 + 4) % 7 = 6 -> (9 + 2) % 7 = 4. Sequence 1: slot 0,
+     * na 1. Sequence 2: no slot. Sequence 3: identity path. */
+    T pos(RAD_I32, { 4 }); pos.n({ 12, 5, 20, 31 });
+    T cu(RAD_I32, { 5 }); cu.n({ 0, 1, 2, 3, 4 });
+    T na(RAD_I32, { 4 }); na.n({ 3, 1, 4, 3 });
+    T path(RAD_I32, { 4, 5 }); path.n({ 0, 2, 4, 0, 0,   0, 0, 0, 0, 0,   0, 1, 2, 3, 0,   0, 1, 2, 0, 0 });
+    T sx(RAD_I32, { 4, 1 }); sx.n({ 2, 0, -1, 1 });
+    A a; a.t(pos).t(cu).t(na).t(path).t(st).t(sx).i("M", 4).i("n", n).i("ring", ring).i("seqs", 4)
+          .s("dtype", "bf16");
+    CHECK_OK(run("qsa_tail_compact", a));
+    auto at = [&](int64_t s, int64_t r, int64_t d) { return st.at((s * ring + r) * n + d); };
+    CHECK_EQ(at(2, 3, 0), 200.0f + 4); CHECK_EQ(at(2, 4, 0), 200.0f + 6);
+    CHECK_EQ(at(2, 6, 0), 200.0f + 6); CHECK_EQ(at(2, 2, 0), 200.0f + 2);
+    CHECK_EQ(at(0, 0, 0), 0.0f); CHECK_EQ(at(1, 3, 0), 100.0f + 3);
+    /* A path entry past the ring is refused before any write. */
+    path.n({ 0, 2, 9, 0, 0 });
+    CHECK_EQ(run("qsa_tail_compact", a), RAD_E_INVAL);
+}
+
+/* qsa_tail_store stores a tree row at its flat slot, siblings at distinct rows. */
+TEST(qsa_tail_store_stores_tree_rows_at_their_flat_slots) {
+    const int64_t n = 2, ring = 8;
+    T k(RAD_BF16, { 4, n }); k.f({ 1, 1, 2, 2, 3, 3, 4, 4 });
+    T pos(RAD_I32, { 4 }); pos.n({ 10, 11, 11, 12 });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, 4 });
+    T st(RAD_BF16, { 1, 1, ring, n }); st.f(std::vector<float>((size_t)(ring * n), 0.0f));
+    T sx(RAD_I32, { 1, 1 }); sx.n({ 0 });
+    T sp(RAD_I32, { 4 }); sp.n({ -1, 0, 0, 1 });
+    A a; a.t(k).t(pos).t(cu).t(st).t(sx).t(sp).i("M", 4).i("n", n).i("ratio", 4).i("ring", ring)
+          .i("seqs", 1).s("dtype", "bf16");
+    CHECK_OK(run("qsa_tail_store", a));
+    for (int j = 0; j < 4; ++j) CHECK_EQ(st.at(((10 + j) % ring) * n), (float)(j + 1));
+}
+
 /* dflash_conv: tap 0 always, tap 1 only past a block's first row; each tap's coefficient is base
  * plus its group's delta, read from the first taps * NG columns of a twice-as-wide row. */
 TEST(dflash_conv_resets_its_taps_at_each_block) {
@@ -10163,6 +11081,10 @@ std::vector<Geo> geometries() {
                                          .i("block_size", 4).i("causal", 1).i("window", 0)
                                          .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
                                          .i("ctx", 9)),
+        G("attn_paged_tree_sel", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                             .i("block_size", 4).i("causal", 1).i("window", 0)
+                                             .s("q_dtype", "f32").s("kv_dtype", "f32")
+                                             .i("n_head", 4).i("ctx", 9).i("sel_pitch", 3)),
         G("attn_paged_sink", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                          .i("block_size", 4).i("causal", 0).i("window", 0)
                                          .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
@@ -10196,6 +11118,8 @@ std::vector<Geo> geometries() {
                                  .i("block_bytes", 8)),
         G("qsa_tail_store", "M", 4, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                                     .s("dtype", "bf16")),
+        G("qsa_tail_compact", "M", 4, a.i("M", R).i("n", 32).i("ring", 6).i("seqs", 2)
+                                      .s("dtype", "bf16")),
         G("qsa_work", "M", 6, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                               .i("work", 8).s("dtype", "bf16")),
         G("dflash_conv", "T", 6, a.i("T", R).i("hidden_size", 32).i("taps", 2).i("group_size", 16)
@@ -10247,6 +11171,8 @@ std::vector<Geo> geometries() {
                                                    .i("conv_width", 4).i("n_head_k", 1)
                                                    .i("n_head_v", 2)),
         G("gdn_gated_rmsnorm", "M", 3, a.i("M", R).i("channels", 8).d("eps", 1e-6).s("act", "silu")),
+        /* No row count: `off`, the window's write offset, sets the entries (off + 4). */
+        G("kv_window_compact", "off", 2, a.i("off", R).s("dtype", "f32")),
         G("all_reduce", "numel", 16, a.i("world_size", 1).i("numel", R).s("dtype", "f32")
                                      .i("exact", 1)),
         G("all_gather", "numel", 16, a.i("world_size", 1).i("numel", R).s("dtype", "f32")),
@@ -11221,4 +12147,398 @@ TEST(op_sam_attn_refuses_malformed_geometry) {
           .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
           .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
     CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
+}
+
+/* ================================================================== tree verification of the delta net
+ * gdn_conv_update, gdn_recurrent_update (anchor form) and the folded pair take `spec_parent` and
+ * `spec_path` (docs/OPS.md, "Tree verification of the delta net"). The oracle here is the op itself
+ * run sequentially: a tree row must equal the last row of a CHAIN decode of its root-to-row path,
+ * from the same committed state, bit for bit; and a step that follows a tree and is handed the
+ * accepted rows as `spec_path` must leave the caches, and give the outputs, of a chain that decoded
+ * exactly those rows. Heads are 16 x 16 (libref's anchor block then holds 7 rows' records), f32
+ * throughout, so every comparison is on bytes. */
+namespace {
+namespace gt {
+constexpr int64_t K = 16, V = 16, Hg = 1, Hv = 2, W = 4, CD = 2 * Hg * K + Hv * V;
+constexpr int64_t MAXR = 7;                    /* rows a 16 x 16 anchor block holds */
+constexpr int64_t DEPTH = W - 2 + MAXR;        /* conv window entries */
+
+struct Rows { std::vector<float> x, a, b, z; };
+
+uint32_t g_rs = 12345;
+float rnd() {
+    g_rs = g_rs * 1664525u + 1013904223u;
+    return (float)((int)(g_rs >> 9) % 2001 - 1000) / 1000.0f;
+}
+
+Rows gen(int n) {
+    Rows r;
+    r.x.resize((size_t)(n * CD)); r.a.resize((size_t)(n * Hv)); r.b.resize((size_t)(n * Hv));
+    r.z.resize((size_t)(n * Hv * V));
+    for (auto* v : { &r.x, &r.a, &r.b, &r.z }) for (auto& e : *v) e = rnd();
+    return r;
+}
+Rows pick(const Rows& s, const std::vector<int>& rows) {
+    Rows r;
+    for (int i : rows) {
+        r.x.insert(r.x.end(), s.x.begin() + i * CD, s.x.begin() + (i + 1) * CD);
+        r.a.insert(r.a.end(), s.a.begin() + i * Hv, s.a.begin() + (i + 1) * Hv);
+        r.b.insert(r.b.end(), s.b.begin() + i * Hv, s.b.begin() + (i + 1) * Hv);
+        r.z.insert(r.z.end(), s.z.begin() + i * Hv * V, s.z.begin() + (i + 1) * Hv * V);
+    }
+    return r;
+}
+
+T dup(const T& s) { T r = s; r.t.data = r.mem.data(); return r; }
+
+/* The layer's weights, fixed across a case. */
+struct Weights {
+    T w, alog, dtb, nw;
+    Weights() : w(RAD_F32, { CD, W }), alog(RAD_F32, { Hv }), dtb(RAD_F32, { Hv }),
+                nw(RAD_F32, { V }) {
+        std::vector<float> v((size_t)(CD * W));
+        for (auto& e : v) e = 0.5f * rnd();
+        w.f(v);
+        alog.f({ -2.0f, -1.75f }); dtb.f({ -1.0f, -0.5f });
+        std::vector<float> n((size_t)V);
+        for (auto& e : n) e = 1.0f + 0.25f * rnd();
+        nw.f(n);
+    }
+};
+const Weights& weights() { static Weights w; return w; }
+
+/* One sequence's caches: the conv window and the anchor state (slot 0; slot 1 the factors). */
+struct Cache {
+    T cs, st;
+    Cache() : cs(RAD_F32, { 1, CD, DEPTH }), st(RAD_F32, { 2, Hv, V, K }) {}
+};
+Cache fresh() {
+    Cache c;
+    std::vector<float> w((size_t)(CD * DEPTH)), s((size_t)(2 * Hv * V * K), 0.0f);
+    for (auto& e : w) e = rnd();
+    for (size_t i = 0; i < (size_t)(Hv * V * K); ++i) s[i] = 0.1f * rnd();
+    c.cs.f(w); c.st.f(s);
+    return c;
+}
+Cache dup(const Cache& c) { Cache r; r.cs = dup(c.cs); r.st = dup(c.st); return r; }
+
+T ivec(const std::vector<int>& v) {
+    T t(RAD_I32, { (int64_t)v.size() });
+    t.n(std::vector<int64_t>(v.begin(), v.end()));
+    return t;
+}
+T path_t(const std::vector<int>& v) {
+    T t(RAD_I32, { 1, (int64_t)v.size() });
+    t.n(std::vector<int64_t>(v.begin(), v.end()));
+    return t;
+}
+
+/* The folded op over n rows: parents / path null for a chain / no path. */
+int fused(Cache& c, const Rows& r, int n, const std::vector<int>* par,
+          const std::vector<int>* path, int nacc, T& o, const char* form = "anchor") {
+    const Weights& w = weights();
+    T x(RAD_F32, { n, CD }), a(RAD_F32, { n, Hv }), b(RAD_F32, { n, Hv }),
+      z(RAD_F32, { n, Hv, V });
+    x.f(r.x); a.f(r.a); b.f(r.b); z.f(r.z);
+    T cidx(RAD_I32, { 1 }); cidx.n({ 0 });
+    T sidx(RAD_I32, { 1, 6 }); sidx.n({ 0, 0, 0, 1, 1, 1 });
+    T na(RAD_I32, { 1 }); na.n({ nacc });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, n });
+    T sp = par ? ivec(*par) : T(RAD_I32, { 1 }), pp = path ? path_t(*path) : T(RAD_I32, { 1, 1 });
+    A f; f.t(x).t(w.w).tnull().t(c.cs).t(cidx).t(a).t(b).t(w.alog).t(w.dtb).t(c.st).t(sidx)
+          .t(na).t(cu).t(z).t(w.nw).t(o).tnull().tnull();
+    if (par) f.t(sp); else f.tnull();
+    if (path) f.t(pp); else f.tnull();
+    f.i("q_len", n).i("head_k", K).i("head_v", V).i("conv_width", W).i("n_head_v", Hv)
+     .d("scale", 0.25).d("eps", 1e-6).s("act", "silu").s("state_form", form);
+    return run("gdn_conv_recurrent_update", f);
+}
+
+/* The same as the pair: gdn_conv_update, then gdn_recurrent_update over its q, k and v. */
+int pair(Cache& c, const Rows& r, int n, const std::vector<int>* par,
+         const std::vector<int>* path, int nacc, T& o) {
+    const Weights& w = weights();
+    T x(RAD_F32, { n, CD }), a(RAD_F32, { n, Hv }), b(RAD_F32, { n, Hv }),
+      z(RAD_F32, { n, Hv, V });
+    x.f(r.x); a.f(r.a); b.f(r.b); z.f(r.z);
+    T cidx(RAD_I32, { 1 }); cidx.n({ 0 });
+    T sidx(RAD_I32, { 1, 6 }); sidx.n({ 0, 0, 0, 1, 1, 1 });
+    T na(RAD_I32, { 1 }); na.n({ nacc });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, n });
+    T q(RAD_F32, { n, Hg, K }), k(RAD_F32, { n, Hg, K }), v(RAD_F32, { n, Hv, V });
+    T sp = par ? ivec(*par) : T(RAD_I32, { 1 }), pp = path ? path_t(*path) : T(RAD_I32, { 1, 1 });
+    A cv; cv.t(x).t(w.w).tnull().t(c.cs).t(cidx).t(na).t(cu).t(q).t(k).t(v);
+    if (par) cv.t(sp); else cv.tnull();
+    if (path) cv.t(pp); else cv.tnull();
+    cv.i("q_len", n).i("head_k", K).i("head_v", V).i("conv_width", W);
+    int rc = run("gdn_conv_update", cv);
+    if (rc != RAD_OK) return rc;
+    A rr; rr.t(q).t(k).t(v).t(a).t(b).t(w.alog).t(w.dtb).t(c.st).t(sidx).t(na).t(cu).t(z)
+            .t(w.nw).t(o).tnull().tnull();
+    if (par) rr.t(sp); else rr.tnull();
+    if (path) rr.t(pp); else rr.tnull();
+    rr.i("q_len", n).i("head_k", K).i("head_v", V).i("n_head_v", Hv).d("scale", 0.25)
+      .d("eps", 1e-6).s("act", "silu").s("state_form", "anchor");
+    return run("gdn_recurrent_update", rr);
+}
+
+bool same_rows(const T& a, int ra, const T& b, int rb) {
+    const size_t n = (size_t)(Hv * V) * 4;
+    return std::memcmp(a.mem.data() + (size_t)ra * n, b.mem.data() + (size_t)rb * n, n) == 0;
+}
+/* Conv window entries [0, e) of every channel, and the anchor state slot, equal. */
+bool same_caches(const Cache& a, const Cache& b, int64_t entries) {
+    for (int64_t c = 0; c < CD; ++c)
+        for (int64_t e = 0; e < entries; ++e)
+            if (a.cs.at(c * DEPTH + e) != b.cs.at(c * DEPTH + e)) return false;
+    return std::memcmp(a.st.mem.data(), b.st.mem.data(), (size_t)(Hv * V * K) * 4) == 0;
+}
+
+/* Rows from the anchor (row 0) down to r. */
+std::vector<int> root_path(const std::vector<int>& par, int r) {
+    std::vector<int> p;
+    for (int x = r; x >= 0; x = par[x] < 0 ? (x > 0 ? x - 1 : -1) : par[x]) p.push_back(x);
+    return std::vector<int>(p.rbegin(), p.rend());
+}
+
+/* Every row of the tree equals the chain over its path, and every path committed through
+ * `spec_path` equals the chain that decoded just that path, followed by an ordinary step and by a
+ * tree step. */
+void tree_case(const std::vector<int>& par) {
+    const int R = (int)par.size();
+    const Rows rows = gen(R);
+    const Cache init = fresh();
+
+    Cache ct = dup(init);
+    T o_tree(RAD_F32, { R, Hv, V });
+    REQUIRE_EQ(fused(ct, rows, R, &par, nullptr, 1, o_tree), RAD_OK);
+
+    /* The pair agrees with the fold. */
+    {
+        Cache cp = dup(init);
+        T o_pair(RAD_F32, { R, Hv, V });
+        REQUIRE_EQ(pair(cp, rows, R, &par, nullptr, 1, o_pair), RAD_OK);
+        CHECK(o_pair.mem == o_tree.mem);
+        CHECK(cp.cs.mem == ct.cs.mem);
+        CHECK(cp.st.mem == ct.st.mem);
+    }
+
+    const Rows next = gen(3);
+    const std::vector<int> par2 = { -1, 0, 0, 1 };
+    const Rows next2 = gen(4);
+    for (int r = 0; r < R; ++r) {
+        const std::vector<int> path = root_path(par, r);
+        const int len = (int)path.size();
+        {   /* Row r is the last row of the chain over its path. */
+            Cache cq = dup(init);
+            T o_seq(RAD_F32, { len, Hv, V });
+            REQUIRE_EQ(fused(cq, pick(rows, path), len, nullptr, nullptr, 1, o_seq), RAD_OK);
+            CHECK(same_rows(o_tree, r, o_seq, len - 1));
+        }
+        /* Commit the path, then an ordinary chain step, then a tree step. */
+        for (int variant = 0; variant < 2; ++variant) {
+            const Rows& n2 = variant ? next2 : next;
+            const int n = variant ? 4 : 3;
+            const std::vector<int>* p2 = variant ? &par2 : nullptr;
+            Cache c1 = dup(ct);
+            T o2(RAD_F32, { n, Hv, V });
+            REQUIRE_EQ(fused(c1, n2, n, p2, &path, len, o2), RAD_OK);
+
+            Cache c0 = dup(init);
+            T o1(RAD_F32, { len, Hv, V }), o2s(RAD_F32, { n, Hv, V });
+            REQUIRE_EQ(fused(c0, pick(rows, path), len, nullptr, nullptr, 1, o1), RAD_OK);
+            REQUIRE_EQ(fused(c0, n2, n, p2, nullptr, len, o2s), RAD_OK);
+            CHECK(o2.mem == o2s.mem);
+            CHECK(same_caches(c1, c0, W - 2 + n));
+        }
+    }
+}
+}  /* namespace gt */
+}  /* namespace */
+
+/* A chain written as a tree (-2 on every row, or its explicit parents) is the chain. */
+TEST(gdn_tree_chain_is_the_plain_chain) {
+    const std::vector<int> chain = { -1, 0, 1, 2, 3 }, ord = { -1, -2, -2, -2, -2 };
+    const gt::Rows rows = gt::gen(5);
+    const gt::Cache init = gt::fresh();
+    T o0(RAD_F32, { 5, gt::Hv, gt::V }), o1 = gt::dup(o0), o2 = gt::dup(o0);
+    gt::Cache c0 = gt::dup(init), c1 = gt::dup(init), c2 = gt::dup(init);
+    CHECK_OK(gt::fused(c0, rows, 5, nullptr, nullptr, 1, o0));
+    CHECK_OK(gt::fused(c1, rows, 5, &chain, nullptr, 1, o1));
+    CHECK_OK(gt::fused(c2, rows, 5, &ord, nullptr, 1, o2));
+    CHECK(o0.mem == o1.mem);
+    CHECK(o0.mem == o2.mem);
+    CHECK(c0.cs.mem == c1.cs.mem);
+    CHECK(c0.st.mem == c1.st.mem);
+    CHECK(c0.st.mem == c2.st.mem);
+    gt::tree_case(chain);
+}
+
+/* Stage 1's shape: a chain of two, then three leaves off the anchor. */
+TEST(gdn_tree_root_fork_leaves_equal_their_sequential_paths) {
+    gt::tree_case({ -1, 0, 1, 0, 0, 0 });
+}
+
+/* A leaf under the anchor and under a chain node. */
+TEST(gdn_tree_leaves_at_two_depths) {
+    gt::tree_case({ -1, 0, 1, 2, 1, 0, 3 });
+}
+
+/* Two non-leaf children of the anchor, each with children of its own, and a non-leaf node whose
+ * children are one leaf and one non-leaf: the state a branch starts from is its parent's, not the
+ * last row's. */
+TEST(gdn_tree_two_nonleaf_children_equal_their_sequential_paths) {
+    gt::tree_case({ -1, 0, 1, 1, 0, 4, 4 });
+    gt::tree_case({ -1, 0, 0, 1, 2, 3, 4 });
+    gt::tree_case({ -1, 0, 1, 0, 3, 2, 4 });
+}
+
+/* The window follows the ancestor chain past the block's first row: a depth-1 node's taps are the
+ * anchor and the committed window, a depth-2 node's the node, the anchor and the window's newest. */
+TEST(gdn_tree_conv_taps_follow_the_ancestor_chain_and_the_window) {
+    const std::vector<int> par = { -1, 0, 0, 2, 2 };
+    const int R = 5;
+    const gt::Rows rows = gt::gen(R);
+    const gt::Cache init = gt::fresh();
+    gt::Cache c = gt::dup(init);
+    const gt::Weights& w = gt::weights();
+    T x(RAD_F32, { R, gt::CD }); x.f(rows.x);
+    T cidx(RAD_I32, { 1 }); cidx.n({ 0 });
+    T na(RAD_I32, { 1 }); na.n({ 1 });
+    T cu(RAD_I32, { 2 }); cu.n({ 0, R });
+    T q(RAD_F32, { R, gt::Hg, gt::K }), k(RAD_F32, { R, gt::Hg, gt::K }),
+      v(RAD_F32, { R, gt::Hv, gt::V });
+    T sp = gt::ivec(par);
+    A cv; cv.t(x).t(w.w).tnull().t(c.cs).t(cidx).t(na).t(cu).t(q).t(k).t(v).t(sp).tnull()
+          .i("q_len", R).i("head_k", gt::K).i("head_v", gt::V).i("conv_width", gt::W);
+    REQUIRE_EQ(run("gdn_conv_update", cv), RAD_OK);
+    /* Channel 5 (a q channel), by hand: window entries 0..2 are hist = [h0, h1, h2], read at
+     * num_accepted - 1 = 0. Row 3's chain is 3, 2, 0, then the window's newest, h2. */
+    const int64_t ch = 5;
+    auto xv = [&](int row) { return rows.x[(size_t)(row * gt::CD + ch)]; };
+    auto hist = [&](int i) { return init.cs.at(ch * gt::DEPTH + i); };
+    auto wt = [&](int j) { return w.w.at(ch * gt::W + j); };
+    auto silu = [](float a) { return a / (1.0f + std::exp(-a)); };
+    const float want3 = silu(((0.0f + wt(0) * hist(2)) + wt(1) * xv(0)) + wt(2) * xv(2) + wt(3) * xv(3));
+    CHECK_NEAR(q.at(3 * gt::K + ch), want3, 1e-5);
+    /* Row 1's chain is 1, 0, then the window's newest two: h2, h1. */
+    const float want1 = silu(((wt(0) * hist(1) + wt(1) * hist(2)) + wt(2) * xv(0)) + wt(3) * xv(1));
+    CHECK_NEAR(q.at(1 * gt::K + ch), want1, 1e-5);
+}
+
+/* The window left after a tree step is in the chain layout (raw input of row r at entry r + 2),
+ * whatever the tree, and the next step reads it through spec_path. */
+TEST(gdn_tree_conv_window_gather_equals_compaction) {
+    const std::vector<int> par = { -1, 0, 1, 0, 3, 3 };
+    const std::vector<int> path = { 0, 3, 5 };
+    const int R = 6;
+    const gt::Rows rows = gt::gen(R), next = gt::gen(3);
+    const gt::Weights& w = gt::weights();
+    gt::Cache c = gt::fresh();
+
+    auto conv = [&](gt::Cache& cc, const gt::Rows& r, int n, const std::vector<int>* sp,
+                    const std::vector<int>* pp, int nacc, T& q, T& k, T& v) {
+        T x(RAD_F32, { n, gt::CD }); x.f(r.x);
+        T cidx(RAD_I32, { 1 }); cidx.n({ 0 });
+        T na(RAD_I32, { 1 }); na.n({ nacc });
+        T cu(RAD_I32, { 2 }); cu.n({ 0, n });
+        T spt = sp ? gt::ivec(*sp) : T(RAD_I32, { 1 }), ppt = pp ? gt::path_t(*pp) : T(RAD_I32, { 1, 1 });
+        A a; a.t(x).t(w.w).tnull().t(cc.cs).t(cidx).t(na).t(cu).t(q).t(k).t(v);
+        if (sp) a.t(spt); else a.tnull();
+        if (pp) a.t(ppt); else a.tnull();
+        a.i("q_len", n).i("head_k", gt::K).i("head_v", gt::V).i("conv_width", gt::W);
+        return run("gdn_conv_update", a);
+    };
+    T q(RAD_F32, { R, gt::Hg, gt::K }), k(RAD_F32, { R, gt::Hg, gt::K }),
+      v(RAD_F32, { R, gt::Hv, gt::V });
+    REQUIRE_EQ(conv(c, rows, R, &par, nullptr, 1, q, k, v), RAD_OK);
+
+    /* Gathered through spec_path ... */
+    gt::Cache g = gt::dup(c);
+    T q1(RAD_F32, { 3, gt::Hg, gt::K }), k1(RAD_F32, { 3, gt::Hg, gt::K }),
+      v1(RAD_F32, { 3, gt::Hv, gt::V });
+    REQUIRE_EQ(conv(g, next, 3, nullptr, &path, 3, q1, k1, v1), RAD_OK);
+
+    /* ... or compacted first and read as a chain. */
+    gt::Cache m = gt::dup(c);
+    T sidx(RAD_I32, { 1 }); sidx.n({ 0 });
+    T na(RAD_I32, { 1 }); na.n({ 3 });
+    T pt = gt::path_t(path);
+    A kc; kc.t(m.cs).t(sidx).t(na).t(pt).i("off", gt::W - 2);
+    REQUIRE_EQ(run("kv_window_compact", kc), RAD_OK);
+    T q2(RAD_F32, { 3, gt::Hg, gt::K }), k2(RAD_F32, { 3, gt::Hg, gt::K }),
+      v2(RAD_F32, { 3, gt::Hv, gt::V });
+    REQUIRE_EQ(conv(m, next, 3, nullptr, nullptr, 3, q2, k2, v2), RAD_OK);
+    CHECK(q1.mem == q2.mem);
+    CHECK(k1.mem == k2.mem);
+    CHECK(v1.mem == v2.mem);
+    for (int64_t ch = 0; ch < gt::CD; ++ch)
+        for (int64_t e = 0; e < gt::W - 2 + 3; ++e)
+            CHECK_EQ(g.cs.at(ch * gt::DEPTH + e), m.cs.at(ch * gt::DEPTH + e));
+}
+
+TEST(gdn_tree_refusals) {
+    const gt::Rows rows = gt::gen(4);
+    const gt::Cache init = gt::fresh();
+    T o(RAD_F32, { 4, gt::Hv, gt::V });
+    {   /* a parent at or after its child */
+        const std::vector<int> bad = { -1, 0, 2, 1 };
+        gt::Cache c = gt::dup(init);
+        CHECK_EQ(gt::fused(c, rows, 4, &bad, nullptr, 1, o), (int)RAD_E_INVAL);
+    }
+    {   /* a tree names this step's row states: the per-candidate form has none */
+        const std::vector<int> par = { -1, 0, 0, 1 };
+        gt::Cache c = gt::dup(init);
+        CHECK_EQ(gt::fused(c, rows, 4, &par, nullptr, 1, o, "per_candidate"), (int)RAD_E_UNSUPPORTED);
+    }
+    {   /* more rows than the factor block holds (tmax 7) */
+        const gt::Rows big = gt::gen(8);
+        std::vector<int> par(8, -2);
+        par[0] = -1;
+        T ob(RAD_F32, { 8, gt::Hv, gt::V });
+        gt::Cache c = gt::dup(init);
+        CHECK_EQ(gt::fused(c, big, 8, &par, nullptr, 1, ob), (int)RAD_E_SHAPE);
+    }
+    {   /* a committed row past the records the block holds */
+        const std::vector<int> path = { 0, 9 };
+        gt::Cache c = gt::dup(init);
+        CHECK_EQ(gt::fused(c, rows, 4, nullptr, &path, 2, o), (int)RAD_E_SHAPE);
+    }
+    {   /* num_accepted beyond spec_path's pitch */
+        const std::vector<int> path = { 0, 1 };
+        gt::Cache c = gt::dup(init);
+        CHECK_EQ(gt::fused(c, rows, 4, nullptr, &path, 3, o), (int)RAD_E_SHAPE);
+    }
+}
+
+/* kv_window_compact: entry off + t takes the entry of row path[t], t ascending, per channel and
+ * only for the sequences whose num_accepted says so; i32 and bf16 windows alike. */
+TEST(op_kv_window_compact_moves_committed_rows_down) {
+    for (uint32_t dt : { (uint32_t)RAD_I32, (uint32_t)RAD_BF16 }) {
+        const int64_t S = 3, C = 3, E = 9, off = 2;
+        T cache(dt, { S, C, E });
+        for (int64_t i = 0; i < S * C * E; ++i) st_dt(dt, cache.t.data, i, (float)(i % 100));
+        const T before = gt::dup(cache);
+        T sidx(RAD_I32, { 3, 2 }); sidx.n({ 0, 7, 1, 7, -1, 7 });   /* stride 2: column 0 is the slot; -1 pads */
+        T nacc(RAD_I32, { 3 }); nacc.n({ 4, 1, 3 });
+        T path(RAD_I32, { 3, 5 });
+        path.n({ 0, 2, 3, 5, 0, 0, 1, 2, 3, 4, 0, 1, 4, 0, 0 });
+        A a; a.t(cache).t(sidx).t(nacc).t(path).i("off", off);
+        CHECK_OK(run("kv_window_compact", a));
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t c = 0; c < C; ++c)
+                for (int64_t e = 0; e < E; ++e) {
+                    const int64_t i = (s * C + c) * E + e;
+                    float want = before.at(i);
+                    if (s == 0 && e == off + 1) want = before.at((s * C + c) * E + off + 2);
+                    if (s == 0 && e == off + 2) want = before.at((s * C + c) * E + off + 3);
+                    if (s == 0 && e == off + 3) want = before.at((s * C + c) * E + off + 5);
+                    CHECK_EQ(cache.at(i), want);
+                }
+        /* A path that does not ascend is refused (in place it would read an overwritten entry). */
+        T bad(RAD_I32, { 3, 5 });
+        bad.n({ 0, 0, 3, 5, 0, 0, 1, 2, 3, 4, 0, 1, 4, 0, 0 });
+        A b; b.t(cache).t(sidx).t(nacc).t(bad).i("off", off);
+        CHECK_EQ(run("kv_window_compact", b), (int)RAD_E_INVAL);
+    }
 }

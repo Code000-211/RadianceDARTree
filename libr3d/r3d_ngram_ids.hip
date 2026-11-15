@@ -114,6 +114,9 @@ extern "C" int r3d_rad_ngram_ids(const RadArgs* a, RadStream s)
     const RadTensor* nacc = r3d_opt(a, NG_NACC);
     const RadTensor* ids  = r3d_opt(a, NG_IDS);
     const RadTensor* ahd  = r3d_opt(a, NG_AHEAD);
+    /* operand 11, `spec_parent` (a tree verify, docs/OPS.md): hashed over ancestors, which this
+     * kernel does not do, so it declines and the selector falls through to libref/libr4d. */
+    if (r3d_opt(a, 11)) return R3D_NO(RAD_E_UNSUPPORTED);
     if (!r3d_p(tok) || !r3d_wp(st) || !r3d_p(cu) || !r3d_p(mult) ||
         !r3d_p(vsz) || !r3d_p(off) || !r3d_wp(ids)) return R3D_NO(RAD_E_INVAL);
     if (tok->dtype != RAD_I32 || st->dtype != RAD_I32 || ids->dtype != RAD_I32)

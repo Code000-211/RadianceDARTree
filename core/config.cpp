@@ -204,6 +204,18 @@ static const Flag g_flags[] = {
                                         "from N decoding sequences on (0 never): the long block pays\n"
                                         "at one sequence, the short one at many. auto (the default):\n"
                                         "never for a chain, from 2 for a tree drafter" },
+    { "--draft-tree",         "MODE",   "auto (default) | off | on -- verify a draft head's proposals as a\n"
+    "                                    tree. auto: where the model's plugin measured a gain. A serial\n"
+    "                                    head (Qwen3.8-Flash-Next's MTP) then verifies its greedy chain\n"
+    "                                    plus runner-up siblings of the chain's first token; the text\n"
+    "                                    is unchanged, only how many drafts land a step" },
+    { "--draft-tree-leaves",  "N",      "a serial head's tree: runner-up siblings of the chain's first\n"
+                                        "token, 0..7 (default 3)" },
+    { "--draft-tree-nodes",   "N",      "a serial head's tree: the most nodes one verify carries\n"
+                                        "(default: rounds + leaves)" },
+    { "--draft-tree-width",   "N",      "a serial head's tree: frontier rows its head grows a round\n"
+                                        "(default 1: the chain and its leaves); more asks the plugin\n"
+                                        "for a deeper tree" },
     { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
     "                                    samples each proposal from its own shortlist and the sampler\n"
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
@@ -827,6 +839,19 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!std::strcmp(v, "auto")) c->draft_short_from = -1;
             else if (!parse_int(a.c_str(), v, 0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL;
         }
+        else if (S("--draft-tree")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "auto")) c->draft_tree = -1;
+            else if (!std::strcmp(v, "off"))  c->draft_tree = 0;
+            else if (!std::strcmp(v, "on"))   c->draft_tree = 1;
+            else {
+                RAD_ERR("--draft-tree takes auto, off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-tree-leaves"))     { if (!num(0, 7, &c->draft_tree_leaves)) return RAD_E_INVAL; }
+        else if (S("--draft-tree-nodes"))      { if (!num(0, 64, &c->draft_tree_nodes)) return RAD_E_INVAL; }
+        else if (S("--draft-tree-width"))      { if (!num(1, 64, &c->draft_tree_width)) return RAD_E_INVAL; }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -1412,6 +1437,12 @@ const ShowRow kShow[] = {
     { "--draft-short-from",   [](const Config& c) {
           return c.draft_short_from < 0 ? std::string("auto")
                : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
+    { "--draft-tree",         [](const Config& c) {
+          return std::string(c.draft_tree < 0 ? "auto" : c.draft_tree ? "on" : "off"); } },
+    { "--draft-tree-leaves",  [](const Config& c) { return num(c.draft_tree_leaves); } },
+    { "--draft-tree-nodes",   [](const Config& c) {
+          return c.draft_tree_nodes > 0 ? num(c.draft_tree_nodes) : std::string("auto"); } },
+    { "--draft-tree-width",   [](const Config& c) { return num(c.draft_tree_width); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },

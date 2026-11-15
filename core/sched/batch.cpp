@@ -115,6 +115,9 @@ void BatchBuilder::carve(Set& s, char* h) {
     pair(&s.h_q,      &s.d_q,      S);
     pair(&s.h_ctx,    &s.d_ctx,    S);
     pair(&s.h_acc,    &s.d_acc,    S);
+    /* RadBatch::spec_path, only for a tree drafter: nothing else reads it, and a deployment
+     * without one lays the slab out as before. */
+    pair(&s.h_path,   &s.d_path,   path_pitch_ * S);
     pair(&s.h_cktok,  &s.d_cktok,  S);
     pair(&s.h_ckslot, &s.d_ckslot, S);
     pair(&s.h_out,    &s.d_out,    O);
@@ -487,6 +490,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
     bidi_on_ = prog.encoder.modalities != 0 && prog.encoder.bidirectional != 0;
     lora_on_ = cfg.lora.enabled();
     pw_cap_ = prog.plugin_words;
+    path_pitch_ = prog.drafter_tree && cfg.n_spec > 0 ? (int64_t)cfg.n_spec + 1 : 0;
     return RAD_OK;
 }
 
@@ -1133,6 +1137,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         s.h_ctx[i] = e.ctx_len;
         s.h_acc[i] = e.n_accepted;
         s.h_arow[i] = -1;
+        /* The identity: a row the host built follows no tree verify the card has not already
+         * described (a card row's is rewritten by ADV_TRUNK from its acceptance). */
+        for (int64_t t = 0; t < path_pitch_; ++t) s.h_path[(int64_t)i * path_pitch_ + t] = (int32_t)t;
         if (e.is_prefill) { if (e.n_tokens > max_q_pf) max_q_pf = e.n_tokens; }
         else               { if (e.n_tokens > max_q_dec) max_q_dec = e.n_tokens; }
     }
@@ -1290,6 +1297,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.num_accepted = cfg_.n_spec > 0 ? on_rank(base, b0, s.d_acc) : nullptr;
         /* Staged above on a tree step: each row's parent row, -2 for an ordinary causal one. */
         B.spec_parent = plan.spec_is_tree ? on_rank(base, b0, s.d_parent) : nullptr;
+        B.spec_path = path_pitch_ ? on_rank(base, b0, s.d_path) : nullptr;
+        B.spec_path_pitch = (int32_t)path_pitch_;
         /* Pass 1 is a block drafter's query pass (a serial head has no pass 1). */
         B.anchor_rows = plan.draft_pass == 1 ? on_rank(base, b0, s.d_arow) : nullptr;
         B.rope_pos = mm_on_ ? on_rank(base, b0, s.d_rope) : nullptr;
@@ -1382,6 +1391,10 @@ AdvanceArgs BatchBuilder::advance_args(int rank) const {
     a.q_off    = off(s.d_q);
     a.row_off  = off(s.d_rows);
     a.parent_off = last_tree_ ? off(s.d_parent) : -1;
+    if (path_pitch_) {
+        a.path_off   = off(s.d_path);
+        a.path_pitch = (int32_t)path_pitch_;
+    }
     a.row_pitch = (int32_t)max_seqs_;
     a.grp_off  = off(s.d_grp);
     if (mm_on_) {

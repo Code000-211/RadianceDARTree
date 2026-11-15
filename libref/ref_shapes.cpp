@@ -1091,6 +1091,7 @@ int ref_ple_conv_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ S }, 0, 1, 0);                         /* has_init */
     o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
     o.t(D, { M, n });                                /* y */
+    o.skip();                                        /* spec_parent */
     return o.finish("ple_conv", operand, out);
 }
 
@@ -1166,6 +1167,7 @@ int ref_ngram_ids_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t_idx({ S }, 0, M, 0);                                         /* num_accepted: at M - 1 */
     o.t((uint32_t)RAD_I32, { M, heads });                            /* ids */
     o.skip();                                                        /* ahead_ids */
+    o.skip();                                                        /* spec_parent */
     return o.finish("ngram_ids", operand, out);
 }
 
@@ -1560,6 +1562,39 @@ int ref_attn_paged_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     return o.finish("attn_paged_tree", operand, out);
 }
 
+/* attn_paged_tree_sel on one sequence: `sel_pitch` page slots a row, two of them used, a region of
+ * the sequence's first page with only bit 0 (the row's own key) set. */
+int ref_attn_paged_tree_sel_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "q_len", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t bs  = gi(p, n_p, "block_size", 16);
+    const int64_t gqa = gi(p, n_p, "gqa", 1);
+    const int64_t nh  = gi(p, n_p, "n_head", gqa);
+    const int64_t sp  = gi(p, n_p, "sel_pitch", 0);
+    if (M <= 0 || hd <= 0 || bs <= 0 || gqa <= 0 || nh <= 0 || nh % gqa || sp <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t kvh = nh / gqa;
+    int64_t ctx = gi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t max_blocks = (ctx + bs - 1) / bs;
+    const uint32_t Q  = act_dt(p, n_p);
+    const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
+    const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? Q : kv;
+    if (KV == (uint32_t)RAD_I8) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(Q,  { M, nh, hd });                              /* q */
+    o.t(KV, { max_blocks, kvh, bs, 2 * hd });            /* kv_cache */
+    o.t_idx({ M, sp }, max_blocks, -1, 0);               /* sel */
+    o.t_idx({ M }, 0, sp < 2 ? sp : 2, 0);               /* nsel */
+    o.skip(); o.skip(); o.skip();                        /* descales, cu_seqlens */
+    o.t(Q,  { M, nh, hd });                              /* out */
+    o.t_idx_dt((uint32_t)RAD_I64, { M }, 0, 1, 0);       /* vmask: bit 0 */
+    o.t_idx({ 1, max_blocks }, max_blocks, -1, 0);       /* block_table */
+    o.t_idx({ 1 }, 0, 0, 0);                             /* rb */
+    o.skip();                                            /* seq_cu: an even split */
+    return o.finish("attn_paged_tree_sel", operand, out);
+}
+
 /* attn_paged's operands with the sinks before `out`: a learned logit a query head. */
 int ref_attn_paged_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int nbase = 8;
@@ -1888,6 +1923,7 @@ int ref_qsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     o.t((uint32_t)RAD_I32, { M, topk + 1 });                      /* sel */
     o.t((uint32_t)RAD_I32, { M });                                /* nsel */
     o.t((uint32_t)RAD_I32, { M });                                /* seqused */
+    o.skip(); o.skip(); o.skip();                                 /* spec_parent, rscore, vmask */
     return o.finish("qsa_select", operand, out);
 }
 
@@ -1902,7 +1938,24 @@ int ref_qsa_tail_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     o.t_idx({ M + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu -- a row a sequence */
     o.t(D, { M, 1, ring, n });                                    /* state */
     o.t_idx({ M, 1 }, M, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);     /* sidx -- a slot each */
+    o.skip();                                                     /* spec_parent */
     return o.finish("qsa_tail_store", operand, out);
+}
+
+/* The tree compaction. A description has no per-sequence path to draw: num_accepted is a constant
+ * 1, so every sequence is skipped and the call is the no-op a decode after a prefill is. */
+int ref_qsa_tail_compact_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ring = gi(p, n_p, "ring", 0);
+    if (M <= 0 || n <= 0 || ring <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t_idx({ M }, 1 << 16, -1, 0);                               /* pos */
+    o.t_idx({ M + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu -- a row a sequence */
+    o.t_idx({ M }, 0, 1, 0);                                      /* num_accepted -- all ones */
+    o.t_idx({ M, 2 }, 2, -1, 0);                                  /* spec_path */
+    o.t(D, { M, 1, ring, n });                                    /* state */
+    o.t_idx({ M, 1 }, M, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);     /* sidx -- a slot each */
+    return o.finish("qsa_tail_compact", operand, out);
 }
 
 int ref_qsa_work_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1924,6 +1977,7 @@ int ref_qsa_work_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t((uint32_t)RAD_I32, { work });                             /* page */
     o.t((uint32_t)RAD_I32, { work });                             /* bpos */
     o.t((uint32_t)RAD_I32, { S });                                /* nc */
+    for (int i = 0; i < 8; ++i) o.skip();       /* spec_parent, num_accepted, sstage .. rcu */
     return o.finish("qsa_work", operand, out);
 }
 
@@ -2602,6 +2656,8 @@ int ref_gdn_conv_update_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     o.t(g.D, { g.S * g.M, g.Hk, g.hk });             /* q */
     o.t(g.D, { g.S * g.M, g.Hk, g.hk });             /* k */
     o.t(g.D, { g.S * g.M, g.Hv, g.hv });             /* v */
+    o.skip();                                        /* spec_parent -- the chain, as before */
+    o.skip();                                        /* spec_path */
     return o.finish("gdn_conv_update", operand, out);
 }
 
@@ -2660,6 +2716,8 @@ int ref_gdn_recurrent_update_shape(const RadParam* p, int n_p, int operand, RadO
      * op, then quant_act_fp8) covers the same arithmetic. */
     o.skip();                                        /* o_q */
     o.skip();                                        /* o_scale */
+    o.skip();                                        /* spec_parent */
+    o.skip();                                        /* spec_path */
     return o.finish("gdn_recurrent_update", operand, out);
 }
 
@@ -2687,7 +2745,25 @@ int ref_gdn_conv_recurrent_update_shape(const RadParam* p, int n_p, int operand,
     o.t(g.D, { T, g.Hv, g.hv });                     /* o */
     o.skip();                                        /* o_q -- see gdn_recurrent_update */
     o.skip();                                        /* o_scale */
+    o.skip();                                        /* spec_parent */
+    o.skip();                                        /* spec_path */
     return o.finish("gdn_conv_recurrent_update", operand, out);
+}
+
+/* kv_window_compact: a window one sequence deep whose chosen path is legal (ascending, every entry
+ * stored) and does something: three rows committed, the last two both at row 2 of the block, so
+ * entry off + 1 takes row 2's. Every other geometry is the caller's `off`. */
+int ref_kv_window_compact_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t off = gi(p, n_p, "off", -1);
+    if (off < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t S = n_seq_of(p, n_p), C = 8, E = off + 4;
+    Opd o;
+    o.t(D, { S, C, E });                             /* cache, INOUT */
+    o.t_idx({ S }, S, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* state_idx */
+    o.t_idx({ S }, 0, 3, 0);                         /* num_accepted */
+    o.t_idx({ S, 4 }, 0, 2, 0);                      /* spec_path: 2 everywhere (>= t for t <= 2) */
+    return o.finish("kv_window_compact", operand, out);
 }
 
 int ref_gdn_gated_rmsnorm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

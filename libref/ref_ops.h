@@ -162,6 +162,7 @@ int ref_logits_gemm        (const RadArgs*, RadStream);
 int ref_attn_paged         (const RadArgs*, RadStream);
 int ref_attn_paged_anchor_window(const RadArgs*, RadStream);
 int ref_attn_paged_tree    (const RadArgs*, RadStream);
+int ref_attn_paged_tree_sel(const RadArgs*, RadStream);
 int ref_attn_paged_sink    (const RadArgs*, RadStream);
 int ref_attn_dense         (const RadArgs*, RadStream);
 int ref_attn_cross         (const RadArgs*, RadStream);
@@ -269,6 +270,7 @@ int ref_qsa_block_key      (const RadArgs*, RadStream);
 int ref_qsa_score          (const RadArgs*, RadStream);
 int ref_qsa_select         (const RadArgs*, RadStream);
 int ref_qsa_tail_store     (const RadArgs*, RadStream);
+int ref_qsa_tail_compact   (const RadArgs*, RadStream);
 int ref_qsa_work           (const RadArgs*, RadStream);
 /* the residency map between a streamed group's block ids and its ring slots (ref_kvstream.cpp) */
 int ref_kv_resolve         (const RadArgs*, RadStream);
@@ -307,6 +309,7 @@ int ref_gdn_chunk_scan     (const RadArgs*, RadStream);
 int ref_gdn_recurrent_update(const RadArgs*, RadStream);
 int ref_gdn_conv_recurrent_update(const RadArgs*, RadStream);
 int ref_gdn_gated_rmsnorm  (const RadArgs*, RadStream);
+int ref_kv_window_compact  (const RadArgs*, RadStream);
 
 /* ---- collectives */
 int     ref_all_reduce     (const RadArgs*, RadStream);
@@ -448,6 +451,7 @@ REF_SHAPE_FN(ref_logits_gemm);
 REF_SHAPE_FN(ref_attn_paged);
 REF_SHAPE_FN(ref_attn_paged_anchor_window);
 REF_SHAPE_FN(ref_attn_paged_tree);
+REF_SHAPE_FN(ref_attn_paged_tree_sel);
 REF_SHAPE_FN(ref_attn_paged_sink);
 REF_SHAPE_FN(ref_attn_dense);
 REF_SHAPE_FN(ref_attn_cross);
@@ -545,6 +549,7 @@ REF_SHAPE_FN(ref_qsa_block_key);
 REF_SHAPE_FN(ref_qsa_score);
 REF_SHAPE_FN(ref_qsa_select);
 REF_SHAPE_FN(ref_qsa_tail_store);
+REF_SHAPE_FN(ref_qsa_tail_compact);
 REF_SHAPE_FN(ref_qsa_work);
 REF_SHAPE_FN(ref_kv_resolve);
 REF_SHAPE_FN(ref_dflash_conv);
@@ -572,6 +577,7 @@ REF_SHAPE_FN(ref_gdn_chunk_scan);
 REF_SHAPE_FN(ref_gdn_recurrent_update);
 REF_SHAPE_FN(ref_gdn_conv_recurrent_update);
 REF_SHAPE_FN(ref_gdn_gated_rmsnorm);
+REF_SHAPE_FN(ref_kv_window_compact);
 
 REF_SHAPE_FN(ref_all_reduce);
 REF_SHAPE_FN(ref_all_gather);
