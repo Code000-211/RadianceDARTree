@@ -4635,6 +4635,43 @@ TEST(expert_pin_top_keeps_the_hottest_resident) {
     CHECK(p.report(f.prog).find("pinned hot") != std::string::npos);
 }
 
+/* Real profiles carry per-layer shares in [0, 1] (xs_profile_load divides by the layer's total), so
+ * the cut must not assume integer gaps between shares: F = 0.25 pins the hottest quarter, not every
+ * resident expert. */
+TEST(expert_pin_top_cuts_fractional_shares) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, 0);
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e) {
+            RadFileProfile r{};
+            r.layer = l;
+            r.expert = e;
+            r.share = (float)(e + 1) / 36.0f;
+            prof.push_back(r);
+        }
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.25f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, hot_pinned = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 || !mu.pinned) continue;
+        ++pinned;
+        if (mu.expert >= 6) ++hot_pinned;
+    }
+    CHECK_EQ(pinned, 4);
+    CHECK_EQ(hot_pinned, 4);
+}
+
 TEST(expert_pin_top_zero_pins_nothing) {
     Fixture f;
     build_moe_layers(f, 1, 4, 1 * MiB, 0);
