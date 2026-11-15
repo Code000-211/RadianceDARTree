@@ -420,7 +420,7 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     /* Block positions: one component per block, or three under M-RoPE with planes. Under M-RoPE
      * `bpos` is [max_work, 3]; this step passes [work, 3], or only column 0 when the pass has no
      * planes (qsa_work then writes component 0 and the block key reads the one-component form). */
-    const bool mc = g.rope_mc && batch->rope_pos;
+    const bool mc = g.rope_mc && batch->rope_pos && !tree;
     RadOperand bpos = g.rope_mc ? RAD_B_COL(w.bpos, 0, mc ? 3 : 1) : brows(w.bpos, work);
     if (g.rope_mc) bpos.rows = work;
     if (tree || heal) {
