@@ -271,6 +271,10 @@ __device__ __forceinline__ void hc8_dot_down2(const unsigned short* __restrict__
  * threads' sums make the row. All of a quarter's sixteen-code loads issue before the first is used
  * (five at lowrank 320); kUpMaxQ bounds lowrank at 512. */
 constexpr int kUpMaxQ = 8;
+#ifndef HC_UP_FLOATD
+#define HC_UP_FLOATD 5
+#endif
+constexpr int kUpFloatD = HC_UP_FLOATD;   /* rows from which `d` is staged as floats */
 template <int RG>
 __device__ __forceinline__ void hc8_dot_up(const float* __restrict__ sd, long lr,
                                            const unsigned char* __restrict__ wr, int q4,
@@ -351,6 +355,55 @@ __device__ __forceinline__ void hc8_up_dot_rows(const unsigned short* __restrict
             float dv[16];
             bf8_f(*(const uint4*)dr, *(float(*)[8])dv);
             bf8_f(*(const uint4*)(dr + 8), *(float(*)[8])(dv + 8));
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+#pragma unroll
+                for (int m = 0; m < RPT; ++m) acc[m][r] = fmaf(wf[m][t], dv[t], acc[m][r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < RPT; ++m)
+#pragma unroll
+        for (int r = 0; r < RG; ++r) {
+            float a = acc[m][r] * o[m].sc;
+            a += __shfl_xor(a, 1);
+            a += __shfl_xor(a, 2);
+            acc[m][r] = a;
+        }
+}
+
+/* hc8_up_dot_rows with `d` held as floats (converted once when staged): each 16-byte LDS read
+ * is four values with no shift or mask, so a (row, quarter) step is sixteen reads' worth of
+ * fmaf and no conversion. Same values, same fmaf order. */
+template <int RG, int RPT>
+__device__ __forceinline__ void hc8_up_dot_rows_f(const float* __restrict__ sdf, long lr,
+                                                  const Hc8UpQuarter* o, int q4,
+                                                  float (*acc)[RG]) {
+    const long G = lr / 4, k0 = (long)q4 * G;
+    const int  nq = (int)(G / 16);
+#pragma unroll
+    for (int m = 0; m < RPT; ++m)
+#pragma unroll
+        for (int r = 0; r < RG; ++r) acc[m][r] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kUpMaxQ; ++i) {
+        if (i >= nq) break;
+        float wf[RPT][16];
+#pragma unroll
+        for (int m = 0; m < RPT; ++m) {
+            e4m3x8(o[m].c[i].x, o[m].c[i].y, wf[m]);
+            e4m3x8(o[m].c[i].z, o[m].c[i].w, wf[m] + 8);
+        }
+#pragma unroll
+        for (int r = 0; r < RG; ++r) {
+            const float4* dr = (const float4*)(sdf + (long)r * lr + k0 + 16 * i);
+            float dv[16];
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const float4 x = dr[v];
+                dv[4 * v] = x.x; dv[4 * v + 1] = x.y; dv[4 * v + 2] = x.z; dv[4 * v + 3] = x.w;
+            }
 #pragma unroll
             for (int t = 0; t < 16; ++t) {
 #pragma unroll
@@ -1396,7 +1449,8 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
         }
     }
 
-    /* `d` as bf16 for the E4M3 dot (hc8_up_dot_rows), as floats for the bf16 one. */
+    /* `d` as bf16 for the E4M3 dot (hc8_up_dot_rows), as floats for the bf16 one and, from
+     * kUpFloatD rows, the E4M3 one too (hc8_up_dot_rows_f). */
     unsigned short* const sdh = (unsigned short*)sd;
     if (dpre) {
 #pragma unroll
@@ -1405,7 +1459,7 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
             for (int s = 0; s < kDStage; ++s) {
                 const long k = tid + (long)s * kThreads;
                 if (k >= lr) continue;
-                if constexpr (F8) sdh[(long)r * lr + k] = dv[r][s];
+                if constexpr (F8) { if constexpr (RG >= kUpFloatD) sd[(long)r * lr + k] = bf2f(dv[r][s]); else sdh[(long)r * lr + k] = dv[r][s]; }
                 else              sd[(long)r * lr + k] = bf2f(dv[r][s]);
             }
     } else {
@@ -1415,7 +1469,7 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
             const bool live = r0 + r < rows;
             for (long k = tid; k < lr; k += kThreads) {
                 const unsigned short v = live ? dbuf[(r0 + r) * lr + k] : (unsigned short)0;
-                if constexpr (F8) sdh[(long)r * lr + k] = v;
+                if constexpr (F8) { if constexpr (RG >= kUpFloatD) sd[(long)r * lr + k] = bf2f(v); else sdh[(long)r * lr + k] = v; }
                 else              sd[(long)r * lr + k] = bf2f(v);
             }
         }
@@ -1426,7 +1480,8 @@ __device__ __forceinline__ void hc_up_mix_body(const void* __restrict__ upv, lon
      * E4M3 form takes each row four threads at a time, as in hc_up_kernel. */
     if constexpr (F8) {
         float acc[RPT][RG];
-        hc8_up_dot_rows<RG, RPT>(sdh, lr, wq, q4, acc);
+        if constexpr (RG >= kUpFloatD) hc8_up_dot_rows_f<RG, RPT>(sd, lr, wq, q4, acc);
+        else                           hc8_up_dot_rows<RG, RPT>(sdh, lr, wq, q4, acc);
 #pragma unroll
         for (int m = 0; m < RPT; ++m)
 #pragma unroll
@@ -5143,6 +5198,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * there kernels A and B as one grid (hc_read_fused_kernel) when the row group is the whole
      * step, the up-mix fuses (q's counters or none) and the per-stream counters exist. */
     const bool pre = f8 && hc == 4 && n == 10LL * kThreads && g_hc_decode_form != 1;
+    /* Measured at lowrank 320 (warm and cold): two rows 8 columns a block, three to six 16, seven and eight 24. */
+    if (pre && rows >= 2) ta = rows >= 7 ? 24 : rows >= 3 ? 16 : 8;
     if (pre) {
         const long rgf = hc_up_rg(rows, lr);
         const int       rpt = hc_up_rpt(true, (int)hc, n);

@@ -145,6 +145,18 @@ __device__ __forceinline__ float ru_act(float z, int kind) {
 // RU_TMAX bounds the candidate block STG can stage (LDS for four partials and two scales per
 // token). The launcher checks the caller's width against it.
 #define RU_TMAX 16
+#ifndef RU_SISEL
+#define RU_SISEL 1
+#endif
+#ifndef RU_PRE
+#define RU_PRE 1
+#endif
+#ifndef RU_FUSE
+#define RU_FUSE 1
+#endif
+#ifndef RU_PD
+#define RU_PD 3
+#endif
 
 // RU_ANC_DUP=0 drops the two neighbouring-page copies of the replay factors (and, without the
 // marker, of the anchor). Incorrect without RU_ANC_MARK (a moved page index reads an unwritten
@@ -378,9 +390,19 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
   __shared__ __attribute__((aligned(16))) float s_rv[TREE ? RU_TMAX * RU_V : 1];
   __shared__ float s_rgb[TREE ? RU_TMAX * 2 : 1];
   __shared__ float wsum[THR / 32];
+  __shared__ float wsum2[2][THR / 32];   // the row norm's partials, double buffered: one barrier a row
   // NORM 3: a block of tokens' bf16 output rows, for the rotation (one token a wave afterwards)
   constexpr int RB = THR / 32;
   __shared__ __attribute__((aligned(8))) unsigned short srot[NORM == 3 ? RB * RU_V : 1];
+  // RU_PRE: with the folded convolution and staged scales, every token's l2-scaled q and k as f32 in
+  // LDS (the scaled values the token loop would otherwise rebuild per row: widen, scale), written
+  // once by all threads between two barriers instead of inside the serial chain.
+  constexpr bool PRE = RU_PRE && CV && STG && !TREE;
+  constexpr bool FUSE = RU_FUSE && PRE && ANC && SDT == 0;
+  __shared__ __attribute__((aligned(16))) float spq[PRE ? RU_CVT * RU_K : 1];
+  __shared__ __attribute__((aligned(16))) float spk[PRE ? RU_CVT * RU_K : 1];
+  __shared__ float sact[FUSE ? RU_CVT * RU_V : 1];   // the output gate's activation per (token, row)
+  __shared__ float ssc[FUSE ? RU_CVT * 4 : 1];     // per token: e^g, beta, g
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -401,7 +423,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
   // ---- CV: issue the convolution's inputs first so they are in flight during the anchor replay.
   // Thread tid owns one q|k channel of the key head (q below RU_K, k above) and, below RU_V, one v
   // channel of the value head.
-  static_assert(!CV || (NORM && VS == 1 && (STG == 0 || TREE)), "the folded convolution is the decode shape");
+  static_assert(!CV || (NORM && VS == 1), "the folded convolution is the decode shape");
   static_assert(RU_K == RU_V, "one LDS row pitch serves the q, k and v taps");
   constexpr int CW = R4D_GDN_CONV_W, CS = R4D_GDN_CONV_W - 1;
   __shared__ __attribute__((aligned(16))) unsigned short cvq[CV ? RU_CVT * RU_K : 1],
@@ -535,7 +557,10 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       ? (const ST*)(state + (size_t)(mrk == 0 ? sf2 : (mrk == 1 ? sf : sf0)) * st_slot
                     + (size_t)hv * st_head)
       : (const ST*)fb;
-  const int si = sidx[(size_t)n * sidx_stride + (ANC ? acol : (nacc - 1))];
+  // The anchor columns 1, 2 and 3 are the entries loaded above (sa1, sa2, sf0): select rather than
+  // issue a second dependent global load on the marker's critical path.
+  const int si = (RU_SISEL && ANC && RU_ANC_MARK) ? (acol == 1 ? sa1 : (acol == 2 ? sa2 : sf0))
+                                      : sidx[(size_t)n * sidx_stride + (ANC ? acol : (nacc - 1))];
   // A negative slot is padding; 0 is a real slot.
   if (si < 0) return;
   /* Fixed 32-row group (see RU_FSTR), uniform per wave for any VS (a wave is 16 consecutive rows
@@ -714,191 +739,109 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       const float ssk = spart[tid * 4 + 1] + spart[tid * 4 + 3];
       sscl[tid * 2]     = __frsqrt_rn(ssq + 1e-6f) * scale;
       sscl[tid * 2 + 1] = __frsqrt_rn(ssk + 1e-6f);
+      if constexpr (FUSE) {
+        // The token's decay and beta, as the token loop computes them, and the replay factors'
+        // pair; the loop reads them from LDS instead of running the transcendentals in the chain.
+        const float ra = sab[tid], rb = sab[T + tid];
+        const float g_ = -alog * ru_softplus(ra + dtb, sp_thr);
+        const float bt_ = 1.0f / (1.0f + __expf(-rb));
+        ssc[tid * 4]     = __expf(g_);
+        ssc[tid * 4 + 1] = bt_;
+        ssc[tid * 4 + 2] = g_;
+        ST* const f = fb + (size_t)tid * RU_FSTR + 4 * RU_K + RU_V;
+        ST* const f0 = fb0 + (size_t)tid * RU_FSTR + 4 * RU_K + RU_V;
+        ST* const f2 = fb2 + (size_t)tid * RU_FSTR + 4 * RU_K + RU_V;
+#pragma unroll
+        for (int gp = 0; gp < 4; ++gp) {
+          f[2 * gp] = (ST)g_; f[2 * gp + 1] = (ST)bt_;
+          if (dup_f) { f0[2 * gp] = (ST)g_; f0[2 * gp + 1] = (ST)bt_; f2[2 * gp] = (ST)g_; f2[2 * gp + 1] = (ST)bt_; }
+        }
+      }
     }
     __syncthreads();
+    if constexpr (PRE) {
+#pragma unroll
+      for (int i = 0; i < (RU_CVT * 64 + THR - 1) / THR; ++i) {
+        const int u = tid + i * THR;
+        if (u < T * 64) {
+          const int ut = u >> 6, isk = (u >> 5) & 1, c = u & 31;
+          const unsigned short* src = (isk ? cvk : cvq) + ut * RU_K + 4 * c;
+          const float sc = sscl[ut * 2 + isk];
+          const uint2 w = *(const uint2*)src;
+          ru_f4 r;
+          r[0] = bf2f((unsigned short)(w.x & 0xFFFFu)) * sc;
+          r[1] = bf2f((unsigned short)(w.x >> 16)) * sc;
+          r[2] = bf2f((unsigned short)(w.y & 0xFFFFu)) * sc;
+          r[3] = bf2f((unsigned short)(w.y >> 16)) * sc;
+          *(ru_f4*)((isk ? spk : spq) + ut * RU_K + 4 * c) = r;
+          if constexpr (FUSE) {
+            // The replay factors' four k copies (one per 32-row group), written here once by all
+            // threads instead of by the group leaders inside the token loop.
+            if (isk) {
+              ST* const f = fb + (size_t)ut * RU_FSTR + 4 * c;
+              ST* const f0 = fb0 + (size_t)ut * RU_FSTR + 4 * c;
+              ST* const f2 = fb2 + (size_t)ut * RU_FSTR + 4 * c;
+#pragma unroll
+              for (int gp = 0; gp < 4; ++gp) {
+                *(ru_f4*)(f + gp * RU_K) = r;
+                if (dup_f) { *(ru_f4*)(f0 + gp * RU_K) = r; *(ru_f4*)(f2 + gp * RU_K) = r; }
+              }
+            }
+          }
+        }
+      }
+      if constexpr (FUSE) {
+        for (int u = tid; u < T * RU_V; u += THR) {
+          const int ut = u / RU_V, vr = u % RU_V;
+          const ST vv = (ST)bf2f(cvv[u]);
+          sact[u] = ru_act(bf2f(szg[u]), nact);
+          fb[(size_t)ut * RU_FSTR + 4 * RU_K + vr] = vv;
+          if (dup_f) { fb0[(size_t)ut * RU_FSTR + 4 * RU_K + vr] = vv; fb2[(size_t)ut * RU_FSTR + 4 * RU_K + vr] = vv; }
+        }
+      }
+      __syncthreads();
+    }
   }
 
   // A tree is walked in its planned order (ru_tree_plan); `oi` counts the rows emitted so far.
   const int nsteps = TREE ? __builtin_amdgcn_readfirstlane(s_tmp[127]) : T;
   int oi = 0;
-  for (int si = 0; si < nsteps; ++si) {
-    int t = si;
-    bool leaf = false;
-    if constexpr (TREE) {
-      const int se = __builtin_amdgcn_readfirstlane(s_sched[si]);   // uniform: scalar registers
-      const int kind = se >> 8;
-      t = se & 255;
-#ifndef RU_X1
-      if (kind == 2) {
-        // Back to the anchor: the barrier makes every earlier row's LDS record (and the published
-        // anchor, which the same thread wrote) visible and ordered before the reload.
-        __syncthreads();
-        const ST* pa = state + (size_t)(RU_ANC_MARK ? sa2 : sa1) * st_slot + (size_t)hv * st_head
-                     + (size_t)row * RU_K + k0;
-#pragma unroll
-        for (int j = 0; j < RU_HK; j += 8) ru_load8<0, SDT>(&h[j], pa + j);
-        continue;
-      }
-      if (kind == 3) {
-        // The replay's arithmetic, over the record this workgroup kept for row t.
-        const float* const kr = s_rk + t * RU_K + k0;   // read from LDS where used
-        const float vr = s_rv[t * RU_V + row];
-        const float egr = __expf(s_rgb[2 * t]);
-        const float btr = s_rgb[2 * t + 1];
-        float dotr = 0.0f;
-#pragma unroll
-        for (int j = 0; j < RU_HK; ++j) { h[j] *= egr; dotr += h[j] * kr[j]; }
-        dotr += r4d_xor_lane<1>(dotr);
-        const float ur = (vr - dotr) * btr;
-#pragma unroll
-        for (int j = 0; j < RU_HK; ++j) h[j] += ur * kr[j];
-        continue;
-      }
-#endif
-      leaf = kind == 1;
-    }
-    const int tok = bos + t;
-    const unsigned short* qp = CV ? cvq + t * RU_K + k0 : q + ((size_t)tok * Hg + hk) * RU_K + k0;
-    const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
-
-    // A tree row keeps q as the packed bf16 words it loaded and widens (and scales) it where the
-    // output dot uses it: the same values, 32 registers instead of 64 across the state pass.
-    float qq[TREE ? 1 : RU_HK], kk[RU_HK];
-    uint4 qw[TREE ? RU_HK / 8 : 1];
-#pragma unroll
-    for (int j = 0; j < RU_HK; j += 8) {
-      const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
-      const unsigned short* sq = (const unsigned short*)&wq;
-      const unsigned short* sk = (const unsigned short*)&wk;
-      if constexpr (TREE) qw[j / 8] = wq;
-#pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        if constexpr (!TREE) qq[j + e] = bf2f(sq[e]);
-        kk[j + e] = bf2f(sk[e]);
-      }
-    }
-    auto qraw = [&](int j) {
-      if constexpr (TREE) {
-        const unsigned w = ((const unsigned*)&qw[j >> 3])[(j & 7) >> 1];
-        return __uint_as_float((j & 1) ? (w & 0xFFFF0000u) : (w << 16));
-      } else {
-        return qq[j];
-      }
-    };
-
-    // l2 norms: 64 in-lane terms, then one exchange with the lane holding the other half
-    float qs, ks;
-    if (STG) {
-      qs = sscl[t * 2]; ks = sscl[t * 2 + 1];
-    } else {
-      float sq = 0.0f, sk = 0.0f;
-#pragma unroll
-      for (int j = 0; j < RU_HK; ++j) { const float qj = qraw(j); sq += qj * qj; sk += kk[j] * kk[j]; }
-      sq += r4d_xor_lane<1>(sq);
-      sk += r4d_xor_lane<1>(sk);
-      qs = __frsqrt_rn(sq + 1e-6f) * scale; ks = __frsqrt_rn(sk + 1e-6f);
-    }
-#pragma unroll
-    for (int j = 0; j < RU_HK; ++j) { if constexpr (!TREE) qq[j] *= qs; kk[j] *= ks; }
-
-    const float ra  = CV ? sab[t]     : ru_ab<ABF16>(av, (size_t)tok * ab_stride + hv);
-    const float rb  = CV ? sab[T + t] : ru_ab<ABF16>(bv, (size_t)tok * ab_stride + hv);
-    const float g   = -alog * ru_softplus(ra + dtb, sp_thr);
-    const float bt  = 1.0f / (1.0f + __expf(-rb));
-    const float eg  = __expf(g);
-
-    float dot = 0.0f;
-    if constexpr (TREE) {
-      // A leaf reads the live state without advancing it: the same products on a temporary, which
-      // the second pass recomputes (h * eg is the same multiply) instead of storing.
-#pragma unroll
-      for (int j = 0; j < RU_HK; ++j) { const float hj = h[j] * eg; dot += hj * kk[j]; }
-    } else {
-#pragma unroll
-      for (int j = 0; j < RU_HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
-    }
-    dot += r4d_xor_lane<1>(dot);
-
-    const float vraw = bf2f(CV ? cvv[t * RU_V + row] : v[((size_t)tok * H + hv) * RU_V + row]);
-    const float u = (vraw - dot) * bt;
-
-    if (ANC) {
-      // This step's factors for the next step's replay: one thread pair per row group writes the
-      // group's k copy and decay/beta; every row writes its own v.
-      ST* f  = fb  + (size_t)t * RU_FSTR;
-      ST* f0 = fb0 + (size_t)t * RU_FSTR;
-      ST* f2 = fb2 + (size_t)t * RU_FSTR;
-      if ((row & 31) == 0) {
-#pragma unroll
-        for (int j = 0; j < RU_HK; j += 8) {
-          float kn[8];
-#pragma unroll
-          for (int e = 0; e < 8; ++e) kn[e] = kk[j + e];
-          ru_store8<0, SDT>(f + grp * RU_K + k0 + j, kn);
-          if (dup_f) {
-            ru_store8<0, SDT>(f0 + grp * RU_K + k0 + j, kn);
-            ru_store8<0, SDT>(f2 + grp * RU_K + k0 + j, kn);
-          }
-        }
-        if (half == 0) {
-          f[4 * RU_K + RU_V + 2 * grp]      = (ST)g;
-          f[4 * RU_K + RU_V + 2 * grp + 1]  = (ST)bt;
-          if (dup_f) {
-            f0[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
-            f0[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
-            f2[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
-            f2[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
-          }
-        }
-      }
-      if (half == 0) {
-        f[4 * RU_K + row] = (ST)vraw;
-        if (dup_f) { f0[4 * RU_K + row] = (ST)vraw; f2[4 * RU_K + row] = (ST)vraw; }
-      }
-    }
-
-#ifndef RU_X3
-    if constexpr (TREE) {
-      // This row's record for a later restore: exact copies of what the factor block receives.
-      if (row == 0) {
-#pragma unroll
-        for (int j = 0; j < RU_HK; ++j) s_rk[t * RU_K + k0 + j] = kk[j];
-      }
-      if (half == 0) s_rv[t * RU_V + row] = vraw;
-      if (tid == 0) { s_rgb[2 * t] = g; s_rgb[2 * t + 1] = bt; }
-    }
-#endif
-
-    float on = 0.0f;
-    if constexpr (TREE) {
-#pragma unroll
-      for (int j = 0; j < RU_HK; ++j) {
-        const float hn = h[j] * eg + u * kk[j];
-        on += hn * (qraw(j) * qs);
-        h[j] = leaf ? h[j] : hn;
-      }
-    } else {
-#pragma unroll
-      for (int j = 0; j < RU_HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
-    }
-    on += r4d_xor_lane<1>(on);
-
+  // The row's epilogue: gated norm, bf16 store, the folded quantiser, a per-candidate state store.
+  // The norm weight is the same every row: one load, not one behind each row's barrier.
+  const float nwr = NORM ? nw[row] : 0.0f;
+  // The norm's two halves: this thread's partial of the row's sum of squares into LDS, and (after
+  // the barrier, or in the pipelined form after the next row's pass) the total and the rest.
+  auto post_a = [&](const int t, const float on) {
     if (NORM) {
       // sum of squares over the row: one channel per thread pair, 16 per wave
       float sq = (half == 0) ? on * on : 0.0f;
       // compile-time masks: 16 uses v_permlanex16, the rest DPP row_xmask
       sq += r4d_xor_lane<16>(sq); sq += r4d_xor_lane<8>(sq); sq += r4d_xor_lane<4>(sq);
       sq += r4d_xor_lane<2>(sq);  sq += r4d_xor_lane<1>(sq);
-      if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = sq;
-      __syncthreads();
+      float* const wn = FUSE ? wsum2[t & 1] : wsum;
+      if ((threadIdx.x & 31) == 0) wn[threadIdx.x >> 5] = sq;
+    }
+  };
+  auto post_b = [&](const int t, const int tok, float on) {
+    if (NORM) {
+      float* const wn = FUSE ? wsum2[t & 1] : wsum;
       float tot = 0.0f;
 #pragma unroll
-      for (int i = 0; i < THR / 32; ++i) tot += wsum[i];
+      for (int i = 0; i < THR / 32; ++i) tot += wn[i];
       const float sc = __frsqrt_rn(tot * (1.0f / RU_V) + neps);
-      const unsigned short zr = CV ? szg[t * RU_V + row]
-                                   : zg[(size_t)tok * zg_pitch + (size_t)hv * RU_V + row];
-      on *= sc * nw[row] * ru_act(bf2f(zr), nact);
-      __syncthreads();                 // wsum is reused by the next token
+      float actv;
+      if constexpr (FUSE) {
+        actv = sact[t * RU_V + row];
+      } else {
+        const unsigned short zr = CV ? szg[t * RU_V + row]
+                                     : zg[(size_t)tok * zg_pitch + (size_t)hv * RU_V + row];
+        actv = ru_act(bf2f(zr), nact);
+      }
+      on *= sc * nwr * actv;
+      // The pipelined form double buffers the partials (the next row's lands in the other buffer,
+      // and the one after it only after the next row's barrier, which every thread reaches after
+      // reading this one); the plain form reuses one and fences it.
+      if (!FUSE) __syncthreads();
     }
 
     const unsigned short ob = f2bf(on);
@@ -983,7 +926,257 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
         for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
       }
     }
+  };
+  auto post_row = [&](const int t, const int tok, float on) {
+    post_a(t, on);
+    if (NORM) __syncthreads();
+    post_b(t, tok, on);
+  };
+  if constexpr (FUSE) {
+    // The delta rule's two passes over the state fuse across rows: row t's update and output dot
+    // (h += u k; on += h q) and row t+1's decay and key dot (h *= e^g; dot += h k) touch each
+    // element once, in the order each chain had, so every sum and every rounding is the sequential
+    // form's. The two chains are independent, which doubles the adds in flight. The scaled q and k
+    // rows (and the per-token decay and beta) come from LDS, staged by all threads before the
+    // loop together with the replay factors' stores, so the chain holds nothing else. The LDS
+    // reads run RU_PD chunks of four ahead of the arithmetic: the chain is latency bound, and a
+    // read issued next to its use would put an LDS round trip behind every four elements.
+    constexpr int NC = RU_HK / 4;
+    constexpr int PD = RU_PD;
+    float kc[RU_HK];                       // the row's k: the previous pass's k' for this row
+    float dot = 0.0f;
+    {
+      const float eg0 = ssc[0];
+      ru_f4 ka[PD];
+#pragma unroll
+      for (int c = 0; c < PD; ++c) ka[c] = *(const ru_f4*)(spk + k0 + 4 * c);
+#pragma unroll
+      for (int c = 0; c < NC; ++c) {
+        const ru_f4 kv = ka[c % PD];
+        if (c + PD < NC) ka[c % PD] = *(const ru_f4*)(spk + k0 + 4 * (c + PD));
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          kc[4 * c + e] = kv[e];
+          h[4 * c + e] *= eg0; dot += h[4 * c + e] * kv[e];
+        }
+      }
+    }
+    dot += r4d_xor_lane<1>(dot);
+    for (int t = 0; t < T; ++t) {
+      const float vraw = bf2f(cvv[t * RU_V + row]);
+      const float u = (vraw - dot) * ssc[t * 4 + 1];
+      const bool last = (t + 1 >= T);
+      const int tn = last ? t : t + 1;
+      const float egn = last ? 1.0f : ssc[tn * 4];
+      const float* const qrow = spq + t * RU_K + k0;
+      const float* const nrow = spk + tn * RU_K + k0;
+      ru_f4 qa[PD], na[PD];
+#pragma unroll
+      for (int c = 0; c < PD; ++c) { qa[c] = *(const ru_f4*)(qrow + 4 * c); na[c] = *(const ru_f4*)(nrow + 4 * c); }
+      float on = 0.0f, dotn = 0.0f;
+#pragma unroll
+      for (int c = 0; c < NC; ++c) {
+        const ru_f4 qt = qa[c % PD], kn = na[c % PD];
+        if (c + PD < NC) {
+          qa[c % PD] = *(const ru_f4*)(qrow + 4 * (c + PD));
+          na[c % PD] = *(const ru_f4*)(nrow + 4 * (c + PD));
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          float x = h[4 * c + e] + u * kc[4 * c + e];
+          on += x * qt[e];
+          x = x * egn;
+          dotn += x * kn[e];
+          h[4 * c + e] = x;
+          kc[4 * c + e] = kn[e];
+        }
+      }
+      on += r4d_xor_lane<1>(on);
+      dotn += r4d_xor_lane<1>(dotn);
+      dot = dotn;
+      oi = t;
+      post_a(t, on);
+      __syncthreads();
+      post_b(t, bos + t, on);
+    }
+  }
+  if constexpr (!FUSE) {
+  for (int si = 0; si < nsteps; ++si) {
+    int t = si;
+    bool leaf = false;
+    if constexpr (TREE) {
+      const int se = __builtin_amdgcn_readfirstlane(s_sched[si]);   // uniform: scalar registers
+      const int kind = se >> 8;
+      t = se & 255;
+#ifndef RU_X1
+      if (kind == 2) {
+        // Back to the anchor: the barrier makes every earlier row's LDS record (and the published
+        // anchor, which the same thread wrote) visible and ordered before the reload.
+        __syncthreads();
+        const ST* pa = state + (size_t)(RU_ANC_MARK ? sa2 : sa1) * st_slot + (size_t)hv * st_head
+                     + (size_t)row * RU_K + k0;
+#pragma unroll
+        for (int j = 0; j < RU_HK; j += 8) ru_load8<0, SDT>(&h[j], pa + j);
+        continue;
+      }
+      if (kind == 3) {
+        // The replay's arithmetic, over the record this workgroup kept for row t.
+        const float* const kr = s_rk + t * RU_K + k0;   // read from LDS where used
+        const float vr = s_rv[t * RU_V + row];
+        const float egr = __expf(s_rgb[2 * t]);
+        const float btr = s_rgb[2 * t + 1];
+        float dotr = 0.0f;
+#pragma unroll
+        for (int j = 0; j < RU_HK; ++j) { h[j] *= egr; dotr += h[j] * kr[j]; }
+        dotr += r4d_xor_lane<1>(dotr);
+        const float ur = (vr - dotr) * btr;
+#pragma unroll
+        for (int j = 0; j < RU_HK; ++j) h[j] += ur * kr[j];
+        continue;
+      }
+#endif
+      leaf = kind == 1;
+    }
+    const int tok = bos + t;
+    const unsigned short* qp = CV ? cvq + t * RU_K + k0 : q + ((size_t)tok * Hg + hk) * RU_K + k0;
+    const unsigned short* kp = CV ? cvk + t * RU_K + k0 : k + ((size_t)tok * Hg + hk) * RU_K + k0;
+
+    // A tree row keeps q as the packed bf16 words it loaded and widens (and scales) it where the
+    // output dot uses it: the same values, 32 registers instead of 64 across the state pass.
+    float qq[TREE ? 1 : RU_HK], kk[RU_HK];
+    uint4 qw[TREE ? RU_HK / 8 : 1];
+    if constexpr (PRE) {
+#pragma unroll
+      for (int j = 0; j < RU_HK; j += 4) {
+        *(ru_f4*)&qq[j] = *(const ru_f4*)(spq + t * RU_K + k0 + j);
+        *(ru_f4*)&kk[j] = *(const ru_f4*)(spk + t * RU_K + k0 + j);
+      }
+    } else {
+#pragma unroll
+    for (int j = 0; j < RU_HK; j += 8) {
+      const uint4 wq = *(const uint4*)(qp + j), wk = *(const uint4*)(kp + j);
+      const unsigned short* sq = (const unsigned short*)&wq;
+      const unsigned short* sk = (const unsigned short*)&wk;
+      if constexpr (TREE) qw[j / 8] = wq;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        if constexpr (!TREE) qq[j + e] = bf2f(sq[e]);
+        kk[j + e] = bf2f(sk[e]);
+      }
+    }
+    }
+    auto qraw = [&](int j) {
+      if constexpr (TREE) {
+        const unsigned w = ((const unsigned*)&qw[j >> 3])[(j & 7) >> 1];
+        return __uint_as_float((j & 1) ? (w & 0xFFFF0000u) : (w << 16));
+      } else {
+        return qq[j];
+      }
+    };
+
+    // l2 norms: 64 in-lane terms, then one exchange with the lane holding the other half
+    float qs = 0.0f, ks = 0.0f;
+    if (PRE) {
+    } else if (STG) {
+      qs = sscl[t * 2]; ks = sscl[t * 2 + 1];
+    } else {
+      float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+      for (int j = 0; j < RU_HK; ++j) { const float qj = qraw(j); sq += qj * qj; sk += kk[j] * kk[j]; }
+      sq += r4d_xor_lane<1>(sq);
+      sk += r4d_xor_lane<1>(sk);
+      qs = __frsqrt_rn(sq + 1e-6f) * scale; ks = __frsqrt_rn(sk + 1e-6f);
+    }
+    if constexpr (!PRE) {
+#pragma unroll
+    for (int j = 0; j < RU_HK; ++j) { if constexpr (!TREE) qq[j] *= qs; kk[j] *= ks; }
+    }
+
+    const float ra  = CV ? sab[t]     : ru_ab<ABF16>(av, (size_t)tok * ab_stride + hv);
+    const float rb  = CV ? sab[T + t] : ru_ab<ABF16>(bv, (size_t)tok * ab_stride + hv);
+    const float g   = -alog * ru_softplus(ra + dtb, sp_thr);
+    const float bt  = 1.0f / (1.0f + __expf(-rb));
+    const float eg  = __expf(g);
+
+    float dot = 0.0f;
+    if constexpr (TREE) {
+      // A leaf reads the live state without advancing it: the same products on a temporary, which
+      // the second pass recomputes (h * eg is the same multiply) instead of storing.
+#pragma unroll
+      for (int j = 0; j < RU_HK; ++j) { const float hj = h[j] * eg; dot += hj * kk[j]; }
+    } else {
+#pragma unroll
+      for (int j = 0; j < RU_HK; ++j) { h[j] *= eg; dot += h[j] * kk[j]; }
+    }
+    dot += r4d_xor_lane<1>(dot);
+
+    const float vraw = bf2f(CV ? cvv[t * RU_V + row] : v[((size_t)tok * H + hv) * RU_V + row]);
+    const float u = (vraw - dot) * bt;
+
+    if (ANC) {
+      // This step's factors for the next step's replay: one thread pair per row group writes the
+      // group's k copy and decay/beta; every row writes its own v.
+      ST* f  = fb  + (size_t)t * RU_FSTR;
+      ST* f0 = fb0 + (size_t)t * RU_FSTR;
+      ST* f2 = fb2 + (size_t)t * RU_FSTR;
+      if ((row & 31) == 0) {
+#pragma unroll
+        for (int j = 0; j < RU_HK; j += 8) {
+          float kn[8];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) kn[e] = kk[j + e];
+          ru_store8<0, SDT>(f + grp * RU_K + k0 + j, kn);
+          if (dup_f) {
+            ru_store8<0, SDT>(f0 + grp * RU_K + k0 + j, kn);
+            ru_store8<0, SDT>(f2 + grp * RU_K + k0 + j, kn);
+          }
+        }
+        if (half == 0) {
+          f[4 * RU_K + RU_V + 2 * grp]      = (ST)g;
+          f[4 * RU_K + RU_V + 2 * grp + 1]  = (ST)bt;
+          if (dup_f) {
+            f0[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+            f0[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+            f2[4 * RU_K + RU_V + 2 * grp]     = (ST)g;
+            f2[4 * RU_K + RU_V + 2 * grp + 1] = (ST)bt;
+          }
+        }
+      }
+      if (half == 0) {
+        f[4 * RU_K + row] = (ST)vraw;
+        if (dup_f) { f0[4 * RU_K + row] = (ST)vraw; f2[4 * RU_K + row] = (ST)vraw; }
+      }
+    }
+
+#ifndef RU_X3
+    if constexpr (TREE) {
+      // This row's record for a later restore: exact copies of what the factor block receives.
+      if (row == 0) {
+#pragma unroll
+        for (int j = 0; j < RU_HK; ++j) s_rk[t * RU_K + k0 + j] = kk[j];
+      }
+      if (half == 0) s_rv[t * RU_V + row] = vraw;
+      if (tid == 0) { s_rgb[2 * t] = g; s_rgb[2 * t + 1] = bt; }
+    }
+#endif
+
+    float on = 0.0f;
+    if constexpr (TREE) {
+#pragma unroll
+      for (int j = 0; j < RU_HK; ++j) {
+        const float hn = h[j] * eg + u * kk[j];
+        on += hn * (qraw(j) * qs);
+        h[j] = leaf ? h[j] : hn;
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < RU_HK; ++j) { h[j] += u * kk[j]; on += h[j] * qq[j]; }
+    }
+    on += r4d_xor_lane<1>(on);
+
+    post_row(t, tok, on);
     ++oi;
+  }
   }
 
   // NORM 4: had_quant_act_i8g's codes at IQ8R's group, one scale per 256 columns of `o`: two value
@@ -1304,7 +1497,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                                     long z_pitch, const void* nw, float neps, int nact, int N,
                                     int H, int Hg, float scale, float thr, int state_fp16,
                                     RadStream stream, int oq_i8, bool anc, bool w_f32,
-                                    bool chain, RuSpec spec = RuSpec{}) {
+                                    bool chain, RuSpec spec = RuSpec{}, bool fuse = false) {
   if (anc && sidx_stride < 6) return RAD_E_SHAPE;
   if (anc && sidx_stride * RU_FSTR > st_head) return RAD_E_SHAPE;
   const int sdt = state_fp16 ? 1 : 0;
@@ -1312,16 +1505,16 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const long flood = (long)N * slots_written * st_slot * (sdt ? 2 : 4);
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
-#define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
-  do { if (oq_i8 == 3) RC_LAUNCH_NM(4, NTC, ANCC, SDTC, CVC);                                  \
-       else if (oq_i8 == 2) RC_LAUNCH_NM(3, NTC, ANCC, SDTC, CVC);                             \
-       else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
-       else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
-#define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  do { if (chain) RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, r4dchain);                            \
-       else       RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, R4dUnchained); } while (0)
-#define RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, CH_)                                           \
-  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, 0,     \
+#define RC_LAUNCH(NTC, ANCC, SDTC, CVC, STGC)                                                 \
+  do { if (oq_i8 == 3) RC_LAUNCH_NM(4, NTC, ANCC, SDTC, CVC, STGC);                            \
+       else if (oq_i8 == 2) RC_LAUNCH_NM(3, NTC, ANCC, SDTC, CVC, STGC);                       \
+       else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC, STGC);                            \
+       else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC, STGC); } while (0)
+#define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC, STGC)                                          \
+  do { if (chain) RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, STGC, r4dchain);                      \
+       else       RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, STGC, R4dUnchained); } while (0)
+#define RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, STGC, CH_)                                     \
+  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, STGC, SDTC, CVC, 0, \
                                                       CH_>),                                   \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
@@ -1348,12 +1541,16 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if (oq_i8 == 2) RC_TREE_NM(3, CVC);                                               \
        else if (oq_i8) RC_TREE_NM(2, CVC);                                                    \
        else            RC_TREE_NM(1, CVC); } while (0)
-#define RC_PICKNT(ANCC, SDTC, CVC) \
-  do { if (nt) RC_LAUNCH(1, ANCC, SDTC, CVC); else RC_LAUNCH(0, ANCC, SDTC, CVC); } while (0)
+// STGC 1 is the fused multi-row form (RU_FUSE): the anchor form over an f32 state only, picked
+// by the caller when a launch carries more than one row a sequence.
+#define RC_PICKNT(ANCC, SDTC, CVC, STGC) \
+  do { if (nt) RC_LAUNCH(1, ANCC, SDTC, CVC, STGC); else RC_LAUNCH(0, ANCC, SDTC, CVC, STGC); } while (0)
 #define RC_PICKANC(SDTC, CVC) \
-  do { if (anc) RC_PICKNT(1, SDTC, CVC); else RC_PICKNT(0, SDTC, CVC); } while (0)
+  do { if (anc) RC_PICKNT(1, SDTC, CVC, 0); else RC_PICKNT(0, SDTC, CVC, 0); } while (0)
 #define RC_PICKSDT(CVC) \
-  do { if (sdt) RC_PICKANC(1, CVC); else RC_PICKANC(0, CVC); } while (0)
+  do { if (sdt) RC_PICKANC(1, CVC); \
+       else if (anc) { if (fuse) RC_PICKNT(1, 0, CVC, 1); else RC_PICKNT(1, 0, CVC, 0); } \
+       else RC_PICKNT(0, 0, CVC, 0); } while (0)
   if (spec.parent || spec.path) {
     if (!anc || sdt) return RAD_E_UNSUPPORTED;
     if (w_f32) RC_TREE(2); else RC_TREE(1);
@@ -1668,7 +1865,7 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
         wide ? 3 : had ? 2 : oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0,
         cw->dtype == RAD_F32,
-        r4d_geti_or(a, "chain", 0) != 0, spec);
+        r4d_geti_or(a, "chain", 0) != 0, spec, T > (long long)N);
 }
 
 extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
