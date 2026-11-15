@@ -686,6 +686,8 @@ AVX_KERNEL(qsa_tail_store) {
     int64_t nw = 0;
     for (int64_t t = 0; t < T; ++t) {
         const int64_t s = seq[t];
+        /* A tree block wider than the ring would alias flat slots. */
+        if (s >= 0 && tree_seq(sp, cu, s) && cu_at(cu, s + 1) - cu_at(cu, s) > ring) return RAD_E_SHAPE;
         if (s < 0 || t < cu_at(cu, s + 1) - ring) continue;
         const int64_t si = ldi(sx, col0(sx, s));
         if (si < 0) continue;
@@ -815,11 +817,12 @@ AVX_KERNEL(qsa_work) {
         if (tree) {
             const int rc = tree_check(sp, po, cu, s);
             if (rc < 0) return rc;
+            if (t1 - t0 > ring) return RAD_E_SHAPE;       /* flat ring slots would alias */
         }
         const int64_t p0 = ldi(po, offlin(po, t0));
         const int64_t p1 = tree ? p0 : ldi(po, offlin(po, t1 - 1));
         int64_t lo = p0 / ratio;
-        if (na && ldi(na, offlin(na, s)) >= 2) {
+        if (na && ldi(na, offlin(na, s)) >= 2 && p0 - ldi(na, offlin(na, s)) >= 0) {
             const int64_t x = p0 - ldi(na, offlin(na, s)) - ratio + 2;
             lo = std::min(lo, x <= 0 ? (int64_t)0 : (x + ratio - 1) / ratio);
         }
@@ -907,6 +910,7 @@ AVX_KERNEL(qsa_work) {
                 while (ldi(po, offlin(po, y)) > q) y = tree_parent(sp, t0, y);
                 return y;
             };
+            if (si < 0) continue;                 /* no slot: no keys, rnc 0, rtab -1 */
             const int64_t nr = (px + 1) / ratio - b0;
             st_int_dt(rnc->dtype, rnc->data, offlin(rnc, x), nr);
             for (int64_t i = 0; i < nr; ++i)

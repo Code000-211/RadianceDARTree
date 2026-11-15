@@ -18,6 +18,7 @@
 #include "rad_fp8.h"
 
 #include <atomic>
+#include <string>
 
 namespace rad {
 namespace arch {
@@ -60,6 +61,14 @@ struct QsaIndexer {
          * wider than them is one sequence (RadBuildCtx::max_mixed_tok); such a step scores and
          * selects in windows of this many rows (step()). */
         int64_t     plane_rows = 0;
+        /* Tree verification (rad_drafter_tree, docs/QSA.md "Tree verify"): this layer's block keys,
+         * tail and selection follow RadBatch::spec_parent and spec_path. Set for a trunk layer of a
+         * tree deployment and never for the MTP head's own layer, whose tail its history pass
+         * stores in committed order (it keeps the classic issue sequence). `region` is the width
+         * RW of a row's region-block tables, at least (deepest path + ratio) / ratio + 1. Off
+         * leaves every op below as it was. */
+        bool        tree       = false;
+        int64_t     region     = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -98,6 +107,23 @@ struct QsaIndexer {
          * step by `rope_table` for the attention block; the indexer rotates at the same `rot`,
          * `theta` and `scale`. Without it the unfused per-head norms run. */
         rad_buf cos_sin = 0;
+        /* A tree verify's scratch and outputs (the ops a tree step adds, see store_keys), shared
+         * by every layer like the buffers above and declared only for a tree deployment. The rows
+         * are the step's, indexed by absolute batch row, so they are `max_tok` tall (a mixed
+         * step's prefill rows are inert and still index). `region` below is RW. */
+        rad_buf skey   = 0;   /* [max_tok, head_dim] bf16: a row's scratch block key */
+        rad_buf sstage = 0;   /* [max_tok * ratio, head_dim] bf16: its raw keys */
+        rad_buf spage  = 0;   /* [max_tok] i32 */
+        rad_buf sbpos  = 0;   /* [max_tok] i32 */
+        rad_buf rnc    = 0;   /* [max_tok] i32: region blocks the row's path completes */
+        rad_buf rcu    = 0;   /* [max_tok + 1] i32 */
+        rad_buf rtab   = 0;   /* [max_tok, region] i32 */
+        rad_buf rscore = 0;   /* [max_tok, region] f32 */
+        rad_buf vmask  = 0;   /* [max_tok] i64: bit k = region key rb + k is the row's to read */
+        /* [roundup(max_seqs, 16)] i32: each sequence's region base `ratio * nc` (the committed
+         * blocks of a tree sequence end where its region starts), for attn_paged_tree_sel. Padded
+         * to int_affine's 16 entries a launch; `nc` is padded alike. */
+        rad_buf rb     = 0;
     };
 
     Geom       g{};
@@ -112,6 +138,10 @@ struct QsaIndexer {
      * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0;
+    /* Tree verification: the tail's close over the previous verify's path, the scratch block keys,
+     * the region's scores, and the region bases (int_affine: rb = ratio * nc). */
+    rad_op      op_tail_compact = 0, op_bkey2 = 0, op_score_region = 0, op_rb = 0;
+    static constexpr int64_t kRbRows = 16;      /* int_affine's most entries a launch */
 
     bool on() const { return op_rope != 0; }
 
@@ -196,13 +226,33 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                   RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     if (!w_kn) return RAD_E_INVAL;
 
-    op_work = rw(b, RAD_OP(b, "qsa_work",
+    /* A tree layer needs the whole scratch wire; without it the layer is a classic one (c.tree is
+     * how the architecture asks, the buffers how it delivers). */
+    const bool tw = c.tree && w.skey && w.sstage && w.spage && w.sbpos && w.rnc && w.rcu &&
+                    w.rtab && w.rscore && w.vmask && w.rb && c.region > 0;
+    c.tree = tw;
+    if (tw) {
+        const rad_buf wr[10] = { w.stage, w.page, w.bpos, w.nc, w.sstage, w.spage, w.sbpos,
+                                 w.rtab, w.rnc, w.rcu };
+        op_work = RAD_OP(b, "qsa_work",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
+                               RAD_INT("ratio", c.ratio), RAD_INT("ring", c.ring),
+                               RAD_INT("seqs", g.max_seqs),
+                               RAD_INT("work", c.max_work), RAD_STR("dtype", g.dtype)),
+                    RAD_NOWEIGHTS);
+        if (op_work) {
+            rad_op_reads(b, op_work, &w.qk, 1);
+            rad_op_writes(b, op_work, wr, 10);
+        }
+    } else {
+        op_work = rw(b, RAD_OP(b, "qsa_work",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
                                RAD_INT("ratio", c.ratio), RAD_INT("ring", c.ring),
                                RAD_INT("seqs", g.max_seqs),
                                RAD_INT("work", c.max_work), RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.qk}, {w.stage, w.page, w.bpos, w.nc});
+    }
 
     /* The block-key group, declared immediately before its consumer (see the declaration). One KV
      * head, `block_size` = ratio and `head_dim` = n / (2 * ratio) make a page hold exactly one
@@ -214,6 +264,10 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         d.dtype     = RAD_BF16;
         d.n_head_kv = 1;
         d.head_dim  = c.head_dim / (2 * c.ratio);
+        /* A page holds one block key, not `ratio` tokens' K and V, so the acceptance's K/V move
+         * (the core's tree_compact) must not touch it: a tree verify leaves it alone and the next
+         * step's qsa_work heals it from the compacted tail (docs/QSA.md). */
+        d.no_tree_compact = c.tree ? 1 : 0;
         *bk = rad_decl_kv_group(b, nm.f("kv_qsa_bkey"), &d);
         if (!*bk) return RAD_E_INVAL;
         /* qsa_score reads every complete block of the history each step, so this group stays resident
@@ -246,12 +300,64 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                 {w.qk}, {});
 
     /* M is queries for both, up to a whole prefill chunk: the selection is per query. */
+    /* The scratch block keys of a tree step: the same op over the scratch rows, into a plain
+     * buffer (the first block-key op's output is the KV cache, so this is an instance of its own). */
+    if (tw) {
+        const RadParam ps[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
+                                RAD_INT("ratio", c.ratio), RAD_INT("rotary_dim", c.rot),
+                                RAD_INT("block_size", c.ratio),
+                                RAD_F64("eps", g.eps), RAD_F64("theta", g.theta),
+                                RAD_F64("scale", g.rope_scale), RAD_F64("wadd", g.wadd_qk),
+                                RAD_STR("dtype", g.dtype), RAD_STR("mode", g.rope_mode),
+                                RAD_STR("sections", g.rope_sections) };
+        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (g.rope_mc ? 0 : 2);
+        op_bkey2 = rw(b, decl_rotary(b, g, "qsa_block_key", ps, n_ps, &w_kn, 1),
+                      {w.sstage, w.spage, w.sbpos}, {w.skey});
+        op_tail_compact = RAD_OP(b, "qsa_tail_compact",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n", c.head_dim),
+                               RAD_INT("ring", c.ring), RAD_INT("seqs", g.max_seqs),
+                               RAD_STR("dtype", g.dtype)),
+                    RAD_NOWEIGHTS);
+        /* An op the libraries do not serve stays 0 and fails only the step that issues it. */
+    }
     op_score = rw(b, RAD_OP(b, "qsa_score",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
                                 RAD_INT("heads", c.heads), RAD_INT("blocks", c.max_blocks),
                                 RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                  {w.q, w.nc}, {w.score});
+    if (tw) {
+        /* The region's scores, each row a one-row sequence over its own scratch keys. */
+        op_score_region = rw(b, RAD_OP(b, "qsa_score",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.head_dim),
+                                RAD_INT("heads", c.heads), RAD_INT("blocks", c.region),
+                                RAD_INT("seqs", g.max_tok), RAD_STR("dtype", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 {w.q, w.skey, w.rtab, w.rcu, w.rnc}, {w.rscore});
+        /* rb = ratio * nc, 16 sequences a launch (int_affine's lists are that long at most). */
+        std::string src, mul, add;
+        for (int64_t i = 0; i < kRbRows; ++i) {
+            src += std::to_string(i) + " ";
+            mul += std::to_string(c.ratio) + " ";
+            add += "0 ";
+        }
+        op_rb = rw(b, RAD_OP(b, "int_affine",
+                      RAD_PARAMS(RAD_INT("M", kRbRows), RAD_STR("src", src.c_str()),
+                                 RAD_STR("mul", mul.c_str()), RAD_STR("add", add.c_str())),
+                      RAD_NOWEIGHTS),
+                  {w.nc}, {w.rb});
+        const rad_buf rd[3] = { w.score, w.nc, w.rscore };
+        const rad_buf wr[4] = { w.sel, w.nsel, w.sequ, w.vmask };
+        op_select = RAD_OP(b, "qsa_select",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                 RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                 RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
+                      RAD_NOWEIGHTS);
+        if (op_select) {
+            rad_op_reads(b, op_select, rd, 3);
+            rad_op_writes(b, op_select, wr, 4);
+        }
+    } else
     op_select = rw(b, RAD_OP(b, "qsa_select",
                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
                                  RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
@@ -278,37 +384,103 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
      * groups get a second copy), so use the batch's pitch. */
     const int64_t tw = tlb->state_index_pitch > 0 ? tlb->state_index_pitch : 1;
 
+    /* Tree verification (docs/QSA.md "Tree verify"): `tree` is this step verifying a tree (the
+     * decode half's rows carry spec_parent), `heal` the step after one (RadBatch::spec_path), which
+     * closes the tail over the accepted path before anything reads it and has qsa_work rebuild the
+     * block keys the previous step's committed tokens completed. Both only for a trunk layer
+     * (Config::tree): the MTP head's tail is stored in committed order. */
+    const bool tree = c.tree && tree_verify_step(batch);
+    const bool heal = c.tree && tree_path_step(batch);
+    if ((tree || heal) && (!op_work || (heal && !op_tail_compact) ||
+                           (tree && (!op_bkey2 || !op_score_region || !op_rb)))) {
+        rad_step_fail(c_, "qsa: a tree verify (or the step after one) needs qsa_tail_compact, "
+                          "the scratch block keys and the region score, which no loaded library "
+                          "serves");
+        return false;
+    }
+    if (heal) {
+        /* Exactly once per layer and step, before qsa_work. A sequence that followed a chain has
+         * the identity path (num_accepted below 2 moves nothing). */
+        RAD_ISSUE_N(c_, op_tail_compact, S,
+                    praw(batch->positions, RAD_I32, T), praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    praw(batch->num_accepted, RAD_I32, S),
+                    praw2(batch->spec_path, RAD_I32, S, batch->spec_path_pitch),
+                    kv_cache(c.kv_tail, layer), praw2(tlb->state_index, RAD_I32, S, tw));
+    }
+
     /* Invariant: the work list runs before the tail store. The gather reads a completing block's
      * raw keys, up to `ratio - 1` of which are in the tail from earlier steps and are about to be
      * overwritten. The ring also spaces overwrites by `ring` positions, but the order still decides
-     * what a straddling block reads. */
-    const int64_t work = (T + c.ratio - 1) / c.ratio + S;
+     * what a straddling block reads. A heal adds up to ceil(max_spec / ratio) blocks a sequence. */
+    int64_t work = (T + c.ratio - 1) / c.ratio + S;
+    if (tree || heal) {
+        work += S * ((g.max_spec + c.ratio - 1) / c.ratio);
+        if (work > c.max_work) work = c.max_work;
+    }
     /* Block positions: one component per block, or three under M-RoPE with planes. Under M-RoPE
      * `bpos` is [max_work, 3]; this step passes [work, 3], or only column 0 when the pass has no
      * planes (qsa_work then writes component 0 and the block key reads the one-component form). */
     const bool mc = g.rope_mc && batch->rope_pos;
     RadOperand bpos = g.rope_mc ? RAD_B_COL(w.bpos, 0, mc ? 3 : 1) : brows(w.bpos, work);
     if (g.rope_mc) bpos.rows = work;
-    RAD_ISSUE_N(c_, op_work, T,
-                bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
-                praw(batch->positions, RAD_I32, T),
-                praw(batch->cu_seqlens, RAD_I32, S + 1),
-                kv_cache(c.kv_tail, layer),
-                praw2(tlb->state_index, RAD_I32, S, tw),
-                praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
-                mc ? praw2(batch->rope_pos, RAD_I32, 3, T) : RAD_NONE,
-                brows(w.stage, work * c.ratio), brows(w.page, work), bpos,
-                brows(w.nc, S));
+    if (tree || heal) {
+        /* The trailing optionals, in order: spec_parent, num_accepted, then (a tree step only) the
+         * scratch outputs. An absent one is a hole. */
+        RAD_ISSUE_N(c_, op_work, T,
+                    bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                    praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    kv_cache(c.kv_tail, layer),
+                    praw2(tlb->state_index, RAD_I32, S, tw),
+                    praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                    mc ? praw2(batch->rope_pos, RAD_I32, 3, T) : RAD_NONE,
+                    brows(w.stage, work * c.ratio), brows(w.page, work), bpos,
+                    brows(w.nc, S),
+                    tree ? praw(batch->spec_parent, RAD_I32, T) : RAD_NONE,
+                    (tree || heal) ? praw(batch->num_accepted, RAD_I32, S) : RAD_NONE,
+                    tree ? brows(w.sstage, T * c.ratio) : RAD_NONE,
+                    tree ? brows(w.spage, T) : RAD_NONE,
+                    tree ? brows(w.sbpos, T) : RAD_NONE,
+                    tree ? brows(w.rtab, T) : RAD_NONE,
+                    tree ? brows(w.rnc, T) : RAD_NONE,
+                    tree ? brows(w.rcu, T + 1) : RAD_NONE);
+    } else {
+        RAD_ISSUE_N(c_, op_work, T,
+                    bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                    praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    kv_cache(c.kv_tail, layer),
+                    praw2(tlb->state_index, RAD_I32, S, tw),
+                    praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                    mc ? praw2(batch->rope_pos, RAD_I32, 3, T) : RAD_NONE,
+                    brows(w.stage, work * c.ratio), brows(w.page, work), bpos,
+                    brows(w.nc, S));
+    }
     RAD_ISSUE_N(c_, op_bkey, work,
                 brows(w.stage, work * c.ratio), RAD_W(w_kn),
                 brows(w.page, work), bpos,
                 kv_cache(kv_bk, layer));
-    RAD_ISSUE_N(c_, op_tail, T,
-                bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
-                praw(batch->positions, RAD_I32, T),
-                praw(batch->cu_seqlens, RAD_I32, S + 1),
-                kv_cache(c.kv_tail, layer),
-                praw2(tlb->state_index, RAD_I32, S, tw));
+    /* The scratch block keys: one launch row per step row, and a row that completes no block is
+     * skipped on its `spage` of -1. */
+    if (tree)
+        RAD_ISSUE_N(c_, op_bkey2, T,
+                    brows(w.sstage, T * c.ratio), RAD_W(w_kn),
+                    brows(w.spage, T), brows(w.sbpos, T), brows(w.skey, T));
+    if (tree)
+        RAD_ISSUE_N(c_, op_tail, T,
+                    bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                    praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    kv_cache(c.kv_tail, layer),
+                    praw2(tlb->state_index, RAD_I32, S, tw),
+                    praw(batch->spec_parent, RAD_I32, T));
+    else
+        RAD_ISSUE_N(c_, op_tail, T,
+                    bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                    praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    kv_cache(c.kv_tail, layer),
+                    praw2(tlb->state_index, RAD_I32, S, tw));
     return true;
 }
 
@@ -375,6 +547,11 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * in one pass over the step, and a row two windows share is written twice with the same
      * bytes. */
     const int64_t PR = c.plane_rows > 0 ? c.plane_rows : T;
+    if (T > PR && c.tree && tree_verify_step(batch)) {
+        rad_step_fail(c_, "qsa: a tree verify beside a prefill wider than the score plane has no "
+                          "windowed form");
+        return;
+    }
     if (T > PR) {
         if (S != 1 || !win_cu) {
             rad_step_fail(c_, "qsa: a step wider than the score plane must be one sequence with "
@@ -404,6 +581,25 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
                 praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
                 bcol_at(w.score, 0, c.max_blocks, 0, live, T));
+    if (c.tree && tree_verify_step(batch)) {
+        /* The region's blocks, scored per row over its own scratch keys (rows are one-row
+         * sequences: `seqs` is max_tok), then the union ranked and the region's visibility masked.
+         * `nc` of a tree sequence is its committed block count, which is also its region base
+         * over `ratio`: the attention's `rb`. */
+        RAD_ISSUE_N(c_, op_score_region, T,
+                    brows(w.q, T), brows(w.skey, T), brows(w.rtab, T), brows(w.rcu, T + 1),
+                    brows(w.rnc, T), brows(w.rscore, T));
+        for (int64_t o = 0; o < S; o += kRbRows)
+            RAD_ISSUE(c_, op_rb, brow_slice(w.nc, o, kRbRows, 1), brow_slice(w.rb, o, kRbRows, 1));
+        RAD_ISSUE_N(c_, op_select, T,
+                    bcol_at(w.score, 0, c.max_blocks, 0, live, T),
+                    praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                    brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                    praw(batch->cu_seqlens, RAD_I32, S + 1),
+                    brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T),
+                    praw(batch->spec_parent, RAD_I32, T), brows(w.rscore, T),
+                    brows(w.vmask, T));
+    } else
     RAD_ISSUE_N(c_, op_select, T,
                 bcol_at(w.score, 0, c.max_blocks, 0, live, T),
                 praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),

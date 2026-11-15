@@ -202,7 +202,8 @@ static const RadOperandSpec oQsaTailStore[] = { { "k", RAD_OPD_IN, 0 },
                                                 { "pos", RAD_OPD_IN, 0 },
                                                 { "cu", RAD_OPD_IN, 0 },
                                                 { "state", RAD_OPD_INOUT, 0 },
-                                                { "sidx", RAD_OPD_IN, 0 } };
+                                                { "sidx", RAD_OPD_IN, 0 },
+                                                { "spec_parent", RAD_OPD_IN, 1 } };
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
                                                  P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
@@ -311,7 +312,9 @@ static const RadOperandSpec oGdnConvUpdate[] = { { "x", RAD_OPD_IN, 0 },
                                                 { "cu", RAD_OPD_IN, 0 },
                                                 { "q", RAD_OPD_OUT, 0 },
                                                 { "k", RAD_OPD_OUT, 0 },
-                                                { "v", RAD_OPD_OUT, 0 } };
+                                                { "v", RAD_OPD_OUT, 0 },
+                                                 { "spec_parent", RAD_OPD_IN, 1 },
+                                                 { "spec_path", RAD_OPD_IN, 1 } };
 
 static const RadParamSpec pExpertScale[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
                                              P_STR("dtype") };
@@ -393,7 +396,9 @@ static const RadOperandSpec oGdnRecurrent[] = { { "q", RAD_OPD_IN, 0 },
                                                { "norm_w", RAD_OPD_WEIGHT, 1 },
                                                { "o", RAD_OPD_OUT, 0 },
                                                { "o_q", RAD_OPD_OUT, 1 },
-                                               { "o_scale", RAD_OPD_OUT, 1 } };
+                                               { "o_scale", RAD_OPD_OUT, 1 },
+                                                { "spec_parent", RAD_OPD_IN, 1 },
+                                                { "spec_path", RAD_OPD_IN, 1 } };
 
 /* gdn_conv_recurrent_update: the decode conv and the recurrent update as one kernel, the
  * convolution's operands then the recurrence's minus q, k and v (never materialised). */
@@ -419,7 +424,9 @@ static const RadOperandSpec oGdnConvRecurrent[] = { { "x", RAD_OPD_IN, 0 },
                                                    { "norm_w", RAD_OPD_WEIGHT, 0 },
                                                    { "o", RAD_OPD_OUT, 0 },
                                                    { "o_q", RAD_OPD_OUT, 1 },
-                                                   { "o_scale", RAD_OPD_OUT, 1 } };
+                                                   { "o_scale", RAD_OPD_OUT, 1 },
+                                                    { "spec_parent", RAD_OPD_IN, 1 },
+                                                    { "spec_path", RAD_OPD_IN, 1 } };
 
 
 /* ================================================================== the vocab and the sampler
@@ -571,7 +578,8 @@ static const RadOperandSpec oNgramIds[] = { { "tok", RAD_OPD_IN, 0 },
                                             { "has_init", RAD_OPD_IN, 1 },
                                             { "num_accepted", RAD_OPD_IN, 1 },
                                             { "ids", RAD_OPD_OUT, 0 },
-                                            { "ahead_ids", RAD_OPD_OUT, 1 } };
+                                            { "ahead_ids", RAD_OPD_OUT, 1 },
+                                            { "spec_parent", RAD_OPD_IN, 1 } };
 static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype") };
 static const RadOperandSpec oGemmQBias[] = { { "a", RAD_OPD_IN, 0 }, { "a_scale", RAD_OPD_IN, 0 },
                                              { "b", RAD_OPD_WEIGHT, 0 },

@@ -229,6 +229,7 @@ int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, co
 }  // namespace
 
 extern "C" int halo_rad_ple_conv(const RadArgs* a, RadStream s) {
+    if (halo_opt(a, 9)) return HALO_NO(RAD_E_UNSUPPORTED);  /* spec_parent: a tree verify is not served here */
     return conv_launch(a, s, true, halo_opt(a, PC_X), halo_opt(a, PC_W), halo_opt(a, PC_CS),
                        halo_opt(a, PC_CU), halo_opt(a, PC_RESID), halo_opt(a, PC_CIDX),
                        halo_opt(a, PC_HINIT), halo_opt(a, PC_NACC), halo_opt(a, PC_Y));

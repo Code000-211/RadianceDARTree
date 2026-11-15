@@ -296,7 +296,22 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t PT = T - DT;
     const int64_t v_dim = cfg.v_dim();
 
+    /* Tree verification planes (rad_block_gdn_fp8.h says what they do), trailing operands present
+     * only on a tree step: a chain's issue is the list it always was. */
+    const bool treed = tree_verify_step(batch) || tree_path_step(batch);
+    const RadOperand spar  = tree_verify_step(batch)
+                                 ? praw(batch->spec_parent, RAD_I32, DT) : RAD_NONE;
+    const RadOperand spath = tree_path_step(batch)
+                                 ? praw2(batch->spec_path, RAD_I32, D, batch->spec_path_pitch)
+                                 : RAD_NONE;
     if (D > 0) {
+        if (treed)
+            RAD_ISSUE_N(c, op_conv_update, qd,
+                        brows(w.in, DT), RAD_W(w_conv), RAD_NONE, kv_cache(kv_conv, layer),
+                        praw(cv_idx, RAD_I32, D), praw(batch->num_accepted, RAD_I32, D),
+                        praw(batch->cu_seqlens, RAD_I32, D + 1),
+                        brows(w.q, DT), brows(w.k, DT), brows(w.v, DT), spar, spath);
+        else
         RAD_ISSUE_N(c, op_conv_update, qd,
                     brows(w.in, DT), RAD_W(w_conv), RAD_NONE, kv_cache(kv_conv, layer),
                     praw(cv_idx, RAD_I32, D), praw(batch->num_accepted, RAD_I32, D),
@@ -304,6 +319,16 @@ inline void GdnBF16::step(RadCtx* c, const RadBatch* batch) const {
                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT));
         /* a and b are the last 2*n_head_v columns of the projection row, read in place. The
          * recurrent kernel folds the gated norm, so it takes z and the gain. */
+        if (treed)
+            RAD_ISSUE_N(c, op_recur, qd,
+                        brows(w.q, DT), brows(w.k, DT), brows(w.v, DT),
+                        bcol(w.in, conv_dim, H, DT), bcol(w.in, conv_dim + H, H, DT),
+                        RAD_W(w_a_log), RAD_W(w_dt_bias), kv_cache(kv_state, layer),
+                        praw2(st_idx, RAD_I32, D, st_w), praw(batch->num_accepted, RAD_I32, D),
+                        praw(batch->cu_seqlens, RAD_I32, D + 1),
+                        brows(w.z, DT), RAD_W(w_out_norm), brows(w.o, DT),
+                        RAD_NONE, RAD_NONE, spar, spath);
+        else
         RAD_ISSUE_N(c, op_recur, qd,
                     brows(w.q, DT), brows(w.k, DT), brows(w.v, DT),
                     bcol(w.in, conv_dim, H, DT), bcol(w.in, conv_dim + H, H, DT),

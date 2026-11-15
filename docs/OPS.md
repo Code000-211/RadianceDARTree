@@ -572,8 +572,14 @@ gqa 12 and gqa 6, page 4, bf16 and i8 caches, on its split-KV decode kernel run 
 list: a tiny prep launch packs the row's visible region keys (ascending) behind its `nsel` pages, so
 the kernel sees exactly the row's keys at consecutive indices and masks nothing. A tree row is
 therefore byte-identical to `attn_paged` (the sparse decode row) over the sequential decode of its
-path, not merely close, and a chain row to the plain sparse row over the same pages. The split law,
-the partial buffer and the merge are the sparse `attn_paged` launch's; the op takes scratch for
+path, not merely close, and a chain row to the plain sparse row over the same pages. The split count is the
+sparse `attn_paged` law evaluated at the SEQUENCE count (`n_seq`, the block table's rows), not at the
+launch row count, because the sequential decode of those sequences launches with `num_seqs` =
+`n_seq`; the law reads `kv_heads * num_seqs` (and `max_ctx`, and the `splits` tunable when set), so
+the byte-identity above holds for a sequential decode with the same sequence count, `max_ctx` and
+tunable, and is independent of how many tree rows a sequence carries. A sequential decode batched
+with a different sequence count splits differently and is only close, unless `splits` is pinned.
+The partial buffer and the merge are the sparse `attn_paged` launch's; the op takes scratch for
 `max_seqs` rows of 66 more i32 beyond the partials. Visibility is the mask's and the page list's
 alone: the architecture states `nsel` and `vmask` per row from QSA's selection (`qsa_select`'s
 `vmask` output). Every bit's page must be mapped, and every row must see at least one key.
@@ -3788,6 +3794,46 @@ therefore not established.
 |---|---|---|
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
 | `dflash_tree` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `nodes` `temp`:f64/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens`, `parents` |
+
+| `mtp_tree_grow` | `M` `round` `rounds` `nodes` `width` `block_size`/opt `sel_pitch`/opt | `didx`, `dval`, `state`:inout, `head_pos`?, `head_row`?, `table`? → `tok`, `par`, `sel`?, `nsel`?, `vmask`?, `rb`? |
+
+### Serial draft tree growth (`mtp_tree_grow`)
+
+The stage-2 tree of a serial draft head (`RadDrafterDecl::tree_width` > 1, `docs/PLUGIN.md`): the head
+runs `rounds` (R) passes and grows a tree of `nodes` (N) nodes, `width` (W) frontier rows a pass.
+One launch per pass, `round` its parameter (the ABI freezes it as one, so the plugin declares an op a
+round). `abi/rad_mtp_tree.h` is the algorithm; libref and libr4d run that one function.
+
+- `didx`, `dval` `[rows, 8]` i32 and f32: the head's reranked top-8 (ids and logits) of the rows the
+  pass embedded, `rows` = `M` in round 1 (one row a sequence, the root's) and `M * width` after
+  (row `s * width + w` the w-th frontier row). A candidate whose id is negative or whose logit is not
+  finite is dropped.
+- `state` `[M, rad_mtp_tree_state_words(N, W, R)]` i32, inout, persistent across a step's passes (the
+  words are laid out in the header): head index, nodes created, the frontier's node ids, the node
+  table (token, parent, depth, cumulative log probability, ancestors mask) and the candidate pool.
+  Round 1 resets it. Round 1 also reads each sequence's head index (the index node 0's K and V sit at,
+  node k's at `head + k`) at `head_pos[head_row[s]]`: the pass's positions and
+  `RadBatch::draft_out_ids`.
+- A frontier row's candidate `c` is scored `cum(parent) + (dval_c - m) - log(sum_k exp(dval_k - m))`,
+  `m` the largest valid logit, the sum in column order, in f32 (the head's shortlist of eight is all
+  there is to normalise over). The pool keeps every candidate; each round takes the best, ties to the
+  one pooled first (lower frontier row, then lower column). After a round below `rounds` the best
+  `min(W, N - created)` become nodes `created + 1, ...` (creation order, so a parent precedes its
+  child, and the node ids the head's K and V flat slots are named by); after round `rounds` every node
+  the budget has left is created (they are never embedded). A pool that runs dry pads with a copy of
+  node 1's token under the root.
+- `tok` `[M, pitch]`, `par` `[M, pitch]` i32, `pitch >= N`: after a round below `rounds`, entry `w` the
+  w-th new node's token and parent node id (0 the root), a token of -1 ending the list; after round
+  `rounds`, entry `j - 1` node `j`'s token and parent for `j = 1..N`, which is what the block-style take
+  reads (`docs/PLUGIN.md`).
+- With `sel_pitch` > 0 (`block_size` the head's KV page, `table` the head's block table `[M, pitch]`,
+  `sel` `[M * W, sel_pitch]` i32, `nsel` `[M * W]`, `vmask` `[M * W]` i64 and `rb` `[M]`, all together),
+  after a round below `rounds` the next pass's operands for `attn_paged_tree_sel`: `rb = block *
+  floor(head / block)`, `sel` the committed pages `table[0 .. rb / block)` (the last `sel_pitch` of them
+  when there are more: above QSA's exactness bound the head reads a recency window, not its selection,
+  which costs acceptance and nothing else), and row `w`'s `vmask` the keys `[rb, head]` plus bit
+  `head - rb + id` for every ancestor-or-self `id >= 1` of its node. A row past the new nodes reads
+  one key and is discarded.
 
 `dflash_tree` grows the same lattice into a tree of `nodes` nodes instead of walking one path
 (`rad_drafter_tree`). Node 0 is the anchor at lattice position -1 with log probability 0. A node at

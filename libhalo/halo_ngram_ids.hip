@@ -154,6 +154,7 @@ enum { NG_TOK = 0, NG_STATE, NG_CU, NG_MULT, NG_VSZ, NG_OFF, NG_CIDX, NG_HINIT, 
        NG_AHEAD };
 
 extern "C" int halo_rad_ngram_ids(const RadArgs* a, RadStream stream) {
+    if (halo_opt(a, 11)) return HALO_NO(RAD_E_UNSUPPORTED);  /* spec_parent: a tree verify is not served here */
     const RadTensor* tok  = halo_opt(a, NG_TOK);
     const RadTensor* st   = halo_opt(a, NG_STATE);
     const RadTensor* cu   = halo_opt(a, NG_CU);

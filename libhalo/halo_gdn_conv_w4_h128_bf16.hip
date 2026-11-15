@@ -563,6 +563,7 @@ extern "C" int halo_rad_gdn_conv_prep(const RadArgs* a, RadStream s) {
 enum { CUP_X = 0, CUP_W, CUP_B, CUP_CSTATE, CUP_SIDX, CUP_NACC, CUP_CU, CUP_Q, CUP_K, CUP_V };
 
 extern "C" int halo_rad_gdn_conv_update(const RadArgs* a, RadStream s) {
+    if (halo_opt(a, 10) || halo_opt(a, 11)) return HALO_NO(RAD_E_UNSUPPORTED);  /* spec_parent, spec_path: a tree verify is not served here, so the selector falls through to libr4d / libref */
     if (gdn_dims_ok() != RAD_OK) return HALO_NO(RAD_E_SHAPE);
     const RadTensor* x    = halo_opt(a, CUP_X);
     const RadTensor* w    = halo_opt(a, CUP_W);

@@ -396,6 +396,8 @@ static const RadOperandSpec oGdnConvUpdate[] = {
     { "q",            RAD_OPD_OUT,    0 },
     { "k",            RAD_OPD_OUT,    0 },
     { "v",            RAD_OPD_OUT,    0 },
+    { "spec_parent", RAD_OPD_IN, 1 },
+    { "spec_path", RAD_OPD_IN, 1 },
 };
 
 static const RadParamSpec pGdnKktSolve[] = {
@@ -485,6 +487,8 @@ static const RadOperandSpec oGdnRecurrentUpdate[] = {
      * caller quantises separately (the prefill path). */
     { "o_q",          RAD_OPD_OUT,    1 },
     { "o_scale",      RAD_OPD_OUT,    1 },
+    { "spec_parent", RAD_OPD_IN, 1 },
+    { "spec_path", RAD_OPD_IN, 1 },
 };
 
 /* The decode convolution folded into the recurrent update. gdn_recurrent_update is the only
@@ -525,6 +529,8 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
     { "o",            RAD_OPD_OUT,    0 },
     { "o_q",          RAD_OPD_OUT,    1 },
     { "o_scale",      RAD_OPD_OUT,    1 },
+    { "spec_parent", RAD_OPD_IN, 1 },
+    { "spec_path", RAD_OPD_IN, 1 },
 };
 
 /* The control vector's projection (halo_hc_bf16.hip, with the other gated-residual kernels): a bf16
@@ -1309,6 +1315,14 @@ static const RadOperandSpec oQsaWork[] = {
     /* Complete blocks per sequence, needed by the scorer and the selection and computed here on
      * the way, which saves a launch per layer per step. */
     { "nc",    RAD_OPD_OUT, 0 },
+    { "spec_parent", RAD_OPD_IN, 1 },
+    { "num_accepted", RAD_OPD_IN, 1 },
+    { "sstage", RAD_OPD_OUT, 1 },
+    { "spage", RAD_OPD_OUT, 1 },
+    { "sbpos", RAD_OPD_OUT, 1 },
+    { "rtab", RAD_OPD_OUT, 1 },
+    { "rnc", RAD_OPD_OUT, 1 },
+    { "rcu", RAD_OPD_OUT, 1 },
 };
 
 /* `qsa_tail_store`, a new op whose schema this plugin fixes: it keeps the raw index keys of
@@ -1332,6 +1346,7 @@ static const RadOperandSpec oQsaTailStore[] = {
     { "cu",    RAD_OPD_IN,    0 },
     { "state", RAD_OPD_INOUT, 0 },
     { "sidx",  RAD_OPD_IN,    0 },
+    { "spec_parent", RAD_OPD_IN, 1 },
 };
 
 /* `qsa_select`, a new op whose schema this plugin fixes: it turns the scores into the page-id
@@ -1366,6 +1381,9 @@ static const RadOperandSpec oQsaSelect[] = {
      * per-sequence length as ordinary operands, so the sparse attention is the same op issued with
      * `sel` and this. Emitted here because it is one store of a value this kernel has. */
     { "seqused", RAD_OPD_OUT, 0 },
+    { "spec_parent", RAD_OPD_IN, 1 },
+    { "rscore", RAD_OPD_IN, 1 },
+    { "vmask", RAD_OPD_OUT, 1 },
 };
 
 /* `kv_resolve`: the residency map of a streamed KV group, between `qsa_select` and the attention
@@ -2213,6 +2231,7 @@ static const RadOperandSpec oPleConv[] = {
     { "has_init",     RAD_OPD_IN,     1 },
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
+    { "spec_parent", RAD_OPD_IN, 1 },
 };
 /* ple_conv's operands without `resid`, its parameters without `dilation`. */
 static const RadParamSpec pCausalConv[] = {
@@ -2253,6 +2272,7 @@ static const RadOperandSpec oNgramIds[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "ids",          RAD_OPD_OUT,    0 },
     { "ahead_ids",    RAD_OPD_OUT,    1 },
+    { "spec_parent", RAD_OPD_IN, 1 },
 };
 
 static const RadParamSpec pLogits[] = {

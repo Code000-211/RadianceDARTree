@@ -111,6 +111,15 @@ struct PleLayer {
     rad_buf b_ids = 0, b_emb = 0, b_embd = 0, b_k = 0, b_v = 0, b_gv = 0, b_gvn = 0, b_out = 0;
     rad_op  op_ids = 0, op_gather = 0, op_embd = 0;
     rad_op  op_gate = 0, op_conv = 0, op_add = 0;
+    /* kv_window_compact over the two windows (a tree deployment, RadBatch::spec_path): the verify
+     * rows' write layout is [row 0 at entry `off`], so the accepted path is gathered ahead of the
+     * first reader. The token window is i32, `off` ngram - 2; the conv window is the activation
+     * dtype, `off` hist() - 1 = (width - 1) * dilation - 1. Declared only where the build has the
+     * row; issued only when the step carries a spec_path. */
+    rad_op  op_win_tok = 0, op_win_conv = 0;
+    /* A tree deployment (RadBuildCtx::draft_tree): declares the two compaction ops. Set by the
+     * architecture before declare(); a chain deployment declares exactly what it did. */
+    bool    tree = false;
     /* The draft passes' hint (hint_ids, hint_fetch), where a drafter and `ngram_hint` exist: the
      * per-slot tails the hash continues from, the hinted ids (host domain, as `ple_ids`) and the
      * rows fetched for them, which nothing reads. */
@@ -461,6 +470,16 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     if (!op_ids || !op_gather || !op_embd || !key.op || !value.op || !op_gate || !op_conv ||
         !op_add)
         return RAD_E_INVAL;
+    /* The windows' closing over a tree verify's committed rows. Optional at declare, as every
+     * tree-only op: a build that lacks the row declines it and fails only a step that needs it. */
+    if (tree && g.max_spec > 0 && rad_op_declared(b, "kv_window_compact")) {
+        op_win_tok  = RAD_OP(b, "kv_window_compact",
+                             RAD_PARAMS(RAD_INT("off", c.ngram - 2), RAD_STR("dtype", "i32")),
+                             RAD_NOWEIGHTS);
+        op_win_conv = RAD_OP(b, "kv_window_compact",
+                             RAD_PARAMS(RAD_INT("off", c.hist() - 1), RAD_STR("dtype", g.dtype)),
+                             RAD_NOWEIGHTS);
+    }
     return RAD_OK;
 }
 
@@ -488,7 +507,29 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
     batch_split(batch, &D, &DT);
     const int64_t P = S - D;
 
-    if (D > 0)
+    /* The step after a tree verify: the token window closes over the accepted path before its
+     * first reader. A chain's path is the identity and the op moves nothing. */
+    if (tree_path_step(batch)) {
+        if (!op_win_tok) {
+            rad_step_fail(c_, "ple: the step follows a tree verify but the build has no "
+                              "kv_window_compact row");
+            return;
+        }
+        RAD_ISSUE(c_, op_win_tok, kv_cache(kv_tok, layer_), praw(tk_idx, RAD_I32, D),
+                  praw(batch->num_accepted, RAD_I32, D),
+                  praw2(batch->spec_path, RAD_I32, D, batch->spec_path_pitch));
+    }
+    if (D > 0 && tree_verify_step(batch))
+        /* the tree's parents, the decode half only (the op refuses them without num_accepted) */
+        RAD_ISSUE_N(c_, op_ids, DT,
+                    praw(batch->token_ids, RAD_I32, DT), kv_cache(kv_tok, layer_),
+                    praw(batch->cu_seqlens, RAD_I32, D + 1),
+                    RAD_W(w_mult), RAD_W(w_vsz), RAD_W(w_off),
+                    praw(tk_idx, RAD_I32, D),
+                    praw(batch->ctx_lens, RAD_I32, D),
+                    praw(batch->num_accepted, RAD_I32, D),
+                    brows(b_ids, DT), RAD_NONE, praw(batch->spec_parent, RAD_I32, DT));
+    else if (D > 0)
         RAD_ISSUE_N(c_, op_ids, DT,
                     praw(batch->token_ids, RAD_I32, DT), kv_cache(kv_tok, layer_),
                     praw(batch->cu_seqlens, RAD_I32, D + 1),
@@ -569,7 +610,25 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                 RAD_W(w_nk), RAD_W(w_nq), RAD_W(w_nc),
                 brows(b_gv, T), brows(b_gvn, T));
 
-    if (D > 0)
+    if (tree_path_step(batch)) {
+        if (!op_win_conv) {
+            rad_step_fail(c_, "ple: the step follows a tree verify but the build has no "
+                              "kv_window_compact row");
+            return;
+        }
+        RAD_ISSUE(c_, op_win_conv, kv_cache(kv_conv, layer_), praw(cv_idx, RAD_I32, D),
+                  praw(batch->num_accepted, RAD_I32, D),
+                  praw2(batch->spec_path, RAD_I32, D, batch->spec_path_pitch));
+    }
+    if (D > 0 && tree_verify_step(batch))
+        RAD_ISSUE_N(c_, op_conv, DT,
+                    brows(b_gvn, DT), RAD_W(w_conv), kv_cache(kv_conv, layer_),
+                    praw(batch->cu_seqlens, RAD_I32, D + 1), brows(b_gv, DT),
+                    praw(cv_idx, RAD_I32, D),
+                    praw(batch->ctx_lens, RAD_I32, D),
+                    praw(batch->num_accepted, RAD_I32, D),
+                    brows(b_out, DT), praw(batch->spec_parent, RAD_I32, DT));
+    else if (D > 0)
         RAD_ISSUE_N(c_, op_conv, DT,
                     brows(b_gvn, DT), RAD_W(w_conv), kv_cache(kv_conv, layer_),
                     praw(batch->cu_seqlens, RAD_I32, D + 1), brows(b_gv, DT),

@@ -7864,6 +7864,57 @@ TEST(a_step_issued_ahead_behind_a_serial_tree_verifies_the_cards_tree_and_path) 
     CHECK_EQ(rq->output[rq->output.size() - 1], 905);
 }
 
+/* A host-built step after a tree verify (no step issued ahead: a prefill chunk, admission, ...) has
+ * no ADV_TRUNK to rewrite its path plane, so the host stages the path the previous verify
+ * committed: leaf node 5 is [0, 5, 2, 3, ...], not the identity. A chain or prefill step in
+ * between returns it to the identity. */
+TEST(a_host_built_step_after_a_tree_verify_stages_the_accepted_path) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    REQUIRE(f.sch.step() != nullptr);
+    {
+        int32_t acc_n = 1, tok = 905;
+        uint8_t eos = 0;
+        int32_t path[RAD_SCHED_MAX_SPEC] = { 5 };
+        Scheduler::StepResult res;
+        res.n_seq = (int)f.sch.plan().e.size();
+        res.n_accepted = &acc_n;
+        res.token = &tok;
+        res.eos = &eos;
+        res.path = path;
+        CHECK_OK(f.sch.commit(res));
+    }
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();   /* built on the host: nothing was issued ahead */
+    REQUIRE(b != nullptr);
+    REQUIRE(b->spec_path != nullptr);
+    CHECK_EQ(b->num_accepted[0], 2);
+    const int32_t want[7] = { 0, 5, 2, 3, 4, 5, 6 };
+    for (int t = 0; t < 7; ++t) CHECK_EQ(b->spec_path[t], want[t]);
+    /* a verify that accepted nothing leaves the identity for the next host step */
+    {
+        int32_t acc_n = 0, tok = 906;
+        uint8_t eos = 0;
+        int32_t path[RAD_SCHED_MAX_SPEC] = { 0 };
+        Scheduler::StepResult res;
+        res.n_seq = (int)f.sch.plan().e.size();
+        res.n_accepted = &acc_n;
+        res.token = &tok;
+        res.eos = &eos;
+        res.path = path;
+        CHECK_OK(f.sch.commit(res));
+    }
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    for (int t = 0; t < 7; ++t) CHECK_EQ(b->spec_path[t], t);
+}
+
 /* The metrics count depth: a chain of 3 and three leaves is a tree of depth 3, so a verify that
  * accepts the whole chain accepts 3 of 3, not 3 of 6. */
 TEST(a_serial_trees_acceptance_is_counted_by_depth) {

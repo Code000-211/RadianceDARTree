@@ -243,6 +243,16 @@ static const RadOperandSpec oScale[]  = { OPD("x"), WGT("s"), OUT("y") };
 static const RadOperandSpec oGather[] = { OPD("x"), OPD("idx"), OUT("y") };
 static const RadOperandSpec oScatterRows[] = { OPD("v"), OPD("idx"), INOUT("x") };
 
+/* mtp_tree_grow: libref's schema (ref_registry.cpp), the growth of a serial draft head's tree. */
+static const RadParamSpec pMtpTreeGrow[] = { P_INT("M"), P_INT("round"), P_INT("rounds"),
+                                             P_INT("nodes"), P_INT("width"),
+                                             P_INTO("block_size"), P_INTO("sel_pitch") };
+static const RadOperandSpec oMtpTreeGrow[] = { OPD("didx"), OPD("dval"), INOUT("state"),
+                                               OPD_O("head_pos"), OPD_O("head_row"),
+                                               OPD_O("table"), OUT("tok"), OUT("par"),
+                                               OUT_O("sel"), OUT_O("nsel"), OUT_O("vmask"),
+                                               OUT_O("rb") };
+
 static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_STR("to") };
 
 /* ---- quantisation and rotation ------------------------------------------------------------ */
@@ -1140,6 +1150,13 @@ static const RadOpSchema kSchemas[] = {
   "depthwise causal conv with ple_conv's window, no activation and no residual (LFM2)." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds),
   "hashed n-gram row ids for PLE; `spec_parent` hashes a tree verify's ancestors." },
+{ "mtp_tree_grow", ARR(pMtpTreeGrow), ARR(oMtpTreeGrow),
+  "One pass of a serial draft head's best-first tree growth: each frontier row's top-8 candidates "
+  "(didx, dval) are scored parent log probability + log_softmax over the row's eight, pooled, and "
+  "the best become the next frontier (up to `width`, the node budget permitting), or after round "
+  "`rounds` every remaining node; the final tree is written as tokens and parent node ids "
+  "(0 the root), and the next pass's tree-attention operands (sel, nsel, vmask, rb) from the "
+  "head's block table. abi/rad_mtp_tree.h." },
 { "gather_rows", ARR(pMnD), ARR(oGather), "y[i,:] = x[idx[i],:]." },
 { "scatter_rows", ARR(pMnD), ARR(oScatterRows),
   "x[idx[i],:] = v[i,:], the mirror of gather_rows: `x` is INOUT and the write is partial, a "
@@ -1814,6 +1831,8 @@ SIMPLE("avx_scale", "scale", "elem", "a [1] weight broadcast over every element"
 SIMPLE("avx_gather_rows", "gather_rows", "elem", "y[i,:] = x[idx[i],:]", DT_ANY, L(gather_rows)),
 SIMPLE("avx_scatter_rows", "scatter_rows", "elem", "x[idx[i],:] = v[i,:]", DT_ANY,
        L(scatter_rows)),
+SIMPLE("avx_mtp_tree_grow", "mtp_tree_grow", "draft",
+       "A serial draft head's tree grown best-first, pass by pass", DT_ANY, L(mtp_tree_grow)),
 SIMPLE("avx_ngram_ids", "ngram_ids", "vocab", "hashed n-gram row ids for PLE", DT_ANY,
        L(ngram_ids)),
 SIMPLE("avx_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot, a signed sqrt",

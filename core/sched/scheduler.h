@@ -61,6 +61,12 @@ struct SchedReq {
      * a chain proposal (prompt lookup, or a chain drafter) clears it. */
     int32_t  draft_par[RAD_SCHED_MAX_SPEC] = {};
     bool     draft_tree = false;
+    /* The rows of the last verify block this sequence committed after the anchor, in path order
+     * (the accepted nodes' rows), when that verify was a tree. A host-built step that follows it
+     * stages them as RadBatch::spec_path; a card-built one has the card's own. 0 for a chain,
+     * a prefill chunk or a fresh/preempted sequence (the identity). */
+    int32_t  last_path[RAD_SCHED_MAX_SPEC] = {};
+    int32_t  last_npath = 0;
 
     /* A serial drafter's valid history: positions [0, draft_filled) of the head's own layer hold
      * K and V for the sequence's real tokens. Only the head writes that layer, so before drafting

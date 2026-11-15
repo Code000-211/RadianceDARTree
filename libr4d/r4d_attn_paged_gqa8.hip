@@ -297,7 +297,24 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _bf16)(const RadArgs* a, Rad
  * 1.6x the partials of the band bound 5. */
 /* `row` is a token's bytes in a (block, head) page, 0 for the bf16 cache's 2 * head_dim elements
  * (fill_paged_row). */
-static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row = 0) {
+#if R4D_ATTN_H256
+/* The tree-sel split count. A tree launch's num_seqs is its ROW count, but the sequential decode of
+ * the same rows runs with the SEQUENCE count, and r4d_decode_splits depends on num_seqs (units =
+ * kv_heads * num_seqs). So tsel evaluates the law at `n_seq` sequences (q_len 1, the tsel row
+ * constraint), which is what the chain / sequential launch of those sequences evaluates: a tree row
+ * and its path's sequential decode then split, accumulate and merge identically (same max_ctx, same
+ * `splits` tunable). The count is independent of how many tree rows a sequence carries. */
+static int g8_tsel_splits(const R4DArgs& r, int sp, int n_seq) {
+    R4DArgs law = r;
+    law.splits   = sp;
+    law.num_seqs = n_seq;
+    law.q_len    = 1;
+    return r4d_decode_splits(&law, G8_D_TILE);
+}
+#endif
+
+static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row = 0,
+                                 bool tsel = false) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
 
@@ -317,6 +334,15 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
         r.splits     = sp;
         if (r.max_ctx <= 0) return R4D_NO(RAD_E_INVAL);
         int64_t worst = 0;
+#if R4D_ATTN_H256
+        if (tsel) {
+            /* rows = max_seqs, splits at the law's maximum (one sequence); nonincreasing in n_seq. */
+            r.q_len    = 1;
+            r.num_seqs = (int)max_seqs;
+            r.splits   = g8_tsel_splits(r, sp, 1);
+            return GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
+        }
+#endif
         for (long long q = 1; q <= q_hi; ++q)
             for (long long n = 1; n <= max_seqs; ++n) {
                 r.q_len    = (int)q;
@@ -329,6 +355,9 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
     const int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r.splits = sp;
+#if R4D_ATTN_H256
+    if (tsel) r.splits = g8_tsel_splits(r, sp, 1);
+#endif
     return GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
 }
 
@@ -611,7 +640,7 @@ static long g8_tsel_align(long v) { return (v + 255) & ~255L; }
 /* Declare-time size: the decode partials of the sparse row at the declared bound, plus the prep
  * arrays at `max_seqs` rows. */
 static int64_t g8_tsel_scratch(const RadArgs* a, long long row) {
-    const int64_t dec = g8_decode_scratch(a, 256, row);
+    const int64_t dec = g8_decode_scratch(a, 256, row, true);
     if (dec < 0) return dec;
     long long rows = r4d_geti_or(a, "max_seqs", 0);
     if (rows <= 0) {
@@ -633,7 +662,7 @@ static int g8_tsel_launch(const RadArgs* a, RadStream stream, long long row, int
     G8Tsel t;
     rc = g8_tsel_operands(a, r, tb, &t);
     if (rc != RAD_OK) return rc;
-    r.splits = sp;
+    r.splits = g8_tsel_splits(r, sp, t.n_seq);
     const long dec = g8_tsel_align(GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r));
     const long need = dec + g8_tsel_prep_bytes(r.num_seqs);
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);

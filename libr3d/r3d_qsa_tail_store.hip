@@ -58,6 +58,7 @@ extern "C" {
 
 int r3d_rad_qsa_tail_store(const RadArgs* a, RadStream s)
 {
+    if (r3d_opt(a, 5)) return R3D_NO(RAD_E_UNSUPPORTED);  /* spec_parent: a tree verify is not served here */
     if (!a || a->n_t < 5) return R3D_NO(RAD_E_INVAL);
     const RadTensor* k = r3d_opt(a, 0), *po = r3d_opt(a, 1), *cu = r3d_opt(a, 2),
                     *st = r3d_opt(a, 3), *sx = r3d_opt(a, 4);

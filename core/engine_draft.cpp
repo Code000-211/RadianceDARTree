@@ -184,6 +184,7 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
             a.leaves     = tree_width_ > 1 ? 0 : tree_leaves_;
             a.vocab      = (int32_t)meta_.n_vocab;
             a.width      = tree_width_;
+            a.depth      = draft_rounds_;
         }
         if (from_proposal) {
             a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
@@ -433,6 +434,19 @@ int Engine::finish_serial_drafter(const StepOut& so) {
                     "host planned %d; the step issued ahead verifies the host's count",
                     drafter_.name, (int)S.ntree, (unsigned long long)serial_row_[(size_t)i].seq,
                     nodes);
+            return RAD_E_STATE;
+        }
+        /* The card made the final tree safe (ADV_BTAKE); a tree that still breaks the bounds the
+         * host sized its reservations by (a parent before its child, depth <= the head's rounds)
+         * is refused here rather than verified. */
+        bool tree_ok = !serial_tree_ || nodes <= RAD_SCHED_MAX_SPEC;
+        for (int j = 0; serial_tree_ && tree_ok && j < nodes; ++j)
+            tree_ok = S.par[j] >= 0 && S.par[j] <= j;
+        if (serial_tree_ && tree_ok) tree_ok = Scheduler::tree_depth(S.par, nodes) <= draft_rounds_;
+        if (!tree_ok) {
+            RAD_ERR("drafter '%s': sequence %llu's tree is not a tree of depth <= %d with every "
+                    "parent before its child", drafter_.name,
+                    (unsigned long long)serial_row_[(size_t)i].seq, draft_rounds_);
             return RAD_E_STATE;
         }
         for (int rd = 1; rd <= nodes; ++rd)

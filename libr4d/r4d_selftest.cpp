@@ -46,6 +46,7 @@
 #include "rad_philox.h"
 #include "rad_sample.h"
 #include "rad_yarn.h"
+#include "rad_mtp_tree.h"
 
 #include <dlfcn.h>
 #include <spawn.h>
@@ -4163,6 +4164,52 @@ static void attn_tsel_case(const Plugin& pl, int64_t G, bool bf16) {
                 nd += d;
             }
             ok((n_plain + " rows are byte-identical to the sequential decode of their paths").c_str(),
+               nd == 0, fmt("%lld bytes differ; rows%s", (long long)nd, rows.c_str()));
+        }
+        /* 3b. the same at production depths, where the split law is not capped by the tiles. The
+         * tree launch has R rows over ONE sequence (the split law is evaluated at that sequence
+         * count); the reference is one single-row launch per row (num_seqs 1), a different launch
+         * row count from the tree's. At 65536 and 200000 tokens the law gives 128 / 256 splits
+         * (gqa 12 / 6) instead of the 7 the small max_ctx allows, so a split count that followed the
+         * launch ROW count (13 rows: 9 or 19 splits) would change the f16 partials' order and so
+         * the bytes. */
+        for (const int64_t deep : { (int64_t)65536, (int64_t)200000 }) {
+            std::vector<RadParam> pt2 = pt, pc2 = pc;
+            for (auto& q : pt2) if (!std::strcmp(q.key, "max_ctx")) q = PI("max_ctx", deep);
+            for (auto& q : pc2) {
+                if (!std::strcmp(q.key, "max_ctx")) q = PI("max_ctx", deep);
+                if (!std::strcmp(q.key, "max_seqs")) q = PI("max_seqs", 1);
+            }
+            {
+                std::vector<RadTensor> ts = tsel_ops(d_o);
+                tree_tail(ts);
+                run_case(tk, ts, pt2);
+            }
+            const std::vector<uint8_t> o_deep = get_out(d_o);
+            const size_t rowq = (size_t)(nq * hd) * 2;
+            for (int64_t r = 0; r < R; ++r) {
+                std::vector<RadTensor> ts = {
+                    T((uint8_t*)d_q + (size_t)r * rowq, RAD_BF16, { 1, nq, hd }),
+                    T(d_c, kvdt, { NB, nkv, bs, rowb }),
+                    TI32({ 1, SP + 16 },
+                         std::vector<int32_t>(seq_tab.begin() + r * (SP + 16),
+                                              seq_tab.begin() + (r + 1) * (SP + 16))),
+                    TI32({ 1 }, std::vector<int32_t>{ seq_used[(size_t)r] }),
+                    RadTensor{}, RadTensor{}, RadTensor{},
+                    T((uint8_t*)d_os + (size_t)r * rowq, RAD_BF16, { 1, nq * hd }),
+                };
+                run_case(ck, ts, pc2);
+            }
+            const std::vector<uint8_t> o_seq = get_out(d_os);
+            std::string rows;
+            int64_t nd = 0;
+            for (int64_t r = 0; r < R; ++r) {
+                const int64_t d = ndiff_rows(o_deep, o_seq, r, r + 1);
+                if (d) rows += " " + std::to_string((long long)r);
+                nd += d;
+            }
+            ok((n_plain + " rows at max_ctx " + std::to_string((long long)deep) +
+                " are byte-identical to the single-row sequential decode").c_str(),
                nd == 0, fmt("%lld bytes differ; rows%s", (long long)nd, rows.c_str()));
         }
     }
@@ -10523,6 +10570,120 @@ void sub_i32_cases(const Plugin& pl) {
     for (int64_t i = 0; i < n; ++i) want[(size_t)i] = x[(size_t)i] - 1234;
     const int64_t bad = differ(down_i32(dy, (size_t)n), want);
     ok("sub_i32 exact", bad == 0, fmt("%lld entries differ", (long long)bad));
+}
+
+/* mtp_tree_grow (abi/rad_mtp_tree.h): the device launch against the header's host walk over the
+ * same inputs, pass by pass through three rounds of five sequences at widths 3, with the
+ * tree-attention outputs on. Random candidate rows are far apart in logit, so the one place the
+ * device may differ from the host (expf / logf in the log-softmax) cannot reorder the pool.
+ * Exact on every output. */
+void mtp_tree_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
+    if (!r) { ok("mtp_tree_grow", false, "row absent"); return; }
+    const int M = 5, W = 3, R = 3, N = 6, K = RAD_MTP_TREE_K, B = 4, SP = 9, PITCH = 8;
+    const int sw = rad_mtp_tree_state_words(N, W, R);
+    uint32_t seed = 12345;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xffffff; };
+    std::vector<int32_t> hstate((size_t)M * sw, 0), dstate0;
+    void* dst = up_i32(hstate);
+    std::vector<int32_t> table((size_t)M * 64);
+    for (int m = 0; m < M; ++m)
+        for (int i = 0; i < 64; ++i) table[(size_t)m * 64 + i] = 1000 * (m + 1) + i;
+    void* dtab = up_i32(table);
+    /* round 1's head index: the draft row of each sequence's history rows */
+    const int T1 = 3 * M;
+    std::vector<int32_t> hpos((size_t)T1), hrow((size_t)M);
+    for (int t = 0; t < T1; ++t) hpos[(size_t)t] = 5 + (int)(rnd() % 60);
+    for (int m = 0; m < M; ++m) hrow[(size_t)m] = 3 * m + 2;
+    void* dhpos = up_i32(hpos);
+    void* dhrow = up_i32(hrow);
+    void* dtok = dalloc((size_t)M * PITCH * 4);
+    void* dpar = dalloc((size_t)M * PITCH * 4);
+    void* dsel = dalloc((size_t)M * W * SP * 4);
+    void* dnsel = dalloc((size_t)M * W * 4);
+    void* dvm = dalloc((size_t)M * W * 8);
+    void* drb = dalloc((size_t)M * 4);
+    if (!dst || !dtab || !dhpos || !dhrow || !dtok || !dpar || !dsel || !dnsel || !dvm || !drb) {
+        ok("mtp_tree_grow", false, "alloc");
+        return;
+    }
+    std::vector<int32_t> wtok((size_t)M * PITCH), wpar((size_t)M * PITCH);
+    int bad = 0;
+    for (int round = 1; round <= R; ++round) {
+        const int rows = round == 1 ? M : M * W;
+        std::vector<int32_t> idx((size_t)rows * K);
+        std::vector<float> val((size_t)rows * K);
+        for (int i = 0; i < rows; ++i) {
+            std::vector<float> v((size_t)K);
+            for (int c = 0; c < K; ++c) v[(size_t)c] = 8.0f - 1.7f * c - (rnd() % 100) * 0.001f;
+            for (int c = 0; c < K; ++c) {
+                idx[(size_t)i * K + c] = (int)(rnd() % 50000);
+                val[(size_t)i * K + c] = v[(size_t)c];
+            }
+        }
+        void* didx = up_i32(idx);
+        void* dval = up_f32(val);
+        std::vector<RadParam> ps = { PI("M", M), PI("round", round), PI("rounds", R),
+                                     PI("nodes", N), PI("width", W), PI("block_size", B),
+                                     PI("sel_pitch", SP) };
+        const bool first = round == 1;
+        const int rc = launch(r, { T(didx, RAD_I32, { rows, K }), T(dval, RAD_F32, { rows, K }),
+                                   T(dst, RAD_I32, { M, sw }),
+                                   T(first ? dhpos : nullptr, RAD_I32, { T1 }),
+                                   T(first ? dhrow : nullptr, RAD_I32, { M }),
+                                   T(dtab, RAD_I32, { M, 64 }),
+                                   T(dtok, RAD_I32, { M, PITCH }), T(dpar, RAD_I32, { M, PITCH }),
+                                   T(dsel, RAD_I32, { M * W, SP }), T(dnsel, RAD_I32, { M * W }),
+                                   T(dvm, RAD_I64, { M * W }), T(drb, RAD_I32, { M }) },
+                              ps);
+        if (rc != RAD_OK) { ok("mtp_tree_grow launch", false, "rc " + std::to_string(rc)); return; }
+        /* the host walk */
+        RadMtpTreeCfg cfg{};
+        cfg.round = round; cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = B;
+        cfg.sel_pitch = SP; cfg.pitch = PITCH;
+        std::vector<int32_t> hsel((size_t)M * W * SP, 0), hnsel((size_t)M * W, 0), hrb((size_t)M, 0);
+        std::vector<long long> hvm((size_t)M * W, 0);
+        for (int m = 0; m < M; ++m) {
+            const int head = round == 1 ? hpos[(size_t)hrow[(size_t)m]] : -1;
+            rad_mtp_tree_grow_seq(&cfg, hstate.data() + (size_t)m * sw, idx.data(), val.data(),
+                                  (long)m * (round == 1 ? 1 : W), K, 1, head,
+                                  table.data() + (size_t)m * 64, wtok.data() + (size_t)m * PITCH,
+                                  wpar.data() + (size_t)m * PITCH, hsel.data() + (size_t)m * W * SP,
+                                  hnsel.data() + (size_t)m * W, hvm.data() + (size_t)m * W,
+                                  hrb.data() + m);
+        }
+        const std::vector<int32_t> gtok = down_i32(dtok, (size_t)M * PITCH);
+        const std::vector<int32_t> gpar = down_i32(dpar, (size_t)M * PITCH);
+        const std::vector<int32_t> gsel = down_i32(dsel, (size_t)M * W * SP);
+        const std::vector<int32_t> gnsel = down_i32(dnsel, (size_t)M * W);
+        const std::vector<int32_t> grb = down_i32(drb, (size_t)M);
+        std::vector<long long> gvm((size_t)M * W);
+        st_memcpy(gvm.data(), dvm, gvm.size() * 8, hipMemcpyDeviceToHost);
+        const int nt = round < R ? W : N;
+        for (int m = 0; m < M; ++m) {
+            for (int j = 0; j < nt; ++j) {
+                bad += gtok[(size_t)m * PITCH + j] != wtok[(size_t)m * PITCH + j];
+                bad += gpar[(size_t)m * PITCH + j] != wpar[(size_t)m * PITCH + j];
+            }
+            if (round < R) {
+                bad += grb[(size_t)m] != hrb[(size_t)m];
+                for (int w = 0; w < W; ++w) {
+                    bad += gnsel[(size_t)m * W + w] != hnsel[(size_t)m * W + w];
+                    bad += gvm[(size_t)m * W + w] != hvm[(size_t)m * W + w];
+                    for (int k = 0; k < SP; ++k)
+                        bad += gsel[((size_t)m * W + w) * SP + k] != hsel[((size_t)m * W + w) * SP + k];
+                }
+            }
+        }
+    }
+    /* the final tree is a tree: parents precede their children, tokens set */
+    for (int m = 0; m < M; ++m)
+        for (int j = 0; j < N; ++j) {
+            const int pj = wpar[(size_t)m * PITCH + j];
+            bad += !(pj >= 0 && pj <= j);
+        }
+    ok("mtp_tree_grow matches the host walk over three rounds", bad == 0,
+       fmt("%d entries differ", bad));
 }
 
 /* iota with and without a period. Exact. */
@@ -25058,7 +25219,7 @@ static void qsa_tree_exact_case(const Plugin& pl) {
     if (!w || !bk || !tl || !cm || !sc || !se) { ok(what, false, "a row is absent"); return; }
     const QRows R{ w, bk, tl, cm, sc, se, true };
     using namespace qsat;
-    int bad = 0, nodes = 0, above = 0, sc_bad = 0;
+    int bad = 0, nodes = 0, above = 0, sc_bad = 0, mask_bad = 0;
     for (int64_t base = 33; base <= 40 && bad < 5; ++base)
         for (uint64_t seed = 1; seed <= 3 && bad < 5; ++seed)
             for (int64_t topk : { 3, 5, 40 }) {
@@ -25106,6 +25267,19 @@ static void qsa_tree_exact_case(const Plugin& pl) {
                         const float a = T_.rsc.getf(x * RW + i), b = co.score[0][(size_t)(b0 + i)];
                         if (std::memcmp(&a, &b, 4) != 0) ++sc_bad;
                     }
+                    /* The mask by flat slot identity: bit (base - rb) + y for ancestor-or-self y, bit
+                     * q - rb for committed q, set iff the chain read that position. A sibling at the
+                     * same depth is another bit. */
+                    uint64_t want = 0;
+                    for (int64_t q2 = rb; q2 < base; ++q2) if (cv.count(q2)) want |= 1ull << (q2 - rb);
+                    for (int64_t y : rows) if (cv.count(pos[(size_t)y])) want |= 1ull << (base - rb + y);
+                    if ((uint64_t)T_.vm.geti(x) != want) {
+                        ++mask_bad;
+                        if (mask_bad <= 3)
+                            std::printf("        base %lld seed %llu topk %lld node %lld: vmask %llx want %llx\n",
+                                        (long long)base, (unsigned long long)seed, (long long)topk, (long long)x,
+                                        (unsigned long long)T_.vm.geti(x), (unsigned long long)want);
+                    }
                     if (cv != tv || T_.su.geti(x) != T_.ns.geti(x) * ratio) {
                         if (++bad <= 3)
                             std::printf("        base %lld seed %llu topk %lld node %lld: chain %zu keys, tree %zu\n",
@@ -25113,8 +25287,9 @@ static void qsa_tree_exact_case(const Plugin& pl) {
                     }
                 }
             }
-    ok(what, bad == 0 && sc_bad == 0 && above > 100,
-       fmt("%d nodes, %d above the bound, %d visible-set mismatches, %d region scores off the chain's", nodes, above, bad, sc_bad));
+    ok(what, bad == 0 && sc_bad == 0 && mask_bad == 0 && above > 100,
+       fmt("%d nodes, %d above the bound, %d visible-set mismatches, %d vmask mismatches, %d region scores off the chain's",
+           nodes, above, bad, mask_bad, sc_bad));
 }
 
 /* Op by op on the same inputs, the device's integer outputs and copied key bytes against libref's:
@@ -25194,6 +25369,261 @@ static void qsa_tree_ref_case(const Plugin& pl) {
     ok(what, bad == 0, fmt("%d trees, %d differences", trees, bad));
 }
 
+/* A batch of several sequences, device against libref, the whole two-step flow: each sequence is
+ * prefilled and given one step by libref (a verify for a tree sequence, a decode for an ordinary
+ * one), then ONE batch step runs on both sides from the same bytes: compaction, work (heal and
+ * tree), the main and the scratch block keys, the tail store, the committed and the region score and
+ * the selection. Every output tensor and the whole state (ring pool, block-key pages) are compared
+ * byte for byte. Trees at t0 > 0, two trees, a tree beside an ordinary sequence, slots reversed
+ * against the sequences and per-sequence page ranges. The batch operand lists of an ordinary-only
+ * step carry no tree operands. */
+static QB& qsa_ones() {
+    static QB w(RAD_F32, { qsat::n });
+    w.fillf(1.0f);
+    return w;
+}
+
+struct QBS {                                    /* the state of NS sequences */
+    QB tail, bk, tab, sx;
+    explicit QBS(int64_t NS)
+        : tail(RAD_BF16, { NS, 1, qsat::ring, qsat::n }), bk(RAD_BF16, { NS * qsat::nbmax, qsat::n }),
+          tab(RAD_I32, { NS, qsat::nbmax }), sx(RAD_I32, { NS, 1 }) {
+        for (int64_t s = 0; s < NS; ++s) {
+            for (int64_t b = 0; b < qsat::nbmax; ++b) tab.seti(s * qsat::nbmax + b, s * qsat::nbmax + b);
+            sx.seti(s, NS - 1 - s);
+        }
+        tail.fillf(-7.0f);
+        bk.fillf(-5.0f);
+    }
+};
+
+struct QSeqB {
+    bool tree = true;
+    int64_t base = 0, na = 1;
+    std::vector<int64_t> par, path;
+    std::vector<std::vector<float>> K, Q;
+};
+
+struct QBT {                                    /* the tensors of one batch step */
+    QB k, pos, cu, sp, nav, pth, stage, page, bpos, nc, sst, spg, sbp, rtb, rnc, rcu, skey;
+    QB se, ns, su, vm, sc, rsc, q, sc0, rsc0;       /* sc0, rsc0: this side's own scores when injected over */
+    QBT(int64_t NS, int64_t Tn, int64_t work, int64_t tk)
+        : k(RAD_BF16, { Tn, qsat::n }), pos(RAD_I32, { Tn }), cu(RAD_I32, { NS + 1 }), sp(RAD_I32, { Tn }),
+          nav(RAD_I32, { NS }), pth(RAD_I32, { NS, 16 }),
+          stage(RAD_BF16, { work * qsat::ratio, qsat::n }), page(RAD_I32, { work }), bpos(RAD_I32, { work }),
+          nc(RAD_I32, { NS }), sst(RAD_BF16, { Tn * qsat::ratio, qsat::n }), spg(RAD_I32, { Tn }),
+          sbp(RAD_I32, { Tn }), rtb(RAD_I32, { Tn, qsat::RW }), rnc(RAD_I32, { Tn }), rcu(RAD_I32, { Tn + 1 }),
+          skey(RAD_BF16, { Tn, qsat::n }), se(RAD_I32, { Tn, tk + 1 }), ns(RAD_I32, { Tn }), su(RAD_I32, { Tn }),
+          vm(RAD_I64, { Tn }), sc(RAD_F32, { Tn, qsat::nbmax }), rsc(RAD_F32, { Tn, qsat::RW }),
+          q(RAD_BF16, { Tn, qsat::heads * qsat::n }), sc0(RAD_F32, { Tn, qsat::nbmax }),
+          rsc0(RAD_F32, { Tn, qsat::RW }) {}
+};
+
+static bool qsa_score_close(float a, float b) {
+    if (std::isinf(a) || std::isinf(b)) return a == b;
+    return std::fabs(a - b) <= 1e-4f * std::max(1.0f, std::fabs(a));
+}
+
+/* `inject`, when given, is a step already run: its score planes replace this one's before the
+ * selection, so the selections of the two sides see identical scores (the device's matrix score is
+ * not bit-identical to libref's order of summation). */
+static bool qsa_bstep(const QRows& R, QBS& S, QBT& B, const std::vector<QSeqB>& seqs, int64_t topk, bool treeops,
+                      const QBT* inject = nullptr) {
+    using namespace qsat;
+    const int64_t NS = (int64_t)seqs.size();
+    const int64_t Tn = B.pos.numel(), work = B.page.numel();
+    int64_t t = 0;
+    B.cu.seti(0, 0);
+    bool anypath = false;
+    for (int64_t s = 0; s < NS; ++s) {
+        const QSeqB& q = seqs[(size_t)s];
+        std::vector<int64_t> depth(q.K.size(), 0);
+        for (size_t j = 0; j < q.K.size(); ++j, ++t) {
+            depth[j] = q.tree ? (j ? depth[(size_t)q.par[j]] + 1 : 0) : (int64_t)j;
+            B.pos.seti(t, q.base + depth[j]);
+            B.sp.seti(t, !q.tree ? -2 : j ? q.par[j] : -1);
+            for (int64_t d = 0; d < n; ++d) B.k.setf(t * n + d, q.K[j][(size_t)d]);
+            for (int64_t d = 0; d < heads * n; ++d) B.q.setf(t * heads * n + d, q.Q[j][(size_t)d]);
+        }
+        B.cu.seti(s + 1, t);
+        B.nav.seti(s, q.na);
+        for (size_t i = 0; i < q.path.size(); ++i) B.pth.seti(s * 16 + (int64_t)i, q.path[i]);
+        anypath |= q.na >= 2;
+    }
+    if (anypath && qsa_launch(R.compact, { &B.pos, &B.cu, &B.nav, &B.pth, &S.tail, &S.sx },
+                              { PI("M", NS), PI("n", n), PI("ring", ring), PI("seqs", NS), PS("dtype", "bf16") },
+                              R.dev) != RAD_OK)
+        return false;
+    B.skey.fillf(-3.0f);
+    const std::vector<RadParam> wp = { PI("M", Tn), PI("n", n), PI("ratio", ratio), PI("ring", ring),
+                                       PI("seqs", NS), PI("work", work), PS("dtype", "bf16") };
+    int rc;
+    if (treeops)
+        rc = qsa_launch(R.work, { &B.k, &B.pos, &B.cu, &S.tail, &S.sx, &S.tab, nullptr, &B.stage, &B.page, &B.bpos,
+                                  &B.nc, &B.sp, &B.nav, &B.sst, &B.spg, &B.sbp, &B.rtb, &B.rnc, &B.rcu }, wp, R.dev);
+    else
+        rc = qsa_launch(R.work, { &B.k, &B.pos, &B.cu, &S.tail, &S.sx, &S.tab, nullptr, &B.stage, &B.page, &B.bpos,
+                                  &B.nc, nullptr, &B.nav }, wp, R.dev);
+    if (rc != RAD_OK) return false;
+    if (qsa_launch(R.bkey, { &B.stage, &qsa_ones(), &B.page, &B.bpos, &S.bk }, qsa_bk_params(work), R.dev) != RAD_OK)
+        return false;
+    if (treeops &&
+        qsa_launch(R.bkey, { &B.sst, &qsa_ones(), &B.spg, &B.sbp, &B.skey }, qsa_bk_params(Tn), R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.tail, treeops ? std::vector<QB*>{ &B.k, &B.pos, &B.cu, &S.tail, &S.sx, &B.sp }
+                                   : std::vector<QB*>{ &B.k, &B.pos, &B.cu, &S.tail, &S.sx },
+                   { PI("M", Tn), PI("n", n), PI("ratio", ratio), PI("ring", ring), PI("seqs", NS),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    if (qsa_launch(R.score, { &B.q, &S.bk, &S.tab, &B.cu, &B.nc, &B.sc },
+                   { PI("M", Tn), PI("n", n), PI("heads", heads), PI("blocks", nbmax), PI("seqs", NS),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    if (treeops &&
+        qsa_launch(R.score, { &B.q, &B.skey, &B.rtb, &B.rcu, &B.rnc, &B.rsc },
+                   { PI("M", Tn), PI("n", n), PI("heads", heads), PI("blocks", RW), PI("seqs", Tn),
+                     PS("dtype", "bf16") }, R.dev) != RAD_OK)
+        return false;
+    B.sc0.h = B.sc.h; B.rsc0.h = B.rsc.h;
+    if (inject) { B.sc.h = inject->sc.h; if (treeops) B.rsc.h = inject->rsc.h; }
+    B.vm.h.assign(B.vm.h.size(), 0x55);
+    std::vector<QB*> so = { &B.sc, &S.tab, &B.nc, &B.pos, &B.cu, &B.se, &B.ns, &B.su };
+    if (treeops) { so.push_back(&B.sp); so.push_back(&B.rsc); so.push_back(&B.vm); }
+    return qsa_launch(R.sel, so, { PI("M", Tn), PI("blocks", nbmax), PI("topk", topk), PI("ratio", ratio),
+                                   PI("seqs", NS) }, R.dev) == RAD_OK;
+}
+
+static void qsa_batch_ref_case(const Plugin& pl) {
+    const char* what = "qsa batch of several sequences vs libref (t0 > 0, two trees, tree beside a chain)";
+    const RadKernelInfo *w = find(pl, "qsa_work_bf16"), *bk = find(pl, "qsa_block_key_bf16"),
+                        *tl = find(pl, "qsa_tail_store_bf16"), *cm = find(pl, "qsa_tail_compact_bf16"),
+                        *sc = find(pl, "qsa_score_bf16"), *se = find(pl, "qsa_select_i32");
+    const RadKernelInfo *rw = qsa_ref_row("qsa_work"), *rt = qsa_ref_row("qsa_tail_store"),
+                        *rc = qsa_ref_row("qsa_tail_compact"), *rs = qsa_ref_row("qsa_select"),
+                        *rbk = qsa_ref_row("qsa_block_key"), *rsc = qsa_ref_row("qsa_score");
+    if (!w || !bk || !tl || !cm || !sc || !se || !rw || !rt || !rc || !rs || !rbk || !rsc) {
+        ok(what, false, "a row is absent");
+        return;
+    }
+    using namespace qsat;
+    const QRows Rd{ w, bk, tl, cm, sc, se, true }, Rr{ rw, rbk, rt, rc, rsc, rs, false };
+    struct Cfg { std::vector<bool> kinds; int64_t topk; bool pal; };
+    const std::vector<Cfg> cfgs = { { { false, true }, 3, false }, { { true, true }, 3, false },
+                                    { { true, true }, 2, true },   { { true, false, true }, 3, false },
+                                    { { true, false, true }, 40, false }, { { false, true, false, true }, 4, true },
+                                    { { true, true, true }, 5, false } };
+    int bad = 0, cases = 0, trees_nz = 0;
+    for (const Cfg& c : cfgs)
+        for (uint64_t seed = 1; seed <= 4; ++seed) {
+            uint64_t g = seed * 2654435761u + (uint64_t)c.topk * 97 + c.kinds.size();
+            const int64_t NS = (int64_t)c.kinds.size();
+            QBS Sr(NS);
+            std::vector<QSeqB> seqs;
+            for (int64_t s = 0; s < NS; ++s) {
+                QState one(c.topk);
+                const int64_t base0 = 17 + (int64_t)((g >> 3) % 14);
+                g = g * 6364136223846793005ull + 1442695040888963407ull;
+                std::vector<std::vector<float>> pk, K1, Q1;
+                for (int64_t t = 0; t < base0; ++t) pk.push_back(qsa_key(g, c.pal));
+                qsa_chain(Rr, one, pk, {}, 0, nullptr);
+                QSeqB q;
+                q.tree = c.kinds[(size_t)s];
+                auto rows = [&](int64_t Rn, std::vector<std::vector<float>>& K, std::vector<std::vector<float>>& Qv) {
+                    for (int64_t j = 0; j < Rn; ++j) {
+                        K.push_back(qsa_key(g, c.pal));
+                        std::vector<float> qq;
+                        for (int64_t h = 0; h < heads; ++h) { auto x = qsa_key(g, c.pal); qq.insert(qq.end(), x.begin(), x.end()); }
+                        Qv.push_back(qq);
+                    }
+                };
+                if (q.tree) {
+                    const int64_t R1 = 6 + (int64_t)((g >> 5) % 7);
+                    rows(R1, K1, Q1);
+                    const auto par = qsa_rand_tree(g, R1, (g >> 7) & 1);
+                    QTree T1(R1, c.topk);
+                    qsa_tree(Rr, one, T1, K1, Q1, par, base0, 0, nullptr, false);
+                    std::vector<int64_t> depth((size_t)R1, 0);
+                    int64_t best = 0;
+                    for (int64_t j = 1; j < R1; ++j) { depth[(size_t)j] = depth[(size_t)par[(size_t)j]] + 1; if (depth[(size_t)j] > depth[(size_t)best]) best = j; }
+                    for (int64_t y = best;; y = par[(size_t)y]) { q.path.push_back(y); if (y == 0) break; }
+                    std::reverse(q.path.begin(), q.path.end());
+                    q.na = (int64_t)q.path.size();
+                    q.base = base0 + q.na;
+                    rows(3 + (int64_t)((g >> 9) % 8), q.K, q.Q);
+                    q.par = qsa_rand_tree(g, (int64_t)q.K.size(), (g >> 11) & 1);
+                } else {
+                    const int64_t R1 = 2 + (int64_t)((g >> 5) % 5);
+                    rows(R1, K1, Q1);
+                    qsa_chain(Rr, one, K1, {}, base0, nullptr);
+                    q.na = 1;
+                    q.base = base0 + R1;
+                    rows(1 + (int64_t)((g >> 9) % 4), q.K, q.Q);
+                }
+                seqs.push_back(q);
+                /* The sequence's state into its slot and page range. */
+                const int64_t slot = NS - 1 - s;
+                std::memcpy(Sr.tail.h.data() + (size_t)(slot * ring * n) * 2, one.tail.h.data(), (size_t)(ring * n) * 2);
+                std::memcpy(Sr.bk.h.data() + (size_t)(s * nbmax * n) * 2, one.bk.h.data(), (size_t)(nbmax * n) * 2);
+            }
+            QBS Sd = Sr;
+            int64_t Tn = 0;
+            bool anytree = false;
+            for (const auto& q : seqs) { Tn += (int64_t)q.K.size(); anytree |= q.tree; }
+            const int64_t work = 12 * NS + 8;
+            QBT Bd(NS, Tn, work, c.topk), Br(NS, Tn, work, c.topk);
+            if (!qsa_bstep(Rd, Sd, Bd, seqs, c.topk, anytree) || !qsa_bstep(Rr, Sr, Br, seqs, c.topk, anytree, &Bd)) {
+                ok(what, false, "a launch failed");
+                return;
+            }
+            ++cases;
+            int64_t t0 = 0;
+            for (const auto& q : seqs) { if (q.tree && t0 > 0) ++trees_nz; t0 += (int64_t)q.K.size(); }
+            auto same = [&](const QB& a, const QB& b, const char* nm) {
+                if (a.h == b.h) return;
+                if (++bad <= 6)
+                    std::printf("        kinds %zu topk %lld seed %llu: %s differs\n", c.kinds.size(),
+                                (long long)c.topk, (unsigned long long)seed, nm);
+            };
+            same(Sd.tail, Sr.tail, "the ring pool"); same(Sd.bk, Sr.bk, "the block-key pages");
+            same(Bd.nc, Br.nc, "nc"); same(Bd.page, Br.page, "page"); same(Bd.bpos, Br.bpos, "bpos");
+            same(Bd.stage, Br.stage, "stage");
+            /* The scores, on the columns a row's sequence has (the rest is not written). */
+            {
+                int64_t row = 0, nsc = 0, nrg = 0;
+                for (int64_t s2 = 0; s2 < NS; ++s2)
+                    for (; row < Bd.cu.geti(s2 + 1); ++row) {
+                        for (int64_t b = 0; b < Bd.nc.geti(s2); ++b)
+                            if (!qsa_score_close(Bd.sc.getf(row * nbmax + b), Br.sc0.getf(row * nbmax + b))) ++nsc;
+                        if (anytree)
+                            for (int64_t b = 0; b < Bd.rnc.geti(row); ++b)
+                                if (!qsa_score_close(Bd.rsc.getf(row * RW + b), Br.rsc0.getf(row * RW + b))) ++nrg;
+                    }
+                if (nsc || nrg) {
+                    ++bad;
+                    std::printf("        kinds %zu topk %lld seed %llu: %lld committed, %lld region scores differ\n",
+                                c.kinds.size(), (long long)c.topk, (unsigned long long)seed, (long long)nsc, (long long)nrg);
+                }
+            }
+            same(Bd.se, Br.se, "sel"); same(Bd.ns, Br.ns, "nsel"); same(Bd.su, Br.su, "seqused");
+            if (anytree) {
+                same(Bd.spg, Br.spg, "spage"); same(Bd.sbp, Br.sbp, "sbpos"); same(Bd.rtb, Br.rtb, "rtab");
+                same(Bd.rnc, Br.rnc, "rnc"); same(Bd.rcu, Br.rcu, "rcu");
+                same(Bd.vm, Br.vm, "vmask");
+                for (int64_t x = 0; x < Tn; ++x)
+                    if (Bd.spg.geti(x) >= 0) {
+                        if (std::memcmp(Bd.sst.h.data() + (size_t)(x * ratio * n) * 2, Br.sst.h.data() + (size_t)(x * ratio * n) * 2, (size_t)(ratio * n) * 2) != 0) {
+                            ++bad; std::printf("        sstage rows of %lld differ\n", (long long)x);
+                        }
+                        if (std::memcmp(Bd.skey.h.data() + (size_t)(x * n) * 2, Br.skey.h.data() + (size_t)(x * n) * 2, (size_t)n * 2) != 0) {
+                            ++bad; std::printf("        scratch key of row %lld differs\n", (long long)x);
+                        }
+                    }
+            }
+        }
+    ok(what, bad == 0 && trees_nz > 10,
+       fmt("%d batches, %d trees at t0 > 0, %d differences", cases, trees_nz, bad));
+}
+
 /* qsa_tail_compact against libref: three sequences (a path to move, na 1 and a slot -1) in a
  * four-slot pool, random bf16 rows, ring 7. Every byte of the pool must equal libref's. */
 static void qsa_tail_compact_case(const Plugin& pl) {
@@ -25204,11 +25634,12 @@ static void qsa_tail_compact_case(const Plugin& pl) {
     const int64_t n = 128, ring = 7, slots = 4;
     int bad = 0;
     for (int it = 0; it < 12; ++it) {
-        QB st(RAD_BF16, { slots, 1, ring, n }), pos(RAD_I32, { 3 }), cu(RAD_I32, { 4 }), na(RAD_I32, { 3 });
+        QB st(RAD_BF16, { slots, 1, ring, n }), pos(RAD_I32, { 6 }), cu(RAD_I32, { 4 }), na(RAD_I32, { 3 });
         QB path(RAD_I32, { 3, 6 }), sx(RAD_I32, { 3, 1 });
         for (int64_t i = 0; i < st.numel(); ++i) st.setf(i, (float)((int)(st_mix32((uint32_t)(i + it * 977)) % 61) - 30));
-        pos.setv({ 20 + it, 9, 30 });
-        cu.setv({ 0, 1, 2, 3 });
+        /* Several rows per sequence, so the anchors sit at t0 = 0, 3 and 4. */
+        pos.setv({ 20 + it, 21 + it, 21 + it, 9, 30, 31 });
+        cu.setv({ 0, 3, 4, 6 });
         na.setv({ 2 + it % 4, 1, 3 });
         path.setv({ 0, 1 + it % 3, 3 + it % 3, 5, 6, 6,   0, 0, 0, 0, 0, 0,   0, 1, 2, 0, 0, 0 });
         sx.setv({ 3, 1, -1 });
@@ -33788,6 +34219,7 @@ static void device_phase(const Plugin& pl) {
         qsa_work_case(pl);
         qsa_tree_ref_case(pl);
         qsa_tree_exact_case(pl);
+        qsa_batch_ref_case(pl);
     }
 
     if (sel("qsa_tail_compact_bf16")) {
@@ -33909,6 +34341,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("frame_store")) au::frame_store_cases(pl);
     if (sel("iota")) au::iota_cases(pl);
     if (sel("sub_i32")) au::sub_i32_cases(pl);
+    if (sel("mtp_tree_grow")) au::mtp_tree_cases(pl);
     if (sel("gelu_bf16")) au::gelu_case(pl);
     if (sel("mul_weight_bf16")) au::mul_weight_f32_case(pl);
     if (sel("qk_norm_rope_bf16")) au::qk_norm_rope_f32_gain_case(pl);

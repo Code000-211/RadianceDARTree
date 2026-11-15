@@ -149,6 +149,12 @@ struct MtpHcBlock {
     /* The indexer's window bounds for a pass wider than its score plane (QsaIndexer::step), set by
      * the caller before step(); null where no pass is. */
     const int32_t* qsa_win_cu = nullptr;
+    /* Stage 2 of a serial draft tree (RadDrafterDecl::tree_width > 1): the rounds after the first
+     * carry W frontier rows a sequence with RadBatch::spec_parent naming each parent by node id.
+     * Their attention is the tree form over the head's in-flight rows (`attn.tree_any`, operands
+     * written by mtp_tree_grow), and the indexer, whose selection those rows do not use and whose
+     * keys the next history pass rewrites, is not run. Set by the plugin before declare(). */
+    bool         tree_rounds = false;
     MoeFP8       mlp{};
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
@@ -505,7 +511,8 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
 
     /* The indexer runs first because the attention reads its selection; `w.h` is already final,
      * written by the connection above. */
-    qsa.step(c, attn.w.h, batch, qsa_win_cu);
+    if (!(tree_rounds && r > 1 && batch->spec_parent))
+        qsa.step(c, attn.w.h, batch, qsa_win_cu);
     attn.step(c, batch);
 
     hc_attn.write(c, T, 0, T);

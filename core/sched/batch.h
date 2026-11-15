@@ -62,6 +62,10 @@ struct StepEntry {
      * acceptance but not the adaptive window's estimate of the draft head (DraftController,
      * draft.h). */
     bool    ngram = false;
+    /* The previous step's committed rows (SchedReq::last_path), npath of them, or null: the host
+     * stages RadBatch::spec_path from them. Unused on a device row. */
+    const int32_t* last_path = nullptr;
+    int32_t n_last_path = 0;
     /* Device row: the card overwrites its tokens, positions, rollback count and slots from the
      * StepSlot before the pass runs (advance.h); `ctx_len` is then only an upper bound for the
      * host-side ceilings. dev_tok/dev_out/dev_aux are advance.h's row descriptor: the verify

@@ -94,6 +94,21 @@ RAD_ADV_FN int32_t adv_parent(const StepSlot& S, int32_t j) {
     return (p < 0 || p >= j) ? j - 1 : p;
 }
 
+/* Whether par[0..n) (node j + 1's parent) is a tree no deeper than `depth` (0: any depth): every
+ * parent in [0, j] (an earlier node), so parents precede children. */
+RAD_ADV_FN bool adv_tree_valid(const int32_t* par, int32_t n, int32_t depth) {
+    int32_t dep[1 + RAD_SCHED_MAX_SPEC];
+    if (n < 0 || n > RAD_SCHED_MAX_SPEC) return false;
+    dep[0] = 0;
+    for (int32_t j = 0; j < n; ++j) {
+        const int32_t p = par[j];
+        if (p < 0 || p > j) return false;
+        dep[j + 1] = dep[p] + 1;
+        if (depth > 0 && dep[j + 1] > depth) return false;
+    }
+    return true;
+}
+
 /* Writes a row's position and moves its rotary components by the same amount. A row whose
  * position does not change keeps the host's components. */
 RAD_ADV_FN void adv_pos(const AdvanceArgs& a, int32_t* pos, int32_t row, int32_t p) {
@@ -353,7 +368,8 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         for (int32_t w = 0; w < a.width && cnt < room && w < n; ++w) {
             if (prow[w] < 0) break;
             int32_t par = qrow[w];
-            if (par < 0 || par > S.ntree) par = 0;      /* a parent not made yet: the root */
+            /* A parent not made by an earlier round (the same pass's rows have no K/V yet): root. */
+            if (par < 0 || par >= first) par = 0;
             const int32_t node = S.ntree + 1;
             S.tok[node] = prow[w];
             S.par[node - 1] = par;
@@ -425,6 +441,16 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         if (a.par) {
             for (int32_t j = 0; j < a.round; ++j) S.par[j] = a.par[(int64_t)i * a.src_pitch + j];
             S.ntree = a.round;
+            /* A serial tree the plugin grew: the host reserved K/V and history rows for depth
+             * <= R, so anything else becomes the chain prefix (nodes 1..R, then siblings of node
+             * 1 that the walk never takes), a tree of the same node count. */
+            if (a.tree_nodes > 0 && a.depth > 0 &&
+                !adv_tree_valid(S.par, S.ntree, a.depth)) {
+                for (int32_t j = 0; j < S.ntree; ++j) {
+                    if (j < a.depth) S.par[j] = j;
+                    else { S.par[j] = 0; S.tok[1 + j] = S.tok[1]; }
+                }
+            }
         } else {
             S.ntree = 0;
         }

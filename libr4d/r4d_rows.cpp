@@ -876,6 +876,34 @@ static const RadOperandSpec oDflashMarkov[] = {
     { "tile_scores", RAD_OPD_OUT, 0 }, { "tile_tokens", RAD_OPD_OUT, 0 },
     { "tokens", RAD_OPD_OUT, 0 },
 };
+/* mtp_tree_grow (abi/rad_mtp_tree.h; libref's schema field for field). `state` holds
+ * rad_mtp_tree_state_words(nodes, width, rounds) words a sequence, persistent across a step's
+ * passes. Round 1 reads each sequence's head index at head_pos[head_row[s]]. `sel`, `nsel`,
+ * `vmask`, `rb` (with `table`) are the next pass's tree-attention operands, written together when
+ * `sel_pitch` > 0. */
+static const RadParamSpec pMtpTreeGrow[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "round",      RAD_P_INT, RAD_REQUIRED },
+    { "rounds",     RAD_P_INT, RAD_REQUIRED },
+    { "nodes",      RAD_P_INT, RAD_REQUIRED },
+    { "width",      RAD_P_INT, RAD_REQUIRED },
+    { "block_size", RAD_P_INT, RAD_OPTIONAL },
+    { "sel_pitch",  RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oMtpTreeGrow[] = {
+    { "didx",     RAD_OPD_IN,    0 },
+    { "dval",     RAD_OPD_IN,    0 },
+    { "state",    RAD_OPD_INOUT, 0 },
+    { "head_pos", RAD_OPD_IN,    1 },
+    { "head_row", RAD_OPD_IN,    1 },
+    { "table",    RAD_OPD_IN,    1 },
+    { "tok",      RAD_OPD_OUT,   0 },
+    { "par",      RAD_OPD_OUT,   0 },
+    { "sel",      RAD_OPD_OUT,   1 },
+    { "nsel",     RAD_OPD_OUT,   1 },
+    { "vmask",    RAD_OPD_OUT,   1 },
+    { "rb",       RAD_OPD_OUT,   1 },
+};
 /* dflash_tree: dflash_select's, plus the node count, the softmax temperature and the parents. */
 static const RadParamSpec pDflashTree[] = {
     { "M",       RAD_P_INT, RAD_REQUIRED },
@@ -3749,6 +3777,13 @@ static const RadOpSchema kSchemas[] = {
            "next position's predecessor."),
     SCHEMA("dflash_markov_greedy_f32", pDflashMarkov, oDflashMarkov,
            "DSpark full-vocabulary greedy walk with F32 base logits and BF16 codebooks."),
+    SCHEMA("mtp_tree_grow", pMtpTreeGrow, oMtpTreeGrow,
+           "One pass of a serial draft head's best-first tree growth: each frontier row's top-8 "
+           "candidates (didx, dval) are scored parent log probability + log_softmax over the row's "
+           "eight, pooled, and the best become the next frontier (up to `width`, the node budget "
+           "permitting), or after round `rounds` every remaining node; the final tree is written as "
+           "tokens and parent node ids (0 the root), and the next pass's tree-attention operands "
+           "(sel, nsel, vmask, rb) from the head's block table. abi/rad_mtp_tree.h."),
     SCHEMA("dflash_tree", pDflashTree, oDflashTree,
            "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: "
            "a taken node's children are the valid candidates at the next position, each with log "
@@ -4988,6 +5023,11 @@ static const RadConstraint cDflashSelect[] = {
 static const RadConstraint cDflashMarkov[] = {
     C_GE("steps", 1), C_DIV("rank", 32), C_LE("rank", 512),
     C_GE("n_vocab", 1), C_IN("dtype", "bf16"),
+};
+/* mtp_tree_grow keeps its node table and pool in a sequence's state words, 60 nodes at most (the
+ * masks are 64 bits). */
+static const RadConstraint cMtpTreeGrow[] = {
+    C_GE("rounds", 1), C_GE("round", 1), C_GE("width", 1), C_GE("nodes", 1), C_LE("nodes", 60),
 };
 /* dflash_tree's frontier (nodes x top_k children) and its node table live in LDS. */
 static const RadConstraint cDflashTree[] = {
@@ -7734,8 +7774,6 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr,
   nullptr, nullptr, r4d_fuse_attn_paged_gate_had_quant },
 
-/* The int8 cache on Flash-Next's QSA layers (gqa12 at one and two ranks, gqa6 with 4-token pages
- * at four) and at gqa 8: a token's row is 516 bytes (abi/rad_builder.h). */
 /* attn_paged_tree_sel and its gated merges (r4d_attn_paged_gqa8.hip, G8_TSEL): the QSA layers of a
  * tree verify at both ratios and both cache dtypes. */
 { "attn_tsel_h256_gqa12_bf16kv", "attn_paged_tree_sel", "attn",
@@ -7870,6 +7908,8 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr,
   nullptr, nullptr, r4d_fuse_attn_paged_tree_sel_gate_had_quant },
 
+/* The int8 cache on Flash-Next's QSA layers (gqa12 at one and two ranks, gqa6 with 4-token pages
+ * at four) and at gqa 8: a token's row is 516 bytes (abi/rad_builder.h). */
 { "attn_prefill_h256_gqa12_i8", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
   "head_dim 256, 12 queries per kv head, paged block 4, varlen",
@@ -10114,6 +10154,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cDflashSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
+
+{ "mtp_tree_grow_i32", "mtp_tree_grow", "draft",
+  "A serial draft head's tree grown best-first a pass at a time (rad_drafter_tree, the stage-2 "
+  "head): each frontier row's top-8 candidates pooled against their parents' cumulative log "
+  "probability, the next frontier, the final tree and the next pass's tree-attention operands; one "
+  "thread a sequence",
+  "nodes <= 60; the tree-attention outputs need sel's row pitch to be sel_pitch",
+  "i32 candidate ids, tokens, parents, state and pages, f32 logits, i64 masks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMtpTreeGrow), NOTUNE,
+  nullptr, nullptr, r4d_rad_mtp_tree_grow, nullptr, nullptr, nullptr, nullptr },
 
 { "dflash_tree_bf16", "dflash_tree", "dflash",
   "DFlash2's candidate lattice grown best-first into a tree (rad_drafter_tree): the selector's "

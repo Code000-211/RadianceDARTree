@@ -2516,6 +2516,27 @@ int ref_dflash_markov_greedy_f32_shape(const RadParam* p, int n_p, int operand, 
     return ref_markov_shape(p, n_p, operand, out, RAD_F32, "dflash_markov_greedy_f32");
 }
 
+/* mtp_tree_grow, described at round 1 with the attention outputs absent: a zeroed state, the
+ * candidate rows of M sequences and the tree's tokens and parents. */
+int ref_mtp_tree_grow_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    const int64_t R = gi(p, n_p, "rounds", 0);
+    const int64_t N = gi(p, n_p, "nodes", 0);
+    const int64_t W = gi(p, n_p, "width", 0);
+    if (M <= 0 || R <= 0 || N <= 0 || W <= 0 || N > 60) return RAD_E_UNSUPPORTED;
+    const int64_t sw = 4 + W + 6 * (N + 1) + 4 * 8 * W * R;
+    const int64_t rows = gi(p, n_p, "round", 1) == 1 ? M : M * W;
+    Opd o;
+    o.t_idx({ rows, 8 }, 50000, -1, 0);                    /* didx */
+    o.t((uint32_t)RAD_F32, { rows, 8 });                   /* dval */
+    o.t_idx({ M, sw }, 1, 0, 0);                           /* state, zero */
+    o.skip(); o.skip(); o.skip();                          /* head_pos, head_row, table */
+    o.t_idx({ M, N }, 50000, -1, 0);                       /* tok */
+    o.t_idx({ M, N }, N + 1, -1, 0);                       /* par */
+    o.skip(); o.skip(); o.skip(); o.skip();                /* sel, nsel, vmask, rb */
+    return o.finish("mtp_tree_grow", operand, out);
+}
+
 /* dflash_select's operands, then `nodes` tokens and parents a sequence. */
 int ref_dflash_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M     = gi(p, n_p, "M", 0);

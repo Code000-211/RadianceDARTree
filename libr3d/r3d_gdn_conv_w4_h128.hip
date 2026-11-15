@@ -533,6 +533,7 @@ enum { CU_X = 0, CU_W, CU_B, CU_CSTATE, CU_SIDX, CU_NACC, CU_CU, CU_Q, CU_K, CU_
 
 extern "C" int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s)
 {
+    if (r3d_opt(a, 10) || r3d_opt(a, 11)) return R3D_NO(RAD_E_UNSUPPORTED);  /* spec_parent, spec_path: a tree verify is not served here */
     if (!a) return R3D_NO(RAD_E_INVAL);
     const RadTensor* x    = r3d_opt(a, CU_X);
     const RadTensor* w    = r3d_opt(a, CU_W);

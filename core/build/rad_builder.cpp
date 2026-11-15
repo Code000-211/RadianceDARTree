@@ -2725,6 +2725,11 @@ int Builder::finish() {
         err(RAD_E_STATE, "declare_drafter '%s': tree_nodes %d, but rad_drafter_tree was never "
                          "called; a serial tree is declared by both.", prog_.drafter_name.c_str(),
             prog_.drafter.tree_nodes);
+    if (prog_.drafter.tree_width > 1 && prog_.drafter_shared_kv)
+        err(RAD_E_STATE, "declare_drafter '%s': tree_width %d with rad_drafter_shared_kv. A tree "
+                         "grown round by round stages its rows by depth and flat slot from the "
+                         "head's own cache, which a shared-KV head does not keep", prog_.drafter_name.c_str(),
+            prog_.drafter.tree_width);
     if (prog_.drafter.tree_width > 1 && prog_.drafter_parents == 0)
         err(RAD_E_STATE, "declare_drafter '%s': tree_width %d grows the tree in the plugin, which "
                          "needs rad_drafter_tree's parents buffer", prog_.drafter_name.c_str(),

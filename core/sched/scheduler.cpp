@@ -9,6 +9,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <numeric>
 #include <string>
@@ -1406,6 +1407,7 @@ bool Scheduler::preempt_back() {
     r.n_computed = 0;
     r.n_cached = 0;
     r.n_accepted = 0;
+    s.last_npath = 0;
     r.state = ReqState::Preempted;
     s.preempted_us = mono_us();
     s.drafter_reset();
@@ -2141,6 +2143,10 @@ const RadBatch* Scheduler::step() {
          * take the slot before: the previous channel's sample in ple_conv, a foreign token in
          * ngram_ids. */
         e.n_accepted = prefill ? 1 : r.n_accepted + 1;
+        if (!prefill && s.last_npath > 0) {
+            e.last_path = s.last_path;
+            e.n_last_path = s.last_npath;
+        }
         e.conv_cursor = s.conv_cursor;
         e.draft = s.draft;
         e.n_draft = s.n_draft;
@@ -2732,6 +2738,7 @@ int Scheduler::commit(StepResult& res) {
         if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
             pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
 
+        s.last_npath = 0;
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
             /* The chunk is committed: a window group returns its blocks below the window now,
@@ -2822,6 +2829,11 @@ int Scheduler::commit(StepResult& res) {
             };
             /* On a tree step the accepted drafts are the path's nodes, in path order. */
             const int32_t* path = res.path ? res.path + (size_t)i * RAD_SCHED_MAX_SPEC : nullptr;
+            /* The next step, if the host builds it, stages this path as its spec_path. */
+            if (path && a > 0 && a <= RAD_SCHED_MAX_SPEC) {
+                std::memcpy(s.last_path, path, (size_t)a * sizeof(int32_t));
+                s.last_npath = a;
+            }
             for (int32_t j = 0; j < a; ++j) {
                 const int32_t d = path ? path[j] - 1 : j;
                 emit(d >= 0 && d < e.n_spec ? s.draft[d] : s.draft[j], j);

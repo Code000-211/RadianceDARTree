@@ -187,6 +187,10 @@ struct AdvanceArgs {
     int32_t leaves = 0;
     int32_t vocab = 0;
     int32_t width = 1;
+    /*   depth       R, the head's rounds: ADV_BTAKE's bound on the plugin's final tree (a tree of
+     *               a deeper path, or a parent that is not an earlier node, falls back to the
+     *               chain prefix, see adv_tree_valid). 0 = unchecked. */
+    int32_t depth = 0;
     /* ADV_TRUNK: RadBatch::spec_path, [n_seq, path_pitch] in the slab (-1: none staged). */
     int64_t path_off = -1;
     int32_t path_pitch = 0;

@@ -1140,6 +1140,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         /* The identity: a row the host built follows no tree verify the card has not already
          * described (a card row's is rewritten by ADV_TRUNK from its acceptance). */
         for (int64_t t = 0; t < path_pitch_; ++t) s.h_path[(int64_t)i * path_pitch_ + t] = (int32_t)t;
+        /* ...except the sequence's own last verify was a tree and this step could not be issued
+         * ahead: the accepted nodes' rows are the path (as ADV_TRUNK writes it), not 0,1,2... */
+        if (!e.dev && !e.is_prefill && e.last_path)
+            for (int64_t t = 1; t <= e.n_last_path && t < path_pitch_; ++t)
+                s.h_path[(int64_t)i * path_pitch_ + t] = e.last_path[t - 1];
         if (e.is_prefill) { if (e.n_tokens > max_q_pf) max_q_pf = e.n_tokens; }
         else               { if (e.n_tokens > max_q_dec) max_q_dec = e.n_tokens; }
     }

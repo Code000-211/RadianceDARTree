@@ -1044,6 +1044,7 @@ static int ru_state_form(const RadArgs* a) {
 }
 
 extern "C" int r3dh_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
+    if (r3dh_opt(a, 16) || r3dh_opt(a, 17)) return R3DH_NO(RAD_E_UNSUPPORTED);  /* spec_parent, spec_path: a tree verify is not served here, so the selector falls through to libr4d / libref */
     if (gdn_dims_ok() != RAD_OK) return R3DH_NO(RAD_E_SHAPE);
     const RadTensor* q     = r3dh_opt(a, OPD_RU_Q);
     const RadTensor* k     = r3dh_opt(a, OPD_RU_K);
@@ -1150,6 +1151,7 @@ enum { OPD_CR_X = 0, OPD_CR_CW, OPD_CR_CB, OPD_CR_CSTATE, OPD_CR_CIDX, OPD_CR_A,
        OPD_CR_NORMW, OPD_CR_O, OPD_CR_OQ, OPD_CR_OS };
 
 extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+    if (r3dh_opt(a, 18) || r3dh_opt(a, 19)) return R3DH_NO(RAD_E_UNSUPPORTED);  /* spec_parent, spec_path: a tree verify is not served here, so the selector falls through to libr4d / libref */
     if (gdn_dims_ok() != RAD_OK) return R3DH_NO(RAD_E_SHAPE);
     const RadTensor* x     = r3dh_opt(a, OPD_CR_X);
     const RadTensor* cw    = r3dh_opt(a, OPD_CR_CW);

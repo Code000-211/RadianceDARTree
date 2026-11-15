@@ -1304,6 +1304,7 @@ static int ru_spec_planes(const RadTensor* spar, const RadTensor* spath, long lo
         R4D_DT(spath, RAD_I32);
         if (spath->rank != 2 || spath->shape[0] < n_seq || spath->shape[1] < 1)
             return R4D_NO(RAD_E_SHAPE);
+        if (spath->stride[0] < spath->shape[1]) return R4D_NO(RAD_E_STRIDE);
         if (spath->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
         spec->path = (const int*)spath->data;
         spec->pitch = (int)spath->stride[0];

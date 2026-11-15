@@ -122,6 +122,23 @@ struct AttnGatedFP8 {
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;          /* attn_paged + gate_quant_fp8 or gate_had_quant_i8g */
+    /* Tree verification (docs/QSA.md "Tree verify", docs/OPS.md attn_paged_tree_sel): the decode
+     * half of a step with RadBatch::spec_parent attends over the committed pages of `qsa_sel` plus
+     * the region keys `qsa_vmask` names, in one softmax. `qsa_vmask` ([max_tok] i64, qsa_select's)
+     * and `qsa_rb` ([n_seq] i32, the region base each sequence's keys start at, from
+     * QsaIndexer::step) are set by the architecture with the selection, and both ops are declared
+     * only with them; a step that needs the tree form and finds none fails. The plain form serves
+     * every layer, the gated form where `op_attn_gq` does. */
+    rad_buf    qsa_vmask = 0, qsa_rb = 0;
+    /* The page list and count the tree form reads where they are not `qsa_sel` / `qsa_nsel`: the
+     * serial draft head's own tree rounds (stage 2) take theirs from mtp_tree_grow, while its
+     * history pass keeps the QSA selection. Zero: the QSA's. */
+    rad_buf    tree_sel = 0, tree_nsel = 0;
+    /* Every decode row of a step carrying spec_parent is a tree row (the draft head's tree rounds
+     * run without drafts of their own, so `n_spec` is no sign); otherwise a tree verify is
+     * tree_verify_step(). */
+    bool       tree_any = false;
+    rad_op     op_tsel = 0, op_tsel_gq = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -354,6 +371,30 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         rad_op_writes(b, op_attn, &w.attn.x, 1);
     }
 
+    /* The tree form of the sparse attention, one launch row per query row at q_len 1 like the
+     * sparse issue; `sel_pitch` is the selection's row pitch (libr4d sizes its scratch from it).
+     * Its reads are listed because the selection, the mask and the region bases are not
+     * necessarily live otherwise (the arena may overlay them). */
+    const rad_buf tsl = tree_sel ? tree_sel : qsa_sel, tns = tree_nsel ? tree_nsel : qsa_nsel;
+    if (op_attn && tsl && tns && qsa_vmask && qsa_rb && g.max_spec > 0 &&
+        rad_op_declared(b, "attn_paged_tree_sel")) {
+        op_tsel = rad_decl_op(b, "attn_paged_tree_sel",
+                       RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
+                                  RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                  RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
+                                  RAD_INT("block_size", kv_block > 0 ? kv_block
+                                                                     : (int64_t)RAD_KV_BLOCK),
+                                  RAD_INT("max_seqs", qsa_rows()), RAD_INT("max_ctx", g.max_ctx),
+                                  RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype),
+                                  RAD_INT("sel_pitch", qsa_topk + 1)),
+                       RAD_NOWEIGHTS);
+        if (op_tsel) {
+            const rad_buf rd[5] = { w.q, tsl, tns, qsa_vmask, qsa_rb };
+            RAD_ARCH_TRY(rad_op_reads (b, op_tsel, rd, 5));
+            RAD_ARCH_TRY(rad_op_writes(b, op_tsel, &w.attn.x, 1));
+        }
+    }
+
     /* The resolve belongs here rather than in the indexer: it must follow this layer's store,
      * since a block copied in from the mirror has to carry this step's tokens. Its band is the
      * step's widest launch and its row `qsa_topk + 1` wide, as the attention declares. */
@@ -488,6 +529,30 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
             const rad_buf wr[3] = { w.attn.x, w.attn.cq(), w.attn.cs() };
             RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq, rd, 4));
             RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq, wr, 3));
+        }
+        /* ...and its tree form: attn_paged_tree_sel_gate_quant / _gate_had_quant. */
+        const char* tsel_gq = w.attn.q8_rot ? "attn_paged_tree_sel_gate_had_quant"
+                                            : "attn_paged_tree_sel_gate_quant";
+        if (op_attn_gq && op_tsel && rad_op_declared(b, tsel_gq)) {
+            op_tsel_gq = RAD_OP(b, tsel_gq,
+                                RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
+                                           RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                           RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
+                                           RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                           RAD_INT("max_seqs", qsa_gq_rows()),
+                                           RAD_INT("max_ctx", g.max_ctx),
+                                           RAD_STR("q_dtype", g.dtype),
+                                           RAD_STR("kv_dtype", g.kv_dtype),
+                                           RAD_INT("group", RAD_FP8_BLOCK),
+                                           RAD_STR("act", "sigmoid"),
+                                           RAD_INT("sel_pitch", qsa_topk + 1)),
+                                RAD_NOWEIGHTS);
+            if (op_tsel_gq) {
+                const rad_buf rd[6] = { w.q, tsl, tns, w.qg, qsa_vmask, qsa_rb };
+                const rad_buf wr[3] = { w.attn.x, w.attn.cq(), w.attn.cs() };
+                RAD_ARCH_TRY(rad_op_reads (b, op_tsel_gq, rd, 6));
+                RAD_ARCH_TRY(rad_op_writes(b, op_tsel_gq, wr, 3));
+            }
         }
     }
 
@@ -705,10 +770,34 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         (st && st->block_bytes > 0) ? st->host_layer_stride / st->block_bytes : 0;
     const bool ring_addressed = st && st->slots > 0 && st_blocks > 0 && st->slots < st_blocks;
     const bool ring_bound = ring_addressed && !kv_stage_layer(c, kv, kvb, layer);
+    /* A tree verify (RadBatch::spec_parent): the decode half's rows go to attn_paged_tree_sel, one
+     * launch row per query at every context (below `qsa_exact_to` QSA's select emits every
+     * committed page, so the dense path is this op too), and only the rows after them (a mixed
+     * step's prefill half) take the paths below. A pure verify step carries its gate in the tree
+     * merge where the gated form exists; beside a prefill half the gate is the chain after the
+     * attention, for every row alike. */
+    int64_t D_t = 0, DT_t = 0;
+    batch_split(batch, &D_t, &DT_t);
+    const bool tree = tree_any ? (batch->spec_parent != nullptr && D_t > 0)
+                               : tree_verify_step(batch);
+    const rad_buf tsl = tree_sel ? tree_sel : qsa_sel, tns = tree_nsel ? tree_nsel : qsa_nsel;
+    int64_t tree_rows = 0;           /* rows [0, tree_rows) are the tree's, the rest the classic's */
+    if (tree) {
+        if (!tsl || !op_tsel || !qsa_vmask || !qsa_rb || !table || !kvb || kvb->stream) {
+            rad_step_fail(c, "a tree verify reached a layer with no tree attention: it needs "
+                             "attn_paged_tree_sel (attn_paged_tree_sel_gate_quant), the QSA "
+                             "selection with its vmask and region bases, and a resident (not "
+                             "streamed) attention group");
+            return;
+        }
+        int64_t D0 = 0;
+        batch_split(batch, &D0, &tree_rows);
+    }
     const bool    sparse = qsa_sel && qsa_sequ &&
                            (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
                             reach > qsa_exact_to);
-    const bool gated = sparse && op_attn_gq;
+    const bool tree_gated = tree && tree_rows == T && op_tsel_gq;
+    const bool gated = tree ? tree_gated : (sparse && op_attn_gq);
     /* A streamed group's selection, per launch: make the rows' blocks resident and rewrite `sel`
      * as ring slots, after this layer's store (a block copied in from the mirror must carry this
      * step's tokens) and before the attention. A pass on the stage view leaves `sel` as block ids
@@ -725,7 +814,43 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * attention and out projection can finish a piece's rows and hand off its reduction while the
      * next piece's attention runs. Each piece is launched as a step of the piece's width would
      * launch it. */
-    if (gated && !own_ar && pieces && pieces->cuts(T) && !op_add) {
+    if (tree) {
+        /* Rows of the verify block: the page lists and masks are the selection's, per row; the
+         * block table and the sequences' bounds are the step's whole (rb and cu index by
+         * sequence, vmask, sel, nsel, q and out by row), so a chunk offsets only the row
+         * operands. */
+        const int64_t qw = g.q_dim(), hd = g.head_dim;
+        const int64_t chunk = tree_gated ? qsa_gq_rows() : qsa_rows();
+        const int64_t S = batch->n_seq;
+        const RadOperand btab = praw2(table, RAD_I32, S, kvb->block_table_pitch);
+        const RadOperand rbs  = brows(qsa_rb, S);
+        const RadOperand scu  = praw(batch->cu_seqlens, RAD_I32, S + 1);
+        for (int64_t off = 0; off < tree_rows; off += chunk) {
+            const int64_t rows = (tree_rows - off) < chunk ? (tree_rows - off) : chunk;
+            if (tree_gated)
+                RAD_ISSUE_N(c, op_tsel_gq, 1,
+                            brow_slice(w.q, off, rows, qw), kv_cache(kv, layer),
+                            brow_slice(tsl, off, rows, qsa_topk + 1),
+                            brow_slice(tns, off, rows, 1),
+                            RAD_NONE, RAD_NONE, RAD_NONE,
+                            brow_slice(w.attn.x, off, rows, qw),
+                            bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
+                            brow_slice(w.attn.cq(), off, rows, qw),
+                            brow_slice(w.attn.cs(), off, rows, qw / w.attn.cg()),
+                            brow_slice(qsa_vmask, off, rows, 1), btab, rbs, scu);
+            else
+                RAD_ISSUE_N(c, op_tsel, 1,
+                            brow_slice(w.q, off, rows, qw), kv_cache(kv, layer),
+                            brow_slice(tsl, off, rows, qsa_topk + 1),
+                            brow_slice(tns, off, rows, 1),
+                            RAD_NONE, RAD_NONE, RAD_NONE,
+                            brow_slice(w.attn.x, off, rows, qw),
+                            brow_slice(qsa_vmask, off, rows, 1), btab, rbs, scu);
+        }
+    }
+    if (tree && tree_rows == T) {
+        /* the whole step was the tree's: nothing below it, but the gate chain and the projection */
+    } else if (gated && !own_ar && pieces && pieces->cuts(T) && !op_add) {
         const int64_t chunk = qsa_gq_rows();
         const int64_t qw = g.q_dim(), hd = g.head_dim;
         for (int64_t p0 = 0; p0 < T; p0 += pieces->rows) {
@@ -751,7 +876,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
         return;
     }
-    if (gated) {
+    else if (gated) {
         const int64_t chunk = qsa_gq_rows();
         const int64_t qw = g.q_dim(), hd = g.head_dim;
         for (int64_t off = 0; off < T; off += chunk) {
@@ -771,7 +896,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     } else if (sparse) {
         const int64_t chunk = qsa_rows();
         const int64_t qw = g.q_dim();
-        for (int64_t off = 0; off < T; off += chunk) {
+        for (int64_t off = tree_rows; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
             resolve_sel(off, rows);
             RAD_ISSUE_N(c, op_attn, 1,
@@ -810,7 +935,17 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
         const int32_t qp = batch->max_q_len_prefill > 0 ? batch->max_q_len_prefill
                                                         : batch->max_q_len;
-        if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
+        if (tree) {
+            /* The decode half was the tree's; the prefill half is the second launch of the mixed
+             * form below, over its own sequences. */
+            const int64_t P = batch->n_seq - D;
+            RAD_ISSUE_N(c, op_attn, g.max_tok,
+                        brows(w.q, T), kv_cache(kv, layer),
+                        praw2(table ? table + D * pitch : nullptr, RAD_I32, P, pitch),
+                        praw(used ? used + D : nullptr, RAD_I32, P),
+                        RAD_NONE, RAD_NONE, praw(batch->cu_seqlens + D, RAD_I32, P + 1),
+                        brows(w.attn.x, T));
+        } else if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
             batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode) {
             const int64_t P = batch->n_seq - D;
             RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode,

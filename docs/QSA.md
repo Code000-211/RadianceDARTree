@@ -196,6 +196,17 @@ most `ring - ratio + 1` rows and at most `64 - (ratio - 1)` (the mask), and `wor
 the heal blocks. Each tree row costs a scratch launch item and a block-key launch row even when it
 completes no block; verify steps are decode-sized.
 
+Caller obligations (the device kernels cannot refuse, libref and libavx do where they can):
+pass the tree operands only on a pure verify step (the device tree select is a global-memory
+radix select, slow on 64K+ blocks, and it is used for every row of a launch that carries them, so
+a mixed prefill and verify step would pay it for the prefill rows); never give a tree sequence
+more than `ring` rows or a slot of -1 (a slotless tree row has `rnc` 0 and `rtab` -1, and its
+selection is not defined); keep `spec_path`'s pitch at least `max_spec + 1`, since the device
+compaction silently stops at the pitch where libref refuses; and size `work` to hold the heal
+blocks, the anchor blocks and every other sequence's blocks: when it is too small the list is
+cut at its END, which loses the later items, the anchor-completed block among them. A stale
+`num_accepted >= 2` on a sequence shorter than that many tokens heals nothing.
+
 ## Per-query selection (prefill)
 
 At prefill every query in a chunk selects its own set from one shared history. Both scoring ops

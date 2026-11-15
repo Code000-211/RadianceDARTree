@@ -279,3 +279,75 @@ TEST(fishomni_tags_a_reference_transcript_as_the_prompt_builder_does) {
 }
 
 RAD_TEST_MAIN()
+
+/* The rows a DARTree deployment of Flash-Next (qwen4exp) issues resolve to libr4d at its
+ * geometry: head_dim 256, gqa 12 (one rank) and 6 (two), a page of 4, bf16 and int8 KV, and the
+ * QSA selection's `sel_pitch` of 513. A step that cannot resolve one of them fails on the card the
+ * first time it verifies a tree. The plugin's declare asks for these by name; the shapes here are
+ * the ones it declares (arch/common/rad_block_attn_gated_fp8.h, rad_qsa.h, rad_block_ple.h). */
+TEST(the_tree_rows_resolve_to_libr4d_at_flash_nexts_geometry) {
+    Registry r;
+    const int st = r.load_dir(dir_of("kernels"), { "libr4d", "libref" });
+    if (!r.plugin("libr4d")) {
+        (void)st;
+        ARTIFACT_MISSING("libr4d under " + dir_of("kernels"));
+    }
+    auto row = [&](const char* op, const Geometry& g) {
+        const KernelRow* k = r.select(op, g, RAD_DOMAIN_DEVICE);
+        return k ? std::string(k->info->name) : std::string("<none>");
+    };
+    for (const int gqa : { 12, 6 })
+        for (const char* kv : { "bf16", "i8" }) {
+            Geometry g;
+            g.set_i("q_len", 1); g.set_i("head_dim", 256); g.set_i("gqa", gqa);
+            g.set_i("causal", 1); g.set_i("window", 0); g.set_i("n_head", 2 * gqa);
+            g.set_i("block_size", 4); g.set_i("max_seqs", 256); g.set_i("max_ctx", 200000);
+            g.set_i("sel_pitch", 513);
+            g.set_s("q_dtype", "bf16"); g.set_s("kv_dtype", kv);
+            const std::string plain = row("attn_paged_tree_sel", g);
+            CHECK(plain != "<none>");
+            if (plain == "<none>")
+                fprintf(stderr, "    attn_paged_tree_sel gqa %d kv %s: no row\n", gqa, kv);
+            Geometry gq = g;
+            gq.set_i("group", 128); gq.set_s("act", "sigmoid");
+            for (const char* op :
+                 { "attn_paged_tree_sel_gate_quant", "attn_paged_tree_sel_gate_had_quant" }) {
+                const std::string name = row(op, gq);
+                CHECK(name != "<none>");
+                if (name == "<none>") fprintf(stderr, "    %s gqa %d kv %s: no row\n", op, gqa, kv);
+            }
+        }
+    /* The windows' compaction, the tail's, the region score, the region bases and the stage-2
+     * grower. */
+    for (const auto& w : { std::make_pair(1, "i32"), std::make_pair(8, "bf16") }) {
+        Geometry g;
+        g.set_i("off", w.first); g.set_s("dtype", w.second);
+        CHECK(row("kv_window_compact", g) != "<none>");
+    }
+    {
+        Geometry g;
+        g.set_i("M", 4); g.set_i("n", 128); g.set_i("ring", 11); g.set_i("seqs", 8);
+        g.set_s("dtype", "bf16");
+        CHECK(row("qsa_tail_compact", g) != "<none>");
+    }
+    {
+        Geometry g;
+        g.set_i("M", 16); g.set_i("n", 128); g.set_i("heads", 4); g.set_i("blocks", 8);
+        g.set_i("seqs", 2048); g.set_s("dtype", "bf16");
+        CHECK(row("qsa_score", g) != "<none>");
+    }
+    {
+        Geometry g;
+        g.set_i("M", 16);
+        g.set_s("src", "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ");
+        g.set_s("mul", "4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 ");
+        g.set_s("add", "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
+        CHECK(row("int_affine", g) != "<none>");
+    }
+    {
+        Geometry g;
+        g.set_i("M", 8); g.set_i("round", 2); g.set_i("rounds", 3); g.set_i("nodes", 6);
+        g.set_i("width", 3); g.set_i("block_size", 4); g.set_i("sel_pitch", 513);
+        CHECK_EQ(row("mtp_tree_grow", g), std::string("mtp_tree_grow_i32"));
+    }
+}

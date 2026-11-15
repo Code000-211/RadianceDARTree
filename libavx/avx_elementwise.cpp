@@ -1151,3 +1151,94 @@ AVX_KERNEL(softmax) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ mtp_tree_grow */
+/* `didx`, `dval`, `state`, `head_pos`?, `head_row`?, `table`? -> `tok`, `par`, `sel`?, `nsel`?,
+ * `vmask`?, `rb`?  One pass of a serial draft head's best-first tree growth: libref's walk
+ * (ref_quant.cpp), the same shared code (abi/rad_mtp_tree.h), one sequence at a time. */
+#ifndef AVX_MTP_TREE_ONCE
+#define AVX_MTP_TREE_ONCE
+#include "rad_mtp_tree.h"
+#include <vector>
+#endif
+AVX_KERNEL(mtp_tree_grow) {
+    if (a->n_t < 8) return RAD_E_INVAL;
+    const RadTensor *didx = &a->t[0], *dval = &a->t[1], *st = &a->t[2];
+    const RadTensor* hpos = rad_arg_in(a, 3);
+    const RadTensor* hrow = rad_arg_in(a, 4);
+    const RadTensor* tab  = rad_arg_in(a, 5);
+    const RadTensor *tok = &a->t[6], *par = &a->t[7];
+    const RadTensor* sel   = a->n_t > 8  ? rad_arg_in(a, 8)  : nullptr;
+    const RadTensor* nsel  = a->n_t > 9  ? rad_arg_in(a, 9)  : nullptr;
+    const RadTensor* vmask = a->n_t > 10 ? rad_arg_in(a, 10) : nullptr;
+    const RadTensor* rbt   = a->n_t > 11 ? rad_arg_in(a, 11) : nullptr;
+    if (!didx->data || !dval->data || !st->data || !tok->data || !par->data) return RAD_E_INVAL;
+    if (didx->dtype != RAD_I32 || dval->dtype != RAD_F32 || st->dtype != RAD_I32 ||
+        tok->dtype != RAD_I32 || par->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+
+    RadMtpTreeCfg cfg{};
+    cfg.round  = (int)p_int(a, "round", 0);
+    cfg.rounds = (int)p_int(a, "rounds", 0);
+    cfg.nodes  = (int)p_int(a, "nodes", 0);
+    cfg.width  = (int)p_int(a, "width", 0);
+    cfg.block  = (int)p_int(a, "block_size", 0);
+    cfg.sel_pitch = (int)p_int(a, "sel_pitch", 0);
+    const int64_t M = band_rows(st->rank >= 2 ? st->shape[0] : numel(st), p_int(a, "M", 0));
+    cfg.pitch = (int)(tok->rank >= 2 ? tok->shape[tok->rank - 1] : cfg.nodes);
+    if (M <= 0 || cfg.round < 1 || cfg.rounds < 1 || cfg.nodes < 1 || cfg.width < 1 ||
+        cfg.round > cfg.rounds || cfg.nodes > RAD_MTP_TREE_MAX_NODES)
+        return RAD_E_SHAPE;
+    const int64_t sw = rad_mtp_tree_state_words(cfg.nodes, cfg.width, cfg.rounds);
+    if (st->rank < 2 || st->shape[1] < sw || st->shape[0] < M) return RAD_E_SHAPE;
+    if (cfg.pitch < cfg.nodes || numel(tok) < M * cfg.pitch || numel(par) < M * cfg.pitch)
+        return RAD_E_SHAPE;
+    const int64_t per = cfg.round == 1 ? 1 : cfg.width;
+    if (didx->rank < 2 || didx->shape[didx->rank - 1] != RAD_MTP_TREE_K ||
+        didx->shape[0] < M * per || dval->shape[0] < M * per)
+        return RAD_E_SHAPE;
+    const bool att = cfg.sel_pitch > 0 && sel && nsel && vmask && rbt && tab;
+    if (cfg.sel_pitch > 0 && !att) return RAD_E_INVAL;
+    if (att && (sel->shape[0] < M * cfg.width || sel->shape[1] < cfg.sel_pitch ||
+                numel(nsel) < M * cfg.width || numel(vmask) < M * cfg.width ||
+                numel(rbt) < M))
+        return RAD_E_SHAPE;
+
+    const int*   ip  = (const int*)didx->data;
+    const float* fp  = (const float*)dval->data;
+    const int64_t drs = didx->stride[0];
+    const int64_t vrs = dval->stride[0];
+    if (drs != vrs || didx->stride[didx->rank - 1] != 1 || dval->stride[dval->rank - 1] != 1)
+        return RAD_E_STRIDE;
+    for (int64_t m = 0; m < M; ++m) {
+        int head = -1;
+        if (cfg.round == 1 && hpos && hrow) {
+            const int64_t r = ldi(hrow, offlin(hrow, m));
+            if (r < 0 || r >= numel(hpos)) return RAD_E_SHAPE;
+            head = (int)ldi(hpos, offlin(hpos, r));
+        }
+        int* sp = (int*)st->data + m * st->stride[0];
+        std::vector<long long> vm((size_t)cfg.width, 0);
+        std::vector<int> selw((size_t)cfg.width * (att ? cfg.sel_pitch : 1), -1);
+        std::vector<int> nsw((size_t)cfg.width, 0);
+        int rb = 0;
+        const int rc = rad_mtp_tree_grow_seq(
+            &cfg, sp, ip, fp, m * per, drs, 1, head,
+            att ? (const int*)tab->data + m * tab->stride[0] : nullptr,
+            (int*)tok->data + m * tok->stride[0], (int*)par->data + m * par->stride[0],
+            att ? selw.data() : nullptr, att ? nsw.data() : nullptr, att ? vm.data() : nullptr,
+            att ? &rb : nullptr);
+        if (rc < 0) return RAD_E_SHAPE;
+        if (att && cfg.round < cfg.rounds) {
+            for (int w = 0; w < cfg.width; ++w) {
+                int* srow = (int*)sel->data + (m * cfg.width + w) * sel->stride[0];
+                for (int k = 0; k < cfg.sel_pitch; ++k)
+                    srow[k] = selw[(size_t)w * cfg.sel_pitch + k];
+                ((int*)nsel->data)[(m * cfg.width + w) * nsel->stride[0]] = nsw[(size_t)w];
+                ((long long*)vmask->data)[(m * cfg.width + w) * vmask->stride[0]] = vm[(size_t)w];
+            }
+            ((int*)rbt->data)[m * rbt->stride[0]] = rb;
+        }
+    }
+    return RAD_OK;
+}

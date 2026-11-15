@@ -156,6 +156,7 @@ enum { QW_K = 0, QW_POS, QW_CU, QW_STATE, QW_SIDX, QW_BT, QW_ROPE, QW_STAGE, QW_
        QW_NC };
 
 extern "C" int halo_rad_qsa_work(const RadArgs* a, RadStream stream) {
+    for (int i_ = 11; i_ <= 18; ++i_) if (halo_opt(a, i_)) return HALO_NO(RAD_E_UNSUPPORTED);  /* spec_parent, num_accepted and the tree outputs: a tree verify is not served here */
     const RadTensor* k  = halo_opt(a, QW_K);
     const RadTensor* po = halo_opt(a, QW_POS);
     const RadTensor* cu = halo_opt(a, QW_CU);

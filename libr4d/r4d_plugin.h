@@ -220,6 +220,8 @@ R4D_WIN_AHEAD_DECL(256, 1) R4D_WIN_AHEAD_DECL(256, 2) R4D_WIN_AHEAD_DECL(256, 4)
 #undef R4D_WIN_AHEAD_DECL
 /* dflash_tree (r4d_dflash_tree_bf16.hip): dflash_select's lattice grown best-first into a tree. */
 int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
+/* mtp_tree_grow (r4d_mtp_tree.hip): a serial draft head's tree grown best-first, a pass at a time. */
+int     r4d_rad_mtp_tree_grow(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
  * draft head's merge (r4d_pair_argmax_f32.hip). */
 int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);

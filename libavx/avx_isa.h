@@ -89,7 +89,7 @@ int         avx_par_force(int threads);
     X(lili_cand)            X(lili_attn)            X(lili_factor)          X(lili_walk)          \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
-    X(scatter_rows)         X(ngram_ids)            X(ple_conv_bias)                              \
+    X(scatter_rows)         X(ngram_ids)            X(ple_conv_bias)        X(mtp_tree_grow)      \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
     X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
     X(seg_mean_bf16_sum) \

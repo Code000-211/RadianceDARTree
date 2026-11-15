@@ -210,6 +210,7 @@ set(R4D_UNITS
   "r4d_dflash_select_bf16|"
   "r4d_dflash_markov_bf16|"
   "r4d_dflash_tree_bf16|"
+  "r4d_mtp_tree|"
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"

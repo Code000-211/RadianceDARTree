@@ -327,6 +327,8 @@ int ref_qsa_tail_store(const RadArgs* a, RadStream) {
     std::vector<W> w;
     for (int64_t t = 0; t < T; ++t) {
         const int64_t s = seq_holding(cu, n_seq, t, -1);
+        /* A tree block wider than the ring would alias flat slots. */
+        if (s >= 0 && tree_seq(sp, cu, s) && cu_at(cu, s + 1) - cu_at(cu, s) > ring) return RAD_E_SHAPE;
         if (s < 0 || t < cu_at(cu, s + 1) - ring) continue;
         const int64_t si = ldi(sx, col0(sx, s));
         if (si < 0) continue;
@@ -478,10 +480,11 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
         if (t0 < 0 || t1 > T) return RAD_E_SHAPE;
         const bool tree = tree_seq(sp, cu, s);
         if (tree) RAD_REF_TRY(tree_check(sp, po, cu, s));
+        if (tree && t1 - t0 > ring) return RAD_E_SHAPE;   /* flat ring slots would alias */
         const int64_t p0 = ldi(po, offlin(po, t0));
         const int64_t p1 = tree ? p0 : ldi(po, offlin(po, t1 - 1));
         int64_t lo = p0 / ratio;
-        if (na && ldi(na, offlin(na, s)) >= 2) {
+        if (na && ldi(na, offlin(na, s)) >= 2 && p0 - ldi(na, offlin(na, s)) >= 0) {
             const int64_t x = p0 - ldi(na, offlin(na, s)) - ratio + 2;
             lo = std::min(lo, x <= 0 ? (int64_t)0 : (x + ratio - 1) / ratio);
         }
@@ -571,6 +574,7 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
                 while (ldi(po, offlin(po, y)) > q) y = tree_parent(sp, t0, y);
                 return y;
             };
+            if (si < 0) continue;                 /* no slot: no keys, rnc 0, rtab -1 */
             const int64_t nr = (px + 1) / ratio - b0;
             st_int(rnc->dtype, rnc->data, offlin(rnc, x), nr);
             for (int64_t i = 0; i < nr; ++i)

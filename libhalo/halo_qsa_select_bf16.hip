@@ -1170,6 +1170,7 @@ enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL
        QL_SEQ = 7 };
 
 extern "C" int halo_rad_qsa_select(const RadArgs* a, RadStream stream) {
+    if (halo_opt(a, 8) || halo_opt(a, 9) || halo_opt(a, 10)) return HALO_NO(RAD_E_UNSUPPORTED);  /* spec_parent, rscore, vmask: a tree verify is not served here */
     const RadTensor* sc = halo_opt(a, QL_SCORE);
     const RadTensor* bt = halo_opt(a, QL_BT);
     const RadTensor* nc = halo_opt(a, QL_NC);

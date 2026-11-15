@@ -348,6 +348,18 @@ static const RadOperandSpec oDflashTree[] = { OPD("cand"), OPD("unary"), OPD_O("
                                               OPD("anchor"), WGT("pred"), WGT("succ"),
                                               OUT("tokens"), OUT("parents") };
 
+/* mtp_tree_grow (abi/rad_mtp_tree.h). `state` holds rad_mtp_tree_state_words(nodes, width, rounds)
+ * words a sequence. Round 1 reads each sequence's head index at head_pos[head_row[s]]; the four
+ * attention outputs go together, written when `sel_pitch` > 0. */
+static const RadParamSpec pMtpTreeGrow[] = { P_INT("M"), P_INT("round"), P_INT("rounds"),
+                                             P_INT("nodes"), P_INT("width"),
+                                             P_INTO("block_size"), P_INTO("sel_pitch") };
+static const RadOperandSpec oMtpTreeGrow[] = { OPD("didx"), OPD("dval"), INOUT("state"),
+                                               OPD_O("head_pos"), OPD_O("head_row"),
+                                               OPD_O("table"), OUT("tok"), OUT("par"),
+                                               OUT_O("sel"), OUT_O("nsel"), OUT_O("vmask"),
+                                               OUT_O("rb") };
+
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
 static const RadOperandSpec oRmsHadQuant[] = { OPD("x"), INOUT_O("residual"), WGT("w"),
@@ -1518,6 +1530,13 @@ static const RadOpSchema kSchemas[] = {
   "ties), then use that token as the next predecessor." },
 { "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
   "Full-vocabulary greedy Markov walk with F32 base logits and BF16 codebooks." },
+{ "mtp_tree_grow", ARR(pMtpTreeGrow), ARR(oMtpTreeGrow),
+  "One pass of a serial draft head's best-first tree growth: each frontier row's top-8 candidates "
+  "(didx, dval) are scored parent log probability + log_softmax over the row's eight, pooled, and "
+  "the best become the next frontier (up to `width`, the node budget permitting), or after round "
+  "`rounds` every remaining node; the final tree is written as tokens and parent node ids "
+  "(0 the root), and the next pass's tree-attention operands (sel, nsel, vmask, rb) from the "
+  "head's block table. abi/rad_mtp_tree.h." },
 { "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
   "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
   "is the anchor, each selected node's children are the valid candidates at the next position "
@@ -1842,8 +1861,8 @@ static const RadOpSchema kSchemas[] = {
   "accepted prefix replayed onto it out of a scratch slot, two slots whatever the depth -- and it "
   "produces the SAME `o` from a COMPLETELY DIFFERENT `state`. A reference that implements one and "
   "is handed the other computes a correct answer to the other question, which is why the form is "
-  "declared rather than inferred from the index row's width. ref serves per_candidate and "
-  "DECLINES anchor; libr4d serves both. "
+  "declared rather than inferred from the index row's width. ref serves both (anchor is the tree-verify form). "
+  "libr4d serves both. "
   "`cu` bounds the sequences exactly as it does on the sibling "
   "gdn_conv_update, which runs off the same tensor on the same step. "
   "`spec_parent` / `spec_path` (anchor form only) verify a tree: every row starts from its "
@@ -2566,6 +2585,9 @@ SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
        "Full-vocabulary greedy Markov walk with F32 base logits",
        "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
        ref_dflash_markov_greedy_f32),
+SIMPLE("ref_mtp_tree_grow", "mtp_tree_grow", "draft",
+       "A serial draft head's tree grown best-first, pass by pass",
+       "i32 candidates, f32 logits, i32 state, tokens and parents out", ref_mtp_tree_grow),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),

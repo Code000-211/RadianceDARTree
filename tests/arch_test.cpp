@@ -1531,11 +1531,11 @@ TEST(the_recurrent_path_slices_a_and_b_out_of_the_projection_row) {
         const RecOp* o = b.op_of(i.op);
         if (!o || o->op != "gdn_recurrent_update") continue;
         seen = true;
-        /* Sixteen, as both kernel registries declare for gdn_recurrent_update and
-         * core/runtime/issue.cpp requires. The count comes from the schema, since this harness
-         * only records operands. The last two (the folded out-projection quantiser) are unused by
-         * the bf16 block; operands are positional, so an absent optional operand is a null
-         * operand, not a shorter list. */
+        /* Sixteen: the schema declares eighteen, the last two (spec_parent, spec_path) optional
+         * and trailing, so an architecture that never drafts a tree issues the shorter list
+         * (issue.cpp allows it). Of the sixteen, the last two (the folded out-projection
+         * quantiser) are unused by the bf16 block: an absent optional operand before the end is
+         * a null operand, not a shorter list. */
         CHECK_EQ((int)i.opd.size(), 16);
         CHECK_EQ(i.opd[14].kind, (uint8_t)RAD_OPK_NONE);
         CHECK_EQ(i.opd[15].kind, (uint8_t)RAD_OPK_NONE);
@@ -12856,4 +12856,341 @@ TEST(the_plain_bf16_plugins_ask_for_chained_launches) {
         CHECK_OK(unlimitedocr_bf16::probe(&meta, &p));
         CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);
     }
+}
+
+/* ==================================================================== DARTree on Flash-Next
+ *
+ * The engine asks for a serial draft tree through RadBuildCtx (draft_tree, max_spec = N, draft_rounds
+ * = R, draft_tree_leaves, draft_tree_width); the plugin declares it, sizes by N, and routes the
+ * decode half of a step that carries RadBatch::spec_parent (and spec_path) through the tree forms. */
+namespace {
+
+RadBuildCtx q4_tree_ctx(int rank, int world, int N, int R, int L, int W, int64_t max_seqs = 4) {
+    RadBuildCtx c = q4_ctx(rank, world, max_seqs);
+    c.max_spec = N;
+    c.draft_tree = 1;
+    c.draft_rounds = R;
+    c.draft_tree_leaves = L;
+    c.draft_tree_width = W;
+    return c;
+}
+
+/* A step of `n_seq` sequences as a tree engine builds it: a verify block of N + 1 rows (the anchor,
+ * the chain 1..R, the leaves under the anchor) when `verify`, else one row; `path` adds the
+ * previous step's accepted path (the identity but for sequence 1, which took node 5). */
+struct TreeKit {
+    std::unique_ptr<Kit> k;
+    std::vector<int32_t> par, path, nacc;
+};
+TreeKit tree_kit(const RadBuilder& b, int n_seq, int N, int R, bool verify, bool path) {
+    TreeKit t;
+    t.k = kit(b, std::vector<int>((size_t)n_seq, verify ? N + 1 : 1), {});
+    RadBatch& bt = t.k->b;
+    if (verify) {
+        for (int s = 0; s < n_seq; ++s)
+            for (int j = 0; j <= N; ++j)
+                t.par.push_back(j == 0 ? -1 : j <= R ? j - 1 : 0);
+        bt.spec_parent = t.par.data();
+    }
+    if (path) {
+        const int pitch = N + 1;
+        for (int s = 0; s < n_seq; ++s) {
+            for (int j = 0; j < pitch; ++j) t.path.push_back(j);
+            t.nacc.push_back(1);
+        }
+        if (n_seq > 1) { t.path[(size_t)pitch + 1] = 5; t.nacc[1] = 2; }
+        bt.spec_path = t.path.data();
+        bt.spec_path_pitch = pitch;
+        bt.num_accepted = t.nacc.data();
+    }
+    return t;
+}
+
+bool absent(const RadOperand& o) { return o.kind == RAD_OPK_NONE; }
+
+}  /* namespace */
+
+TEST(flashnext_declares_a_draft_tree_only_when_the_engine_asks_for_one) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    auto declared = [&](RadBuildCtx ctx, RadBuilder& b) {
+        b.encs = { { "draft_head", u2_head() } };
+        return qwen4exp_fp8::declare(&b, &meta, &ctx);
+    };
+    int tail_group = -1, bkey_group = -1;
+    auto groups = [&](const RadBuilder& b) {
+        for (size_t i = 0; i < b.kv_groups.size(); ++i) {
+            if (b.kv_groups[i].name.find("kv_qsa_tail") != std::string::npos) tail_group = (int)i;
+            if (b.kv_groups[i].name.find("kv_qsa_bkey") != std::string::npos) bkey_group = (int)i;
+        }
+    };
+
+    /* No tree: the chain as before, no tree op declared, nothing flagged. */
+    {
+        RadBuilder b;
+        REQUIRE_EQ(declared(q4_ctx(0, 1), b), RAD_OK);
+        CHECK_EQ(b.drafter.depth, 3);
+        CHECK_EQ(b.drafter.tree_nodes, 0);
+        CHECK(!b.drafter_tree);
+        for (const char* op : { "qsa_tail_compact", "attn_paged_tree_sel", "mtp_tree_grow",
+                                "int_affine", "kv_window_compact" })
+            CHECK_EQ(count_op(b, op), 0);
+        groups(b);
+        REQUIRE(bkey_group >= 0);
+        for (const RecKV& g : b.kv_groups) CHECK_EQ(g.d.no_tree_compact, 0);
+    }
+
+    /* Stage 1 at the default operating point: the greedy chain of R = 3 and L leaves, N = 7. */
+    const int N = 7, R = 3;
+    for (const int world : { 1, 2 }) {
+        RadBuilder b;
+        const RadBuildCtx ctx = q4_tree_ctx(0, world, N, R, 4, 1);
+        REQUIRE_EQ(declared(ctx, b), RAD_OK);
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+        CHECK_EQ(b.drafter.depth, R);
+        CHECK_EQ(b.drafter.tree_nodes, N);
+        CHECK_EQ(b.drafter.tree_leaves, 4);
+        CHECK_EQ(b.drafter.tree_width, 1);
+        CHECK(b.drafter_tree);
+        CHECK_EQ(b.drafter_parents, (rad_buf)0);
+        CHECK_EQ(b.drafter.proposal_pitch, 8);         /* columns 1..L of the reranked top 8 */
+        /* Everything the deepest speculation sizes is N, not R: the logits rows, the delta net's
+         * anchor state, the QSA tail's ring. */
+        const RecBuf* logits = find_b(b, "logits");
+        REQUIRE(logits != nullptr);
+        CHECK_EQ(logits->d.shape[0], 4 * (N + 1));
+        groups(b);
+        REQUIRE(tail_group >= 0 && bkey_group >= 0);
+        CHECK_EQ(b.kv_groups[(size_t)tail_group].d.state_dim[0], 4 + N);
+        /* Only the block-key group is flagged: its pages hold a block key, not four tokens' K and
+         * V, and the core's accepted-path move must skip it. */
+        for (size_t i = 0; i < b.kv_groups.size(); ++i)
+            CHECK_EQ(b.kv_groups[i].d.no_tree_compact, (int)i == bkey_group ? 1 : 0);
+        /* The tree ops: one tail compaction a QSA layer, the scratch block key and the region
+         * score beside the committed ones, the region bases, the tree attention in both forms. */
+        const int qsa_layers = count_op(b, "qsa_tail_compact");
+        CHECK(qsa_layers > 0);
+        CHECK_EQ(count_op(b, "int_affine"), qsa_layers);
+        CHECK_EQ(count_op(b, "qsa_score"), 2 * qsa_layers + 1);   /* + the head's */
+        CHECK(count_op(b, "attn_paged_tree_sel") > 0);
+        CHECK_EQ(count_op(b, "mtp_tree_grow"), 0);                 /* stage 1: the core's alone */
+        /* The scratch wire: a row a step row, the vmask the mask the attention reads. */
+        for (const char* nmv : { "qsa_skey", "qsa_vmask", "qsa_rb", "qsa_rtab", "qsa_rscore" })
+            CHECK(find_b(b, nmv) != nullptr);
+        const RecBuf* vm = find_b(b, "qsa_vmask");
+        REQUIRE(vm != nullptr);
+        CHECK_EQ((int)vm->d.dtype, (int)RAD_I64);
+        CHECK_EQ(vm->d.shape[0], 2048);
+        if (count_op(b, "ngram_ids") > 0) CHECK_EQ(count_op(b, "kv_window_compact") % 2, 0);
+    }
+
+    /* Stage 2: the head grows the tree, so it has a parents plane at the proposal's pitch, a
+     * grower a round, and a proposal that is no longer the reranked top 8. */
+    {
+        RadBuilder b;
+        REQUIRE_EQ(declared(q4_tree_ctx(0, 1, N, R, 0, 3), b), RAD_OK);
+        CHECK_EQ(b.drafter.tree_width, 3);
+        CHECK(b.drafter_tree);
+        CHECK(b.drafter_parents != 0);
+        CHECK(b.drafter.proposal != (rad_buf)(find_b(b, "mtp_didx") - &b.bufs[0] + 1));
+        CHECK(b.drafter.proposal_pitch >= N);
+        CHECK_EQ(count_op(b, "mtp_tree_grow"), R);
+        std::set<long long> rounds;
+        for (const RecOp& o : b.ops)
+            if (o.op == "mtp_tree_grow") {
+                rounds.insert(pint(&o, "round"));
+                CHECK_EQ(pint(&o, "rounds"), R);
+                CHECK_EQ(pint(&o, "nodes"), N);
+                CHECK_EQ(pint(&o, "width"), 3);
+            }
+        CHECK_EQ(rounds.size(), (size_t)R);
+        /* the head's own attention has the tree form too */
+        CHECK(count_op(b, "attn_paged_tree_sel") > 0);
+    }
+
+    /* A tree does not combine with the coupled draft. */
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 3, 1);
+        ctx.draft_coupling = 1;
+        CHECK(declared(ctx, b) != RAD_OK);
+    }
+    /* A tree with no head round, or deeper than the delta net's walk: refused, not clamped. */
+    {
+        RadBuilder b;
+        CHECK(declared(q4_tree_ctx(0, 1, 16, 3, 3, 1), b) != RAD_OK);
+    }
+
+    /* The probe advertises it: the default budget, and the state and window ops that make it safe. */
+    {
+        RadArchProbe pr{};
+        REQUIRE_EQ(qwen4exp_fp8::probe(&meta, &pr), RAD_OK);
+        CHECK_EQ((int)pr.tree_nodes, 6);
+        CHECK_EQ((int)pr.tree_linear_ok, 1);
+        CHECK_EQ((int)pr.draft_depth, 3);
+    }
+}
+
+TEST(flashnext_tree_steps_route_the_decode_half_through_the_tree_ops) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3;
+    RadBuilder b;
+    b.encs = { { "draft_head", u2_head() } };
+    RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 4, 1);
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    const int qsa = count_op(b, "qsa_tail_compact");
+    REQUIRE(qsa > 0);
+
+    auto tree_ops = [&](const RadCtx& c) {
+        return issues_of(b, c, "qsa_tail_compact").size() + issues_of(b, c, "attn_paged_tree_sel").size() +
+               issues_of(b, c, "attn_paged_tree_sel_gate_quant").size() +
+               issues_of(b, c, "attn_paged_tree_sel_gate_had_quant").size() +
+               issues_of(b, c, "int_affine").size() + issues_of(b, c, "kv_window_compact").size();
+    };
+
+    /* A chain decode and a prefill chunk, even with a spec_parent plane of -2s (a tree engine
+     * hands it on every step): not one tree op, no tree operand. */
+    {
+        std::vector<int32_t> minus2(4096, -2);
+        const auto chain = kit(b, { 1, 1, 1, 1 }, {});
+        const auto pre   = kit(b, {}, { 64 }, 300);
+        pre->b.spec_parent = minus2.data();
+        for (const Kit* k : { chain.get(), pre.get() }) {
+            const auto v = run_passes(b, qwen4exp_fp8::step, { k });
+            CHECK_PASSES(b, v);
+            CHECK_EQ(tree_ops(*v[0]), (size_t)0);
+            for (const RecIssue* is : issues_of(b, *v[0], "gdn_conv_update")) {
+                CHECK(is->opd.size() <= 10 || absent(is->opd[10]));
+                CHECK(is->opd.size() <= 11 || absent(is->opd[11]));
+            }
+            for (const RecIssue* is : issues_of(b, *v[0], "qsa_select"))
+                CHECK(is->opd.size() <= 8 || absent(is->opd[8]));
+        }
+    }
+
+    /* A tree verify after a tree verify (path, and parents): every QSA layer compacts its tail,
+     * selects with the tree operands and attends with the tree form; the delta net runs the pair
+     * with both planes; the windows close over the path. */
+    {
+        const TreeKit tk = tree_kit(b, 4, N, R, true, true);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { tk.k.get() });
+        CHECK_PASSES(b, v);
+        CHECK_EQ(issues_of(b, *v[0], "qsa_tail_compact").size(), (size_t)qsa);
+        CHECK_EQ(issues_of(b, *v[0], "int_affine").size(), (size_t)qsa);   /* 4 sequences: one launch */
+        const size_t tsel = issues_of(b, *v[0], "attn_paged_tree_sel").size() +
+                            issues_of(b, *v[0], "attn_paged_tree_sel_gate_quant").size() +
+                            issues_of(b, *v[0], "attn_paged_tree_sel_gate_had_quant").size();
+        CHECK_EQ(tsel, (size_t)qsa);
+        /* and the classic attention is not issued on the trunk's decode rows */
+        CHECK_EQ(issues_of(b, *v[0], "attn_paged").size() +
+                 issues_of(b, *v[0], "attn_paged_gate_quant").size(), (size_t)0);
+        for (const RecIssue* is : issues_of(b, *v[0], "qsa_select")) {
+            REQUIRE(is->opd.size() >= 11);
+            CHECK(!absent(is->opd[8]) && !absent(is->opd[9]) && !absent(is->opd[10]));
+        }
+        for (const RecIssue* is : issues_of(b, *v[0], "qsa_work")) {
+            REQUIRE(is->opd.size() >= 18);
+            CHECK(!absent(is->opd[11]) && !absent(is->opd[12]));   /* spec_parent, num_accepted */
+            CHECK(!absent(is->opd[13]) && !absent(is->opd[18 - 1]));
+        }
+        CHECK_EQ(issues_of(b, *v[0], "gdn_conv_recurrent_update").size() +
+                 issues_of(b, *v[0], "gdn_conv_recurrent_update_had").size(), (size_t)0);
+        for (const char* op : { "gdn_conv_update", "gdn_recurrent_update" })
+            for (const RecIssue* is : issues_of(b, *v[0], op)) {
+                const size_t at = std::string(op) == "gdn_conv_update" ? 10 : 16;
+                REQUIRE(is->opd.size() >= at + 2);
+                CHECK(!absent(is->opd[at]) && !absent(is->opd[at + 1]));
+            }
+        for (const RecIssue* is : issues_of(b, *v[0], "ngram_ids")) {
+            REQUIRE(is->opd.size() >= 12);
+            CHECK(!absent(is->opd[11]));
+        }
+        for (const RecIssue* is : issues_of(b, *v[0], "ple_conv")) {
+            REQUIRE(is->opd.size() >= 10);
+            CHECK(!absent(is->opd[9]));
+        }
+    }
+
+    /* A decode that follows a tree: the same compactions and heal, no tree attention, only the
+     * path on the delta net. */
+    {
+        const TreeKit tk = tree_kit(b, 4, N, R, false, true);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { tk.k.get() });
+        CHECK_PASSES(b, v);
+        CHECK_EQ(issues_of(b, *v[0], "qsa_tail_compact").size(), (size_t)qsa);
+        CHECK_EQ(issues_of(b, *v[0], "attn_paged_tree_sel").size() +
+                 issues_of(b, *v[0], "attn_paged_tree_sel_gate_quant").size(), (size_t)0);
+        CHECK_EQ(issues_of(b, *v[0], "int_affine").size(), (size_t)0);
+        for (const RecIssue* is : issues_of(b, *v[0], "gdn_conv_update")) {
+            REQUIRE(is->opd.size() >= 12);
+            CHECK(absent(is->opd[10]) && !absent(is->opd[11]));
+        }
+        for (const RecIssue* is : issues_of(b, *v[0], "qsa_work")) {
+            REQUIRE(is->opd.size() >= 13);
+            CHECK(absent(is->opd[11]) && !absent(is->opd[12]));    /* num_accepted alone: the heal */
+        }
+    }
+
+    /* Stage 1 asks nothing of the head's passes: its history pass and rounds are the chain's. */
+    {
+        const TreeKit tk = tree_kit(b, 4, N, R, true, false);
+        const auto his = history_pass(b, *tk.k);
+        const auto r2 = round_pass(b, 4, 2), r3 = round_pass(b, 4, 3);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { tk.k.get(), his.get(), r2.get(), r3.get() });
+        CHECK_PASSES(b, v);
+        for (size_t i = 1; i < v.size(); ++i) {
+            CHECK_EQ(tree_ops(*v[i]), (size_t)0);
+            CHECK_EQ(issues_of(b, *v[i], "mtp_tree_grow").size(), (size_t)0);
+        }
+    }
+}
+
+TEST(flashnext_stage_two_head_rounds_carry_w_frontier_rows_and_grow_the_tree) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3, W = 3, S = 4;
+    RadBuilder b;
+    b.encs = { { "draft_head", u2_head() } };
+    RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 0, W);
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+
+    const TreeKit tk = tree_kit(b, S, N, R, true, false);
+    const auto his = history_pass(b, *tk.k);
+    /* Round r >= 2: W rows a sequence, spec_parent naming each row's parent by node id. */
+    auto round = [&](int r) {
+        auto k = kit(b, std::vector<int>(S, W), {});
+        k->b.draft_pass = r;
+        return k;
+    };
+    const auto r2 = round(2), r3 = round(3);
+    std::vector<int32_t> par((size_t)S * W);
+    for (size_t i = 0; i < par.size(); ++i) par[i] = (int32_t)(i % W == 2 ? 1 : 0);
+    r2->b.spec_parent = par.data();
+    r3->b.spec_parent = par.data();
+    const auto v = run_passes(b, qwen4exp_fp8::step, { tk.k.get(), his.get(), r2.get(), r3.get() });
+    CHECK_PASSES(b, v);
+
+    /* The history pass is round 1: the grower reads the pass's positions and the draft rows. */
+    const auto g1 = issues_of(b, *v[1], "mtp_tree_grow");
+    REQUIRE_EQ(g1.size(), (size_t)1);
+    CHECK_EQ(pint(b.op_of(g1[0]->op), "round"), 1);
+    REQUIRE(g1[0]->opd.size() >= 12);
+    CHECK(!absent(g1[0]->opd[3]) && !absent(g1[0]->opd[4]) && !absent(g1[0]->opd[5]));
+    /* Each later round: its head attention is the tree form over the grower's operands, the
+     * indexer does not run, and the grower follows the head's candidates. */
+    for (size_t i = 2; i < 4; ++i) {
+        const auto g = issues_of(b, *v[i], "mtp_tree_grow");
+        REQUIRE_EQ(g.size(), (size_t)1);
+        CHECK_EQ(pint(b.op_of(g[0]->op), "round"), (long long)i);
+        CHECK(absent(g[0]->opd[3]) && absent(g[0]->opd[4]));
+        CHECK_EQ(issues_of(b, *v[i], "qsa_select").size(), (size_t)0);
+        CHECK_EQ(issues_of(b, *v[i], "attn_paged").size() +
+                 issues_of(b, *v[i], "attn_paged_gate_quant").size(), (size_t)0);
+        CHECK_EQ(issues_of(b, *v[i], "attn_paged_tree_sel").size() +
+                 issues_of(b, *v[i], "attn_paged_tree_sel_gate_quant").size() +
+                 issues_of(b, *v[i], "attn_paged_tree_sel_gate_had_quant").size(), (size_t)1);
+    }
+    /* the trunk's verify issued no grower */
+    CHECK_EQ(issues_of(b, *v[0], "mtp_tree_grow").size(), (size_t)0);
 }

@@ -88,6 +88,7 @@ __device__ __forceinline__ void qsa_work_scratch(QSA_WORK_PARAMS, int x) {
     if (s < 0 || !qw_tree(sp, cu, s)) return;
     const int t0 = cu[s], p0 = pos[t0], px = pos[x], b0 = p0 / ratio;
     const int si = sidx[(size_t)s * sidx_ld];
+    if (si < 0) return;                      /* no slot: no keys, rnc 0, rtab -1 */
     int nr = (px + 1) / ratio - b0;
     if (nr > rt_cols) nr = rt_cols;
     if (nr < 0) nr = 0;
@@ -147,7 +148,7 @@ __device__ __forceinline__ void qsa_work_body(QSA_WORK_PARAMS) {
         int lo = p0 / ratio;                                        /* ceil((p0-ratio+1)/ratio) */
         /* Heal: the blocks whose last token is one of the na - 1 non-anchor positions the last
          * step committed, [p0 - na + 1, p0 - 1], ahead of the sequence's own. */
-        if (na && na[i] >= 2) {
+        if (na && na[i] >= 2 && p0 - na[i] >= 0) {   /* a stale na on a short sequence heals nothing */
             const int x = p0 - na[i] - ratio + 2;
             const int lh = x <= 0 ? 0 : (x + ratio - 1) / ratio;
             if (lh < lo) lo = lh;

@@ -1466,6 +1466,27 @@ inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_de
     }
 }
 
+/* Tree verification (rad_drafter_tree, docs/PLUGIN.md). A step whose decode half verifies a tree:
+ * the core hands `spec_parent` (-1 the anchor, -2 an ordinary row) on every step of a tree
+ * deployment, prefill steps included, so the plane alone says nothing; a verify carries drafts
+ * (`n_spec` > 0) and its decode half exists. Chain and prefill steps are issued exactly as before.
+ *
+ * `tree_path_step` is the step that follows a tree verify, whose rolling windows and tail must
+ * close over the accepted path first (RadBatch::spec_path). The plane is the identity after a
+ * chain, so a consumer may always read it when non-null. */
+inline bool tree_verify_step(const RadBatch* b) {
+    if (!b->spec_parent || b->n_spec <= 0) return false;
+    int64_t d = 0, dt = 0;
+    batch_split(b, &d, &dt);
+    return d > 0;
+}
+inline bool tree_path_step(const RadBatch* b) {
+    if (!b->spec_path || b->spec_path_pitch <= 0) return false;
+    int64_t d = 0, dt = 0;
+    batch_split(b, &d, &dt);
+    return d > 0;
+}
+
 /* The step batch's entry for one declared KV group (built once per step by the core, spec §8). */
 inline const RadKVGroupBatch* kv_batch(const RadBatch* b, rad_kvgroup group) {
     for (int i = 0; i < b->n_kv_groups; ++i)

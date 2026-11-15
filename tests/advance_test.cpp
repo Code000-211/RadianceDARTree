@@ -1068,4 +1068,66 @@ TEST(a_tree_round_stages_its_frontier_rows_by_depth_and_flat_slot) {
     CHECK_EQ(u.w[Slab::PAR + 1], -2);
 }
 
+/* The plugin's final tree (ADV_BTAKE) is bounded by what the host reserved: depth <= R and every
+ * parent an earlier node. A tree that breaks either falls back to the chain prefix with the same
+ * node count (nodes 1..R chained, the rest siblings of node 1 that the walk never takes). */
+TEST(a_serial_btake_keeps_a_valid_tree_and_falls_back_to_the_chain_prefix_for_a_bad_one) {
+    const int32_t good[5] = { 0, 1, 0, 2, 1 };        /* depth 3 */
+    const int32_t deep[5] = { 0, 1, 2, 3, 0 };        /* depth 4 > R = 3 */
+    const int32_t fwd[5]  = { 0, 1, 4, 0, 0 };        /* node 3's parent (4) is a later node */
+    const int32_t neg[5]  = { 0, -1, 0, 0, 0 };
+    const int32_t* cases[4] = { good, deep, fwd, neg };
+    for (int c = 0; c < 4; ++c) {
+        Slab s(ADV_BTAKE);
+        s.a.round = 5; s.a.src_pitch = 5;
+        s.a.tree_nodes = 5; s.a.depth = 3;
+        int32_t par[5];
+        for (int j = 0; j < 5; ++j) par[j] = cases[c][j];
+        s.a.par = par;
+        s.row(0, true, 0, 6, 0, 0, 0, -1, 5);
+        for (int j = 0; j < 5; ++j) s.src[j] = 70 + j;
+        s.run();
+        const StepSlot& S = s.st[0];
+        CHECK_EQ(S.ntree, 5);
+        for (int j = 0; j < 5; ++j) {
+            if (c == 0) {
+                CHECK_EQ(S.par[j], good[j]);
+                CHECK_EQ(S.tok[1 + j], 70 + j);
+            } else if (j < 3) {
+                CHECK_EQ(S.par[j], j);                  /* the chain prefix, depth R */
+                CHECK_EQ(S.tok[1 + j], 70 + j);
+            } else {
+                CHECK_EQ(S.par[j], 0);                  /* padding siblings of node 1 */
+                CHECK_EQ(S.tok[1 + j], 70);
+            }
+        }
+        CHECK(adv_tree_valid(S.par, S.ntree, 3));
+    }
+    /* depth 0: unchecked, as a block drafter's or an older caller's take */
+    Slab u(ADV_BTAKE);
+    u.a.round = 5; u.a.src_pitch = 5; u.a.tree_nodes = 5;
+    int32_t par[5] = { 0, 1, 2, 3, 4 };
+    u.a.par = par;
+    u.row(0, true, 0, 6, 0, 0, 0, -1, 5);
+    u.run();
+    for (int j = 0; j < 5; ++j) CHECK_EQ(u.st[0].par[j], j);
+}
+
+/* A frontier row's parent must be a node of an earlier round: the same pass's rows have no K/V. */
+TEST(a_tree_round_roots_a_parent_made_in_the_same_pass) {
+    Slab s(ADV_ROUND_TREE);
+    s.a.round = 3; s.a.src_pitch = 3; s.a.tree_nodes = 6; s.a.width = 3;
+    int32_t par[3] = { 1, 3, 4 };          /* nodes 3, 4, 5: node 4's parent 3 is the same pass's */
+    s.a.par = par;
+    s.a.parent_off = Slab::PAR * 4;
+    StepSlot& S = s.st[0];
+    S.head = 100; S.ntree = 2; S.par[0] = 0; S.par[1] = 1; S.tok[1] = 11; S.tok[2] = 12;
+    s.row(0, true, 0, 3, 0, 0, 0, 0, 0);
+    s.src[0] = 21; s.src[1] = 22; s.src[2] = 23;
+    s.run();
+    CHECK_EQ(S.par[2], 1);
+    CHECK_EQ(S.par[3], 0);
+    CHECK_EQ(S.par[4], 0);
+}
+
 RAD_TEST_MAIN()

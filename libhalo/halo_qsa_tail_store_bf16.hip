@@ -88,6 +88,7 @@ static int halo_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, l
 enum { QT_K = 0, QT_POS = 1, QT_CU = 2, QT_STATE = 3, QT_SIDX = 4 };
 
 extern "C" int halo_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
+    if (halo_opt(a, 5)) return HALO_NO(RAD_E_UNSUPPORTED);  /* spec_parent: a tree verify is not served here */
     const RadTensor* k  = halo_opt(a, QT_K);
     const RadTensor* po = halo_opt(a, QT_POS);
     const RadTensor* cu = halo_opt(a, QT_CU);

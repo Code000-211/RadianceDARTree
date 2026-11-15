@@ -433,9 +433,22 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   Requirements: the plugin's trunk honours `spec_parent` on every decode row, and its recurrent
   (`RAD_KV_LINEAR`) and rolling-window (`RAD_KV_CONV`) state follows `RadBatch::spec_path`
   (`RadArchProbe::tree_linear_ok`; a program with such a group is refused without it, as is
-  `--draft-coupling`). A paged group whose entries are not one per token slot (QSA's block keys) sets
+  `--draft-coupling`). **Break for block-drafter trees:** this refusal applies to every tree, so an
+  existing plugin with a block tree and a linear/conv group must now set `tree_linear_ok`. The final
+  tree of a serial tree is checked on the card (`ADV_BTAKE`): a parent that is not an earlier node
+  or a depth above R replaces the whole tree with the chain prefix (same node count). A paged group whose entries are not one per token slot (QSA's block keys) sets
   `RadKVGroupDecl::no_tree_compact`, which the acceptance's K/V move skips. The history pass follows
   the accepted path: its row `t` is path node `t`'s hidden row and its token the target's pick there.
+  `qwen4exp_fp8` is the in-tree example (`arch/qwen4exp_fp8`, `arch/common/rad_qsa.h`,
+  `rad_block_gdn_fp8.h`, `rad_block_ple.h`, `rad_block_attn_gated_fp8.h`): it advertises N = 6
+  (`RadArchProbe::tree_nodes`, `tree_linear_ok`), sizes every window, ring and logits row by N, and on a
+  step with `spec_parent` issues the decode half through the tree forms (the delta net's pair with
+  both planes, never the fold; the PLE and QSA windows closed by `kv_window_compact` and
+  `qsa_tail_compact`; QSA's `qsa_work` tree mode, scratch block keys, region score and `qsa_select`
+  with `vmask`; `attn_paged_tree_sel` in every attention launch, dense and sparse), and on the step
+  after a tree the window and tail compactions and QSA's heal. Stage 2 (`--draft-tree-width` > 1) adds
+  the `mtp_tree_grow` op a round (`docs/OPS.md`, "Serial draft tree growth") and the head's tree
+  rounds, whose attention reads the operands the grower leaves for each frontier row.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
   expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
   GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`

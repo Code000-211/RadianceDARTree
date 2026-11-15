@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -1247,7 +1248,7 @@ TEST(op_vocabulary) {
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
         "dflash_markov_greedy", "dflash_markov_greedy_f32",
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
-        "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
+        "dflash_tree", "mtp_tree_grow", "attn_paged_tree", "attn_paged_anchor_window",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant", "dequant_w4",
@@ -9630,17 +9631,19 @@ struct Rng {
 struct QWorld {
     int64_t n = 8, heads = 2, ratio = 4, ring = 0, topk = 4, nbmax = 40, rot = 0, RW = 8;
     int64_t work = 24;                       /* a launch's work-list capacity */
+    int64_t nseq = 1;                        /* sequences: slot s, table row s, pages s * nbmax + b */
     T tail, bkp, tab, wk;
-    QWorld(int64_t ring_, int64_t topk_, int64_t rot_)
-        : ring(ring_), topk(topk_), rot(rot_), tail(RAD_BF16, { 1, 1, ring_, 8 }),
-          bkp(RAD_BF16, { 40, 8 }), tab(RAD_I32, { 1, 40 }), wk(RAD_F32, { 8 }) {
+    QWorld(int64_t ring_, int64_t topk_, int64_t rot_, int64_t nseq_ = 1)
+        : ring(ring_), topk(topk_), rot(rot_), nseq(nseq_), tail(RAD_BF16, { nseq_, 1, ring_, 8 }),
+          bkp(RAD_BF16, { nseq_ * 40, 8 }), tab(RAD_I32, { nseq_, 40 }), wk(RAD_F32, { 8 }) {
         std::vector<int64_t> id;
-        for (int64_t b = 0; b < nbmax; ++b) id.push_back(b);
-        tab.n(id);                           /* page id == block index, for both groups */
+        for (int64_t s = 0; s < nseq; ++s)
+            for (int64_t b = 0; b < nbmax; ++b) id.push_back(s * nbmax + b);
+        tab.n(id);                           /* page id == block index (plus the sequence's base) */
         wk.f({ 1, 1, 1, 1, 1, 1, 1, 1 });
         /* Unwritten pages and ring rows are recognisable. */
-        tail.f(std::vector<float>((size_t)(ring * n), -77.0f));
-        bkp.f(std::vector<float>((size_t)(nbmax * n), -55.0f));
+        tail.f(std::vector<float>((size_t)(nseq * ring * n), -77.0f));
+        bkp.f(std::vector<float>((size_t)(nseq * nbmax * n), -55.0f));
     }
 
     A bkey(const T& k, const T& page, const T& bpos, T& out, int64_t M) const {
@@ -9866,6 +9869,10 @@ void qsa_tree_scenario(uint64_t seed, int64_t base, int64_t R, int64_t topk, int
     for (int64_t b = first_open + 1; b < w.nbmax; ++b)
         CHECK_EQ(w.bkp.at(b * n), -55.0f);
     CHECK_EQ(o.nc[0], first_open);
+    /* Node j's raw key is at ring row (base + j) % ring, distinct per node. */
+    for (int64_t j = 0; j < R; ++j)
+        for (int64_t d = 0; d < n; ++d)
+            CHECK_EQ(w.tail.at(((base + j) % w.ring) * n + d), K[(size_t)j][(size_t)d]);
 
     std::vector<int64_t> pos, depth((size_t)R, 0);
     for (int64_t j = 0; j < R; ++j) {
@@ -9897,6 +9904,40 @@ void qsa_tree_scenario(uint64_t seed, int64_t base, int64_t R, int64_t topk, int
         const auto tv = qsa_tree_visible(o, x, pos, base, w.ratio);
         CHECK(cv == tv);
         if (cv != tv) fprintf(stderr, "    %s: visible sets differ (chain %zu tree %zu)\n", what.c_str(), cv.size(), tv.size());
+        /* The mask itself, by flat slot identity: bit (base - rb) + y for the ancestor-or-self y
+         * (a sibling at the same depth is another bit), bit q - rb for a committed q, each set iff
+         * the chain read the token at that position; nothing else is set. */
+        {
+            const int64_t rb = base / w.ratio * w.ratio;
+            uint64_t want = 0;
+            for (int64_t q = rb; q < base; ++q)
+                if (cv.count(q)) want |= 1ull << (q - rb);
+            for (int64_t y : rows)
+                if (cv.count(pos[(size_t)y])) want |= 1ull << (base - rb + y);
+            CHECK_EQ((uint64_t)o.vmask[(size_t)x], want);
+            if ((uint64_t)o.vmask[(size_t)x] != want)
+                fprintf(stderr, "    %s: vmask %llx want %llx\n", what.c_str(),
+                        (unsigned long long)o.vmask[(size_t)x], (unsigned long long)want);
+        }
+        /* The keys the row reads, by content (keys are distinct unless the palette is on): the
+         * tree's from its pages and the flat slots, the chain's from the positions it read. */
+        if (!palette) {
+            const int64_t rb = base / w.ratio * w.ratio;
+            auto keyat = [&](int64_t q) -> const std::vector<float>& {
+                return q < base ? pk[(size_t)q] : K[(size_t)rows[(size_t)(q - base)]];
+            };
+            std::vector<std::vector<float>> tk, ck;
+            for (int64_t e = 0; e < o.nsel[(size_t)x]; ++e)
+                for (int64_t i = 0; i < w.ratio; ++i) tk.push_back(pk[(size_t)(o.sel[(size_t)x][(size_t)e] * w.ratio + i)]);
+            for (int k2 = 0; k2 < 64; ++k2) {
+                if (!((o.vmask[(size_t)x] >> k2) & 1)) continue;
+                if (rb + k2 < base) tk.push_back(pk[(size_t)(rb + k2)]);
+                else tk.push_back(K[(size_t)(rb + k2 - base)]);     /* flat slot -> node row */
+            }
+            for (int64_t q : cv) ck.push_back(keyat(q));
+            std::sort(tk.begin(), tk.end()); std::sort(ck.begin(), ck.end());
+            CHECK(tk == ck);
+        }
         /* Below the bound everything is selected. */
         if (ntot <= topk) CHECK_EQ(o.nsel[(size_t)x] + (ntot - first_open), (int64_t)ntot);
         else if (ties_seen) ++*ties_seen;
@@ -10068,6 +10109,298 @@ TEST(qsa_tail_store_stores_tree_rows_at_their_flat_slots) {
           .i("seqs", 1).s("dtype", "bf16");
     CHECK_OK(run("qsa_tail_store", a));
     for (int j = 0; j < 4; ++j) CHECK_EQ(st.at(((10 + j) % ring) * n), (float)(j + 1));
+}
+
+/* ------------------------------------------------------------------ batches of several sequences
+ *
+ * The per-row tables are keyed by absolute batch row, the work list and the sstage rows by absolute
+ * position in the launch, so a tree at t0 > 0, two trees and a tree beside an ordinary sequence are
+ * where an offset error would hide. Each case runs the two-step flow (a verify, then the next step
+ * with the accepted path: compaction, heal, tree) for several sequences in ONE batch and compares
+ * every output, per sequence, with the same sequence run alone (rows from 0, slot 0, table row 0,
+ * the ordinary operand list for a non-tree sequence). The alone run is what the scenario tests
+ * above pin against the sequential decode. */
+namespace {
+
+struct QSeq {
+    bool tree = true;
+    int64_t base = 0, na = 1;
+    std::vector<int64_t> par, path;                 /* tree: parents, accepted path (na entries) */
+    std::vector<std::vector<float>> K, Q;           /* per row */
+};
+
+struct BOut {
+    std::vector<int64_t> nc, spage, sbp, rnc, nsel, su, vmask;
+    std::vector<std::vector<int64_t>> rtab, sel;
+    std::vector<std::vector<float>> rscore, score, sstage, skey;
+};
+
+/* One step over `S` in one batch; the world has one slot, table row and page range per sequence. */
+void qsa_batch_step(QWorld& w, const std::vector<QSeq>& S, bool treeops, BOut* o) {
+    const int64_t n = w.n, ratio = w.ratio, RW = w.RW, NS = (int64_t)S.size();
+    std::vector<int64_t> cuv{ 0 }, posv, spv, nav, slotv;
+    int64_t T_ = 0;
+    for (int64_t s = 0; s < NS; ++s) {
+        const QSeq& q = S[(size_t)s];
+        const int64_t R = (int64_t)q.K.size();
+        std::vector<int64_t> depth((size_t)R, 0);
+        for (int64_t j = 0; j < R; ++j) {
+            depth[(size_t)j] = q.tree ? (j ? depth[(size_t)q.par[(size_t)j]] + 1 : 0) : j;
+            posv.push_back(q.base + depth[(size_t)j]);
+            spv.push_back(!q.tree ? -2 : j ? q.par[(size_t)j] : -1);
+        }
+        T_ += R; cuv.push_back(T_);
+        nav.push_back(q.na);
+        slotv.push_back(NS - 1 - s);                    /* slots reversed: the slot is the sequence's */
+    }
+    const int64_t Tn = T_;
+    T k(RAD_BF16, { Tn, n }), pos(RAD_I32, { Tn }), cu(RAD_I32, { NS + 1 }), sx(RAD_I32, { NS, 1 });
+    T sp(RAD_I32, { Tn }), nat(RAD_I32, { NS }), pth(RAD_I32, { NS, 16 });
+    std::vector<float> kv, qv;
+    std::vector<int64_t> pp((size_t)(NS * 16), 0);
+    bool any_path = false;
+    for (int64_t s = 0; s < NS; ++s) {
+        for (size_t j = 0; j < S[(size_t)s].K.size(); ++j) {
+            kv.insert(kv.end(), S[(size_t)s].K[j].begin(), S[(size_t)s].K[j].end());
+            qv.insert(qv.end(), S[(size_t)s].Q[j].begin(), S[(size_t)s].Q[j].end());
+        }
+        for (size_t i = 0; i < S[(size_t)s].path.size(); ++i) pp[(size_t)(s * 16) + i] = S[(size_t)s].path[i];
+        any_path |= S[(size_t)s].na >= 2;
+    }
+    k.f(kv); pos.n(posv); cu.n(cuv); sx.n(slotv); sp.n(spv); nat.n(nav); pth.n(pp);
+    if (any_path) {
+        A cmp; cmp.t(pos).t(cu).t(nat).t(pth).t(w.tail).t(sx).i("M", NS).i("n", n).i("ring", w.ring)
+                  .i("seqs", NS).s("dtype", "bf16");
+        REQUIRE_EQ(run("qsa_tail_compact", cmp), RAD_OK);
+    }
+    const int64_t work = 12 * NS + 8;
+    T stage(RAD_BF16, { work * ratio, n }), page(RAD_I32, { work }), bpos(RAD_I32, { work }), nc(RAD_I32, { NS });
+    T sst(RAD_BF16, { Tn * ratio, n }), spg(RAD_I32, { Tn }), sbp(RAD_I32, { Tn });
+    T rtb(RAD_I32, { Tn, RW }), rnc(RAD_I32, { Tn }), rcu(RAD_I32, { Tn + 1 });
+    sst.f(std::vector<float>((size_t)(Tn * ratio * n), -9.0f));
+    A a; a.t(k).t(pos).t(cu).t(w.tail).t(sx).t(w.tab).tnull().t(stage).t(page).t(bpos).t(nc);
+    if (treeops) a.t(sp).t(nat).t(sst).t(spg).t(sbp).t(rtb).t(rnc).t(rcu);
+    else a.tnull().t(nat);
+    a.i("M", Tn).i("n", n).i("ratio", ratio).i("ring", w.ring).i("seqs", NS).i("work", work).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_work", a), RAD_OK);
+    A b = w.bkey(stage, page, bpos, w.bkp, work);
+    REQUIRE_EQ(run("qsa_block_key", b), RAD_OK);
+    T skey(RAD_BF16, { Tn, n });
+    skey.f(std::vector<float>((size_t)(Tn * n), -33.0f));
+    if (treeops) {
+        A b2 = w.bkey(sst, spg, sbp, skey, Tn);
+        REQUIRE_EQ(run("qsa_block_key", b2), RAD_OK);
+    }
+    A c; c.t(k).t(pos).t(cu).t(w.tail).t(sx);
+    if (treeops) c.t(sp);
+    c.i("M", Tn).i("n", n).i("ratio", ratio).i("ring", w.ring).i("seqs", NS).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_tail_store", c), RAD_OK);
+
+    T q(RAD_BF16, { Tn, w.heads * n }), sc(RAD_F32, { Tn, w.nbmax }), rsc(RAD_F32, { Tn, RW });
+    q.f(qv);
+    A d; d.t(q).t(w.bkp).t(w.tab).t(cu).t(nc).t(sc).i("M", Tn).i("n", n).i("heads", w.heads)
+          .i("blocks", w.nbmax).i("seqs", NS).s("dtype", "bf16");
+    REQUIRE_EQ(run("qsa_score", d), RAD_OK);
+    if (treeops) {
+        A d2; d2.t(q).t(skey).t(rtb).t(rcu).t(rnc).t(rsc).i("M", Tn).i("n", n).i("heads", w.heads)
+                .i("blocks", RW).i("seqs", Tn).s("dtype", "bf16");
+        REQUIRE_EQ(run("qsa_score", d2), RAD_OK);
+    }
+    T se(RAD_I32, { Tn, w.topk + 1 }), ns(RAD_I32, { Tn }), su(RAD_I32, { Tn }), vm(RAD_I64, { Tn });
+    vm.n(std::vector<int64_t>((size_t)Tn, 0x5555));
+    A e; e.t(sc).t(w.tab).t(nc).t(pos).t(cu).t(se).t(ns).t(su);
+    if (treeops) e.t(sp).t(rsc).t(vm);
+    e.i("M", Tn).i("blocks", w.nbmax).i("topk", w.topk).i("ratio", ratio).i("seqs", NS);
+    REQUIRE_EQ(run("qsa_select", e), RAD_OK);
+
+    for (int64_t s = 0; s < NS; ++s) o->nc.push_back(nc.iat(s));
+    for (int64_t j = 0; j < Tn; ++j) {
+        o->nsel.push_back(ns.iat(j)); o->su.push_back(su.iat(j));
+        o->vmask.push_back(treeops ? vm.iat(j) : 0);
+        std::vector<int64_t> sl;
+        for (int64_t i = 0; i <= w.topk; ++i) sl.push_back(se.iat(j * (w.topk + 1) + i));
+        o->sel.push_back(sl);
+        std::vector<float> scv, rs, ssv, skv;
+        for (int64_t i = 0; i < w.nbmax; ++i) scv.push_back(sc.at(j * w.nbmax + i));
+        o->score.push_back(scv);
+        if (!treeops) {
+            o->spage.push_back(-1); o->sbp.push_back(0); o->rnc.push_back(0);
+            o->rtab.push_back({}); o->rscore.push_back({}); o->sstage.push_back({}); o->skey.push_back({});
+            continue;
+        }
+        o->spage.push_back(spg.iat(j)); o->sbp.push_back(sbp.iat(j)); o->rnc.push_back(rnc.iat(j));
+        std::vector<int64_t> rt;
+        for (int64_t i = 0; i < RW; ++i) { rt.push_back(rtb.iat(j * RW + i)); rs.push_back(rsc.at(j * RW + i)); }
+        o->rtab.push_back(rt); o->rscore.push_back(rs);
+        if (spg.iat(j) >= 0) {
+            for (int64_t i = 0; i < ratio * n; ++i) ssv.push_back(sst.at(j * ratio * n + i));
+            for (int64_t i = 0; i < n; ++i) skv.push_back(skey.at(j * n + i));
+        }
+        o->sstage.push_back(ssv); o->skey.push_back(skv);
+    }
+}
+
+/* A random sequence mid-flight: a prefill, then a verify (tree) or a decode (chain), whose state is
+ * left in `w1` (a one-sequence world). Returns the next step's sequence. */
+QSeq qsa_next_step(Rng& r, QWorld& w1, bool tree, int64_t base0, bool palette) {
+    const int64_t n = w1.n;
+    std::vector<std::vector<float>> pk;
+    for (int64_t t = 0; t < base0; ++t) pk.push_back(qkey(r, n, palette));
+    qsa_chain(w1, pk, {}, 0, false, nullptr);
+    auto rows = [&](int64_t R, std::vector<std::vector<float>>& K, std::vector<std::vector<float>>& Q) {
+        for (int64_t j = 0; j < R; ++j) {
+            K.push_back(qkey(r, n, palette));
+            std::vector<float> q;
+            for (int64_t h = 0; h < w1.heads; ++h) { auto x = qkey(r, n, palette); q.insert(q.end(), x.begin(), x.end()); }
+            Q.push_back(q);
+        }
+    };
+    QSeq out;
+    out.tree = tree;
+    std::vector<std::vector<float>> K1, Q1;
+    if (tree) {
+        const int64_t R1 = 6 + r.below(7);
+        rows(R1, K1, Q1);
+        const std::vector<int64_t> par = qsa_rand_tree(r, R1, r.below(2));
+        TreeOut v1;
+        qsa_tree_step(w1, K1, Q1, par, base0, 0, nullptr, false, &v1);
+        std::vector<int64_t> depth((size_t)R1, 0);
+        int64_t best = 0;
+        for (int64_t j = 1; j < R1; ++j) { depth[(size_t)j] = depth[(size_t)par[(size_t)j]] + 1; if (depth[(size_t)j] > depth[(size_t)best]) best = j; }
+        for (int64_t y = best;; y = par[(size_t)y]) { out.path.push_back(y); if (y == 0) break; }
+        std::reverse(out.path.begin(), out.path.end());
+        out.na = (int64_t)out.path.size();
+        out.base = base0 + out.na;
+        const int64_t R2 = 3 + r.below(8);
+        rows(R2, out.K, out.Q);
+        out.par = qsa_rand_tree(r, R2, r.below(2));
+    } else {
+        const int64_t R1 = 2 + r.below(5);
+        rows(R1, K1, Q1);
+        qsa_chain(w1, K1, {}, base0, false, nullptr);
+        out.na = 1;
+        out.base = base0 + R1;
+        rows(1 + r.below(4), out.K, out.Q);
+    }
+    return out;
+}
+
+/* Copies one sequence's world (slot 0, table row 0) into slot/page range `s` of the batch world. */
+void qsa_place(QWorld& bw, int64_t s, const QWorld& w1) {
+    const int64_t slot = bw.nseq - 1 - s;
+    std::memcpy(bw.tail.mem.data() + (size_t)(slot * bw.ring * bw.n) * 2, w1.tail.mem.data(), (size_t)(w1.ring * w1.n) * 2);
+    std::memcpy(bw.bkp.mem.data() + (size_t)(s * bw.nbmax * bw.n) * 2, w1.bkp.mem.data(), (size_t)(w1.nbmax * w1.n) * 2);
+}
+
+void qsa_batch_case(uint64_t seed, const std::vector<bool>& kinds, int64_t topk, bool palette, const char* tag) {
+    Rng r(seed);
+    const int64_t NS = (int64_t)kinds.size();
+    QWorld bw(16, topk, 0, NS);
+    std::vector<QSeq> S;
+    std::vector<std::unique_ptr<QWorld>> alone;     /* a T keeps a pointer into its own bytes: no copies */
+    for (int64_t s = 0; s < NS; ++s) {
+        alone.push_back(std::make_unique<QWorld>(16, topk, 0));
+        QWorld& w1 = *alone.back();
+        S.push_back(qsa_next_step(r, w1, kinds[(size_t)s], 17 + r.below(16), palette));
+        qsa_place(bw, s, w1);
+    }
+    bool anytree = false;
+    for (const QSeq& q : S) anytree |= q.tree;
+    BOut B;
+    qsa_batch_step(bw, S, anytree, &B);
+    int64_t t0 = 0;
+    for (int64_t s = 0; s < NS; ++s) {
+        const QSeq& q = S[(size_t)s];
+        const int64_t R = (int64_t)q.K.size();
+        BOut A1;
+        qsa_batch_step(*alone[(size_t)s], { q }, q.tree, &A1);
+        const std::string what = std::string(tag) + " seed " + std::to_string(seed) + " seq " + std::to_string(s);
+        CHECK_EQ(B.nc[(size_t)s], A1.nc[0]);
+        for (int64_t x = 0; x < R; ++x) {
+            const size_t bx = (size_t)(t0 + x), ax = (size_t)x;
+            bool same = B.nsel[bx] == A1.nsel[ax] && B.su[bx] == A1.su[ax] && B.vmask[bx] == A1.vmask[ax] &&
+                        B.rnc[bx] == A1.rnc[ax] && B.sbp[bx] == A1.sbp[ax] &&
+                        B.sstage[bx] == A1.sstage[ax] && B.skey[bx] == A1.skey[ax];
+            if (q.tree) same = same && B.rscore[bx] == A1.rscore[ax];
+            /* The scratch row is the absolute batch row; table entries are absolute rows too. */
+            same = same && (B.spage[bx] == (A1.spage[ax] < 0 ? -1 : t0 + A1.spage[ax]));
+            for (size_t i = 0; q.tree && i < A1.rtab[ax].size(); ++i)
+                same = same && B.rtab[bx][i] == (A1.rtab[ax][i] < 0 ? -1 : t0 + A1.rtab[ax][i]);
+            /* sel names pages: the sequence's range is offset by s * nbmax. */
+            for (size_t i = 0; i < A1.sel[ax].size(); ++i)
+                same = same && B.sel[bx][i] == (A1.sel[ax][i] < 0 ? -1 : A1.sel[ax][i] + s * bw.nbmax);
+            for (int64_t b = 0; b < A1.nc[0]; ++b) same = same && B.score[bx][(size_t)b] == A1.score[ax][(size_t)b];
+            CHECK(same);
+            if (!same) fprintf(stderr, "    %s: row %lld differs from the sequence alone\n", what.c_str(), (long long)x);
+        }
+        /* The state the step leaves: the sequence's ring slot and block-key pages. */
+        const int64_t slot = bw.nseq - 1 - s;
+        CHECK(std::memcmp(bw.tail.mem.data() + (size_t)(slot * bw.ring * bw.n) * 2, alone[(size_t)s]->tail.mem.data(), (size_t)(bw.ring * bw.n) * 2) == 0);
+        CHECK(std::memcmp(bw.bkp.mem.data() + (size_t)(s * bw.nbmax * bw.n) * 2, alone[(size_t)s]->bkp.mem.data(), (size_t)(bw.nbmax * bw.n) * 2) == 0);
+        t0 += R;
+    }
+}
+
+}  /* namespace */
+
+TEST(qsa_batch_tree_at_nonzero_offset_matches_the_sequence_alone) {
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+        qsa_batch_case(seed, { false, true }, 40, seed % 2 == 0, "chain+tree below");
+        qsa_batch_case(seed + 50, { false, true }, 3, seed % 2 == 0, "chain+tree above");
+    }
+}
+
+TEST(qsa_batch_two_trees_match_each_sequence_alone) {
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+        qsa_batch_case(seed + 100, { true, true }, 40, seed % 2 == 0, "tree+tree below");
+        qsa_batch_case(seed + 150, { true, true }, 3, seed % 2 == 0, "tree+tree above");
+        qsa_batch_case(seed + 170, { true, true }, 2, true, "tree+tree ties");
+    }
+}
+
+TEST(qsa_batch_tree_beside_an_ordinary_sequence_matches_each_alone) {
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+        qsa_batch_case(seed + 200, { true, false, true }, 40, false, "tree+chain+tree below");
+        qsa_batch_case(seed + 250, { true, false, true }, 3, seed % 2 == 0, "tree+chain+tree above");
+        qsa_batch_case(seed + 270, { false, true, false, true }, 4, false, "chain,tree,chain,tree");
+    }
+}
+
+/* qsa_tail_compact and qsa_tail_store on a batch by hand: slots reversed against the sequences, a
+ * tree at t0 > 0, an ordinary sequence between two trees. */
+TEST(qsa_tail_ops_by_hand_on_a_mixed_batch) {
+    const int64_t n = 2, ring = 8, slots = 3;
+    std::vector<float> init;
+    for (int64_t s = 0; s < slots; ++s)
+        for (int64_t r = 0; r < ring; ++r) { init.push_back((float)(100 * s + r)); init.push_back((float)(-r)); }
+    T st(RAD_BF16, { slots, 1, ring, n }); st.f(init);
+    /* seq 0 (rows 0..1): tree, slot 2, anchor 12, na 2 (path 0, 3) -> base_prev 10; seq 1 (rows 2..4):
+     * ordinary, slot 1, na 1; seq 2 (row 5): tree, slot 0, anchor 21, na 3 (path 0, 2, 3) -> base_prev 18. */
+    T pos(RAD_I32, { 6 }); pos.n({ 12, 13, 30, 31, 32, 21 });
+    T cu(RAD_I32, { 4 }); cu.n({ 0, 2, 5, 6 });
+    T na(RAD_I32, { 3 }); na.n({ 2, 1, 3 });
+    T path(RAD_I32, { 3, 4 }); path.n({ 0, 3, 0, 0,   0, 0, 0, 0,   0, 2, 3, 0 });
+    T sx(RAD_I32, { 3, 1 }); sx.n({ 2, 1, 0 });
+    A a; a.t(pos).t(cu).t(na).t(path).t(st).t(sx).i("M", 3).i("n", n).i("ring", ring).i("seqs", 3)
+          .s("dtype", "bf16");
+    CHECK_OK(run("qsa_tail_compact", a));
+    auto at = [&](int64_t s, int64_t r) { return st.at((s * ring + r) * n); };
+    /* seq 0: row (10 + 1) % 8 = 3 <- (10 + 3) % 8 = 5. */
+    CHECK_EQ(at(2, 3), 200.0f + 5); CHECK_EQ(at(2, 5), 200.0f + 5); CHECK_EQ(at(2, 2), 200.0f + 2);
+    /* seq 2: rows (18 + 1) % 8 = 3 <- (18 + 2) % 8 = 4, then (18 + 2) % 8 = 4 <- (18 + 3) % 8 = 5. */
+    CHECK_EQ(at(0, 3), 4.0f); CHECK_EQ(at(0, 4), 5.0f); CHECK_EQ(at(0, 5), 5.0f);
+    /* The ordinary sequence's slot is untouched. */
+    for (int64_t r = 0; r < ring; ++r) CHECK_EQ(at(1, r), 100.0f + r);
+
+    /* qsa_tail_store: tree rows at flat slots from THEIR anchor, the ordinary sequence at positions. */
+    T k(RAD_BF16, { 6, n }); k.f({ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6 });
+    T sp(RAD_I32, { 6 }); sp.n({ -1, 0, -2, -2, -2, -1 });
+    A c; c.t(k).t(pos).t(cu).t(st).t(sx).t(sp).i("M", 6).i("n", n).i("ratio", 4).i("ring", ring)
+          .i("seqs", 3).s("dtype", "bf16");
+    CHECK_OK(run("qsa_tail_store", c));
+    CHECK_EQ(at(2, 12 % 8), 1.0f); CHECK_EQ(at(2, 13 % 8), 2.0f);
+    CHECK_EQ(at(1, 30 % 8), 3.0f); CHECK_EQ(at(1, 31 % 8), 4.0f); CHECK_EQ(at(1, 32 % 8), 5.0f);
+    CHECK_EQ(at(0, 21 % 8), 6.0f);
 }
 
 /* dflash_conv: tap 0 always, tap 1 only past a block's first row; each tap's coefficient is base
@@ -11063,6 +11396,8 @@ std::vector<Geo> geometries() {
                                                  .s("dtype", "bf16")),
         G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                  .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
+        G("mtp_tree_grow", "M", 2, a.i("M", R).i("round", 1).i("rounds", 3).i("nodes", 6)
+                                   .i("width", 3)),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
@@ -12541,4 +12876,125 @@ TEST(op_kv_window_compact_moves_committed_rows_down) {
         A b; b.t(cache).t(sidx).t(nacc).t(bad).i("off", off);
         CHECK_EQ(run("kv_window_compact", b), (int)RAD_E_INVAL);
     }
+}
+
+/* ================================================================== mtp_tree_grow
+ * A serial draft head's best-first tree (abi/rad_mtp_tree.h), by hand: M = 1, R = 2 rounds, N = 3
+ * nodes, W = 2 frontier rows. The log-softmax of the eight logits 3,2,1,0,-1,-2,-3,-4 is -0.4584,
+ * -1.4584, -2.4584 for its first three columns (a shift does not change it). */
+namespace {
+const int64_t kTgW = 2, kTgR = 2, kTgN = 3;
+int tg_state_words(int64_t N, int64_t W, int64_t R) { return (int)(4 + W + 6 * (N + 1) + 4 * 8 * W * R); }
+
+int tg_launch(int round, T& didx, T& dval, T& st, T& tok, T& par, T* hpos = nullptr, T* hrow = nullptr,
+              T* tab = nullptr, T* sel = nullptr, T* nsel = nullptr, T* vmask = nullptr,
+              T* rb = nullptr, int64_t N = kTgN, int64_t R = kTgR) {
+    A b;
+    b.t(didx).t(dval).t(st);
+    if (hpos) b.t(*hpos); else b.tnull();
+    if (hrow) b.t(*hrow); else b.tnull();
+    if (tab) b.t(*tab); else b.tnull();
+    b.t(tok).t(par);
+    if (sel) b.t(*sel).t(*nsel).t(*vmask).t(*rb);
+    b.i("M", 1).i("round", round).i("rounds", R).i("nodes", N).i("width", kTgW);
+    if (sel) b.i("block_size", 4).i("sel_pitch", (int)sel->t.shape[1]);
+    return run("mtp_tree_grow", b);
+}
+}  /* namespace */
+
+TEST(mtp_tree_grow_takes_the_best_of_the_pool_and_hangs_it_on_its_parent) {
+    const int64_t sw = tg_state_words(kTgN, kTgW, kTgR);
+    T st(RAD_I32, { 1, sw });
+    T tok(RAD_I32, { 1, kTgN }), par(RAD_I32, { 1, kTgN });
+    const std::vector<float> steep = { 3, 2, 1, 0, -1, -2, -3, -4 };
+    const std::vector<float> flat  = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    /* Round 1: the root's two best are nodes 1 and 2, in column order. */
+    T d1(RAD_I32, { 1, 8 }), v1(RAD_F32, { 1, 8 });
+    d1.n({ 10, 11, 12, 13, 14, 15, 16, 17 });
+    v1.f(steep);
+    CHECK_OK(tg_launch(1, d1, v1, st, tok, par));
+    CHECK_EQ(tok.iat(0), 10); CHECK_EQ(par.iat(0), 0);
+    CHECK_EQ(tok.iat(1), 11); CHECK_EQ(par.iat(1), 0);
+
+    /* Round 2, the last: node 1's best child (cum -0.9168) beats the root's third (-2.4584). */
+    {
+        T st2 = clone_t(st);
+        T d2(RAD_I32, { 2, 8 }), v2(RAD_F32, { 2, 8 });
+        d2.n({ 20, 21, 22, 23, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35, 36, 37 });
+        std::vector<float> both = steep; both.insert(both.end(), steep.begin(), steep.end());
+        v2.f(both);
+        CHECK_OK(tg_launch(2, d2, v2, st2, tok, par));
+        CHECK_EQ(tok.iat(0), 10); CHECK_EQ(par.iat(0), 0);
+        CHECK_EQ(tok.iat(1), 11); CHECK_EQ(par.iat(1), 0);
+        CHECK_EQ(tok.iat(2), 20); CHECK_EQ(par.iat(2), 1);
+    }
+    /* Flat children (-2.079 each, so cum -2.537) lose to the root's third candidate (-2.4584): the
+     * pool carries the round-1 leftovers, and the new node hangs off the root. */
+    {
+        T st2 = clone_t(st);
+        T d2(RAD_I32, { 2, 8 }), v2(RAD_F32, { 2, 8 });
+        d2.n({ 20, 21, 22, 23, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35, 36, 37 });
+        std::vector<float> both = flat; both.insert(both.end(), flat.begin(), flat.end());
+        v2.f(both);
+        CHECK_OK(tg_launch(2, d2, v2, st2, tok, par));
+        CHECK_EQ(tok.iat(2), 12); CHECK_EQ(par.iat(2), 0);
+    }
+    /* A pool that runs dry (the second pass's ids are all negative) pads with node 1's token under
+     * the root: 12 nodes over 3 rounds, of which only the root's eight candidates exist. */
+    {
+        const int64_t N = 12, R = 3;
+        T stn(RAD_I32, { 1, tg_state_words(N, kTgW, R) });
+        T tokn(RAD_I32, { 1, N }), parn(RAD_I32, { 1, N });
+        T dn(RAD_I32, { 2, 8 }), vn(RAD_F32, { 2, 8 });
+        dn.n(std::vector<int64_t>(16, -1));
+        vn.f(std::vector<float>(16, 0.0f));
+        CHECK_OK(tg_launch(1, d1, v1, stn, tokn, parn, nullptr, nullptr, nullptr, nullptr, nullptr,
+                           nullptr, nullptr, N, R));
+        CHECK_OK(tg_launch(2, dn, vn, stn, tokn, parn, nullptr, nullptr, nullptr, nullptr, nullptr,
+                           nullptr, nullptr, N, R));
+        CHECK_OK(tg_launch(3, dn, vn, stn, tokn, parn, nullptr, nullptr, nullptr, nullptr, nullptr,
+                           nullptr, nullptr, N, R));
+        /* the eight real candidates in order of log probability (the column order), then four pads */
+        for (int64_t j = 0; j < 8; ++j) { CHECK_EQ(tokn.iat(j), 10 + j); CHECK_EQ(parn.iat(j), 0); }
+        for (int64_t j = 8; j < N; ++j) { CHECK_EQ(tokn.iat(j), 10); CHECK_EQ(parn.iat(j), 0); }
+    }
+}
+
+TEST(mtp_tree_grow_writes_the_next_passs_tree_attention_operands) {
+    const int64_t sw = tg_state_words(kTgN, kTgW, kTgR);
+    T st(RAD_I32, { 1, sw });
+    T tok(RAD_I32, { 1, kTgN }), par(RAD_I32, { 1, kTgN });
+    T d1(RAD_I32, { 1, 8 }), v1(RAD_F32, { 1, 8 });
+    d1.n({ 10, 11, 12, 13, 14, 15, 16, 17 });
+    v1.f({ 3, 2, 1, 0, -1, -2, -3, -4 });
+    /* The pass's rows 0..3 at positions 4..7; the sequence's draft row is row 3, head index 9. */
+    T hpos(RAD_I32, { 4 }), hrow(RAD_I32, { 1 });
+    hpos.n({ 6, 7, 8, 9 });
+    hrow.n({ 3 });
+    T tab(RAD_I32, { 1, 8 });
+    tab.n({ 40, 41, 42, 43, 44, 45, 46, 47 });
+    T sel(RAD_I32, { 2, 4 }), nsel(RAD_I32, { 2 }), vmask(RAD_I64, { 2 }), rb(RAD_I32, { 1 });
+    CHECK_OK(tg_launch(1, d1, v1, st, tok, par, &hpos, &hrow, &tab, &sel, &nsel, &vmask, &rb));
+    /* head 9, block 4: rb = 8, two committed pages below it. */
+    CHECK_EQ(rb.iat(0), 8);
+    CHECK_EQ(nsel.iat(0), 2); CHECK_EQ(nsel.iat(1), 2);
+    CHECK_EQ(sel.iat(0), 40); CHECK_EQ(sel.iat(1), 41); CHECK_EQ(sel.iat(2), -1);
+    /* keys at 8 and 9 (the committed tail, the root among them) and the node's own flat slot
+     * head + id: bit (head - rb) + id */
+    CHECK_EQ(vmask.iat(0), 3 | (1 << 2));
+    CHECK_EQ(vmask.iat(1), 3 | (1 << 3));
+    /* More pages than the list holds: the last four. */
+    T tab2(RAD_I32, { 1, 16 });
+    tab2.n({ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 });
+    hpos.n({ 6, 7, 8, 33 });
+    CHECK_OK(tg_launch(1, d1, v1, st, tok, par, &hpos, &hrow, &tab2, &sel, &nsel, &vmask, &rb));
+    CHECK_EQ(rb.iat(0), 32);      /* eight pages below it, four listed */
+    CHECK_EQ(nsel.iat(0), 4);
+    CHECK_EQ(sel.iat(0), 4); CHECK_EQ(sel.iat(3), 7);
+    CHECK_EQ(vmask.iat(0), 3 | (1 << 2));
+    /* A bad configuration is refused: a width of zero, a round past the last, a pitch under N. */
+    T tok2(RAD_I32, { 1, 2 }), par2(RAD_I32, { 1, 2 });
+    CHECK(tg_launch(1, d1, v1, st, tok2, par2) != RAD_OK);
+    CHECK(tg_launch(3, d1, v1, st, tok, par) != RAD_OK);
 }
