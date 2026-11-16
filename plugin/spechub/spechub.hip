@@ -600,72 +600,398 @@ int rad_mine_mtp_couple_propose_launch(const RadArgs* a, RadStream stream) {
     return R4D_EMIT(stream, propose, dim3((unsigned)((c.M + 63) / 64)), dim3(64), 0, c);
 }
 
-/* The traversal walk (abi/rad_mtp_traversal.h): one workgroup a row, only a request's root row (topo
- * parent -1) does work. The walk itself is the host reference's, run by every lane of the workgroup
- * redundantly (it is serial, short -- a tree of at most 60 rows -- and its control flow reads only
- * data every lane reads alike); what costs is the candidate scans, one per visited node over the
- * sampler's whole plane (1024 slots, FP64 exp each, at top_k 0), and those are the workgroup's: live()
- * compacts the node's live candidates and computes every weight and support slot in parallel, after
- * which the ordered sums run over the stored values on each lane, in the host's order. Tokens and
- * accepted paths are the host's bit for bit. Above kMaxCand candidates one lane walks as before. */
-struct DevTravRows : RadMtpTravRows {
-    short* lj; double* w; unsigned char* kk; int* nl; int* valid; float* top;
-    __device__ void live(int v, const int32_t* sid, int cnt, RadTravLaw* out) const {
-        const int32_t* ids; const float* val; int64_t nc;
-        cand(v, &ids, &val, &nc);
-        __syncthreads();   /* every lane is done with the previous gather */
-        couple_live(ids, val, nc, vocab(), lj, nl, valid, top);
-        const int L = *nl;
-        out->valid = *valid && *top != -INFINITY;
-        out->top = *top; out->L = L; out->ids = ids; out->lj = lj; out->w = w; out->k = kk;
-        if (out->valid) {
-            const float t = *top;
-            for (int i = threadIdx.x; i < L; i += blockDim.x) {
-                const int32_t id = ids[lj[i]];
-                w[i] = ::exp((double)val[lj[i]] - t);
-                int k = 0;
-                while (k < cnt && id != sid[k]) ++k;
-                kk[i] = (unsigned char)k;
-            }
-        }
-        __syncthreads();
-    }
+/* ------------------------------------------------------------------ traversal verification
+ *
+ * abi/rad_mtp_traversal.h, one workgroup a row; only a request's root row (topo parent -1) does
+ * work, and it decides the whole request. Its four waves each take every fourth row of the request
+ * and need nothing from each other until the tree is complete:
+ *
+ *   per row, one wave:  lane 0 reads the row's state (the gate, the canonical draft side) into LDS
+ *       and hands the wave what it needs of it in registers; a lane a later row finds the node's
+ *       child rows in the step's topology; the wave reads the row's candidate
+ *       plane a pass of 32 slots at a time, one slot a lane (a top_k 20 plane is one live pass): the
+ *       largest value and the validity, reduced over the wave in registers, then the integer masses
+ *       (rad_mtp_trav_mass) of the passes that have a live slot, summed in all and on the node's
+ *       support slots and reduced the same way -- integer sums, so the order is free and the totals
+ *       are the host's serial ones bit for bit; lanes 0..7 turn them into the node's law, mass /
+ *       total, and export P;
+ *   one barrier, the kernel's only one;
+ *   wave 0, lane 0: the walk itself (rad_mtp_trav_walk_tree, the host's code over
+ *       the tree in LDS: one FP64 division to enter a node, two and a few dozen multiply-adds when a
+ *       child is rejected), the path's
+ *       tokens and the final token's slot or off-support unit; then the wave finds the off-support
+ *       candidate holding that unit (a prefix over the lanes of each pass, in registers).
+ *
+ * Lanes talk to each other in two ways only: through LDS ACROSS the barrier, and through registers
+ * (v_readlane, DPP) inside a wave. A lane never reads from LDS what another lane wrote since the last
+ * barrier: the hardware would order the two accesses of one wave, but the compiler, which sees a
+ * thread at a time, may move the read before the write. No candidate plane is copied, no lane walks a
+ * plane alone at any width, and the kernel has no scratch segment (nothing private is indexed at run
+ * time). Tokens, paths and exports are the host reference's bit for bit (rad_mtp_trav_verify_root). */
+namespace {
+
+template <int N>
+__device__ __forceinline__ uint32_t tv_xor_lane(uint32_t v) {
+    /* lane ^ N's value on DPP (row_xmask; 16 crosses the wave's two rows): every lane must be active */
+    if constexpr (N < 16)
+        return (uint32_t)__builtin_amdgcn_update_dpp(0, (int)v, 0x160 | N, 0xf, 0xf, true);
+    else
+        return (uint32_t)__builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210u, 0xFEDCBA98u, false, false);
+}
+template <int N>
+__device__ __forceinline__ uint64_t tv_xor_add(uint64_t v) {
+    return v + (((uint64_t)tv_xor_lane<N>((uint32_t)(v >> 32)) << 32) | tv_xor_lane<N>((uint32_t)v));
+}
+/* The wave's sum of a 64-bit integer, in every lane (integers: the order is free). */
+__device__ __forceinline__ uint64_t tv_wave_sum(uint64_t v) {
+    v = tv_xor_add<16>(v); v = tv_xor_add<8>(v); v = tv_xor_add<4>(v);
+    v = tv_xor_add<2>(v);  v = tv_xor_add<1>(v);
+    return v;
+}
+__device__ __forceinline__ uint32_t tv_wave_or(uint32_t v) {
+    v |= tv_xor_lane<16>(v); v |= tv_xor_lane<8>(v); v |= tv_xor_lane<4>(v);
+    v |= tv_xor_lane<2>(v);  v |= tv_xor_lane<1>(v);
+    return v;
+}
+__device__ __forceinline__ float tv_fmax_lane(float a, uint32_t b) { return fmaxf(a, __uint_as_float(b)); }
+__device__ __forceinline__ float tv_wave_max(float v) {
+    v = tv_fmax_lane(v, tv_xor_lane<16>(__float_as_uint(v)));
+    v = tv_fmax_lane(v, tv_xor_lane<8>(__float_as_uint(v)));
+    v = tv_fmax_lane(v, tv_xor_lane<4>(__float_as_uint(v)));
+    v = tv_fmax_lane(v, tv_xor_lane<2>(__float_as_uint(v)));
+    v = tv_fmax_lane(v, tv_xor_lane<1>(__float_as_uint(v)));
+    return v;
+}
+/* Lane 0's value in every lane of the wave (v_readlane): how one lane hands the wave a scalar
+ * without LDS. Every lane must be active. */
+__device__ __forceinline__ int32_t tv_lane0(int32_t v) { return __builtin_amdgcn_readlane(v, 0); }
+__device__ __forceinline__ float tv_lane0f(float v) {
+    return __uint_as_float((uint32_t)__builtin_amdgcn_readlane((int)__float_as_uint(v), 0));
+}
+/* A wave's inclusive prefix sum over its lanes (row_shr 1, 2, 4, 8 inside each row of sixteen, then
+ * the first row's total into the second). Every lane must be active; sums below 2^32. */
+__device__ __forceinline__ uint32_t tv_wave_prefix(uint32_t x, int lane) {
+    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x111, 0xF, 0xF, true);
+    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x112, 0xF, 0xF, true);
+    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x114, 0xF, 0xF, true);
+    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x118, 0xF, 0xF, true);
+    const uint32_t lo = (uint32_t)__builtin_amdgcn_readlane((int)x, 15);
+    return lane >= 16 ? x + lo : x;
+}
+
+constexpr int kTravRows  = RAD_MTP_TRAV_MAX_ROWS;
+constexpr int kTravWaves = kThreads / 32;
+constexpr int kTravPer   = 8;   /* passes a batch */
+
+/* The op's operands as the kernel takes them: 32-bit geometry (the launch refuses anything wider),
+ * which is half the scalar registers of 64-bit strides. */
+struct TravArgs {
+    const int32_t*  idx;
+    const float*    val;
+    const uint32_t* params;
+    const uint32_t* state;
+    int32_t*        token;
+    const int32_t*  topo;
+    uint32_t M, n_cand, vocab, ld0, ld1, ld2, ld3, ld4, ld_topo;
 };
 
-__global__ void trav_verify(const int32_t* idx, const float* values, const uint32_t* params,
-                            const uint32_t* state, int32_t* token, const int32_t* topo, int64_t M,
-                            int64_t n_cand, int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2,
-                            int64_t ld3, int64_t ld4, int64_t ld_topo) {
-    const int64_t row = blockIdx.x;
-    if (row >= M) return;
-    RadMtpTravCall c{ { idx, values, params, state, token, M, n_cand, vocab, { ld0, ld1, ld2, ld3, ld4 } },
-                      topo, ld_topo };
-    if (c.topo[row * c.ld_topo] >= 0) return;   /* not a request's root */
-    if (n_cand > kMaxCand) {
-        if (threadIdx.x == 0) rad_mtp_trav_verify_root(c, row);
-        return;
+/* Eight slots of a row's plane, in registers. Lane l's slots are l, l + 32, l + 64, ... (pass p is
+ * slots [32 p, 32 p + 32), one a lane), so the plane's live head -- 20 slots at top_k 20 -- is one
+ * pass of the wave whatever its width; a batch is eight passes, sixteen loads issued together (a loop
+ * that loaded a pass at a time would wait out a memory latency per pass). */
+struct TvBatch {
+    int32_t id[kTravPer];
+    float   v[kTravPer];
+};
+/* Passes p0 .. p0 + 8 of lane `lane` of a row of n slots; holes past the row's end. `full`: the batch
+ * lies inside the row for every lane, so the loads are unconditional. The ids first: a batch of holes
+ * (every batch but the first at top_k 20) is known from them alone, and its values are not read. Returns
+ * whether any lane of the wave has an id in the batch. */
+__device__ __forceinline__ bool tv_load(const int32_t* ids, const float* val, int lane, uint32_t p0,
+                                        uint32_t n, bool full, TvBatch* c) {
+    const uint32_t j = (uint32_t)lane + 32u * p0;
+    bool on = false;
+    if (full) {
+#pragma unroll
+        for (int i = 0; i < kTravPer; ++i) { c->id[i] = ids[j + 32u * i]; on = on || c->id[i] >= 0; }
+    } else {
+#pragma unroll
+        for (int i = 0; i < kTravPer; ++i) {
+            c->id[i] = -1;
+            if (j + 32u * i < n) c->id[i] = ids[j + 32u * i];
+            on = on || c->id[i] >= 0;
+        }
     }
-    __shared__ short         lj[kMaxCand];
-    __shared__ double        wt[kMaxCand];
-    __shared__ unsigned char kk[kMaxCand];
-    __shared__ int           nl, valid;
-    __shared__ float         top;
-    int64_t n = 1;
-    while (row + n < c.v.M && c.topo[(row + n) * c.ld_topo] >= 0) ++n;
-    const DevTravRows T{ RadMtpTravRows{ c, row, n }, lj, wt, kk, &nl, &valid, &top };
-    const auto& p = *reinterpret_cast<const RadSampleParams*>(c.v.params + row * c.v.ld[2]);
-    RadMtpTravOut o;
-    if (!rad_mtp_trav_walk(T, 0, p.seed, p.pos, &o)) return;
-    if (threadIdx.x != 0) return;
-    for (int i = 0; i + 1 < o.n; ++i)
-        c.v.token[(row + o.node[i]) * c.v.ld[4]] = c.topo[(row + o.node[i + 1]) * c.ld_topo + 1];
-    if (o.has_y) c.v.token[(row + o.node[o.n - 1]) * c.v.ld[4]] = o.y;
+#pragma unroll
+    for (int i = 0; i < kTravPer; ++i) c->v[i] = -INFINITY;
+    if (!__ballot(on)) return false;
+    if (full) {
+#pragma unroll
+        for (int i = 0; i < kTravPer; ++i) c->v[i] = val[j + 32u * i];
+    } else {
+#pragma unroll
+        for (int i = 0; i < kTravPer; ++i)
+            if (j + 32u * i < n) c->v[i] = val[j + 32u * i];
+    }
+    return true;
+}
+
+/* One request, by its root row's workgroup. Called by every thread. */
+__device__ __forceinline__ void trav_request(const TravArgs& c, uint32_t row) {
+    __shared__ RadTravTree T;
+    __shared__ int32_t  s_tok[kTravRows];
+    __shared__ int      s_path[RAD_MTP_TRAV_MAX_DEPTH + 1];   /* lane 0's alone */
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const uint32_t avail = c.M - row < (uint32_t)kTravRows ? c.M - row : (uint32_t)kTravRows;
+    const uint32_t nc = c.n_cand;
+    const uint32_t npass = (nc + 31u) / 32u;
+    const int qb = rad_mtp_trav_qbits(nc);
+
+    /* The rows of the request: the root and the rows after it that have a parent (a lane a row). */
+    uint64_t has = 1;
+    for (uint32_t u0 = 0; u0 < avail; u0 += 32) {
+        const uint32_t u = u0 + (uint32_t)lane;
+        bool in = false;
+        if (u >= 1 && u < avail) in = c.topo[(uint64_t)(row + u) * c.ld_topo] >= 0;
+        has |= (uint64_t)(uint32_t)__ballot(in) << u0;
+    }
+    const int n = ~has ? (int)__builtin_ctzll(~has) : 64;
+
+    /* This wave's rows: the node, the row's law. */
+    for (int v = wave; v < n; v += kTravWaves) {
+        const uint64_t rr = (uint64_t)row + (uint32_t)v;
+        int elig = 0, cnt = 0, swap = 0, exp = 0, nkv = 0;
+        int32_t cid[8];
+        for (int k = 0; k < 8; ++k) cid[k] = -1;
+        if (lane == 0) {
+            s_tok[v] = c.topo[rr * c.ld_topo + 1];
+            /* the state by value: its words are loaded together and stay in registers (nothing below
+             * indexes it at run time), instead of one load a check */
+            const RadMtpCoupleState s = *reinterpret_cast<const RadMtpCoupleState*>(c.state + rr * c.ld3);
+            const RadSampleParams p = *reinterpret_cast<const RadSampleParams*>(c.params + rr * c.ld2);
+            double q[8];
+            int nk = 0, nt = -1, tail = 0;
+            elig = rad_mtp_trav_eligible(s, p, c.vocab) &&
+                   rad_mtp_trav_canon(s, 0, cid, q, &nk, &nt, &tail, &swap);
+            for (int k = 0; k < 8; ++k) {
+                if (!elig) cid[k] = -1;
+                T.ids[v][k] = cid[k];
+                T.qr[v][k] = elig ? q[k] : 0.0;
+            }
+            nkv = elig ? nk : 0;
+            T.nk[v] = nkv;
+            T.nt[v] = nt;
+            T.tail[v] = tail;
+            T.ci[v] = 0;
+            cnt = s.count;
+            exp = elig && (s.draw.dpad_ & RAD_MTP_DRAW_EXPORT_BIT);
+        }
+        /* lane 0's findings, to the wave in registers */
+        elig = tv_lane0(elig);
+        cnt = tv_lane0(cnt);
+        swap = tv_lane0(swap);
+        exp = tv_lane0(exp);
+        nkv = tv_lane0(nkv);
+        int32_t sid[8];
+        for (int k = 0; k < 8; ++k) sid[k] = tv_lane0(cid[k]);
+        /* the node's child rows: a lane a later row of the request, the first row under this node
+         * that carries the slot's token */
+        int chrow[8];
+        for (int k = 0; k < 8; ++k) chrow[k] = -1;
+        if (nkv > 0) {
+            for (int u0 = v + 1; u0 < n; u0 += 32) {
+                const int u = u0 + lane;
+                int32_t upar = -2, utok = -1;
+                if (u < n) {
+                    upar = c.topo[((uint64_t)row + (uint32_t)u) * c.ld_topo];
+                    utok = c.topo[((uint64_t)row + (uint32_t)u) * c.ld_topo + 1];
+                }
+                const bool under = u < n && upar == (int32_t)(row + (uint32_t)v);
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const uint32_t mk = (uint32_t)__ballot(under && utok == sid[k]);
+                    if (mk && chrow[k] < 0 && k < nkv) chrow[k] = u0 + (int)__builtin_ctz(mk);
+                }
+            }
+        }
+        if (lane == 0)
+            for (int k = 0; k < 8; ++k) T.child[v][k] = chrow[k];
+        const int32_t* ids = c.idx + rr * c.ld0;
+        const float*   val = c.val + rr * c.ld1;
+        float top = -INFINITY;
+        uint32_t bad = 0;
+        uint64_t sum = 0, pk[8];
+        for (int k = 0; k < 8; ++k) pk[k] = 0;
+        if (elig) {
+            /* the largest value and the validity */
+            for (uint32_t p0 = 0; p0 < npass; p0 += kTravPer) {
+                TvBatch x;
+                if (!tv_load(ids, val, lane, p0, nc, 32u * (p0 + kTravPer) <= nc, &x)) continue;
+#pragma unroll
+                for (int i = 0; i < kTravPer; ++i) {
+                    const bool on = x.id[i] >= 0;
+                    const bool inval = on && ((uint32_t)x.id[i] >= c.vocab || x.v[i] != x.v[i] || x.v[i] == INFINITY);
+                    bad |= inval ? 1u : 0u;
+                    top = on && !inval && x.v[i] > top ? x.v[i] : top;
+                }
+            }
+            top = tv_wave_max(top);
+            bad = tv_wave_or(bad);
+            /* the masses: in all, and on the support slots */
+            if (!bad && top != -INFINITY) {
+                for (uint32_t p0 = 0; p0 < npass; p0 += kTravPer) {
+                    TvBatch x;
+                    /* a batch of holes (top_k 20: all but the first) adds nothing */
+                    if (!tv_load(ids, val, lane, p0, nc, 32u * (p0 + kTravPer) <= nc, &x)) continue;
+#pragma unroll
+                    for (int i = 0; i < kTravPer; ++i) {
+                        const bool live = x.id[i] >= 0 && x.v[i] != -INFINITY;
+                        if (!__ballot(live)) continue;   /* nor does a pass with none (top_k 20: all but one) */
+                        const uint64_t m = live ? rad_mtp_trav_mass(x.v[i], top, qb) : 0;
+                        sum += m;
+                        /* the support's ids sit in a few slots of the plane: a pass none of them is in
+                         * costs the eight compares */
+                        bool eq[8], anyeq = false;
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) { eq[k] = x.id[i] == sid[k]; anyeq = anyeq || eq[k]; }
+                        if (__ballot(anyeq)) {
+#pragma unroll
+                            for (int k = 0; k < 8; ++k) pk[k] += eq[k] ? m : 0;
+                        }
+                    }
+                }
+            }
+            sum = tv_wave_sum(sum);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) pk[k] = tv_wave_sum(pk[k]);
+        }
+        /* the node's law (rad_mtp_trav_set_law's values): lane k the support slot k, lane 0 the
+         * scalars; every word of the tree is written once, by one lane */
+        if (lane < 8) {
+            const bool valid = elig && !bad && top != -INFINITY && sum > 0;
+            uint64_t on = 0, mine = 0;
+            for (int k = 0; k < 8; ++k) { on += pk[k]; mine = k == lane ? pk[k] : mine; }
+            const double dsum = valid ? rad_mtp_trav_u2d(sum) : 1.0;
+            const double rk = valid ? rad_mtp_trav_u2d(mine) / dsum : 0.0;
+            T.m[v][lane] = rk;
+            if (lane == 0) {
+                const uint64_t off = sum - on;
+                T.moff[v] = valid ? rad_mtp_trav_u2d(off) / dsum : 0.0;
+                T.off[v] = valid ? off : 0;
+                T.top[v] = top;
+                T.ok[v] = valid;
+            }
+            /* the export (rad_mtp_trav_verify_root's): P on the state's own ids */
+            if (valid && exp) {
+                RadMtpCoupleState* sm = const_cast<RadMtpCoupleState*>(
+                    reinterpret_cast<const RadMtpCoupleState*>(c.state + rr * c.ld3));
+                if (lane < cnt) sm->q[rad_mtp_trav_export_slot(lane, swap)] = rk;
+                if (lane == 0) sm->status = RAD_MTP_COUPLE_STATUS_EXPORTED;
+            }
+        }
+    }
+    __syncthreads();   /* the tree is complete */
+    if (wave != 0) return;
+
+    /* Lane 0: the walk (the host's code over the tree in LDS), the path's tokens. */
+    int kind = 0, fnode = 0;
+    uint32_t want_lo = 0, want_hi = 0;
+    float ftop = 0.0f;
+    int32_t fid[8];
+    for (int k = 0; k < 8; ++k) fid[k] = -1;
+    if (lane == 0) {
+        const auto& p0 = *reinterpret_cast<const RadSampleParams*>(c.params + (uint64_t)row * c.ld2);
+        const uint64_t seed = p0.seed, pos0 = p0.pos;
+        int np = 0;
+        if (rad_mtp_trav_walk_tree(T, seed, pos0, s_path, &np)) {
+            const int f = s_path[np - 1];
+            for (int i = 0; i + 1 < np; ++i)
+                c.token[((uint64_t)row + (uint32_t)s_path[i]) * c.ld4] = s_tok[s_path[i + 1]];
+            if (T.ok[f]) {
+                const RadTravPick pk = rad_mtp_trav_final_pick(
+                    T, f, rad_spechub_uniform(seed, pos0 + (uint64_t)(np - 1), RAD_SAMPLE_KEY_RESID));
+                if (pk.kind == 1) c.token[((uint64_t)row + (uint32_t)f) * c.ld4] = T.ids[f][pk.slot];
+                if (pk.kind == 2) {
+                    kind = 2;
+                    fnode = f;
+                    want_lo = (uint32_t)pk.t;
+                    want_hi = (uint32_t)(pk.t >> 32);
+                    ftop = T.top[f];
+                    for (int k = 0; k < 8; ++k) fid[k] = T.ids[f][k];
+                }
+            }
+        }
+    }
+    if (tv_lane0(kind) != 2) return;
+
+    /* The final token off the support: the candidate holding unit `want`, candidates in slot order
+     * (pass by pass, the lanes of a pass in order). Lane 0's finding goes to the wave in registers; a
+     * mass is split in two limbs so its prefix over the lanes is two 32-bit DPP scans. */
+    {
+        const int f = tv_lane0(fnode);
+        const uint64_t want = ((uint64_t)(uint32_t)tv_lane0((int32_t)want_hi) << 32) | (uint32_t)tv_lane0((int32_t)want_lo);
+        const float top = tv_lane0f(ftop);
+        int32_t sid[8];
+        for (int k = 0; k < 8; ++k) sid[k] = tv_lane0(fid[k]);
+        const uint64_t rr = (uint64_t)row + (uint32_t)f;
+        const int32_t* ids = c.idx + rr * c.ld0;
+        const float*   val = c.val + rr * c.ld1;
+        uint64_t before = 0;   /* the off-support mass of the passes already walked: the same in every lane */
+        bool done = false;
+        for (uint32_t p0 = 0; p0 < npass && !done; p0 += kTravPer) {
+            TvBatch x;
+            if (!tv_load(ids, val, lane, p0, nc, 32u * (p0 + kTravPer) <= nc, &x)) continue;
+#pragma unroll
+            for (int i = 0; i < kTravPer; ++i) {
+                bool off = x.id[i] >= 0 && x.v[i] != -INFINITY;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) off = off && x.id[i] != sid[k];
+                if (done || !__ballot(off)) continue;
+                const uint64_t m = off ? rad_mtp_trav_mass(x.v[i], top, qb) : 0;
+                /* a mass is at most 2^41: limbs of 24 and 17 bits, whose prefixes over 32 lanes stay
+                 * below 2^32 */
+                const uint32_t plo = tv_wave_prefix((uint32_t)m & 0xffffffu, lane);
+                const uint32_t phi = tv_wave_prefix((uint32_t)(m >> 24), lane);
+                const uint64_t incl = ((uint64_t)phi << 24) + plo;
+                const uint64_t all = ((uint64_t)(uint32_t)__builtin_amdgcn_readlane((int)phi, 31) << 24) +
+                                     (uint32_t)__builtin_amdgcn_readlane((int)plo, 31);
+                const uint64_t base = before + incl - m;
+                const bool mine = m > 0 && want >= base && want - base < m;
+                if (mine) c.token[rr * c.ld4] = x.id[i];
+                done = __ballot(mine) != 0;
+                before += all;
+            }
+        }
+    }
+}
+
+}  /* namespace */
+
+__global__ __launch_bounds__(kThreads) void trav_verify(
+    const int32_t* idx, const float* values, const uint32_t* params, const uint32_t* state,
+    int32_t* token, const int32_t* topo, uint32_t M, uint32_t n_cand, uint32_t vocab, uint32_t ld0,
+    uint32_t ld1, uint32_t ld2, uint32_t ld3, uint32_t ld4, uint32_t ld_topo) {
+    const uint32_t row = blockIdx.x;
+    if (row >= M) return;
+    if (topo[(uint64_t)row * ld_topo] >= 0) return;   /* not a request's root */
+    const TravArgs c{ idx, values, params, state, token, topo, M, n_cand, vocab, ld0, ld1, ld2, ld3, ld4, ld_topo };
+#ifdef RAD_TRAV_REPEAT
+    /* microbenchmark build: the request is decided RAD_TRAV_REPEAT times back to back (idempotent
+     * without the export bit) */
+    for (int rep = 0; rep < RAD_TRAV_REPEAT; ++rep) { trav_request(c, row); __syncthreads(); }
+#else
+    trav_request(c, row);
+#endif
 }
 
 int rad_mine_mtp_trav_verify_launch(const RadArgs* a, RadStream stream) {
     RadMtpTravCall c{};
     const int rc = rad_mtp_trav_verify_args(a, &c);
     if (rc != RAD_OK) return rc;
+    /* the kernel's geometry is 32-bit */
+    for (int i = 0; i < 5; ++i)
+        if (c.v.ld[i] < 0 || c.v.ld[i] > INT32_MAX) return RAD_E_UNSUPPORTED;
+    if (c.ld_topo < 0 || c.ld_topo > INT32_MAX) return RAD_E_UNSUPPORTED;
     return R4D_EMIT(stream, trav_verify, dim3((unsigned)c.v.M), dim3(kThreads), 0,
                     c.v.idx, c.v.val, c.v.params, c.v.state, c.v.token, c.topo, c.v.M, c.v.n_cand,
                     c.v.vocab, c.v.ld[0], c.v.ld[1], c.v.ld[2], c.v.ld[3], c.v.ld[4], c.ld_topo);

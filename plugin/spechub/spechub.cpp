@@ -99,11 +99,14 @@ const RadOpSchema kSchemas[] = {
     { "mtp_trav_verify", kVerifyParams, 3, kTravOperands, 6,
       "Traversal Verification (arXiv 2505.12398) of a bound draft tree after sample_pick: per "
       "request (a row whose topo parent is -1), the bottom-up sequence-level walk over its rows' "
-      "bound mtp_couple states and target candidates (FP64): a leaf is accepted with the path's "
-      "cumulative ratio, a rejected leaf updates its parent's acceptance, target residual and "
-      "draft law (siblings without replacement). The accepted path's rows get their path child's "
-      "token and the last row the final token; rows whose state is not eligible (the row-wise "
-      "gate) are leaves and keep the pick. topo is [M,2] int32: parent row (-1 root), draft token." },
+      "bound mtp_couple states and target candidates (the target's law as integer masses of an "
+      "FP32 exponential, the walk in FP64): a leaf is accepted with the path's cumulative ratio, a "
+      "rejected leaf updates its parent's acceptance, target residual and draft law (Gumbel "
+      "siblings without replacement; a RheoSampling node's tail child first, then its top-q "
+      "children as point masses). The accepted path's rows get their path child's token and the "
+      "last row the final token; rows whose state is not eligible (the row-wise gate) are leaves "
+      "and keep the pick; an eligible row whose draw asks for it gets P exported over its state. "
+      "topo is [M,2] int32: parent row (-1 root), draft token. Any n_cand." },
 };
 
 }  /* namespace */
@@ -487,7 +490,7 @@ RadKernelInfo rad_spechub_row(int i, RadLaunchFn launch) {
         r.name = "spechub_mtp_trav_verify";
         r.op = "mtp_trav_verify";
         r.family = "draft";
-        r.computes = "Traversal Verification of a coupled draft tree, FP64";
+        r.computes = "Traversal Verification of a coupled draft tree: integer target masses, FP64 walk";
         r.shape = "M,n_cand,n_vocab";
         r.dtypes = "f32,i32,u32";
         r.domain = RAD_DOMAIN_DEVICE;

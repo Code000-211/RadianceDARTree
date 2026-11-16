@@ -254,9 +254,24 @@ static inline RAD_SPECHUB_HD void rad_mtp_couple_verify_row(const RadMtpCoupleVe
     }
 }
 
-/* The traversal walk's view of one request's rows: node v is row `root + v`. A row is a node the
- * walk may use only when the row-wise verify would have accepted its state (same gate), so a row
- * that is greedy, unbound or stale is a leaf here and keeps the pick's token. */
+/* The row-wise verify's gate, which the traversal walk shares: a row is a node the walk may use
+ * only when the row-wise verify would have accepted its state, so a row that is greedy, unbound or
+ * stale is a leaf of the walk and keeps the pick's token. */
+static inline RAD_SPECHUB_HD bool rad_mtp_trav_eligible(const RadMtpCoupleState& s,
+                                                        const RadSampleParams& p, int64_t vocab) {
+    return s.status == 1 && !(p.flags & RAD_SP_GREEDY) && s.draw.seed == p.seed && s.pos == p.pos &&
+           rad_mtp_couple_state_valid(s, vocab);
+}
+
+/* The rows of the request whose root is `row` that the walk reads: the root and the rows after it
+ * with a parent, at most RAD_MTP_TRAV_MAX_ROWS (a later row is a child no verify carries). */
+static inline RAD_SPECHUB_HD int64_t rad_mtp_trav_rows(const RadMtpTravCall& c, int64_t row) {
+    int64_t n = 1;
+    while (row + n < c.v.M && n < RAD_MTP_TRAV_MAX_ROWS && c.topo[(row + n) * c.ld_topo] >= 0) ++n;
+    return n;
+}
+
+/* The traversal walk's view of one request's rows: node v is row `root + v`. */
 struct RadMtpTravRows {
     const RadMtpTravCall& c;
     int64_t root;
@@ -265,10 +280,7 @@ struct RadMtpTravRows {
         const int64_t row = root + v;
         const auto& s = *reinterpret_cast<const RadMtpCoupleState*>(c.v.state + row * c.v.ld[3]);
         const auto& p = *reinterpret_cast<const RadSampleParams*>(c.v.params + row * c.v.ld[2]);
-        if (s.status != 1 || (p.flags & RAD_SP_GREEDY) || s.draw.seed != p.seed || s.pos != p.pos ||
-            !rad_mtp_couple_state_valid(s, c.v.vocab))
-            return nullptr;
-        return &s;
+        return rad_mtp_trav_eligible(s, p, c.v.vocab) ? &s : nullptr;
     }
     RAD_SPECHUB_HD bool cand(int v, const int32_t** ids, const float** val, int64_t* nc) const {
         *ids = c.v.idx + (root + v) * c.v.ld[0];
@@ -286,15 +298,48 @@ struct RadMtpTravRows {
     RAD_SPECHUB_HD int64_t vocab() const { return c.v.vocab; }
 };
 
-/* One request's tree, if `row` is its root: walk it and write the path's tokens. */
-static inline RAD_SPECHUB_HD void rad_mtp_trav_verify_root(const RadMtpTravCall& c, int64_t row) {
+/* The traversal's export (the row-wise verify's rad_mtp_couple_export_p): a row's P on its state's
+ * own ids, in the state's order, from the walk's integer law, and status 2. The walk's law is on the
+ * canonical support; this is the state's slot that canonical slot k goes to (`swap` is
+ * rad_mtp_trav_canon's). */
+static inline RAD_SPECHUB_HD int rad_mtp_trav_export_slot(int k, int swap) {
+    return k == 0 ? swap : (k == swap ? 0 : k);
+}
+
+/* One request's tree, if `row` is its root: walk it and write the path's tokens. The host
+ * reference; the device kernel (spechub.hip, trav_verify) prepares the same tree with a workgroup
+ * and runs the same walk. Every eligible row of the request exports P when its draw asks for it,
+ * on or off the walk (and whether or not the root itself is eligible). */
+static inline void rad_mtp_trav_verify_root(const RadMtpTravCall& c, int64_t row) {
     if (c.topo[row * c.ld_topo] >= 0) return;
-    int64_t n = 1;
-    while (row + n < c.v.M && c.topo[(row + n) * c.ld_topo] >= 0) ++n;
+    const int64_t n = rad_mtp_trav_rows(c, row);
     const RadMtpTravRows T{ c, row, n };
     const auto& p = *reinterpret_cast<const RadSampleParams*>(c.v.params + row * c.v.ld[2]);
     RadMtpTravOut o;
-    if (!rad_mtp_trav_walk(T, 0, p.seed, p.pos, &o)) return;
+    const bool walked = rad_mtp_trav_walk(T, 0, p.seed, p.pos, &o);
+    for (int64_t v = 0; v < n; ++v) {
+        const RadMtpCoupleState* sp = T.state((int)v);
+        if (!sp || !(sp->draw.dpad_ & RAD_MTP_DRAW_EXPORT_BIT)) continue;
+        int32_t ids[8];
+        double  q[8];
+        int nk = 0, nt = -1, tail = 0, swap = 0;
+        if (!rad_mtp_trav_canon(*sp, 0, ids, q, &nk, &nt, &tail, &swap)) continue;
+        const int32_t* ci = nullptr; const float* cv = nullptr;
+        int64_t nc = 0;
+        T.cand((int)v, &ci, &cv, &nc);
+        float top = -INFINITY;
+        if (!rad_mtp_trav_row_top(ci, cv, nc, c.v.vocab, &top)) continue;
+        RadTravLaw w;
+        rad_mtp_trav_row_law(ci, cv, nc, top, ids, sp->count, &w);
+        if (!(w.sum > 0)) continue;
+        RadMtpCoupleState* sm = const_cast<RadMtpCoupleState*>(sp);
+        const double sum = rad_mtp_trav_u2d(w.sum);
+        double pq[8];
+        for (int k = 0; k < 8; ++k) pq[k] = rad_mtp_trav_u2d(w.pq[k]) / sum;
+        for (int k = 0; k < sm->count; ++k) sm->q[rad_mtp_trav_export_slot(k, swap)] = pq[k];
+        sm->status = RAD_MTP_COUPLE_STATUS_EXPORTED;
+    }
+    if (!walked) return;
     for (int i = 0; i + 1 < o.n; ++i)
         c.v.token[(row + o.node[i]) * c.v.ld[4]] = c.topo[(row + o.node[i + 1]) * c.ld_topo + 1];
     if (o.has_y) c.v.token[(row + o.node[o.n - 1]) * c.v.ld[4]] = o.y;
