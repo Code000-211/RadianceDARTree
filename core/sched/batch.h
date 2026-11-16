@@ -45,6 +45,9 @@ struct StepEntry {
      * node index (0 the anchor, j + 1 draft[j]). Null for a chain. Read only on a tree step
      * (StepPlan::spec_is_tree), where a null one is staged as the chain. */
     const int32_t* draft_parent = nullptr;
+    /* Nodes past this one are prompt-lookup grafts (Request::draft_extra); -1: none. Kept here so the
+     * commit reads the step it verified, not what a later set_draft wrote on the request. */
+    int32_t draft_extra = -1;
     /* First logits row, written into `out_ids`, that this entry reads, or -1 for the default
      * rule. The MTP history pass uses it to gather the 1 + n_spec trunk rows of a verifying
      * sequence; the DFlash2 query pass uses it to name the mask rows of its own block. Which

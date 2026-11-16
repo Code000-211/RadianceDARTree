@@ -2006,6 +2006,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * the drawn token's own probability (DESIGN-coupling.md 3.5). */
             m.mtp.couple_prune_abs = std::max<double>(ctx->draft_tree_prune_abs, 0.0);
             m.mtp.couple_prune_rel = std::max<double>(ctx->draft_tree_prune_rel, 0.0);
+            m.mtp.couple_adapt = ctx->draft_adapt ? ctx->draft_adapt : "";
+            m.mtp.couple_rheo = std::max(ctx->draft_rheo, 0);
         }
         m.mtp.media = m.media;
         RAD_ARCH_TRY(m.mtp.declare(b, nm, g, (int)g.n_layer, m.kv_full, &m.kv_qsa_bkey, m.n_rot,
@@ -2051,7 +2053,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * leaves are drawn tokens in draft order, not the shortlist's columns: the propose
              * op prunes them by q-rank itself and the core's capture takes what it left. */
             if (dd.tree_width == 1 && !ctx->draft_coupling &&
-                (ctx->draft_tree_prune_abs > 0.0f || ctx->draft_tree_prune_rel > 0.0f))
+                (ctx->draft_tree_prune_abs > 0.0f || ctx->draft_tree_prune_rel > 0.0f ||
+                 (ctx->draft_adapt && *ctx->draft_adapt)))
                 dd.proposal_score = m.b_mtp_dval;
             m.tree_r = dd.depth;
             m.tree_n = dd.tree_nodes;
@@ -2065,37 +2068,48 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  * only when on, so the unpruned graph is the one it always was. */
                 const double pabs = std::max<double>(ctx->draft_tree_prune_abs, 0.0);
                 const double prel = std::max<double>(ctx->draft_tree_prune_rel, 0.0);
+                const char*  adapt = ctx->draft_adapt ? ctx->draft_adapt : "";
                 const bool   prune = pabs > 0.0 || prel > 0.0;
+                const bool   adapting = *adapt != 0;
                 for (int r = 1; r <= (int)m.tree_r; ++r) {
                     /* With --draft-coupling the grower also draws each frontier row's children
                      * without replacement and writes the node states (abi/rad_mtp_tree_rrs.h);
                      * its pruning then reads slot priorities only (DESIGN-coupling.md 3.5). */
                     if (ctx->draft_coupling) {
-                        const rad_op grow = prune
-                            ? RAD_OP(b, "mtp_tree_grow",
-                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
-                                           RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
-                                           RAD_INT("width", m.tree_w),
-                                           RAD_INT("block_size", kKvBlock),
-                                           RAD_INT("sel_pitch", m.qsacfg.topk + 1),
-                                           RAD_F64("prune_abs", pabs), RAD_F64("prune_rel", prel),
-                                           RAD_INT("n_vocab", g.n_vocab_all)),
-                                RAD_NOWEIGHTS)
-                            : RAD_OP(b, "mtp_tree_grow",
-                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
-                                           RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
-                                           RAD_INT("width", m.tree_w),
-                                           RAD_INT("block_size", kKvBlock),
-                                           RAD_INT("sel_pitch", m.qsacfg.topk + 1),
-                                           RAD_INT("n_vocab", g.n_vocab_all)),
-                                RAD_NOWEIGHTS);
+                        RadParam gp[14];
+                        int      ng = 0;
+                        gp[ng++] = RAD_RANGE("M", 1, g.max_seqs);
+                        gp[ng++] = RAD_INT("round", r);
+                        gp[ng++] = RAD_INT("rounds", m.tree_r);
+                        gp[ng++] = RAD_INT("nodes", m.tree_n);
+                        gp[ng++] = RAD_INT("width", m.tree_w);
+                        gp[ng++] = RAD_INT("block_size", kKvBlock);
+                        gp[ng++] = RAD_INT("sel_pitch", m.qsacfg.topk + 1);
+                        if (prune || adapting) {
+                            gp[ng++] = RAD_F64("prune_abs", pabs);
+                            gp[ng++] = RAD_F64("prune_rel", prel);
+                        }
+                        gp[ng++] = RAD_INT("n_vocab", g.n_vocab_all);
+                        if (adapting) gp[ng++] = RAD_STR("adapt", adapt);
+                        /* --draft-siblings rheo: only when on, so the default graph is unchanged. */
+                        if (ctx->draft_rheo > 0) gp[ng++] = RAD_INT("rheo_m", ctx->draft_rheo - 1);
+                        const rad_op grow = rad_decl_op(b, "mtp_tree_grow", gp, ng, RAD_NOWEIGHTS);
                         m.op_grow[r - 1] = rw(b, grow,
                             { m.b_mtp_didx, m.b_mtp_dval, m.b_mtp_gstate, m.b_mtp_couple_draws },
                             { m.b_mtp_ptok, m.b_mtp_ptree, m.b_mtp_gstate, m.b_mtp_tsel,
                               m.b_mtp_tnsel, m.b_mtp_tvmask, m.b_mtp_trb, m.b_mtp_tsrc,
                               m.b_mtp_tdst, m.b_mtp_couple_state });
                     } else {
-                    const rad_op grow = prune
+                    const rad_op grow = adapting
+                        ? RAD_OP(b, "mtp_tree_grow",
+                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
+                                       RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),
+                                       RAD_INT("width", m.tree_w), RAD_INT("block_size", kKvBlock),
+                                       RAD_INT("sel_pitch", m.qsacfg.topk + 1),
+                                       RAD_F64("prune_abs", pabs), RAD_F64("prune_rel", prel),
+                                       RAD_STR("adapt", adapt)),
+                            RAD_NOWEIGHTS)
+                        : prune
                         ? RAD_OP(b, "mtp_tree_grow",
                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("round", r),
                                        RAD_INT("rounds", m.tree_r), RAD_INT("nodes", m.tree_n),

@@ -108,3 +108,9 @@ if(RAD_BUILD_TESTS)
   set_target_properties(rad-chatparse PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
                                                  ENABLE_EXPORTS ON)
 endif()
+
+# rad-calib-sim replays a --draft-calib-log: expected tokens per ms of fixed chains and of the adaptive
+# rule with the static and the online calibration. Host only; it includes the engine's headers.
+add_executable(rad-calib-sim rad_calib_sim.cpp)
+target_include_directories(rad-calib-sim PRIVATE ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/core/sched)
+set_target_properties(rad-calib-sim PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

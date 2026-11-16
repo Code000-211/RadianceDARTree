@@ -131,6 +131,8 @@ struct SchedReq {
     /* The leading run of the tree set_draft published for the step issued ahead that really is a
      * chain (Request::draft_chain); -1 when the proposal is not predicted as one. */
     int32_t  draft_lead = -1;
+    /* The model-node count of a host-built tree that took a prompt-lookup graft (-1: none). */
+    int32_t  graft_extra = -1;
 
     /* Cancelled while a step in flight or a drafter snapshot still names it; its blocks are
      * released once nothing does. Freed earlier, a kernel still writing a block would put one
@@ -685,6 +687,10 @@ private:
      * far the match behind the proposal runs back (NgramIndex::propose), -1 when the proposal did
      * not come from the index (--debug-draft-oracle). */
     int draft_ngram(SchedReq& s, int depth, int* match = nullptr) const;
+    /* The same proposal into `out` (RAD_SCHED_MAX_SPEC entries) rather than s.draft. */
+    int draft_ngram_into(SchedReq& s, int depth, int32_t* out, int* match) const;
+    /* --draft-ngram-leaves: graft the lookup's proposal onto the host-built tree in s.draft. */
+    void graft_ngram(SchedReq& s, int cap, const int32_t* parents);
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;

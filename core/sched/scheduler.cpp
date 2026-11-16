@@ -1,6 +1,7 @@
 /* scheduler.cpp -- one decision per step. See scheduler.h for the shape and spec §7.1 for why.
  */
 #include "scheduler.h"
+#include "ngram_tree.h"
 #include "mm/processor.h"
 
 #include "server/sink.h"
@@ -565,6 +566,8 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
         for (int i = 0; i < n && i < RAD_SCHED_MAX_SPEC; ++i) s.draft_par[i] = parents[i];
     s.req->draft_parent = parents ? s.draft_par : nullptr;
     s.req->draft_chain = -1;
+    s.req->draft_extra = -1;
+    s.graft_extra = -1;
     s.draft_lead = -1;
 
     /* The step issued ahead already verifies these: it was planned with the drafter's count and
@@ -620,7 +623,41 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
+    if (cfg_.draft_ngram_leaves > 0 && serial_tree_ && n > 0) graft_ngram(s, cap, parents);
     return RAD_OK;
+}
+
+/* --draft-ngram-leaves: a host-built tree verify takes the sequence's prompt-lookup proposal as
+ * extra nodes (core/sched/ngram_tree.h). `s.draft[0..n_draft)` is the model's tree, already cut to
+ * `cap`. The lookup's nodes are marked on the request (draft_extra) so the coupled sampler leaves
+ * them out of every row's child list; they are followed only when a row's emitted token is theirs,
+ * which keeps the emitted law the target's. */
+void Scheduler::graft_ngram(SchedReq& s, int cap, const int32_t* parents) {
+    int32_t prop[RAD_SCHED_MAX_SPEC];
+    int match = -1;
+    const int np = draft_ngram_into(s, std::min(tree_rounds_, (int)RAD_SCHED_MAX_SPEC), prop, &match);
+    if (np <= 0 || match < 0) return;
+    int32_t par[RAD_SCHED_MAX_SPEC];
+    const int n = s.n_draft;
+    for (int j = 0; j < n; ++j) par[j] = parents ? parents[j] : j;
+    NgramTreeCfg c;
+    c.leaves = cfg_.draft_ngram_leaves;
+    c.min_match = cfg_.draft_ngram_min_match;
+    c.max_nodes = std::min(cap, (int)RAD_SCHED_MAX_SPEC);
+    c.max_depth = tree_rounds_;
+    const int act = tree_last_active(s.draft, par, n);
+    const NgramTreeOut o = ngram_tree_merge(s.draft, par, n, act, prop, np, match, c);
+    if (o.added <= 0 && o.displaced <= 0) return;
+    for (int j = 0; j < o.n; ++j) s.draft_par[j] = par[j];
+    s.draft_tree = true;
+    s.n_draft = o.n;
+    s.req->n_draft = o.n;
+    s.req->draft_parent = s.draft_par;
+    s.req->draft_extra = o.n_model;
+    s.graft_extra = o.n_model;
+    if (o.added > 0) ++m_.ngram_graft_steps;
+    m_.ngram_graft_nodes += o.added;
+    m_.ngram_graft_displaced += o.displaced;
 }
 
 /* ------------------------------------------------------------------ cancellation */
@@ -1099,6 +1136,10 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
  * The occurrence comes from the sequence's own index (ngram.h): O(pattern) a lookup, plus the
  * n-grams the last commit added, rather than a scan of the context. */
 int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
+    return draft_ngram_into(s, depth, s.draft, match);
+}
+
+int Scheduler::draft_ngram_into(SchedReq& s, int depth, int32_t* out, int* match) const {
     if (match) *match = -1;
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
@@ -1121,12 +1162,12 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
             h ^= h >> 29;
             const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
             const int32_t t = debug_oracle_[(size_t)(n + d)];
-            s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
+            out[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
         }
         return d;
     }
     if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
-    return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft, match,
+    return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, out, match,
                               LookupGate::kLongMatch);
 }
 
@@ -2221,6 +2262,10 @@ const RadBatch* Scheduler::step() {
         /* A tree drafter's parents, unless prompt lookup replaced its proposal with a chain. */
         e.draft_parent = (!prefill && s.draft_tree && !e.ngram) ? s.draft_par : nullptr;
         r.draft_parent = e.n_spec ? e.draft_parent : nullptr;
+        /* The graft marks follow the proposal this step really verifies (not a stale one, not the
+         * n-gram fallback's chain), and travel with the entry for the commit. */
+        e.draft_extra = (!prefill && !e.ngram && s.n_draft > 0) ? s.graft_extra : -1;
+        r.draft_extra = e.draft_extra;
         e.produces_token = (r.n_computed + want >= target);
         /* The snapshot a hit resumes from, consumed once: the state is in the slot for the whole
          * sequence after this, and restoring it again on a later chunk would rewind it. */
@@ -2790,6 +2835,7 @@ void Scheduler::promote_next() {
             s.req->draft_parent = plan_.spec_is_tree && plan_.e[i].n_spec ? s.draft_par : nullptr;
         }
         if (s.req) s.req->draft_chain = plan_.chain_fast && s.chain_next ? s.draft_lead : -1;
+        if (s.req) s.req->draft_extra = -1;
         s.chain_next = false;
         s.draft_lead = -1;
     }
@@ -2970,6 +3016,13 @@ int Scheduler::commit(StepResult& res) {
                 std::memcpy(s.last_path, path, (size_t)a * sizeof(int32_t));
                 s.last_npath = a;
             }
+            /* A chain-form verify (no path) takes node j + 1 for the j-th accepted token. */
+            if (e.draft_extra >= 0 && e.n_spec > 0) {
+                ++m_.ngram_graft_verifies;
+                if (a > 0 && (path ? path[a - 1] : a) > e.draft_extra) ++m_.ngram_graft_hits;
+                for (int32_t j = 0; j < a; ++j)
+                    if ((path ? path[j] : j + 1) > e.draft_extra) ++m_.ngram_graft_hit_nodes;
+            }
             for (int32_t j = 0; j < a; ++j) {
                 const int32_t d = path ? path[j] - 1 : j;
                 emit(d >= 0 && d < e.n_spec ? s.draft[d] : s.draft[j], j);
@@ -2990,14 +3043,22 @@ int Scheduler::commit(StepResult& res) {
             if (e.n_spec > 0) {
                 /* A serial tree's positions are depths: its rows beyond the first path are leaves,
                  * which are not a deeper draft. */
-                draft_.observe(serial_tree_ && !e.ngram ? tree_depth(e.draft_parent, e.n_spec)
-                                                        : e.n_spec, a);
+                /* The lookup's grafted nodes are not the head's drafts: its acceptance estimates see
+                 * the model's nodes and the accepted prefix that stayed in them only. */
+                int n_obs = e.n_spec, a_obs = a;
+                if (e.draft_extra >= 0 && e.draft_extra < e.n_spec) {
+                    n_obs = e.draft_extra;
+                    a_obs = 0;
+                    while (a_obs < a && (path ? path[a_obs] : a_obs + 1) <= e.draft_extra) ++a_obs;
+                }
+                draft_.observe(serial_tree_ && !e.ngram ? tree_depth(e.draft_parent, n_obs)
+                                                        : n_obs, a_obs);
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
                 if (draft_.adaptive() && (!e.ngram || lookup_adapt_)) {
                     const int was = s.adapt.depth;
-                    const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
+                    const int now = draft_.adapt_observe(s.adapt, n_obs, a_obs);
                     if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {
                         char est[8 * RAD_SCHED_MAX_SPEC];
                         int o = 0;
@@ -3029,6 +3090,8 @@ int Scheduler::commit(StepResult& res) {
         }
         s.n_draft = 0;
         r.n_draft = 0;
+        s.graft_extra = -1;
+        r.draft_extra = -1;
         s.entry = -1;
 
         /* A request the next step carries finishes now but keeps its blocks, which that step

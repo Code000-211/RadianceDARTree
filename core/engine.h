@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "rad_mtp_adapt.h"
 #include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
 #include "cvec.h"
 #include <map>
@@ -29,6 +30,7 @@
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
+#include "sched/mtp_couple_plan.h"   /* MtpCoupleLaw */
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -665,6 +667,21 @@ private:
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
     std::vector<RadMtpCoupleDraw> couple_by_card_;      /* the plan's draw per card slot */
+    MtpCoupleLaw couple_law_;                           /* --draft-coupling-temp/-mul/-truncate */
+    MtpCalibCtl  calib_ctl_;                            /* --draft-calib online, -temp-autofit, replay log */
+    int64_t      calib_step_ = -1;                      /* the engine step finish_serial_drafter settles */
+    std::chrono::steady_clock::time_point calib_t_{};
+    void couple_calibrate(const StepOut& so);
+    /* Coupling tuning counters (engine_draft.cpp, couple_log_stats): coupled rows verified, the
+     * drafts they carried and accepted, and the bound draft laws' shape. Logged every 4096
+     * verified rows and at shutdown. */
+    struct CoupleStats {
+        uint64_t rows = 0, drafted = 0, accepted = 0, full = 0;   /* full: every draft taken */
+        uint64_t laws = 0;                                        /* bound states summed below */
+        double   q_top1 = 0, q_ent = 0, q_support = 0;
+        uint64_t logged_at = 0;
+    } couple_stats_;
+    void couple_log_stats(const char* when);
     RadMtpCoupleState  couple_bound_[RAD_MTP_COUPLE_MAX_ROWS] = {};
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
@@ -725,6 +742,11 @@ private:
     /* --draft-tree-prune / -rel (Config): either threshold on. The plugin's grower and the
      * core's stage-1 leaf capture apply the one rule (abi/rad_mtp_tree.h). */
     bool    tree_prune_ = false;
+    /* --draft-adaptive's "key=value;..." text (abi/rad_mtp_adapt.h) for the plugin's grower
+     * (RadBuildCtx::draft_adapt) and the parsed rule for stage 1's leaves; empty when off or no
+     * serial tree is served. Resolved before declare. */
+    std::string draft_adapt_;
+    RadMtpAdapt adapt_{};
     /* The nodes a serial tree verifies after `done` rounds: the chain and the leaves it adds, up
      * to the budget; `done` for a chain. What expect_draft and set_draft must agree on. */
     int     serial_nodes(int done) const;

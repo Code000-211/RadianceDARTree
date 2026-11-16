@@ -55,11 +55,14 @@
 #include <string.h>
 #include <math.h>
 
+#ifndef RAD_MTP_HD
 #ifdef __HIPCC__
 #define RAD_MTP_HD __host__ __device__
 #else
 #define RAD_MTP_HD
 #endif
+#endif
+#include "rad_mtp_adapt.h"
 
 #define RAD_MTP_TREE_K 8          /* candidates a row reports (the head's reranked top 8) */
 #define RAD_MTP_TREE_MAX_NODES 60 /* the masks are 64 bits wide */
@@ -76,6 +79,8 @@ typedef struct RadMtpTreeCfg {
     int   prune;     /* nonzero when either threshold is on */
     float log_abs;   /* log(prune_abs), -inf when off: keep a candidate whose cum log prob >= it */
     float log_rel;   /* log(prune_rel), -inf when off: keep one whose logit - max logit >= it */
+    /* Cost-aware node selection and calibration (abi/rad_mtp_adapt.h); a zeroed cfg is off. */
+    RadMtpAdapt ad;
 } RadMtpTreeCfg;
 
 static inline int rad_mtp_tree_state_words(int nodes, int width, int rounds) {
@@ -170,11 +175,19 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
         const int bestc = rad_mtp_tree_row_logp(didx + r * row_stride, dval + r * row_stride, lp,
                                                 &mx, &lse);
         if (bestc < 0) continue;
+        /* the calibration of this row's law (a monotone map of its own values: slot priorities
+         * stay slot priorities); the relative-confidence test reads the same scaled gap */
+        const float tcal = rad_mtp_adapt_temp(&cfg->ad, nd[6 * f + 2] + 1);
+        rad_mtp_adapt_recal(lp, K, tcal);
+        rad_mtp_adapt_floor(lp, K, rad_mtp_adapt_lift(&cfg->ad, nd[6 * f + 2] + 1));
         const float base = rad_mtp_tree_bits_f(nd[6 * f + 3]);
         for (int c = 0; c < K; ++c) {
             if (!(lp[c] == lp[c])) continue;     /* NaN: an invalid candidate */
             if (st[3] >= pcap) break;
-            if (!rad_mtp_tree_keep(cfg, c, bestc, base, lp[c], dval[r * row_stride + c], mx))
+            if (!rad_mtp_tree_keep(cfg, c, bestc, base, lp[c],
+                                   tcal == 1.0f ? dval[r * row_stride + c]
+                                                : mx + (dval[r * row_stride + c] - mx) / tcal,
+                                   mx))
                 continue;
             int* e = pool + 4 * st[3]++;
             e[0] = f; e[1] = didx[r * row_stride + c]; e[2] = rad_mtp_tree_f_bits(base + lp[c]);
@@ -182,7 +195,9 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
         }
     }
 
-    /* create */
+    /* create. Adaptive selection acts like pruning: a pool that runs dry or a refused candidate
+     * ends the creation and the tree's remaining entries are inert. */
+    const int shrink = cfg->prune || cfg->ad.on;
     int n_new = cfg->round < R ? W : N;
     if (n_new > N - st[1]) n_new = N - st[1];
     int made[RAD_MTP_TREE_MAX_NODES + 1];
@@ -197,7 +212,13 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
         }
         /* A pruned pool that runs dry ends the creation: no placeholder node is made (but node 1,
          * the trunk's first, always exists), the rest of the tree stays inert. */
-        if (best < 0 && cfg->prune && st[1] > 0) break;
+        if (best < 0 && shrink && st[1] > 0) break;
+        if (best >= 0 && cfg->ad.on && st[1] > 0) {
+            float cum[RAD_MTP_TREE_MAX_NODES];
+            for (int q = 1; q <= st[1]; ++q) cum[q - 1] = rad_mtp_tree_bits_f(nd[6 * q + 3]);
+            if (!rad_mtp_adapt_admit(&cfg->ad, st[1], rad_mtp_adapt_expect(cum, st[1]), expf(bv)))
+                break;
+        }
         const int id = ++st[1];
         int* n = nd + 6 * id;
         if (best < 0) {
@@ -221,7 +242,7 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
         for (int j = 1; j <= N; ++j) {
             /* pruned: the entries past the created nodes are inert (-1), else a copy of node 1's */
             tok[j - 1] = j <= st[1] ? nd[6 * j + 0]
-                                    : cfg->prune ? -1 : (st[1] >= 1 ? nd[6 * 1 + 0] : 0);
+                                    : shrink ? -1 : (st[1] >= 1 ? nd[6 * 1 + 0] : 0);
             par[j - 1] = j <= st[1] ? nd[6 * j + 1] : 0;
         }
         st[2] = 0;

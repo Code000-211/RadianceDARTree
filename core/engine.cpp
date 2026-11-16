@@ -757,6 +757,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    couple_log_stats("final");
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -880,6 +881,10 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
+    sc.draft_verify_block = cfg_.draft_verify_block;
+    sc.draft_verify_traversal = cfg_.draft_verify_traversal;
+    sc.couple_export = cfg_.draft_coupling && (cfg_.draft_calib_mode == 1 || cfg_.draft_coupling_autofit ||
+                                               cfg_.draft_calib_ece || !cfg_.draft_calib_log.empty());
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -1663,6 +1668,7 @@ int Engine::step_loop() {
         /* The drafter for the next step already ran on the card; what remains is to check its
          * acceptance against the host's and publish its proposals. Each driver returns
          * immediately for a kind that is not its own. */
+        calib_step_ = b->step;
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them

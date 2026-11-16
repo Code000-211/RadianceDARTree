@@ -275,10 +275,10 @@ TEST(the_coupling_uniform_is_the_specified_53_bit_draw) {
 /* THE WIRE ROWS ARE THE SIZE THE PLANES ARE ADDRESSED AT. A field inserted into either struct would
  * shift every later operand of a plane the host writes and the device reads. */
 TEST(the_coupling_wire_rows_keep_their_layout) {
-    CHECK_EQ(sizeof(RadMtpCoupleDraw), (size_t)32);
-    CHECK_EQ(sizeof(RadMtpCoupleState), (size_t)160);
-    CHECK_EQ(RAD_MTP_COUPLE_DRAW_WORDS, (size_t)8);
-    CHECK_EQ(RAD_MTP_COUPLE_STATE_WORDS, (size_t)40);
+    CHECK_EQ(sizeof(RadMtpCoupleDraw), (size_t)48);
+    CHECK_EQ(sizeof(RadMtpCoupleState), (size_t)184);
+    CHECK_EQ(RAD_MTP_COUPLE_DRAW_WORDS, (size_t)12);
+    CHECK_EQ(RAD_MTP_COUPLE_STATE_WORDS, (size_t)46);
     CHECK_EQ(offsetof(RadMtpCoupleState, q) % 8, (size_t)0);
 }
 

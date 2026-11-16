@@ -892,6 +892,8 @@ static const RadParamSpec pMtpTreeGrow[] = {
     { "prune_abs",  RAD_P_F64, RAD_OPTIONAL },
     { "prune_rel",  RAD_P_F64, RAD_OPTIONAL },
     { "n_vocab",    RAD_P_INT, RAD_OPTIONAL },
+    { "adapt",      RAD_P_STR, RAD_OPTIONAL },
+    { "rheo_m",     RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oMtpTreeGrow[] = {
     { "didx",     RAD_OPD_IN,    0 },

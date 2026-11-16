@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -60,6 +61,50 @@ int Engine::step_state_init() {
      * pinned staging beside them. A program without them is refused rather than served
      * uncoupled. */
     mtp_couple_ = cfg_.draft_coupling;
+    if (cfg_.draft_verify_traversal && !mtp_couple_) {
+        RAD_ERR("--draft-verify traversal requires --draft-coupling on: the walk needs the draft's "
+                "law Q, which only a coupled draft carries");
+        return RAD_E_INVAL;
+    }
+    {
+        const bool want = cfg_.draft_calib_mode == 1 || cfg_.draft_coupling_autofit || cfg_.draft_calib_ece ||
+                          !cfg_.draft_calib_log.empty();
+        if (want && !cfg_.draft_coupling) {
+            RAD_ERR("--draft-calib online, --draft-coupling-temp-autofit, --draft-calib-ece and "
+                    "--draft-calib-log need --draft-coupling on");
+            return RAD_E_INVAL;
+        }
+        if (want) {
+            MtpCalibCfg cc;
+            cc.mode = cfg_.draft_calib_mode;
+            cc.autofit = cfg_.draft_coupling_autofit;
+            cc.ece = cfg_.draft_calib_ece;
+            cc.log_path = cfg_.draft_calib_log;
+            cc.interval = cfg_.draft_calib_interval;
+            for (size_t b = 0; b < cfg_.draft_calib.size();) {
+                size_t e = cfg_.draft_calib.find(',', b);
+                if (e == std::string::npos) e = cfg_.draft_calib.size();
+                cc.static_T.push_back((float)std::atof(cfg_.draft_calib.substr(b, e - b).c_str()));
+                b = e + 1;
+            }
+            if (!calib_ctl_.configure(cc)) {
+                RAD_ERR("--draft-calib-log: cannot open '%s'", cfg_.draft_calib_log.c_str());
+                return RAD_E_IO;
+            }
+            couple_law_.calib = &calib_ctl_;
+            if (cfg_.draft_calib_mode == 1 && !cfg_.draft_adaptive)
+                RAD_WARN("--draft-calib online without --draft-adaptive on: the calibration only steers "
+                         "the adaptive tree rule, so it is learnt (and logged) but changes nothing");
+            RAD_INFO("online calibration: calib %s%s%s, refit every %d verify steps%s%s",
+                     cc.mode == 1 ? "online" : cc.mode == 2 ? "off" : "static",
+                     cc.autofit ? ", draft temperature autofit" : "", cc.ece ? ", ECE report" : "",
+                     cc.interval, cc.log_path.empty() ? "" : ", replay log ", cc.log_path.c_str());
+        }
+    }
+    couple_law_.request_temp = cfg_.draft_coupling_req_temp;
+    couple_law_.temp = cfg_.draft_coupling_temp;
+    couple_law_.mul = cfg_.draft_coupling_temp_mul;
+    couple_law_.truncate = cfg_.draft_coupling_truncate;
     if (mtp_couple_) {
         /* Coupling is defined on a linear chain of drafts: a serial head's rounds, or a block
          * drafter whose walk samples each position in turn (DFlash2, dflash_couple_propose), its
@@ -196,6 +241,11 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
             /* Stage 1's confidence pruning of the depth-1 leaves: the plugin's candidate logits
              * beside the ids, and the grower's rule (abi/rad_mtp_tree.h), whose thresholds are
              * the same two numbers the plugin's grower op got. */
+            if (tree_width_ == 1 && cfg_.draft_adaptive && !cfg_.draft_coupling && drafter_.proposal_score) {
+                a.adapt = adapt_;
+                if (from_proposal)
+                    a.src_val = static_cast<const float*>(rk.ctx.buf_ptr(drafter_.proposal_score));
+            }
             if (tree_width_ == 1 && tree_prune_ && drafter_.proposal_score) {
                 RadMtpTreeCfg pc{};
                 rad_mtp_tree_set_prune(&pc, cfg_.draft_tree_prune, cfg_.draft_tree_prune_rel);
@@ -443,6 +493,24 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
+    /* Coupling tuning: the coupled (sampled) rows this verify settled. The plan's Request pointer
+     * is not read (reap() may have freed it); the card's staged draw says whether the row coupled. */
+    if (mtp_couple_) {
+        for (size_t i = 0; i < plan.e.size(); ++i) {
+            const StepEntry& e = plan.e[i];
+            if (so.first_row[i] < 0 || e.n_spec <= 0 || e.card < 0 ||
+                (size_t)e.card >= couple_by_card_.size())
+                continue;
+            const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
+            if (d.seq != e.seq || d.mode != 1) continue;
+            ++couple_stats_.rows;
+            couple_stats_.drafted += (uint64_t)e.n_spec;
+            couple_stats_.accepted += (uint64_t)std::max(0, so.accepted[i]);
+            if (so.accepted[i] >= e.n_spec) ++couple_stats_.full;
+        }
+        couple_calibrate(so);
+        if (couple_stats_.rows >= couple_stats_.logged_at + 4096) couple_log_stats("running");
+    }
     sched_.serial_end(serial_done_);
     if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
 
@@ -530,6 +598,20 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
                                     &n_bound, &why, &n_malformed);
     }
     if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
+    /* The draft laws just bound: sharpness of Q (top-1 mass, entropy in nats, support size). */
+    for (int k = 0; k < n_bound; ++k) {
+        const RadMtpCoupleState& b = couple_bound_[k];
+        if (b.status != 1 || b.count < 1) continue;
+        double top = 0, ent = 0;
+        for (int j = 0; j < b.count; ++j) {
+            top = std::max(top, b.q[j]);
+            if (b.q[j] > 0) ent -= b.q[j] * std::log(b.q[j]);
+        }
+        ++couple_stats_.laws;
+        couple_stats_.q_top1 += top;
+        couple_stats_.q_ent += ent;
+        couple_stats_.q_support += b.count;
+    }
     if (n_malformed > 0 && !couple_malformed_note_) {
         couple_malformed_note_ = true;
         RAD_WARN("coupled draft: sequence %llu: %d draft position(s) had a shortlist with no valid "
@@ -542,6 +624,77 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
         if (st < 0 && st != RAD_E_NOTFOUND) return st;
     }
     return RAD_OK;
+}
+
+/* The verify's exact acceptance labels, into the online calibration (core/sched/mtp_calib.h).
+ * The sampler copied each decided row's plane (P over Q's support, status 2) behind the verify on
+ * the step's stream, which the step's own waits cover, so this adds no synchronisation. A row
+ * counts when it was REACHED: its parent was accepted, i.e. the card's accepted prefix (a chain) or
+ * accepted path (a tree) passes through it; its children judged are the rejected ones before the
+ * accepted one, or all of them. */
+void Engine::couple_calibrate(const StepOut& so) {
+    if (!calib_ctl_.enabled()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = calib_t_.time_since_epoch().count() != 0
+                          ? std::chrono::duration<double, std::milli>(now - calib_t_).count() : 0.0;
+    calib_t_ = now;
+    const StepPlan& plan = sched_.plan();
+    const Sampler::CoupleExport* ex = ranks_[0]->sampler.couple_export(calib_step_);
+    const bool tree = plan.spec_is_tree && !so.path.empty();
+    int rows = 0, acc_sum = 0;
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        const StepEntry& e = plan.e[i];
+        if (so.first_row[i] < 0 || e.n_spec <= 0 || e.card < 0 || (size_t)e.card >= couple_by_card_.size())
+            continue;
+        const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
+        if (d.seq != e.seq || d.mode != 1) continue;
+        const int acc = std::max(0, so.accepted[i]);
+        const int32_t* path = tree ? &so.path[i * RAD_SCHED_MAX_SPEC] : nullptr;
+        auto on_path = [&](int node) {
+            if (!tree) return node <= acc;
+            for (int t = 0; t < acc; ++t) if (path[t] == node) return true;
+            return false;
+        };
+        rows += e.n_spec + 1;
+        acc_sum += acc;
+        if (ex)
+            for (const Sampler::CoupleRow& r : ex->rows) {
+                if (r.seq != e.seq) continue;
+                const RadMtpCoupleState& post = ex->post[r.row];
+                if (post.status != RAD_MTP_COUPLE_STATUS_EXPORTED) continue;
+                if (r.k != 0 && !on_path(r.k)) continue;   /* not reached */
+                int accepted_child = -1;
+                for (int t = 0; t < r.nk; ++t)
+                    if (on_path(r.kid_node[t])) { accepted_child = t; break; }
+                const int judged = accepted_child >= 0 ? accepted_child + 1 : r.nk;
+                calib_ctl_.observe_row(r.temp, r.seq, r.q, post.q, judged, accepted_child,
+                                       calib_ctl_.since_of(r.seq));
+            }
+        calib_ctl_.request_step(e.seq, acc, e.n_spec);
+    }
+    if (rows > 0) calib_ctl_.end_step(ms, rows, acc_sum);
+}
+
+/* --draft-coupling tuning line: acceptance of the sampled rows (accepted drafts per verified row,
+ * per drafted token, share of rows that took every draft) beside the shape of the draft laws they
+ * were drawn from. Compare runs of --draft-coupling-temp / -truncate by acc/row at equal drafted/row. */
+void Engine::couple_log_stats(const char* when) {
+    CoupleStats& c = couple_stats_;
+    if (!mtp_couple_ || c.rows == 0 || (c.logged_at == c.rows && !std::strcmp(when, "final"))) return;
+    c.logged_at = c.rows;
+    const double n = (double)c.rows, l = c.laws ? (double)c.laws : 1.0;
+    RAD_INFO("MTP coupled stats (%s): rows %llu, drafted/row %.3f, accepted/row %.3f, accept rate %.4f, "
+             "full-accept rows %.4f; draft law (%s%s, trunc %s): top1 %.3f, entropy %.3f nat, support %.2f",
+             when, (unsigned long long)c.rows, (double)c.drafted / n, (double)c.accepted / n,
+             c.drafted ? (double)c.accepted / (double)c.drafted : 0.0, (double)c.full / n,
+             couple_law_.request_temp ? "request temp x" : "temp ",
+             couple_law_.request_temp ? std::to_string(couple_law_.mul).c_str()
+                                      : std::to_string(couple_law_.temp).c_str(),
+             couple_law_.truncate ? "on" : "off", c.q_top1 / l, c.q_ent / l, c.q_support / l);
+    if (calib_ctl_.enabled()) {
+        RAD_INFO("MTP online calibration (%s):%s", when, calib_ctl_.stats().c_str());
+        calib_ctl_.flush();
+    }
 }
 
 /* One line, once, at the first coupled verify that completed. It reads the snapshot build_step
@@ -581,7 +734,8 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
     std::string why;
     const int stg = mtp_couple_plan_stage(sched_.plan(),
                                           (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
-                                          rows, n, &couple_by_card_, couple_draw_stage_, &why);
+                                          rows, n, &couple_by_card_, couple_draw_stage_, &why,
+                                          &couple_law_);
     if (stg < 0) {
         RAD_ERR("MTP coupled: %s", why.c_str());
         return stg;

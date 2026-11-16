@@ -13079,12 +13079,14 @@ TEST(mtp_tree_grow_takes_the_best_of_the_pool_and_hangs_it_on_its_parent) {
  * children it creates into the node's state, in draft order. A greedy draw or a draw staged for
  * another card is the uncoupled op, word for word. M = 1, R = 3, N = 5, W = 2. */
 namespace {
-int tg_coupled(int round, T& didx, T& dval, T& st, T& tok, T& par, T* draw, T* card, T* plane) {
+int tg_coupled(int round, T& didx, T& dval, T& st, T& tok, T& par, T* draw, T* card, T* plane,
+               int rheo_m = -1) {
     A b;
     b.t(didx).t(dval).t(st).tnull().tnull().tnull().t(tok).t(par);
     b.tnull().tnull().tnull().tnull().tnull().tnull();
     if (draw) b.t(*draw).t(*card).t(*plane); else b.tnull().tnull().tnull();
     b.i("M", 1).i("round", round).i("rounds", 3).i("nodes", 5).i("width", kTgW).i("n_vocab", 1000);
+    if (rheo_m >= 0) b.i("rheo_m", rheo_m);
     return run("mtp_tree_grow", b);
 }
 }  /* namespace */
@@ -13095,7 +13097,7 @@ TEST(mtp_tree_grow_with_a_coupled_draw_creates_each_nodes_children_in_draft_orde
     auto run_tree = [&](uint32_t mode, int32_t card, bool coupled, T* tok_out, T* par_out, T* plane) {
         T st(RAD_I32, { 1, sw });
         T tok(RAD_I32, { 1, N }), par(RAD_I32, { 1, N });
-        T draw(RAD_U32, { 1, 8 }), cs(RAD_I32, { 1 });
+        T draw(RAD_U32, { 1, (int64_t)RAD_MTP_COUPLE_DRAW_WORDS }), cs(RAD_I32, { 1 });
         RadMtpCoupleDraw d{};
         d.seed = 77; d.base = 5; d.seq = 1; d.card = 0; d.mode = mode;
         std::memcpy(draw.mem.data(), &d, sizeof d);
@@ -13145,6 +13147,59 @@ TEST(mtp_tree_grow_with_a_coupled_draw_creates_each_nodes_children_in_draft_orde
         uint32_t x;
         std::memcpy(&x, planeg.mem.data() + w * 4, 4);
         CHECK_EQ(x, 0u);
+    }
+}
+
+/* --draft-siblings rheo: the same op with `rheo_m` = m writes states whose first m children are the m
+ * largest q (the slot order) and whose child m is the one tail draw (scheme m + 1); without the
+ * param the states are the Gumbel ones (scheme 0). */
+TEST(mtp_tree_grow_with_rheo_m_draws_the_top_q_children_and_one_tail_child) {
+    const int64_t N = 5, R = 3, sw = tg_state_words(N, kTgW, R), SW = (int64_t)RAD_MTP_COUPLE_STATE_WORDS;
+    const std::vector<float> steep = { 3, 2, 1, 0.5f, -1, -2, -3, -4 };
+    for (int m = 0; m <= 2; ++m) {
+        T st(RAD_I32, { 1, sw });
+        T tok(RAD_I32, { 1, N }), par(RAD_I32, { 1, N });
+        T draw(RAD_U32, { 1, (int64_t)RAD_MTP_COUPLE_DRAW_WORDS }), cs(RAD_I32, { 1 }), plane(RAD_U32, { N, 1, SW });
+        RadMtpCoupleDraw d{};
+        d.seed = 77 + (uint64_t)m; d.base = 5; d.seq = 1; d.card = 0; d.mode = 1;
+        std::memcpy(draw.mem.data(), &d, sizeof d);
+        cs.n({ 0 });
+        for (int round = 1; round <= (int)R; ++round) {
+            const int64_t rows = round == 1 ? 1 : kTgW;
+            T di(RAD_I32, { rows, 8 }), dv(RAD_F32, { rows, 8 });
+            std::vector<int64_t> ids;
+            std::vector<float> vs;
+            for (int64_t r = 0; r < rows; ++r)
+                for (int c = 0; c < 8; ++c) { ids.push_back(100 * (round + r) + c); vs.push_back(steep[(size_t)c]); }
+            di.n(ids); dv.f(vs);
+            CHECK_OK(tg_coupled(round, di, dv, st, tok, par, &draw, &cs, &plane, m));
+        }
+        int nodes_with_kids = 0, total_kids = 0;
+        for (int64_t f = 0; f < N; ++f) {
+            RadMtpCoupleState s;
+            std::memcpy(&s, plane.mem.data() + (size_t)f * (size_t)SW * 4, sizeof s);
+            std::vector<int64_t> kids;   /* in node order, repeats dropped (a short pool pads with node 1's token) */
+            for (int64_t j = 0; j < N; ++j)
+                if (par.iat(j) == f && std::find(kids.begin(), kids.end(), tok.iat(j)) == kids.end())
+                    kids.push_back(tok.iat(j));
+            if (kids.empty()) continue;
+            ++nodes_with_kids;
+            CHECK_EQ(s.status, 1);
+            CHECK(rad_mtp_couple_state_valid(s, 1000));
+            CHECK_EQ(s.scheme, m + 1);
+            CHECK(kids.size() <= (size_t)(m + 1));
+            /* a node counts the children it really made, in draft order; a placeholder (a dry pool's copy,
+             * score -inf, e.g. the second root child when m = 0 leaves one candidate) counts none */
+            CHECK(s.nkids >= 0 && (size_t)s.nkids <= kids.size());
+            if (m > 0) CHECK_EQ((size_t)s.nkids, kids.size());
+            total_kids += s.nkids;
+            for (int q = 0; q < s.nkids; ++q) CHECK_EQ((int64_t)s.ids[q], kids[(size_t)q]);
+            /* slots 0 .. m-1: the largest q in descending order (steep is descending in the column) */
+            const int nt = std::min<int>(m, s.count);
+            for (int q = 1; q < nt; ++q) CHECK(s.q[q - 1] >= s.q[q]);
+        }
+        CHECK(nodes_with_kids >= 2);
+        CHECK(total_kids >= 3);
     }
 }
 
@@ -13566,4 +13621,77 @@ TEST(mtp_tree_grow_pruned_fuzz_keeps_the_trees_structure_and_the_trunk) {
         if (heavy) { CHECK(n <= R); ++heavy_chains; }
     }
     CHECK(heavy_chains > 1000);
+}
+
+/* --draft-adaptive's grower (abi/rad_mtp_adapt.h) over random shapes, rows, margins, floors and
+ * calibrations: the same structure the pruned grower guarantees (created nodes a prefix, inert
+ * tail, parent before child, no repeated sibling, node 1 exists), the floor is honoured when the
+ * pool has the candidates, and a stricter margin on the SAME rows creates fewer nodes on average. */
+TEST(mtp_tree_grow_adaptive_fuzz_keeps_the_structure_and_shrinks_with_the_margin) {
+    uint32_t s = 0x2545f491u;
+    auto rnd = [&]() { s = s * 1664525u + 1013904223u; return (int)(s >> 8); };
+    long shrunk = 0, loose = 0, strict = 0;
+    for (int trial = 0; trial < 3000; ++trial) {
+        const int W = 1 + rnd() % 4, R = 1 + rnd() % 5;
+        const int N = std::max(1, R + rnd() % 12), K = RAD_MTP_TREE_K, PITCH = N;
+        const int floor_n = 1 + rnd() % 3;
+        char txt[96];
+        std::vector<std::vector<int>> idxs((size_t)R);
+        std::vector<std::vector<float>> vals((size_t)R);
+        for (int round = 1; round <= R; ++round) {
+            const int rows = round == 1 ? 1 : W;
+            idxs[(size_t)round - 1].resize((size_t)rows * K);
+            vals[(size_t)round - 1].resize((size_t)rows * K);
+            for (int r = 0; r < rows; ++r) {
+                std::set<int> used;
+                for (int c = 0; c < K; ++c) {
+                    int id;
+                    do id = rnd() % 5000; while (used.count(id));
+                    used.insert(id);
+                    idxs[(size_t)round - 1][(size_t)r * K + c] = rnd() % 9 == 0 ? -1 : id;
+                    vals[(size_t)round - 1][(size_t)r * K + c] = (float)(rnd() % 800) / 60.0f - 6.0f;
+                }
+            }
+        }
+        const bool temp = rnd() % 2 == 0;
+        int made[2] = { 0, 0 };
+        int mi = 0;
+        for (double margin : { 0.5, 3.0 }) {
+            std::snprintf(txt, sizeof txt, "on=1;floor=%d;margin=%g%s", floor_n, margin,
+                          temp ? ";temp=1.4,1.1" : "");
+            std::vector<int> st((size_t)rad_mtp_tree_state_words(N, W, R), 0), table(64, 1);
+            std::vector<int> tok((size_t)PITCH), par((size_t)PITCH);
+            for (int round = 1; round <= R; ++round) {
+                RadMtpTreeCfg c{};
+                c.round = round; c.rounds = R; c.nodes = N; c.width = W; c.block = 4;
+                c.sel_pitch = 5; c.pitch = PITCH;
+                CHECK(rad_mtp_adapt_parse(txt, &c.ad));
+                std::vector<int> sel((size_t)W * 5), ns((size_t)W), src((size_t)W), dst((size_t)W);
+                std::vector<long long> vm((size_t)W);
+                int rb = 0;
+                CHECK_EQ(rad_mtp_tree_grow_seq(&c, st.data(), idxs[(size_t)round - 1].data(),
+                                               vals[(size_t)round - 1].data(), 0, K, 1,
+                                               round == 1 ? 7 : -1, table.data(), tok.data(),
+                                               par.data(), sel.data(), ns.data(), vm.data(), &rb, 0,
+                                               src.data(), dst.data()), 0);
+            }
+            int n = 0;
+            while (n < N && tok[(size_t)n] >= 0) ++n;
+            CHECK(n >= 1);
+            for (int j = n; j < N; ++j) { CHECK_EQ(tok[(size_t)j], -1); CHECK_EQ(par[(size_t)j], 0); }
+            std::set<std::pair<int, int>> sib;
+            for (int j = 1; j <= n; ++j) {
+                const int p = par[(size_t)j - 1];
+                CHECK(p >= 0 && p < j);
+                CHECK(sib.insert({ p, tok[(size_t)j - 1] }).second);
+            }
+            made[mi++] = n;
+        }
+        /* not a per-input law (fewer nodes also means a smaller expectation), a law in the mean */
+        shrunk += made[1] < made[0];
+        loose += made[0];
+        strict += made[1];
+    }
+    CHECK(shrunk > 100);
+    CHECK(strict < loose);
 }

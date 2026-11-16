@@ -59,7 +59,7 @@ std::vector<Row> cpp_rows() {
 }
 
 /* The layout at RAD_ABI_VERSION 39 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 39, kTableFormat = 2;
+constexpr uint32_t kTableAbi = 40, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -219,7 +219,7 @@ TEST(rad_yarn_is_the_same_function_in_c_and_cpp) {
 }
 
 /* The fields a serial drafter's tree appends sit past each struct's old end (the table above is the
- * ABI 39 snapshot, which allows exactly that), at the offsets a plugin built against these headers
+ * ABI 40 snapshot, which allows exactly that), at the offsets a plugin built against these headers
  * reads them from: RadBatch::spec_path and its pitch, RadDrafterDecl's tree shape, the KV group's
  * no_tree_compact, the probe's tree_linear_ok and tree_nodes, the build context's rounds, leaves
  * and width. */
@@ -247,6 +247,8 @@ TEST(the_serial_tree_fields_are_appended_past_the_old_ends) {
 TEST(the_tree_pruning_fields_are_appended_past_the_tree_shape) {
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_prune_abs), (size_t)212);
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_prune_rel), (size_t)216);
+    CHECK_EQ(offsetof(RadBuildCtx, draft_adapt), (size_t)224);
+    CHECK_EQ(offsetof(RadBuildCtx, draft_rheo), (size_t)232);
     CHECK_EQ(offsetof(RadDrafterDecl, proposal_score), (size_t)68);
     CHECK_EQ(sizeof(RadDrafterDecl), (size_t)72);
 }

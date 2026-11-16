@@ -24,6 +24,7 @@
 
 #include "rad_device.h"
 #include "draft.h"
+#include "rad_mtp_adapt.h"
 
 namespace rad {
 
@@ -206,7 +207,12 @@ struct AdvanceArgs {
     int32_t prune = 0;
     float   prune_log_abs = 0.0f;
     float   prune_log_rel = 0.0f;
+    /* --draft-adaptive's stage 1 (abi/rad_mtp_adapt.h): with adapt.on and a non-null `src_val` a
+     * runner-up leaf is kept only while its (calibrated) probability beats the marginal cost of
+     * its verify row; the chain's `depth` nodes are the tree it joins. */
+    RadMtpAdapt adapt{};
 };
+static_assert(sizeof(AdvanceArgs) <= 3072, "AdvanceArgs is a kernel argument");
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */
 int step_advance(const AdvanceArgs& a, RadStream s);

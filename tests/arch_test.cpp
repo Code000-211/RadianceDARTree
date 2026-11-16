@@ -13286,6 +13286,37 @@ TEST(flashnext_declares_a_draft_tree_only_when_the_engine_asks_for_one) {
         }
         CHECK_EQ(carriers, W == 1 ? 1 : R);
     }
+    /* --draft-siblings rheo (RadBuildCtx::draft_rheo): off, the graph is the Gumbel one op for op and
+     * param for param (draft_rheo 0 adds nothing); on, exactly the propose op with leaves (stage 1)
+     * or every grower op (stage 2) gains `rheo_m` = m. */
+    for (int W : { 1, 3 })
+        for (int pruned = 0; pruned < 2; ++pruned) {
+            RadBuilder b0, b1, b2;
+            RadBuildCtx c0 = q4_tree_ctx(0, 1, N, R, W == 1 ? 3 : 0, W);
+            c0.draft_coupling = 1;
+            if (pruned) { c0.draft_tree_prune_abs = 0.1f; c0.draft_tree_prune_rel = 0.3f; }
+            RadBuildCtx c1 = c0, c2 = c0;
+            c1.draft_rheo = 0;
+            c2.draft_rheo = 3;   /* m = 2 */
+            REQUIRE_EQ(declared(c0, b0), RAD_OK);
+            REQUIRE_EQ(declared(c1, b1), RAD_OK);
+            REQUIRE_EQ(declared(c2, b2), RAD_OK);
+            CHECK_EQ(b0.ops.size(), b1.ops.size());
+            CHECK_EQ(b0.ops.size(), b2.ops.size());
+            int carriers = 0;
+            for (size_t i = 0; i < b0.ops.size(); ++i) {
+                CHECK(b0.ops[i].op == b1.ops[i].op);
+                CHECK_EQ(b0.ops[i].p.size(), b1.ops[i].p.size());
+                CHECK(param(&b1.ops[i], "rheo_m") == nullptr);
+                const bool carrier = W == 1 ? (b2.ops[i].op == "mtp_couple_propose" && pint(&b2.ops[i], "leaves") == 3)
+                                            : b2.ops[i].op == "mtp_tree_grow";
+                CHECK_EQ(b2.ops[i].p.size(), b0.ops[i].p.size() + (carrier ? 1 : 0));
+                if (!carrier) { CHECK(param(&b2.ops[i], "rheo_m") == nullptr); continue; }
+                ++carriers;
+                CHECK_EQ(pint(&b2.ops[i], "rheo_m"), 2);
+            }
+            CHECK_EQ(carriers, W == 1 ? 1 : R);
+        }
     /* More head rounds than the coupling's states: refused with a message, not clamped. */
     {
         RadBuilder b;
@@ -13695,6 +13726,47 @@ TEST(flashnext_refuses_a_draft_tree_wider_than_its_node_budget) {
     /* W = 9 > N = 7 */
     RadBuildCtx ctx = q4_tree_ctx(0, 1, 7, 3, 0, 9);
     CHECK(qwen4exp_fp8::declare(&b, &meta, &ctx) != RAD_OK);
+}
+
+/* --draft-adaptive (RadBuildCtx::draft_adapt): off (null or empty) is the old graph byte for byte;
+ * on adds the `adapt` text to the stage-2 grower (with the two prune parameters it rides beside)
+ * and names the candidates' logits plane for stage 1, and changes no op, buffer or issue. */
+TEST(flashnext_adaptive_selection_only_adds_the_adapt_parameter) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3;
+    const char* text = "on=1;margin=1.2;cost=9.3,10.3,11.3";
+    for (int W : { 1, 3 }) {
+        RadBuilder off, empty, on;
+        for (RadBuilder* b : { &off, &empty, &on }) b->encs = { { "draft_head", u2_head() } };
+        RadBuildCtx c0 = q4_tree_ctx(0, 1, N, R, W == 1 ? 4 : 0, W);
+        RadBuildCtx ce = c0, c1 = c0;
+        ce.draft_adapt = "";
+        c1.draft_adapt = text;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&off, &meta, &c0), RAD_OK);
+        REQUIRE_EQ(qwen4exp_fp8::declare(&empty, &meta, &ce), RAD_OK);
+        REQUIRE_EQ(qwen4exp_fp8::declare(&on, &meta, &c1), RAD_OK);
+        CHECK_EQ(off.ops.size(), on.ops.size());
+        CHECK_EQ(off.bufs.size(), on.bufs.size());
+        CHECK_EQ(off.ops.size(), empty.ops.size());
+        for (size_t i = 0; i < off.ops.size(); ++i) {
+            CHECK_EQ(off.ops[i].op, on.ops[i].op);
+            CHECK_EQ(off.ops[i].reads.size(), on.ops[i].reads.size());
+            CHECK_EQ(off.ops[i].writes.size(), on.ops[i].writes.size());
+            CHECK_EQ(empty.ops[i].p.size(), off.ops[i].p.size());
+            const bool grow = off.ops[i].op == "mtp_tree_grow";
+            CHECK_EQ(on.ops[i].p.size(), off.ops[i].p.size() + (grow ? 3 : 0));   /* abs, rel, adapt */
+            if (grow) {
+                REQUIRE(param(&on.ops[i], "adapt") != nullptr);
+                CHECK(param(&off.ops[i], "adapt") == nullptr);
+                CHECK(param(&empty.ops[i], "adapt") == nullptr);
+            }
+        }
+        CHECK_EQ(off.drafter.proposal_score, (rad_buf)0);
+        CHECK_EQ(empty.drafter.proposal_score, (rad_buf)0);
+        if (W == 1) CHECK(on.drafter.proposal_score != 0);
+        else CHECK_EQ(on.drafter.proposal_score, (rad_buf)0);
+    }
 }
 
 /* Confidence pruning (--draft-tree-prune / -rel, RadBuildCtx::draft_tree_prune_*): the thresholds

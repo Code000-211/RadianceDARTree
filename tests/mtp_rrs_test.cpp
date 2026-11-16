@@ -29,7 +29,10 @@
 #include "rad_test.h"
 
 #include "rad_mtp_tree_rrs.h"
+#include "rad_mtp_traversal.h"
 #include "../plugin/spechub/spechub.h"
+#include "sched/ngram_tree.h"
+#include "rad_mtp_calib.h"
 
 #include <algorithm>
 #include <functional>
@@ -53,13 +56,15 @@ struct Law {
     int32_t qid[8];  float qval[8];                    /* the head's shortlist */
 };
 
+double g_sharp = 1.0;   /* the laws' inverse temperature: a peaked target (T = 0.7 and a top-p) is the engine's regime */
+
 Law law_at(uint64_t prefix_hash, double head_noise) {
     Law L;
     float lt[V], lq[V];
     for (int i = 0; i < V; ++i) {
-        lt[i] = (float)((H(prefix_hash * 131 + (uint64_t)i * 977 + 1) >> 40) % 3000) / 1000.0f - 1.5f;
+        lt[i] = (float)g_sharp * ((float)((H(prefix_hash * 131 + (uint64_t)i * 977 + 1) >> 40) % 3000) / 1000.0f - 1.5f);
         const float nz = (float)((H(prefix_hash * 257 + (uint64_t)i * 331 + 7) >> 40) % 3000) / 1000.0f - 1.5f;
-        lq[i] = 0.75f * lt[i] + (float)head_noise * nz;
+        lq[i] = 0.75f * lt[i] + (float)(head_noise * g_sharp) * nz;
     }
     const uint64_t h = H(prefix_hash + 99);
     const int drop = h % 3 == 0 ? (int)((h >> 8) % V) : -1;   /* a target token the filters removed */
@@ -81,8 +86,9 @@ Law law_at(uint64_t prefix_hash, double head_noise) {
  * coupled grower, which decide by slot priorities. `value_dep` is the NEGATIVE CONTROL: an
  * implementation that reads the drawn child's own q (it cuts a node's draft order at the first child
  * whose own q is below `vd_thr`, with everything after it), applied to the otherwise unpruned tree. */
-struct Prune { double abs = 0, rel = 0; bool value_dep = false; double vd_thr = 0; };
+struct Prune { double abs = 0, rel = 0; bool value_dep = false; double vd_thr = 0; RadMtpAdapt ad{}; };
 const Prune* g_pr = nullptr;
+int g_scheme = 0;   /* sibling scheme of the drafted trees: 0 Gumbel-top-k, m + 1 RheoSampling (--draft-siblings rheo) */
 double g_cut = 0, g_kids = 0;   /* bookkeeping: children cut / drafted, for the "it actually prunes" checks */
 
 uint64_t child_hash(uint64_t ph, int tok) { return H(ph * 1000003ull + (uint64_t)tok + 17); }
@@ -100,9 +106,20 @@ int sample_law(const Law& L, uint64_t seed, uint64_t pos, uint64_t key) {
     return last;
 }
 
+/* The draft law recipe under test (--draft-coupling-temp / -truncate): every draw carries it. The
+ * default is the legacy law. */
+struct LawRecipe { float scale = 0, top_p = 0; int top_k = 0; };
+LawRecipe g_recipe;
+
+/* The online word (RadMtpCoupleDraw::dpad_) per trial, cycled: a draft law that changes between
+ * steps, as the online controller's does. Empty = none. */
+std::vector<uint32_t> g_word_cycle;
+
 RadMtpCoupleDraw make_draw(uint64_t seed, uint64_t base) {
     RadMtpCoupleDraw d{};
     d.seed = seed; d.base = base; d.seq = 1; d.card = 0; d.mode = 1;
+    d.dscale = g_recipe.scale; d.dtop_p = g_recipe.top_p; d.dtop_k = g_recipe.top_k;
+    if (!g_word_cycle.empty()) d.dpad_ = g_word_cycle[(size_t)(rad_mtp_rrs_mix(seed * 7 + 3) % g_word_cycle.size())];
     return d;
 }
 
@@ -127,12 +144,16 @@ int verify(const RadMtpCoupleState& st, const Law& L, uint64_t seed, uint64_t po
 
 struct Tree {
     int      n = 0;                 /* nodes 1..n */
+    int      n_model = -1;          /* nodes past it are prompt-lookup grafts (-1: none) */
     int      tok[64] = {}, par[64] = {};
     uint64_t hash[64] = {};         /* the prefix hash of every node, node 0 the root */
     RadMtpCoupleState st[64] = {};  /* row k's coupled state (status 0: none) */
 };
 
 enum Kind { CHAIN, STAGE1, STAGE2, STAGE2B };
+
+/* The negative control of the graft: the coupled row sees the lookup's nodes as children too. */
+bool g_extras_visible = false;
 
 /* The negative control's pruning: at every node with several drafted children, cut the draft order
  * at the first child (past the first) whose OWN q, the law of the token it took, is below `thr`;
@@ -181,10 +202,12 @@ void draft_chain(Tree* t, uint64_t seed, uint64_t base, int R, int L, double noi
         c.st_round = RAD_MTP_COUPLE_STATE_WORDS; c.st_row = 0;
         c.round = r;
         c.leaves = r == 1 ? L : 0;
+        c.scheme = g_scheme;
         if (g_pr && !g_pr->value_dep) {
             RadMtpTreeCfg pc{};
             rad_mtp_tree_set_prune(&pc, g_pr->abs, g_pr->rel);
             c.prune = pc.prune; c.log_abs = pc.log_abs; c.log_rel = pc.log_rel;
+            c.ad = g_pr->ad; c.max_rounds = R;
         }
         rad_mtp_couple_propose_row(c, 0);
         t->st[r - 1] = rows[r - 1];
@@ -216,7 +239,7 @@ void draft_grow(Tree* t, uint64_t seed, uint64_t base, int W, int R, int N, doub
                 uint64_t h0 = 1) {
     RadMtpTreeCfg cfg{};
     cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = 0; cfg.sel_pitch = 0; cfg.pitch = N;
-    if (g_pr && !g_pr->value_dep) rad_mtp_tree_set_prune(&cfg, g_pr->abs, g_pr->rel);
+    if (g_pr && !g_pr->value_dep) { rad_mtp_tree_set_prune(&cfg, g_pr->abs, g_pr->rel); cfg.ad = g_pr->ad; }
     std::vector<int> st((size_t)rad_mtp_tree_state_words(N, W, R), 0);
     std::vector<RadMtpCoupleState> plane((size_t)N);
     const RadMtpCoupleDraw draw = make_draw(seed, base);
@@ -228,6 +251,7 @@ void draft_grow(Tree* t, uint64_t seed, uint64_t base, int W, int R, int N, doub
     cpl.st_seq = 0;
     cpl.rows = N;
     cpl.vocab = 1000;
+    cpl.scheme = g_scheme;
     int tok[64], par[64];
     uint64_t nodehash[64];
     nodehash[0] = h0;
@@ -278,6 +302,7 @@ int walk(const Tree& t, uint64_t seed, uint64_t n_out, double noise, int want, i
         int nk = 0;
         for (int j = cur + 1; j <= t.n; ++j) {
             if (t.par[j] != cur) continue;
+            if (t.n_model >= 0 && j > t.n_model && !g_extras_visible) continue;   /* Request::draft_extra */
             bool dup = false;
             for (int q = 0; q < nk; ++q) dup = dup || kid[q] == t.tok[j];
             if (!dup) kid[nk++] = t.tok[j];
@@ -289,7 +314,7 @@ int walk(const Tree& t, uint64_t seed, uint64_t n_out, double noise, int want, i
             if (kept > 0 && c.round == depth + 1 && c.x == kid[0]) {
                 RadMtpCoupleState b = c;
                 b.pos = rad_mtp_couple_verify_pos(n_out, depth + 1);
-                if (c.nkids >= 2) b.nkids = kept;
+                if (c.nkids >= 2 || c.scheme) b.nkids = kept;
                 y = verify(b, law, seed, pos, y);
             }
         }
@@ -363,6 +388,143 @@ Result run_kind(Kind kind, int trials, double noise,
         }
     }
     return { zscore(cnt3, e3, trials), acc / trials, zscore(cnt1, e1, trials) };
+}
+
+
+/* ------------------------------------------------------------------ traversal verification */
+
+/* The walk's view of a drafted toy tree: the bound states exactly as `walk` binds them. */
+struct TravTree {
+    const Tree& t;
+    double noise;
+    uint64_t seed, n_out;
+    Law laws[64];
+    RadMtpCoupleState bound[64];
+    bool has[64] = {};
+    int depth[64] = {};
+    TravTree(const Tree& tr, uint64_t sd, uint64_t no, double nz) : t(tr), noise(nz), seed(sd), n_out(no) {
+        depth[0] = 0;
+        for (int j = 0; j <= t.n; ++j) {
+            if (j > 0) depth[j] = depth[t.par[j]] + 1;
+            laws[j] = law_at(t.hash[j], noise);
+            const RadMtpCoupleState& c = t.st[j];
+            int32_t kid[64];
+            int nk = 0;
+            for (int q = j + 1; q <= t.n; ++q) {
+                if (t.par[q] != j) continue;
+                bool dup = false;
+                for (int z = 0; z < nk; ++z) dup = dup || kid[z] == t.tok[q];
+                if (!dup) kid[nk++] = t.tok[q];
+            }
+            if (nk > 0 && c.status == 1) {
+                const int kept = rad_mtp_rrs_prefix(c, kid, nk);
+                if (kept > 0 && c.round == depth[j] + 1 && c.x == kid[0]) {
+                    bound[j] = c;
+                    bound[j].pos = rad_mtp_couple_verify_pos(n_out, depth[j] + 1);
+                    if (c.nkids >= 2) bound[j].nkids = kept;
+                    has[j] = true;
+                }
+            }
+        }
+    }
+    const RadMtpCoupleState* state(int v) const { return has[v] ? &bound[v] : nullptr; }
+    bool cand(int v, const int32_t** ids, const float** val, int64_t* n) const {
+        *ids = laws[v].pid; *val = laws[v].pval; *n = laws[v].pn;
+        return true;
+    }
+    int child(int v, int32_t token) const {
+        for (int j = v + 1; j <= t.n; ++j)
+            if (t.par[j] == v && t.tok[j] == token) return j;
+        return -1;
+    }
+    int64_t vocab() const { return 1000; }
+};
+
+/* One step walked by traversal verification, then continued from the exact target. */
+int walk_trav(const Tree& t, uint64_t seed, uint64_t n_out, double noise, int want, int* out,
+              int* accepted, RadMtpTravOpt opt) {
+    TravTree T(t, seed, n_out, noise);
+    RadMtpTravOut o;
+    int len = 0;
+    *accepted = 0;
+    if (rad_mtp_trav_walk(T, 0, seed, n_out, &o, opt)) {
+        for (int i = 1; i < o.n; ++i) out[len++] = t.tok[o.node[i]];
+        *accepted = o.n - 1;
+        const int last = o.node[o.n - 1];
+        out[len++] = o.has_y ? o.y : sample_law(T.laws[last], seed, n_out + (uint64_t)(o.n - 1), 0);
+    } else {
+        out[len++] = sample_law(T.laws[0], seed, n_out, 0);
+    }
+    uint64_t ph = t.hash[0];
+    for (int i = 0; i < len; ++i) ph = child_hash(ph, out[i]);
+    while (len < want) {
+        const Law law = law_at(ph, noise);
+        const int y = sample_law(law, seed ^ 0xabcdef1234ull, n_out + (uint64_t)len, 1);
+        out[len++] = y;
+        ph = child_hash(ph, y);
+    }
+    return len;
+}
+
+Result run_trav(Kind kind, int trials, double noise, RadMtpTravOpt opt) {
+    std::vector<double> cnt3((size_t)V * V * V, 0), cnt1((size_t)V, 0);
+    double acc = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x1234567ull + (uint64_t)s * 7919ull;
+        Tree t;
+        if (kind == CHAIN)  draft_chain(&t, seed, 0, 3, 0, noise);
+        else if (kind == STAGE1) draft_chain(&t, seed, 0, 3, 3, noise);
+        else if (kind == STAGE2) draft_grow(&t, seed, 0, 2, 3, 7, noise);
+        else                draft_grow(&t, seed, 0, 3, 4, 12, noise);
+        int out[64], accepted = 0;
+        walk_trav(t, seed, 0, noise, 3, out, &accepted, opt);
+        ++cnt1[(size_t)out[0]];
+        ++cnt3[(size_t)((out[0] * V + out[1]) * V + out[2])];
+        acc += accepted;
+    }
+    std::vector<double> e1((size_t)V, 0), e3((size_t)V * V * V, 0);
+    const uint64_t h0 = 1;
+    const Law l0 = law_at(h0, noise);
+    for (int a = 0; a < V; ++a) {
+        e1[(size_t)a] = l0.p[a];
+        const Law l1 = law_at(child_hash(h0, a), noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(child_hash(h0, a), b), noise);
+            for (int c = 0; c < V; ++c) e3[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+    return { zscore(cnt3, e3, trials), acc / trials, zscore(cnt1, e1, trials) };
+}
+
+/* The first FOUR emitted tokens' joint: the fourth is the final token of a three-deep accepted path,
+ * drawn from the walk's residual law, which the three-token statistic never reads. */
+double run_trav4(Kind kind, int trials, double noise) {
+    std::vector<double> cnt((size_t)V * V * V * V, 0), ex((size_t)V * V * V * V, 0);
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x2468ace1ull + (uint64_t)s * 6151ull;
+        Tree t;
+        if (kind == CHAIN)  draft_chain(&t, seed, 0, 3, 0, noise);
+        else if (kind == STAGE1) draft_chain(&t, seed, 0, 3, 3, noise);
+        else if (kind == STAGE2) draft_grow(&t, seed, 0, 2, 3, 7, noise);
+        else                draft_grow(&t, seed, 0, 3, 4, 12, noise);
+        int out[64], accepted = 0;
+        walk_trav(t, seed, 0, noise, 4, out, &accepted, RadMtpTravOpt{});
+        ++cnt[(size_t)(((out[0] * V + out[1]) * V + out[2]) * V + out[3])];
+    }
+    const uint64_t h0 = 1;
+    const Law l0 = law_at(h0, noise);
+    for (int a = 0; a < V; ++a) {
+        const uint64_t ha = child_hash(h0, a); const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const uint64_t hb = child_hash(ha, b); const Law l2 = law_at(hb, noise);
+            for (int c = 0; c < V; ++c) {
+                const Law l3 = law_at(child_hash(hb, c), noise);
+                for (int d = 0; d < V; ++d)
+                    ex[(size_t)(((a * V + b) * V + c) * V + d)] = l0.p[a] * l1.p[b] * l2.p[c] * l3.p[d];
+            }
+        }
+    }
+    return zscore(cnt, ex, trials);
 }
 
 }  /* namespace */
@@ -545,7 +707,7 @@ TEST(the_slot_pruning_rule_reads_q_ranks_only) {
  * [1, 4) -- spanning the step boundaries, with token 0 and everything after marginalised -- and of
  * tokens [0, 3) must be the target's: this is what a draft or verify stream reused across steps
  * would break. */
-Result run_steps(Kind kind, int trials, double noise) {
+Result run_steps(Kind kind, int trials, double noise, bool trav = false) {
     const int want = 6;
     std::vector<double> cnt_a((size_t)V * V * V, 0), cnt_b((size_t)V * V * V, 0);
     double steps = 0;
@@ -560,7 +722,8 @@ Result run_steps(Kind kind, int trials, double noise) {
             else if (kind == STAGE2) draft_grow(&t, seed, (uint64_t)len, 2, 3, 7, noise, h);
             else                     draft_grow(&t, seed, (uint64_t)len, 3, 4, 12, noise, h);
             int step_out[64], accepted = 0;
-            const int n = walk(t, seed, (uint64_t)len, noise, 0, step_out, &accepted);
+            const int n = trav ? walk_trav(t, seed, (uint64_t)len, noise, 0, step_out, &accepted, RadMtpTravOpt{})
+                               : walk(t, seed, (uint64_t)len, noise, 0, step_out, &accepted);
             for (int i = 0; i < n; ++i) { out[len++] = step_out[i]; h = child_hash(h, step_out[i]); }
             ++steps;
         }
@@ -774,7 +937,6 @@ TEST(the_coupled_grower_creates_children_as_a_draft_order_prefix) {
     CHECK(plane[0].status == 0);
 }
 
-RAD_TEST_MAIN()
 
 /* Dynamic rows (DESIGN-dynrows.md): the verify carries only the first n nodes of the drafted tree
  * (a prediction from earlier steps, the chain's form, an inert tail cut). A suffix of a tree in node
@@ -891,3 +1053,1433 @@ TEST(binding_a_chain_form_row_by_token_alone_is_not_exact) {
     std::printf("  chain form bound by token alone (known wrong): z=%.1f\n", r.z);
     CHECK(r.z > 8.0);
 }
+
+/* ==================================================================== --draft-adaptive
+ * Cost-aware node selection and calibration (abi/rad_mtp_adapt.h, docs/DESIGN-adaptive.md). */
+
+static RadMtpAdapt make_adapt(double margin, const char* extra = "") {
+    RadMtpAdapt a;
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "on=1;margin=%g;%s", margin, extra);
+    CHECK(rad_mtp_adapt_parse(buf, &a));
+    return a;
+}
+
+TEST(the_adaptive_cost_model_and_admission_rule) {
+    RadMtpAdapt a;
+    CHECK(rad_mtp_adapt_parse("", &a));
+    CHECK(!a.on);
+    CHECK(rad_mtp_adapt_admit(&a, 5, 3.0f, 1e-9f));   /* off admits everything */
+    /* the profile default: 12.3 ms at 3 nodes (4 rows), +1.0 a node */
+    CHECK(rad_mtp_adapt_parse("on=1", &a));
+    CHECK(std::fabs(rad_mtp_adapt_cost(&a, 3) - 12.3f) < 1e-5f);
+    CHECK(std::fabs(rad_mtp_adapt_cost(&a, 7) - 16.3f) < 1e-5f);
+    /* a table: entries are the cost of 0,1,2.. nodes; a dip is raised, the tail extrapolates by the last slope */
+    CHECK(rad_mtp_adapt_parse("on=1;cost=8.4,9.4,10.0,9.0,12.0", &a));
+    CHECK_EQ(a.ncost, 5);
+    CHECK(std::fabs(rad_mtp_adapt_cost(&a, 0) - 8.4f) < 1e-5f);
+    CHECK(std::fabs(rad_mtp_adapt_cost(&a, 3) - 10.0f) < 1e-5f);
+    CHECK(std::fabs(rad_mtp_adapt_cost(&a, 4) - 12.0f) < 1e-5f);
+    CHECK(std::fabs(rad_mtp_adapt_cost(&a, 6) - 16.0f) < 1e-5f);
+    for (int k = 0; k < 12; ++k) CHECK(rad_mtp_adapt_cost(&a, k + 1) >= rad_mtp_adapt_cost(&a, k));
+    CHECK(!rad_mtp_adapt_parse("on=1;cost=1,x", &a));
+    /* non-finite numbers and lists longer than the tables are refused, not silently cut */
+    CHECK(!rad_mtp_adapt_parse("on=1;cost=1,nan", &a));
+    CHECK(!rad_mtp_adapt_parse("on=1;cost=1,inf", &a));
+    CHECK(!rad_mtp_adapt_parse("on=1;temp=nan", &a));
+    CHECK(!rad_mtp_adapt_parse("on=1;cost=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25", &a));
+    CHECK(rad_mtp_adapt_parse("on=1;cost=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24", &a));
+    /* the rule is the ratio test: p * T(k) > margin * E * dC */
+    CHECK(rad_mtp_adapt_parse("on=1;floor=1;draft=0;base=10;row=1;basek=0", &a));
+    /* k=2, E=2: T=12, dC=1: break-even p = E*dC/T = 1/6 */
+    CHECK(rad_mtp_adapt_admit(&a, 2, 2.0f, 0.17f));
+    CHECK(!rad_mtp_adapt_admit(&a, 2, 2.0f, 0.16f));
+    /* the floor is unconditional */
+    CHECK(rad_mtp_adapt_parse("on=1;floor=3;draft=0;base=10;row=1;basek=0", &a));
+    CHECK(rad_mtp_adapt_admit(&a, 2, 2.0f, 1e-6f));
+    CHECK(!rad_mtp_adapt_admit(&a, 3, 2.0f, 1e-6f));
+    /* a stricter margin admits a subset, and a likelier node never loses admission */
+    const RadMtpAdapt lo = make_adapt(0.5), hi = make_adapt(2.0);
+    for (int k = 1; k < 10; ++k)
+        for (float p = 0.01f; p < 1.0f; p += 0.01f) {
+            if (rad_mtp_adapt_admit(&hi, k, 1.0f + 0.3f * k, p))
+                CHECK(rad_mtp_adapt_admit(&lo, k, 1.0f + 0.3f * k, p));
+            if (rad_mtp_adapt_admit(&lo, k, 1.0f + 0.3f * k, p))
+                CHECK(rad_mtp_adapt_admit(&lo, k, 1.0f + 0.3f * k, p + 0.005f));
+        }
+    /* a flat cost (a verify that does not grow with rows) admits whatever has mass */
+    CHECK(rad_mtp_adapt_parse("on=1;cost=10,10,10,10,10,10;row=0", &a));
+    CHECK(rad_mtp_adapt_admit(&a, 2, 3.0f, 0.01f));
+}
+
+TEST(the_calibration_is_a_monotone_map_of_the_row) {
+    float lp[8], raw[8];
+    double z = 0;
+    const double w[8] = { 5, 3, 2, 1, 0.5, 0.2, 0.1, 0.05 };
+    for (int i = 0; i < 8; ++i) z += w[i];
+    for (int i = 0; i < 8; ++i) raw[i] = lp[i] = (float)std::log(w[i] / z);
+    RadMtpAdapt a;
+    CHECK(rad_mtp_adapt_parse("on=1;temp=1.5,1,0.8", &a));
+    CHECK_EQ(a.ntemp, 3);
+    CHECK(rad_mtp_adapt_temp(&a, 1) == 1.5f && rad_mtp_adapt_temp(&a, 2) == 1.0f);
+    CHECK(rad_mtp_adapt_temp(&a, 3) == 0.8f && rad_mtp_adapt_temp(&a, 9) == 0.8f);   /* the last repeats */
+    rad_mtp_adapt_recal(lp, 8, 1.5f);
+    double s = 0;
+    for (int i = 0; i < 8; ++i) { s += std::exp((double)lp[i]); if (i) CHECK(lp[i] <= lp[i - 1]); }
+    CHECK(std::fabs(s - 1.0) < 1e-5);
+    CHECK(std::exp((double)lp[0]) < std::exp((double)raw[0]));   /* T > 1 flattens the top */
+    rad_mtp_adapt_recal(lp, 8, 1.0f / 1.5f);                     /* and back */
+    for (int i = 0; i < 8; ++i) CHECK(std::fabs(lp[i] - raw[i]) < 1e-4f);
+    RadMtpAdapt off;
+    CHECK(rad_mtp_adapt_parse("", &off));
+    CHECK(rad_mtp_adapt_temp(&off, 1) == 1.0f);
+}
+
+/* The online fit: a head that predicts 0.8 for tokens accepted 50% of the time is overconfident and
+ * its temperature rises; an underconfident depth falls; a calibrated one stays. */
+TEST(the_online_calibrator_follows_over_and_underconfidence) {
+    RadMtpCalib c;
+    uint64_t r = 12345;
+    auto u = [&] { r = H(r); return (double)(r >> 11) / 9007199254740992.0; };
+    for (int round = 0; round < 40; ++round) {
+        for (int i = 0; i < 400; ++i) {
+            c.observe(1, 0.8, u() < 0.5);    /* overconfident */
+            c.observe(2, 0.3, u() < 0.6);    /* underconfident */
+            c.observe(3, 0.5, u() < 0.5);    /* calibrated */
+        }
+        c.refit();
+    }
+    CHECK(c.temp[0] > 1.3f);
+    CHECK(c.temp[1] < 0.8f);
+    CHECK(std::fabs(c.temp[2] - 1.0f) < 0.2f);
+    CHECK(c.temp[0] <= 3.0f && c.temp[1] >= 0.5f);
+    CHECK(c.temp[5] == 1.0f);   /* an unobserved depth keeps its temperature */
+}
+
+/* Grow a tree over a fixed head with a given cfg (uncoupled); the grower's state for inspection. */
+struct Grown { int active = 0, depth = 0, made = 0; int tok[64] = {}, par[64] = {}; };
+static Grown grow_plain(const RadMtpTreeCfg& base, int W, int R, int N) {
+    RadMtpTreeCfg cfg = base;
+    cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = 0; cfg.sel_pitch = 0; cfg.pitch = N;
+    std::vector<int> st((size_t)rad_mtp_tree_state_words(N, W, R), 0);
+    Grown g;
+    uint64_t nodehash[64];
+    nodehash[0] = 1;
+    for (int round = 1; round <= R; ++round) {
+        cfg.round = round;
+        const int nfront = round == 1 ? 1 : st[2];
+        std::vector<int32_t> d((size_t)W * 8, -1);
+        std::vector<float> v((size_t)W * 8, -INFINITY);
+        for (int w = 0; w < nfront && w < W; ++w) {
+            const int f = round == 1 ? 0 : st[4 + w];
+            const Law law = law_at(nodehash[f], 1.0);
+            for (int i = 0; i < 8; ++i) { d[(size_t)w * 8 + i] = law.qid[i]; v[(size_t)w * 8 + i] = law.qval[i]; }
+        }
+        CHECK_EQ(rad_mtp_tree_grow_seq(&cfg, st.data(), d.data(), v.data(), 0, 8, 1, 0, nullptr, g.tok, g.par,
+                                       nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr), 0);
+        const int* nd = st.data() + 4 + W;
+        for (int id = 1; id <= st[1]; ++id) nodehash[id] = child_hash(nodehash[nd[6 * id + 1]], nd[6 * id + 0]);
+    }
+    const int* nd = st.data() + 4 + W;
+    g.made = st[1];
+    for (int j = 1; j <= N; ++j)
+        if (g.tok[j - 1] >= 0) { ++g.active; g.depth = std::max(g.depth, nd[6 * j + 2]); }
+    return g;
+}
+
+TEST(the_adaptive_grower_is_off_bit_for_bit_and_shrinks_monotonically_in_the_margin) {
+    RadMtpTreeCfg off{};
+    const int N = 12, W = 3, R = 4;
+    CHECK_EQ(grow_plain(off, W, R, N).active, N);                  /* the full budget, as before */
+    /* a flat cost keeps everything */
+    RadMtpTreeCfg flat{};
+    CHECK(rad_mtp_adapt_parse("on=1;cost=10,10,10,10,10,10;row=0;draft=0", &flat.ad));
+    CHECK_EQ(grow_plain(flat, W, R, N).active, N);
+    int prev = N + 1, strictly = 0;
+    for (double m : { 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 100.0 }) {
+        RadMtpTreeCfg c{};
+        c.ad = make_adapt(m);
+        const int act = grow_plain(c, W, R, N).active;
+        std::printf("  margin %-6g -> %d active node(s)\n", m, act);
+        CHECK(act >= 1 && act <= N);
+        CHECK(act <= prev);
+        strictly += act < prev;
+        prev = act;
+    }
+    CHECK(strictly >= 2);
+    CHECK_EQ(prev, 1);   /* an impossibly strict margin degrades to the trunk's first node */
+    /* the floor keeps nodes whatever the rule says */
+    RadMtpTreeCfg fl{};
+    fl.ad = make_adapt(100.0, "floor=3");
+    CHECK_EQ(grow_plain(fl, W, R, N).active, 3);
+    /* the chain (width 1): its depth is cut by confidence, never past the rounds */
+    RadMtpTreeCfg ch{};
+    ch.ad = make_adapt(1.0);
+    const Grown cg = grow_plain(ch, 1, 5, 5);
+    CHECK(cg.active >= 1 && cg.active <= 5 && cg.depth >= 1 && cg.depth <= cg.active);
+    /* a sharper calibration (T < 1) never admits fewer nodes than a flatter one */
+    RadMtpTreeCfg sharp{}, soft{};
+    sharp.ad = make_adapt(1.0, "temp=0.6");
+    soft.ad = make_adapt(1.0, "temp=2.0");
+    CHECK(grow_plain(sharp, W, R, N).active >= grow_plain(soft, W, R, N).active);
+}
+
+/* The inert tail of an adaptive tree is what pruning's is: token -1, parent 0. */
+TEST(an_adaptive_tree_ends_in_inert_entries) {
+    RadMtpTreeCfg cfg{};
+    cfg.ad = make_adapt(8.0);
+    const int N = 10, W = 2, R = 4;
+    const Grown g = grow_plain(cfg, W, R, N);
+    CHECK(g.made >= 1 && g.made < N);
+    for (int j = 1; j <= N; ++j) {
+        if (j <= g.made) { CHECK(g.tok[j - 1] >= 0); CHECK(g.par[j - 1] < j); }
+        else { CHECK_EQ(g.tok[j - 1], -1); CHECK_EQ(g.par[j - 1], 0); }
+    }
+}
+
+/* Stage 1's leaves under the rule: a prefix of the descending slots, fewer under a stricter margin,
+ * the same for any permutation of the support. */
+TEST(the_stage1_leaf_rule_keeps_a_prefix) {
+    for (int s = 0; s < 300; ++s) {
+        const Law L = law_at(9000 + (uint64_t)s, 1.0);
+        RadMtpCoupleState st{};
+        CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &st));
+        RadMtpTreeCfg pc{};
+        pc.rounds = 3;
+        int prev = 8;
+        for (double m : { 0.3, 1.0, 3.0, 10.0 }) {
+            pc.ad = make_adapt(m);
+            const int k = rad_mtp_rrs_slot_keep_count(st, &pc, 4);
+            CHECK(k >= 1 && k <= 4);
+            CHECK(k <= prev);
+            prev = k;
+            RadMtpCoupleState sd = st;
+            sd.draw = make_draw(31 + (uint64_t)s, 0);
+            rad_mtp_rrs_draw(&sd, 0, k);
+            CHECK_EQ(sd.nkids, k);
+            RadMtpCoupleState sh = st;
+            for (int i = 7; i > 0; --i) {
+                const int j = (int)(H((uint64_t)s * 17 + (uint64_t)i) % (uint64_t)(i + 1));
+                std::swap(sh.ids[i], sh.ids[j]); std::swap(sh.q[i], sh.q[j]);
+            }
+            CHECK_EQ(rad_mtp_rrs_slot_keep_count(sh, &pc, 4), k);
+        }
+    }
+}
+
+/* LOSSLESS: coupling with adaptive shapes emits the target's law, in every drafter form, with and
+ * without calibration, beside the confidence pruning, and with a far head. */
+TEST(coupling_with_adaptive_selection_emits_the_target_law) {
+    const int trials = 300000;
+    struct Case { const char* name; Kind kind; Prune pr; int trials; double noise; };
+    Prune m1, m2, m3, cal, sharp;
+    m1.ad = make_adapt(1.0);
+    m2.ad = make_adapt(2.5);
+    m3.ad = make_adapt(0.6);
+    Prune l1, l2;
+    l1.ad = make_adapt(0.7);
+    l2.ad = make_adapt(0.85, "temp=1.4");
+    cal.ad = make_adapt(1.5, "temp=1.6,1.3,1.1");
+    sharp.ad = make_adapt(1.0, "temp=0.7");
+    Prune both = m2; both.abs = 0.05; both.rel = 0.3;   /* adaptive beside the confidence pruning */
+    const Case cases[] = {
+        { "stage1 m1",              STAGE1,  m1,    trials,     1.0 },
+        { "stage1 m2.5",            STAGE1,  m2,    trials,     1.0 },
+        { "stage1 cal",             STAGE1,  cal,   trials,     1.0 },
+        { "stage1 m0.7",            STAGE1,  l1,    trials,     1.0 },
+        { "stage1 m0.85 + calib",    STAGE1,  l2,    trials,     1.0 },
+        { "stage2 m1",              STAGE2,  m1,    trials,     1.0 },
+        { "stage2 m2.5",            STAGE2,  m2,    trials,     1.0 },
+        { "stage2 m0.6",            STAGE2,  m3,    trials,     1.0 },
+        { "stage2 cal",             STAGE2,  cal,   trials,     1.0 },
+        { "stage2b m1",             STAGE2B, m1,    trials / 2, 1.0 },
+        { "stage2b cal",            STAGE2B, cal,   trials / 2, 1.0 },
+        { "stage2 prune+adapt",     STAGE2,  both,  trials,     1.0 },
+        { "stage1 m2.5, far head",  STAGE1,  m2,    trials / 2, 3.0 },
+        { "stage2 sharp, far head", STAGE2,  sharp, trials / 2, 3.0 },
+    };
+    for (const Case& c : cases) {
+        double cf;
+        const Result r = run_pruned(c.kind, c.pr, c.trials, c.noise, &cf);
+        std::printf("  %-26s z=%.2f first=%.2f acc=%.3f cut=%.3f\n", c.name, r.z, r.first_z, r.mean_acc, cf);
+        CHECK(r.z < 4.5);
+        CHECK(r.first_z < 4.5);
+    }
+    /* the rule actually shapes the trees it is tested on (not a vacuous pass) */
+    double cf;
+    run_pruned(STAGE2, m2, 20000, 1.0, &cf);
+    CHECK(cf > 0.05 && cf < 0.95);
+    run_pruned(STAGE1, l1, 20000, 1.0, &cf);
+    CHECK(cf > 0.05 && cf < 0.95);
+}
+
+/* Adaptive shapes through the dynamic-rows cuts (a suffix of the tree). */
+TEST(adaptive_trees_cut_by_dynamic_rows_stay_exact) {
+    const int trials = 250000;
+    Prune m2;
+    m2.ad = make_adapt(2.0);
+    const std::function<void(Tree*, int)> c4 = [](Tree* t, int) { t->n = std::min(t->n, 4); };
+    g_pr = &m2;
+    for (Kind k : { STAGE2, STAGE2B, STAGE1 }) {
+        const Result r = run_kind(k, trials, 1.0, &c4);
+        std::printf("  kind=%d adaptive + rows cut at 4: z=%.2f first=%.2f acc=%.3f\n", (int)k, r.z,
+                    r.first_z, r.mean_acc);
+        CHECK(r.z < 4.5);
+        CHECK(r.first_z < 4.5);
+    }
+    g_pr = nullptr;
+}
+
+/* ------------------------------------------------------------------ prompt-lookup grafts
+ * (core/sched/ngram_tree.h, --draft-ngram-leaves). The graft's proposal is the target's own most
+ * likely continuation of the root, damaged at one position by a history hash: a function of the
+ * history, never of the coupled draw, as a lookup of the sequence's own text is. Extra nodes are
+ * followed by the walk when the row's emitted token is theirs; the coupled row sees only the model's
+ * children (n_model), so the emitted law stays the target's whatever the lookup proposes. */
+static int argmax_tok(const Law& L) {
+    int b = 0;
+    for (int i = 1; i < V; ++i) if (L.p[i] > L.p[b]) b = i;
+    return b;
+}
+
+static void graft(Tree* t, int s, int extra_room, int leaves, int how, double noise) {
+    int32_t prop[6];
+    uint64_t h = t->hash[0];
+    for (int i = 0; i < 4; ++i) {
+        const Law L = law_at(h, noise);
+        int tk = argmax_tok(L);
+        if (how == 1 && i == 0) tk = t->tok[1];                            /* the model's own first node */
+        if (how == 2 && i == 0) tk = (int)(H((uint64_t)s * 31 + 7) % V);   /* any token of the toy */
+        if (i == 2 && H((uint64_t)s * 977 + 3) % 3 == 0) tk = (tk + 1) % V;
+        prop[i] = tk;
+        h = child_hash(h, tk);
+    }
+    rad::NgramTreeCfg c;
+    c.leaves = leaves; c.min_match = 4; c.max_nodes = std::min(t->n + extra_room, 60); c.max_depth = 6;
+    int32_t tok[64], par[64];
+    for (int j = 1; j <= t->n; ++j) { tok[j - 1] = t->tok[j]; par[j - 1] = t->par[j]; }
+    /* the real nodes: a pruned grower's inert duplicates (a repeat of node 1 under the root) are free */
+    int act = t->n;
+    while (act > 1 && t->par[act] == 0 && t->tok[act] == t->tok[1]) --act;
+    const rad::NgramTreeOut o = rad::ngram_tree_merge(tok, par, t->n, act, prop, 4, 8, c);
+    if (o.added <= 0) return;
+    t->n = o.n;
+    t->n_model = o.n_model;
+    for (int j = 1; j <= t->n; ++j) {
+        t->tok[j] = tok[j - 1];
+        t->par[j] = par[j - 1];
+        t->hash[j] = child_hash(t->hash[t->par[j]], t->tok[j]);
+    }
+}
+
+TEST(a_tree_with_prompt_lookup_nodes_emits_the_target_law) {
+    const int trials = 300000;
+    const std::function<void(Tree*, int)> app = [](Tree* t, int s) { graft(t, s, 3, 3, 0, 1.0); };
+    const std::function<void(Tree*, int)> swap = [](Tree* t, int s) { graft(t, s, 0, 3, 0, 1.0); };
+    const std::function<void(Tree*, int)> own = [](Tree* t, int s) { graft(t, s, 3, 3, 1, 1.0); };
+    const std::function<void(Tree*, int)> any = [](Tree* t, int s) { graft(t, s, 2, 2, 2, 1.0); };
+    const struct { const char* name; Kind kind; const std::function<void(Tree*, int)>* hook; } cases[] = {
+        { "chain + graft", CHAIN, &app },         { "stage1 + graft", STAGE1, &app },
+        { "stage1 swap", STAGE1, &swap },         { "stage1 own first", STAGE1, &own },
+        { "stage2 + graft", STAGE2, &app },       { "stage2 swap", STAGE2, &swap },
+        { "stage2 any token", STAGE2, &any },     { "stage2b swap", STAGE2B, &swap },
+        { "stage2b own first", STAGE2B, &own },
+    };
+    const Prune ab{ 0.07, 0.4 };
+    for (int pruned = 0; pruned < 2; ++pruned) {
+        g_pr = pruned ? &ab : nullptr;
+        for (const auto& c : cases) {
+            const Result base = run_kind(c.kind, trials, 1.0, nullptr);
+            const Result r = run_kind(c.kind, trials, 1.0, c.hook);
+            std::printf("  %-18s pruned=%d z=%.2f first=%.2f acc=%.3f (without %.3f)\n", c.name, pruned,
+                        r.z, r.first_z, r.mean_acc, base.mean_acc);
+            CHECK(r.z < 4.5);
+            CHECK(r.first_z < 4.5);
+        }
+    }
+    g_pr = nullptr;
+}
+
+
+/* Traversal verification (--draft-verify traversal, abi/rad_mtp_traversal.h): the same trees,
+ * decided bottom-up per path. Exact for every tree kind; accepts at least as much as the row-wise
+ * recursion; each plausible mistake fails the statistic. */
+TEST(traversal_verification_emits_the_target_law_and_accepts_more) {
+    const int trials = 200000;
+    const RadMtpTravOpt ok{};
+    const Result chain = run_trav(CHAIN, trials, 1.0, ok);
+    const Result s1    = run_trav(STAGE1, trials, 1.0, ok);
+    const Result s2    = run_trav(STAGE2, trials, 1.0, ok);
+    const Result s2b   = run_trav(STAGE2B, trials, 1.0, ok);
+    const Result rchain = run_kind(CHAIN, trials, 1.0);
+    const Result rs2    = run_kind(STAGE2, trials, 1.0);
+    std::printf("  traversal chain z=%.2f acc=%.3f (rowwise %.3f) | stage1 z=%.2f acc=%.3f | "
+                "stage2 z=%.2f acc=%.3f (rowwise %.3f) | stage2b z=%.2f acc=%.3f\n",
+                chain.z, chain.mean_acc, rchain.mean_acc, s1.z, s1.mean_acc, s2.z, s2.mean_acc,
+                rs2.mean_acc, s2b.z, s2b.mean_acc);
+    CHECK(chain.z < 4.5); CHECK(chain.first_z < 4.5);
+    CHECK(s1.z < 4.5);    CHECK(s1.first_z < 4.5);
+    CHECK(s2.z < 4.5);    CHECK(s2.first_z < 4.5);
+    CHECK(s2b.z < 4.5);   CHECK(s2b.first_z < 4.5);
+    CHECK(chain.mean_acc > rchain.mean_acc);
+    CHECK(s2.mean_acc > rs2.mean_acc);
+    const Result far = run_trav(STAGE2, 100000, 3.0, ok);
+    CHECK(far.z < 4.5);
+}
+
+TEST(traversal_verification_mistakes_are_not_exact) {
+    for (int ctl = 1; ctl <= 3; ++ctl) {
+        RadMtpTravOpt o; o.ctl = ctl;
+        const Result r = run_trav(STAGE2, 100000, 1.0, o);
+        std::printf("  negative control %d: z=%.2f first_z=%.2f\n", ctl, r.z, r.first_z);
+        CHECK(r.z > 20.0 || r.first_z > 20.0);
+    }
+}
+
+/* The review's additions: the walk's final token (the fourth of a three-deep path), a generation
+ * over several steps (no uniform reused across steps), confidence pruning, and the value-dependent
+ * pruning negative control, all through the traversal walk. */
+TEST(traversal_verification_final_token_and_steps_are_exact) {
+    const Kind kinds[] = { CHAIN, STAGE1, STAGE2, STAGE2B };
+    const char* names[] = { "chain", "stage1", "stage2", "stage2b" };
+    for (int k = 0; k < 4; ++k) {
+        const double z4 = run_trav4(kinds[k], 300000, 1.0);
+        const Result r = run_steps(kinds[k], 100000, 1.0, true);
+        std::printf("  trav %-8s z4=%.2f steps=%.3f z[0..3)=%.2f z[1..4)=%.2f\n", names[k], z4, r.mean_acc, r.z, r.first_z);
+        CHECK(z4 < 4.5);
+        CHECK(r.z < 4.5);
+        CHECK(r.first_z < 4.5);
+    }
+}
+
+TEST(traversal_verification_with_confidence_pruning_is_exact) {
+    const int trials = 200000;
+    const Prune a{ 0.12, 0.0 }, b{ 0.0, 0.17 }, ab{ 0.07, 0.4 };
+    struct Case { Kind k; Prune p; };
+    const Case cases[] = { { STAGE1, a }, { STAGE1, b }, { STAGE2, ab }, { STAGE2B, Prune{ 0.2, 0.17 } },
+                           { STAGE2, Prune{ 0.99, 1.0 } } };
+    for (const Case& cs : cases) {
+        g_pr = &cs.p; g_cut = g_kids = 0;
+        const Result r = run_trav(cs.k, trials, 1.0, RadMtpTravOpt{});
+        g_pr = nullptr;
+        std::printf("  trav pruned kind=%d z=%.2f first=%.2f acc=%.3f cut=%.3f\n", (int)cs.k, r.z, r.first_z, r.mean_acc, g_kids > 0 ? g_cut / g_kids : 0.0);
+        CHECK(r.z < 4.5); CHECK(r.first_z < 4.5);
+        CHECK(g_cut > 0);
+    }
+    Prune v; v.value_dep = true; v.vd_thr = 0.09;
+    for (Kind k : { STAGE1, STAGE2 }) {
+        g_pr = &v; g_cut = g_kids = 0;
+        const Result r = run_trav(k, trials, 1.0, RadMtpTravOpt{});
+        g_pr = nullptr;
+        std::printf("  trav value-dependent pruning kind=%d z=%.1f first=%.1f (known wrong)\n", (int)k, r.z, r.first_z);
+        CHECK(g_cut > 0);
+        CHECK(std::max(r.z, r.first_z) > 20.0);
+    }
+}
+
+/* Peaked laws: the target's inverse temperature 3 (a few tokens carry the mass, the acceptance
+ * ratios sit at or above one on the trunk), where a cap or rounding at p = 1 would show. */
+TEST(traversal_verification_is_exact_on_peaked_laws) {
+    const double old = g_sharp;
+    for (double sh : { 3.0, 6.0 }) {
+        g_sharp = sh;
+        for (Kind k : { CHAIN, STAGE2, STAGE2B }) {
+            const Result r = run_trav(k, 150000, 1.0, RadMtpTravOpt{});
+            const double z4 = run_trav4(k, 200000, 1.0);
+            std::printf("  trav sharp=%.0f kind=%d z=%.2f first=%.2f z4=%.2f acc=%.3f\n", sh, (int)k, r.z, r.first_z, z4, r.mean_acc);
+            CHECK(r.z < 4.5); CHECK(r.first_z < 4.5); CHECK(z4 < 4.5);
+        }
+    }
+    g_sharp = old;
+}
+
+/* A lookup node under a coupled row whose own child was displaced: the row keeps its bound state
+ * (x = the displaced child's draw) and the lookup's one node hangs below it carrying the target's
+ * most likely token. Hidden from the coupled row (Request::draft_extra) the verify is exact; read as
+ * the row's child, the token that equals x selects the row's coupling by the draw's value and the
+ * emitted law is no longer the target's. */
+static void pin_under_row2(Tree* t, int) {
+    const int d = argmax_tok(law_at(t->hash[2], 1.0));
+    t->n = 3;                                   /* nodes 1, 2 and the lookup's: node 3 is replaced */
+    t->tok[3] = d; t->par[3] = 2;
+    t->hash[3] = child_hash(t->hash[2], d);
+    t->n_model = 2;
+}
+
+TEST(a_lookup_node_under_a_coupled_row_stays_exact_only_while_hidden_from_it) {
+    const std::function<void(Tree*, int)> pin = [](Tree* t, int s) { pin_under_row2(t, s); };
+    for (Kind k : { CHAIN, STAGE1 }) {
+        g_extras_visible = false;
+        const Result ok = run_kind(k, 400000, 1.0, &pin);
+        std::printf("  pinned lookup node, hidden, kind %d: z=%.2f first=%.2f\n", (int)k, ok.z, ok.first_z);
+        CHECK(ok.z < 4.5);
+        CHECK(ok.first_z < 4.5);
+    }
+    double worst = 0;
+    g_extras_visible = true;
+    for (Kind k : { CHAIN, STAGE1 }) {
+        const Result r = run_kind(k, 400000, 1.0, &pin);
+        std::printf("  pinned lookup node, visible to the coupled row (known wrong), kind %d: z=%.1f first=%.1f\n",
+                    (int)k, r.z, r.first_z);
+        worst = std::max(worst, std::max(r.z, r.first_z));
+    }
+    g_extras_visible = false;
+    CHECK(worst > 8.0);
+}
+
+/* ------------------------------------------------------------------ the draft law's recipe
+ *
+ * rad_mtp_couple_build_law: the draft temperature (dscale = 1 / T_draft) and the request's top-k /
+ * top-p cut change WHICH Q the head drafts from, never the verify's exactness, because the state
+ * stores the Q that was drawn from and the verify reads it. */
+
+TEST(a_zero_recipe_is_the_legacy_law_bit_for_bit) {
+    for (int s = 0; s < 200; ++s) {
+        const Law L = law_at(9000 + (uint64_t)s, 1.0);
+        RadMtpCoupleState a{}, b{};
+        CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &a));
+        RadMtpCoupleDraw d{};
+        CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &b));
+        CHECK(!std::memcmp(a.ids, b.ids, sizeof a.ids) && !std::memcmp(a.q, b.q, sizeof a.q));
+        d.dscale = 1.0f;   /* an explicit T 1 is the same */
+        RadMtpCoupleState c{};
+        CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &c));
+        CHECK(!std::memcmp(a.q, c.q, sizeof a.q));
+    }
+}
+
+TEST(the_draft_temperature_scales_the_scores_before_the_softmax) {
+    for (int s = 0; s < 200; ++s) {
+        const Law L = law_at(9100 + (uint64_t)s, 1.0);
+        for (float T : { 0.5f, 0.7f, 1.3f, 2.0f }) {
+            RadMtpCoupleDraw d{};
+            d.dscale = 1.0f / T;
+            RadMtpCoupleState st{};
+            CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &st));
+            CHECK(rad_mtp_couple_state_valid([&] { RadMtpCoupleState v = st; v.draw.mode = 1; v.status = 1;
+                                                  v.round = 1; v.x = v.ids[0]; return v; }(), 1000));
+            double z = 0, w[8];
+            for (int i = 0; i < 8; ++i) { w[i] = std::exp((double)L.qval[i] * (double)d.dscale); z += w[i]; }
+            for (int k = 0; k < st.count; ++k) {
+                int i = 0;
+                while (L.qid[i] != st.ids[k]) ++i;
+                CHECK(std::fabs(st.q[k] - w[i] / z) < 1e-6);
+            }
+            /* a sharper draft law (T < 1) has more mass on its mode */
+            RadMtpCoupleState one{};
+            rad_mtp_couple_build_q(L.qid, L.qval, 1000, &one);
+            double m1 = 0, mT = 0;
+            for (int k = 0; k < one.count; ++k) m1 = std::max(m1, one.q[k]);
+            for (int k = 0; k < st.count; ++k) mT = std::max(mT, st.q[k]);
+            if (T < 1.0f) CHECK(mT >= m1 - 1e-12);
+            if (T > 1.0f) CHECK(mT <= m1 + 1e-12);
+        }
+    }
+}
+
+TEST(top_k_and_top_p_cut_the_draft_law_by_value_not_by_position) {
+    for (int s = 0; s < 300; ++s) {
+        const Law L = law_at(9200 + (uint64_t)s, 1.0);
+        for (int k : { 1, 2, 3, 5 }) {
+            RadMtpCoupleDraw d{};
+            d.dscale = 1.0f / 0.7f; d.dtop_k = k;
+            RadMtpCoupleState st{};
+            CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &st));
+            CHECK(st.count <= k && st.count >= 1);
+            /* the survivors are the k largest scores */
+            float kth = -INFINITY;
+            std::vector<float> v(L.qval, L.qval + 8);
+            std::sort(v.begin(), v.end(), std::greater<float>());
+            kth = v[(size_t)k - 1];
+            for (int j = 0; j < st.count; ++j) {
+                int i = 0;
+                while (L.qid[i] != st.ids[j]) ++i;
+                CHECK(L.qval[i] >= kth);
+            }
+            /* the shortlist's order does not matter */
+            int32_t id2[8]; float v2[8];
+            for (int i = 0; i < 8; ++i) { id2[i] = L.qid[7 - i]; v2[i] = L.qval[7 - i]; }
+            RadMtpCoupleState sh{};
+            CHECK(rad_mtp_couple_build_law(id2, v2, 1000, d, &sh));
+            CHECK_EQ(sh.count, st.count);
+            for (int j = 0; j < st.count; ++j) {
+                int m = 0;
+                while (m < sh.count && sh.ids[m] != st.ids[j]) ++m;
+                CHECK(m < sh.count);
+                CHECK(std::fabs(sh.q[m] - st.q[j]) < 1e-12);
+            }
+        }
+        for (float p : { 0.3f, 0.6f, 0.9f, 0.95f }) {
+            RadMtpCoupleDraw d{};
+            d.dscale = 1.0f / 0.7f; d.dtop_p = p;
+            RadMtpCoupleState st{}, full{};
+            CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &st));
+            RadMtpCoupleDraw d0{}; d0.dscale = d.dscale;
+            CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d0, &full));
+            /* the kept set is the smallest top prefix of the scaled law with mass >= p, renormalised */
+            std::vector<double> qs;
+            for (int k = 0; k < full.count; ++k) qs.push_back(full.q[k]);
+            std::sort(qs.begin(), qs.end(), std::greater<double>());
+            double cum = 0;
+            int need = 0;
+            while (need < (int)qs.size()) { cum += qs[(size_t)need++]; if (cum >= (double)p) break; }
+            CHECK_EQ(st.count, need);
+            double tot = 0;
+            for (int k = 0; k < st.count; ++k) tot += st.q[k];
+            CHECK(std::fabs(tot - 1.0) < 1e-12);
+        }
+    }
+    /* non-finite scores are build_q's to refuse, with or without a cut */
+    const Law L = law_at(9300, 1.0);
+    float bad[8];
+    std::memcpy(bad, L.qval, sizeof bad);
+    bad[3] = NAN;
+    RadMtpCoupleDraw d{};
+    d.dscale = 2.0f; d.dtop_k = 2; d.dtop_p = 0.5f;
+    RadMtpCoupleState st{};
+    CHECK(!rad_mtp_couple_build_law(L.qid, bad, 1000, d, &st));
+}
+
+/* THE EXACTNESS HOLDS FOR EVERY RECIPE. A chain, a stage-1 tree and a stage-2 tree drafted from a
+ * temperature-scaled and truncated Q (the real propose row and the real coupled grower, the real
+ * verify) emit the target's law, for a head near and far from the target. The acceptance moves with
+ * the recipe -- that is what the flags tune. */
+TEST(every_draft_law_recipe_emits_the_target_law) {
+    const struct { const char* name; LawRecipe r; } recipes[] = {
+        { "T0.5",           { 2.0f, 0, 0 } },
+        { "T0.7",           { 1.0f / 0.7f, 0, 0 } },
+        { "T1.5",           { 1.0f / 1.5f, 0, 0 } },
+        { "T0.7 k3",        { 1.0f / 0.7f, 0, 3 } },
+        { "T1.0 p0.8",      { 1.0f, 0.8f, 0 } },
+        { "T0.7 k4 p0.9",   { 1.0f / 0.7f, 0.9f, 4 } },
+        { "k1 (a point)",   { 0, 0, 1 } },
+    };
+    const int trials = 200000;
+    for (const auto& rc : recipes) {
+        g_recipe = rc.r;
+        const Result chain = run_kind(CHAIN, trials, 1.0);
+        const Result s1    = run_kind(STAGE1, trials, 1.0);
+        const Result s2    = run_kind(STAGE2, trials, 1.0);
+        const Result far   = run_kind(STAGE1, trials / 2, 3.0);
+        std::printf("  %-14s chain z=%.2f acc=%.3f | stage1 z=%.2f acc=%.3f | stage2 z=%.2f acc=%.3f | far z=%.2f\n",
+                    rc.name, chain.z, chain.mean_acc, s1.z, s1.mean_acc, s2.z, s2.mean_acc, far.z);
+        CHECK(chain.z < 4.5 && chain.first_z < 4.5);
+        CHECK(s1.z < 4.5 && s1.first_z < 4.5);
+        CHECK(s2.z < 4.5 && s2.first_z < 4.5);
+        CHECK(far.z < 4.5 && far.first_z < 4.5);
+    }
+    /* with pruning too: the slot rule reads the recipe's Q only */
+    g_recipe = { 1.0f / 0.7f, 0.9f, 4 };
+    const Prune ab{ 0.07, 0.4 };
+    double cf;
+    const Result p1 = run_pruned(STAGE1, ab, trials, 1.0, &cf);
+    const Result p2 = run_pruned(STAGE2, ab, trials, 1.0, &cf);
+    CHECK(p1.z < 4.5 && p1.first_z < 4.5);
+    CHECK(p2.z < 4.5 && p2.first_z < 4.5);
+    g_recipe = LawRecipe{};
+}
+
+/* A draft law that is far too sharp (a point at T -> 0) or flat still verifies exactly, and the
+ * acceptance of a chain whose head is the target's own sharpened law is higher drafted at the
+ * target's temperature than at 1. The toy target is T 1; its head is 0.75 x the target's scores, so
+ * a draft scaled by 1 / 0.75 recovers the target's law and accepts more than the legacy T1. */
+TEST(drafting_at_the_matching_temperature_accepts_more) {
+    const int trials = 200000;
+    g_recipe = LawRecipe{};
+    const Result base = run_kind(CHAIN, trials, 0.0);
+    g_recipe.scale = 1.0f / 0.75f;
+    const Result match = run_kind(CHAIN, trials, 0.0);
+    g_recipe = LawRecipe{};
+    std::printf("  head = 0.75 x target: legacy acc=%.3f, matched acc=%.3f\n", base.mean_acc, match.mean_acc);
+    CHECK(base.z < 4.5 && match.z < 4.5);
+    CHECK(match.mean_acc > base.mean_acc);
+}
+
+/* NEGATIVE CONTROL for the recipe. The drafts are drawn from the recipe's Q but the verify is handed
+ * the LEGACY Q (the T1 softmax of the shortlist) in the state, i.e. a build that tuned the draft law
+ * without storing it. That is the one way a recipe can break exactness, and the same chi-square
+ * statistic must see it. (A chain: no sibling order to disagree with, so the state binds.) */
+TEST(verifying_against_a_q_other_than_the_one_drafted_from_is_not_exact) {
+    const std::function<void(Tree*, int)> legacy_q = [](Tree* t, int) {
+        for (int k = 0; k <= t->n; ++k) {
+            RadMtpCoupleState& s = t->st[k];
+            if (s.status != 1) continue;
+            const Law L = law_at(t->hash[k], 1.0);
+            RadMtpCoupleState leg{};
+            if (!rad_mtp_couple_build_q(L.qid, L.qval, 1000, &leg)) continue;
+            /* keep the drawn token first, as a bound row requires */
+            std::memcpy(s.ids, leg.ids, sizeof s.ids);
+            std::memcpy(s.q, leg.q, sizeof s.q);
+            s.count = leg.count;
+            int at = -1;
+            for (int i = 0; i < s.count; ++i) if (s.ids[i] == s.x) at = i;
+            if (at > 0) { std::swap(s.ids[0], s.ids[at]); std::swap(s.q[0], s.q[at]); }
+        }
+    };
+    const struct { const char* name; LawRecipe r; } recipes[] = {
+        { "T0.5", { 2.0f, 0, 0 } }, { "k1", { 0, 0, 1 } }, { "T0.7 p0.8", { 1.0f / 0.7f, 0.8f, 0 } },
+    };
+    for (const auto& rc : recipes) {
+        g_recipe = rc.r;
+        const Result ok  = run_kind(CHAIN, 300000, 1.0);
+        const Result bad = run_kind(CHAIN, 300000, 1.0, &legacy_q);
+        std::printf("  %-10s stored Q z=%.2f | legacy Q in the state (known wrong) z=%.1f\n", rc.name, ok.z, bad.z);
+        CHECK(ok.z < 4.5);
+        CHECK(bad.z > 8.0);
+    }
+    g_recipe = LawRecipe{};
+}
+
+/* A recipe never reaches a row that is not coupled: a zero recipe next to a hostile one on the same
+ * shortlist, a degenerate scale (inf, NaN, negative) falls back or is refused, never a crash or a Q
+ * that sums wrong. */
+TEST(hostile_recipe_values_give_a_valid_q_or_a_refusal) {
+    const Law L = law_at(9400, 1.0);
+    const float scales[] = { INFINITY, -INFINITY, NAN, -1.0f, 0.0f, 1e-30f, 1e30f, 3e38f };
+    for (float sc : scales)
+        for (float tp : { -1.0f, 0.0f, 0.5f, 1.0f, 2.0f, NAN })
+            for (int tk : { -5, 0, 1, 8, 100 }) {
+                RadMtpCoupleDraw d{};
+                d.dscale = sc; d.dtop_p = tp; d.dtop_k = tk;
+                RadMtpCoupleState st{};
+                const bool ok = rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &st);
+                if (!ok) { CHECK(st.count == 0); continue; }
+                double tot = 0;
+                for (int k = 0; k < st.count; ++k) { CHECK(st.q[k] > 0 && st.q[k] <= 1.0); tot += st.q[k]; }
+                CHECK(std::fabs(tot - 1.0) < 1e-9);
+            }
+}
+/* ====================================================================================================
+ * RheoSampling siblings (--draft-siblings rheo, abi/rad_mtp_rrs.h): the top-m tokens of Q plus ONE
+ * drawn from the tail law Qt = Q / z outside them, verified by the greedy multi-draft verifier.
+ *
+ * The law of a node is computed EXACTLY, not sampled: the tail child's draw is an inverse CDF of one
+ * uniform and the verify reads two (accept, residual), so each is a step function of its uniform;
+ * the test finds every step by bisection on the real code (to 1e-16) and sums the interval lengths
+ * with the draw's own weights. What comes out must be P, whatever (P, Q) and however many of the
+ * node's slots exist.
+ * ================================================================================================== */
+namespace {
+
+constexpr int SV = 8;   /* toy vocab bound: tokens 0 .. V-1 with V <= 6 here */
+
+struct SLaw {
+    int     V = 0;
+    int32_t pid[SV];  float pval[SV];  int pn = 0;   /* the target's candidate plane (its nucleus) */
+    double  p[SV] = {};                              /* its exact law over tokens 0 .. V-1 */
+    int32_t qid[8];   float qval[8];                 /* the head's shortlist, holes = -1 / -inf */
+};
+
+/* A target over `psup` of the V tokens (the others have no candidate, as after top-p) and a head over
+ * `qsup` of them, independently chosen: the supports may differ, nest or be disjoint. */
+SLaw small_law(uint64_t h, int V, int qsup, int psup, double qspread = 1.0) {
+    SLaw L;
+    L.V = V;
+    int perm[SV], perm2[SV];
+    for (int i = 0; i < V; ++i) { perm[i] = i; perm2[i] = i; }
+    for (int i = V - 1; i > 0; --i) {
+        std::swap(perm[i], perm[(int)(H(h * 31 + (uint64_t)i) % (uint64_t)(i + 1))]);
+        std::swap(perm2[i], perm2[(int)(H(h * 37 + 5 + (uint64_t)i) % (uint64_t)(i + 1))]);
+    }
+    double z = 0;
+    for (int j = 0; j < psup; ++j) {
+        const float lg = (float)((H(h * 131 + (uint64_t)j * 977 + 1) >> 40) % 4000) / 1000.0f - 2.0f;
+        L.pid[L.pn] = perm[j]; L.pval[L.pn++] = lg;
+    }
+    for (int j = 0; j < L.pn; ++j) z += std::exp((double)L.pval[j]);
+    for (int j = 0; j < L.pn; ++j) L.p[L.pid[j]] = std::exp((double)L.pval[j]) / z;
+    for (int i = 0; i < 8; ++i) { L.qid[i] = -1; L.qval[i] = -INFINITY; }
+    for (int j = 0; j < qsup; ++j) {
+        L.qid[j] = perm2[j];
+        L.qval[j] = (float)(qspread * (((H(h * 257 + (uint64_t)j * 331 + 7) >> 40) % 4000) / 1000.0 - 2.0));
+    }
+    return L;
+}
+
+/* The step function f(u), u in [0, 1): its pieces (token, length) in order, found by bisection. */
+std::vector<std::pair<int, double>> pieces(const std::function<int(double)>& f) {
+    std::vector<std::pair<int, double>> out;
+    double lo = 0;
+    const double last = 1.0 - 0x1p-53;
+    while (lo < 1) {
+        const int t = f(lo);
+        double b = 1.0;
+        if (f(last) != t) {
+            double a = lo, bb = last;
+            for (int it = 0; it < 80; ++it) {
+                const double mid = 0.5 * (a + bb);
+                if (f(mid) == t) a = mid; else bb = mid;
+            }
+            b = bb;
+        }
+        out.emplace_back(t, b - lo);
+        if (b >= 1.0) break;
+        lo = b;
+    }
+    return out;
+}
+
+struct Branch { double w; RadMtpCoupleState st; double law[SV]; double hit; };
+
+int decide_u(const RadMtpCoupleState& s, const SLaw& L, double ua, double ur) {
+    int32_t out = -7;
+    CHECK(rad_mtp_rrs_decide_rheo_u(s, L.pid, L.pval, L.pn, 1000, ua, ur, &out));
+    return out;
+}
+
+/* The node's exact output law, branch by branch of the tail child: weight, state, the law of the
+ * emitted token, the probability that it is one of the node's children. nkids is a function of Q's
+ * slots only (here a plain number). */
+std::vector<Branch> rheo_node(const SLaw& L, int m, int nkids) {
+    std::vector<Branch> out;
+    RadMtpCoupleState s0{};
+    CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &s0));
+    s0.draw = make_draw(77, 3); s0.status = 1; s0.round = 1; s0.pos = 5;
+    auto drawn = [&](double ut) { RadMtpCoupleState s = s0; rad_mtp_rrs_draw_rheo_u(&s, ut, nkids, m); return s; };
+    const bool has_tail = s0.count > m;
+    std::vector<std::pair<int, double>> tail_piece;
+    if (has_tail) tail_piece = pieces([&](double ut) { return (int)drawn(ut).ids[m]; });
+    const int nb = has_tail ? (int)tail_piece.size() : 1;
+    double lo = 0;
+    for (int bi = 0; bi < nb; ++bi) {
+        Branch br{};
+        const double len = has_tail ? tail_piece[(size_t)bi].second : 1.0;
+        br.w = len;
+        br.st = drawn(has_tail ? lo + 0.5 * len : 0.5);
+        lo += len;
+        const RadMtpCoupleState& s = br.st;
+        CHECK(rad_mtp_couple_state_valid(s, 1000));
+        const int nt = std::min(m, s.count);
+        const bool tail = s.count > nt && s.nkids > nt;
+        double A = 0;
+        std::vector<std::pair<int, double>> res;
+        if (tail) {
+            const auto pa = pieces([&](double ua) { return decide_u(s, L, ua, 0.5); });
+            for (auto& pc : pa) if (pc.first == s.ids[nt]) A += pc.second;
+            res = pieces([&](double ur) { return decide_u(s, L, 1.0 - 0x1p-53, ur); });
+            br.law[s.ids[nt]] += A;
+        } else {
+            res = pieces([&](double ur) { return decide_u(s, L, 0.5, ur); });
+        }
+        for (auto& pc : res) {
+            CHECK(pc.first >= 0 && pc.first < SV);
+            br.law[pc.first] += (1.0 - A) * pc.second;
+        }
+        for (int k = 0; k < s.nkids; ++k) br.hit += br.law[s.ids[k]];
+        out.push_back(br);
+    }
+    return out;
+}
+
+/* Thm 8's expected node acceptance for the first `nkids` slots of (P, Q, m): sum_T P + sum_tail
+ * min(P, Qt) with the tail slot present, else the P mass of the top-q slots present. */
+double thm8_hit(const SLaw& L, int m, int nkids, const RadMtpCoupleState& q0) {
+    int ord[8];
+    for (int i = 0; i < q0.count; ++i) ord[i] = i;
+    std::stable_sort(ord, ord + q0.count, [&](int a, int b) { return q0.q[a] > q0.q[b]; });
+    const int nt = std::min(m, q0.count);
+    double want = 0, z = 0;
+    for (int i = nt; i < q0.count; ++i) z += q0.q[ord[i]];
+    if (q0.count > nt && nkids > nt) {
+        for (int i = 0; i < nt; ++i) want += L.p[q0.ids[ord[i]]];
+        for (int i = nt; i < q0.count; ++i)
+            want += std::min(L.p[q0.ids[ord[i]]], q0.q[ord[i]] / (nt == 0 ? 1.0 : z));
+    } else {
+        for (int i = 0; i < std::min(nkids, nt); ++i) want += L.p[q0.ids[ord[i]]];
+    }
+    return want;
+}
+
+}  /* namespace */
+
+/* (1) The node's law is P, exactly: V = 4 and 5, m = 0..3, every number of present slots (nkids from
+ * "only the first top-q token" up to the whole m + 1, the last being the tail child; a smaller nkids
+ * is a tail slot that was pruned or cut), P with a nucleus (zeros outside it), Q with a smaller
+ * support than P's, P's and Q's supports disjoint. */
+TEST(rheo_siblings_one_node_law_is_exactly_the_target) {
+    double worst = 0, worst_hit = 0;
+    int cases = 0;
+    for (int V = 4; V <= 5; ++V)
+        for (int m = 0; m <= 3; ++m)
+            for (int qsup = 1; qsup <= V; ++qsup)
+                for (int psup = 1; psup <= V; ++psup)
+                    for (int rep = 0; rep < 3; ++rep) {
+                        const SLaw L = small_law((uint64_t)(V * 1000 + m * 100 + qsup * 10 + psup) * 7 + (uint64_t)rep,
+                                                 V, qsup, psup, rep == 2 ? 3.0 : 1.0);
+                        RadMtpCoupleState q0{};
+                        CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &q0));
+                        for (int nkids = 1; nkids <= m + 1; ++nkids) {   /* a node with children has at least one */
+                            const auto br = rheo_node(L, m, nkids);
+                            double law[SV] = {}, wsum = 0, hit = 0;
+                            for (const auto& b : br) {
+                                wsum += b.w;
+                                hit += b.w * b.hit;
+                                for (int x = 0; x < SV; ++x) law[x] += b.w * b.law[x];
+                            }
+                            CHECK(std::fabs(wsum - 1.0) < 1e-12);
+                            for (int x = 0; x < SV; ++x) {
+                                const double e = x < V ? L.p[x] : 0.0;
+                                worst = std::max(worst, std::fabs(law[x] - e));
+                                CHECK(std::fabs(law[x] - e) < 1e-12);
+                            }
+                            const double want = thm8_hit(L, m, nkids, q0);
+                            worst_hit = std::max(worst_hit, std::fabs(hit - want));
+                            CHECK(std::fabs(hit - want) < 1e-12);
+                            ++cases;
+                        }
+                    }
+    std::printf("  rheo node law: %d (P, Q, m, nkids) cases, worst |law - P| = %.2e, worst |hit - Thm 8| = %.2e\n",
+                cases, worst, worst_hit);
+    CHECK(cases > 600);
+}
+
+/* (1) The first two emitted tokens: x1 from the root node, x2 from the node of the child x1 when x1 is
+ * a child (its own rheo draw over P(. | x1), Q(. | x1)), else a plain target draw: the joint law is
+ * P(x1) P(x2 | x1) to 1e-12, for every branch of the root's tail child. */
+TEST(rheo_siblings_two_deep_joint_law_is_exactly_the_target) {
+    double worst = 0;
+    int cases = 0;
+    for (int V = 4; V <= 5; ++V)
+        for (int m = 1; m <= 2; ++m)
+            for (int cfg = 0; cfg < 12; ++cfg) {
+                const int qs0 = 1 + cfg % V, ps0 = 1 + (cfg * 3 + 1) % V;
+                const SLaw root = small_law((uint64_t)(900 + V * 50 + m * 7 + cfg), V, qs0, ps0);
+                SLaw kid[SV];
+                for (int x = 0; x < V; ++x)
+                    kid[x] = small_law((uint64_t)(5000 + V * 70 + m * 11 + cfg * 13 + x), V, 1 + (cfg + x) % V,
+                                       1 + (cfg + 2 * x + 1) % V);
+                const int nk_root = 1 + cfg % (m + 1), nk_kid = 1 + (cfg / 2) % (m + 1);
+                const auto rb = rheo_node(root, m, nk_root);
+                double joint[SV][SV] = {};
+                for (const auto& b : rb) {
+                    bool is_child[SV] = {};
+                    for (int k = 0; k < b.st.nkids; ++k) is_child[b.st.ids[k]] = true;
+                    for (int x1 = 0; x1 < V; ++x1) {
+                        if (is_child[x1]) {
+                            const auto kb = rheo_node(kid[x1], m, nk_kid);
+                            for (const auto& c : kb)
+                                for (int x2 = 0; x2 < V; ++x2) joint[x1][x2] += b.w * b.law[x1] * c.w * c.law[x2];
+                        } else {
+                            for (int x2 = 0; x2 < V; ++x2) joint[x1][x2] += b.w * b.law[x1] * kid[x1].p[x2];
+                        }
+                    }
+                }
+                for (int x1 = 0; x1 < V; ++x1)
+                    for (int x2 = 0; x2 < V; ++x2) {
+                        const double e = root.p[x1] * kid[x1].p[x2];
+                        worst = std::max(worst, std::fabs(joint[x1][x2] - e));
+                        CHECK(std::fabs(joint[x1][x2] - e) < 1e-12);
+                    }
+                ++cases;
+            }
+    std::printf("  rheo two-deep joint: %d cases, worst |joint - P P| = %.2e\n", cases, worst);
+}
+
+/* (3) m = 0 is the chain's single-draft maximal coupling: the same token as rad_mtp_couple_decide for
+ * the same draft x, the same uniforms, on a grid of both uniforms, for every token of Q's support. */
+TEST(rheo_with_m_zero_is_the_single_draft_coupling) {
+    long checked = 0, diff = 0;
+    for (int V = 3; V <= 6; ++V)
+        for (int rep = 0; rep < 40; ++rep) {
+            const SLaw L = small_law((uint64_t)(77000 + V * 100 + rep), V, 1 + rep % V, 1 + (rep / 2) % V);
+            RadMtpCoupleState chain{};
+            CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &chain));
+            chain.status = 1; chain.round = 1;
+            double tot = 0;
+            for (int i = 0; i < chain.count; ++i) tot += chain.q[i];
+            for (int k = 0; k < chain.count; ++k) {
+                RadMtpCoupleState rheo = chain;
+                RadMtpCoupleState ch = chain;
+                ch.x = chain.ids[k];
+                /* a draw inside token k's interval of the draw's inverse CDF (descending q) */
+                int ord[8];
+                for (int i = 0; i < chain.count; ++i) ord[i] = i;
+                std::stable_sort(ord, ord + chain.count, [&](int a, int b) { return chain.q[a] > chain.q[b]; });
+                double lo = 0, wk = 0;
+                for (int i = 0; i < chain.count; ++i) {
+                    if (ord[i] == k) { wk = chain.q[k]; break; }
+                    lo += chain.q[ord[i]];
+                }
+                rad_mtp_rrs_draw_rheo_u(&rheo, (lo + 0.5 * wk) / tot, 1, 0);
+                CHECK_EQ(rheo.ids[0], ch.x);
+                CHECK_EQ(rheo.scheme, 1);
+                for (int a = 0; a <= 32; ++a)
+                    for (int r = 0; r < 32; ++r) {
+                        const double ua = a / 33.0, ur = (r + 0.5) / 32.0;
+                        int32_t o1 = -1, o2 = -2;
+                        const bool ok1 = rad_mtp_couple_decide(ch, L.pid, L.pval, L.pn, 1000, ua, ur, &o1);
+                        const bool ok2 = rad_mtp_rrs_decide_rheo_u(rheo, L.pid, L.pval, L.pn, 1000, ua, ur, &o2);
+                        CHECK(ok1 && ok2);
+                        ++checked;
+                        if (o1 != o2) ++diff;
+                    }
+            }
+        }
+    std::printf("  rheo m=0 vs chain coupling: %ld decisions, %ld differ\n", checked, diff);
+    CHECK_EQ(diff, 0L);
+}
+
+/* (4) The draw's invariants: the state stays valid (every q > 0, x = ids[0]), the first m slots are the
+ * m largest q in descending order, the tail child has q > 0 and a tail law at most 1, the slot
+ * priorities are non-increasing and a function of the multiset of q only. */
+TEST(rheo_draw_invariants_and_slot_priorities) {
+    for (int s = 0; s < 3000; ++s) {
+        const SLaw L = small_law((uint64_t)(31000 + s), 6, 1 + s % 6, 3, 1.5);
+        RadMtpCoupleState st{};
+        CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &st));
+        st.draw = make_draw(5, 5);
+        st.status = 1; st.round = 1;
+        const int m = s % 5;
+        RadMtpCoupleState sh = st;
+        for (int i = st.count - 1; i > 0; --i) {   /* any permutation of the support */
+            const int j = (int)(H((uint64_t)s * 17 + (uint64_t)i) % (uint64_t)(i + 1));
+            std::swap(sh.ids[i], sh.ids[j]); std::swap(sh.q[i], sh.q[j]);
+        }
+        float a[8], b[8];
+        rad_mtp_rrs_slot_logq_rheo(st, m, a);
+        rad_mtp_rrs_slot_logq_rheo(sh, m, b);
+        for (int c = 0; c < 8; ++c) {
+            CHECK(a[c] == b[c]);
+            if (c > 0) CHECK(a[c] <= a[c - 1]);
+        }
+        const double ut = ((H((uint64_t)s * 3 + 1) >> 11) + 0.5) * 0x1p-53;
+        RadMtpCoupleState d = st;
+        rad_mtp_rrs_draw_rheo_u(&d, ut, 8, m);
+        CHECK(rad_mtp_couple_state_valid(d, 1000));
+        const int nt = std::min(m, d.count);
+        CHECK_EQ(d.nkids, nt + (d.count > nt ? 1 : 0));
+        CHECK_EQ(d.scheme, m + 1);
+        CHECK_EQ(d.x, d.ids[0]);
+        for (int i = 1; i < nt; ++i) CHECK(d.q[i - 1] >= d.q[i]);
+        for (int i = 0; i < d.count; ++i) CHECK(d.q[i] > 0);   /* a sampled child always has Q > 0 */
+        if (d.count > nt) {
+            double z = 0, qmax_tail = 0;
+            for (int i = nt; i < d.count; ++i) { z += d.q[i]; qmax_tail = std::max(qmax_tail, d.q[i]); }
+            CHECK(d.q[nt] / (nt == 0 ? 1.0 : z) <= 1.0 + 1e-15);
+            if (nt > 0) CHECK(d.q[nt - 1] >= qmax_tail);
+            /* the slot priority of the tail child: log min(q of the last top token, z) */
+            const double ref = nt > 0 ? d.q[nt - 1] : 1.0;
+            CHECK(std::fabs((double)a[nt] - std::log(std::min(ref, std::min(z, 1.0)))) < 1e-5);
+        }
+        for (int c = nt + (d.count > nt ? 1 : 0); c < 8; ++c) CHECK(a[c] == -INFINITY);
+        /* keep_count: a prefix of the m + 1 slots, never beyond them */
+        RadMtpTreeCfg pc{};
+        rad_mtp_tree_set_prune(&pc, 0.2, 0.3);
+        const int kc = rad_mtp_rrs_slot_keep_count(st, &pc, 8, m + 1);
+        CHECK(kc >= 1 && kc <= m + 1 && kc <= st.count);
+        CHECK_EQ(rad_mtp_rrs_slot_keep_count(st, nullptr, 8, m + 1), std::min(m + 1, st.count));
+    }
+}
+
+namespace {
+int verify_raw(const RadMtpCoupleState& st, const int32_t* ids, const float* val, int n, uint64_t seed,
+               uint64_t pos, int fallback) {
+    uint32_t params[24] = {};
+    RadSampleParams* p = reinterpret_cast<RadSampleParams*>(params);
+    p->seed = seed; p->pos = pos;
+    int32_t tok = fallback;
+    RadMtpCoupleVerifyCall c{};
+    c.idx = ids; c.val = val; c.params = params;
+    c.state = reinterpret_cast<const uint32_t*>(&st);
+    c.token = &tok;
+    c.M = 1; c.n_cand = n; c.vocab = 1000;
+    c.ld[0] = n; c.ld[1] = n; c.ld[2] = 24; c.ld[3] = RAD_MTP_COUPLE_STATE_WORDS; c.ld[4] = 1;
+    rad_mtp_couple_verify_row(c, 0);
+    return tok;
+}
+}  /* namespace */
+
+/* (1) Monte Carlo through the REAL keyed draw and the real verify row (the plugin's dispatch on
+ * state.scheme): 1e7 samples at m = 1 (a V = 6 case, P nucleus of 5, Q over 4 tokens), then m = 2, the
+ * pruned-tail nodes (nkids = m) and m = 0: chi-square against P, and the measured hit rate against
+ * the exact one. */
+TEST(rheo_siblings_monte_carlo_through_the_real_draw_and_verify_row) {
+    const SLaw L = small_law(424242, 6, 4, 5, 1.2);
+    RadMtpCoupleState q0{};
+    CHECK(rad_mtp_couple_build_q(L.qid, L.qval, 1000, &q0));
+    struct Run { int m, nkids; long trials; };
+    const Run runs[] = { { 1, 2, 10000000 }, { 2, 3, 3000000 }, { 1, 1, 2000000 }, { 2, 2, 2000000 }, { 0, 1, 2000000 } };
+    for (const Run& rn : runs) {
+        std::vector<double> cnt((size_t)6, 0);
+        double hits = 0;
+        for (long s = 0; s < rn.trials; ++s) {
+            RadMtpCoupleState st = q0;
+            st.draw = make_draw(0x9e3779b97f4a7c15ull * (uint64_t)(s + 1), (uint64_t)s);
+            st.status = 1; st.round = 1; st.pos = 5;
+            rad_mtp_rrs_draw_rheo(&st, 0, rn.nkids, rn.m);
+            const int y = verify_raw(st, L.pid, L.pval, L.pn, st.draw.seed, 5, -1);
+            CHECK(y >= 0 && y < 6);
+            ++cnt[(size_t)y];
+            for (int k = 0; k < st.nkids; ++k) hits += st.ids[k] == y;
+        }
+        std::vector<double> e(L.p, L.p + 6);
+        const double z = zscore(cnt, e, (double)rn.trials);
+        const double want = thm8_hit(L, rn.m, rn.nkids, q0);
+        const double hr = hits / (double)rn.trials;
+        const double sd = std::sqrt(want * (1 - want) / (double)rn.trials);
+        std::printf("  rheo MC m=%d nkids=%d n=%ld: chi z=%.2f hit=%.5f (Thm 8 %.5f, %.1f sd)\n", rn.m, rn.nkids,
+                    rn.trials, z, hr, want, sd > 0 ? (hr - want) / sd : 0.0);
+        CHECK(z < 4.5);
+        CHECK(sd == 0 || std::fabs(hr - want) < 4.5 * sd);
+    }
+}
+
+/* (2) The whole pipeline (the real propose row, the real coupled grower, slot priorities that include
+ * the rheo proxy, pruning by them, the core's prefix rule, the real verify) emits the target's law:
+ * stage 1 (trunk chain + leaves), stage 2 and 2b, m = 1 and 2, with and without confidence pruning, a
+ * far head. The tail slot is pruned by q-rank where the thresholds say so. The acceptance of the same
+ * budget with Gumbel siblings is printed beside it. */
+TEST(rheo_siblings_trees_with_and_without_pruning_emit_the_target_law) {
+    const int trials = 300000;
+    const Prune ab{ 0.07, 0.4 }, hard{ 0.2, 0.17 };
+    const struct { const char* name; Kind kind; } kinds[] = { { "stage1", STAGE1 }, { "stage2", STAGE2 }, { "stage2b", STAGE2B } };
+    for (const auto& kd : kinds) {
+        g_scheme = 0;
+        const Result gum = run_kind(kd.kind, trials, 1.0);
+        for (int m = 1; m <= 2; ++m)
+            for (int pr = 0; pr < 3; ++pr) {
+                g_scheme = m + 1;
+                g_pr = pr == 1 ? &ab : pr == 2 ? &hard : nullptr;
+                g_cut = g_kids = 0;
+                const Result r = run_kind(kd.kind, trials, 1.0);
+                const double cut = g_kids > 0 ? g_cut / g_kids : 0;
+                g_pr = nullptr; g_scheme = 0;
+                std::printf("  %-8s rheo m=%d prune=%d: z=%.2f first=%.2f acc=%.3f cut=%.3f | gumbel acc=%.3f\n",
+                            kd.name, m, pr, r.z, r.first_z, r.mean_acc, cut, gum.mean_acc);
+                CHECK(r.z < 4.5);
+                CHECK(r.first_z < 4.5);
+            }
+    }
+    g_scheme = 3; g_pr = nullptr;
+    const Result far = run_kind(STAGE2, 150000, 3.0);
+    g_scheme = 0;
+    CHECK(far.z < 4.5);
+    CHECK(far.first_z < 4.5);
+}
+
+/* Expected children accepted by one node (hit rate: the emitted token is one of the node's children)
+ * with the same number of children k = m + 1, Gumbel-top-k siblings against RheoSampling, on synthetic
+ * (P, Q) pairs shaped like the engine's: P the target's top-k 20 / top-p 0.95 law at temperature T
+ * over a Zipf-ish logit profile, Q the head's temperature-1 softmax of its noisy top 8. Printed, not
+ * asserted: the real number is the engine's `MTP coupled stats` on the model (tools in DESIGN.md). */
+TEST(rheo_against_gumbel_siblings_hit_rate_at_equal_children_on_synthetic_laws) {
+    const int NODES = 300, DRAWS = 6000;
+    for (double T : { 0.7, 1.0 })
+        for (double sigma : { 0.6, 1.2 }) {
+            double hit_g[4] = {}, hit_r[4] = {};
+            for (int n = 0; n < NODES; ++n) {
+                const uint64_t h = H((uint64_t)n * 977 + (uint64_t)(T * 10) * 13 + (uint64_t)(sigma * 10));
+                const int NV = 40;
+                std::vector<double> lg(NV), hl(NV);
+                const double sharp = 1.5 + 4.0 * ((H(h + 1) >> 40) % 1000) / 1000.0;
+                for (int i = 0; i < NV; ++i) {
+                    const double g1 = ((H(h * 3 + (uint64_t)i) >> 40) % 2000) / 1000.0 - 1.0;
+                    const double g2 = ((H(h * 5 + (uint64_t)i + 99) >> 40) % 2000) / 1000.0 - 1.0;
+                    lg[(size_t)i] = -sharp * std::log((double)(i + 1)) + 1.0 * g1;
+                    hl[(size_t)i] = lg[(size_t)i] + sigma * 1.7 * g2;
+                }
+                /* target law: T, top-k 20, top-p 0.95 */
+                std::vector<int> ord(NV);
+                for (int i = 0; i < NV; ++i) ord[(size_t)i] = i;
+                std::sort(ord.begin(), ord.end(), [&](int a, int b) { return lg[(size_t)a] > lg[(size_t)b]; });
+                std::vector<int32_t> pid; std::vector<float> pval;
+                double z = 0;
+                for (int j = 0; j < 20; ++j) z += std::exp(lg[(size_t)ord[(size_t)j]] / T);
+                double cum = 0;
+                for (int j = 0; j < 20 && cum < 0.95; ++j) {
+                    const double p = std::exp(lg[(size_t)ord[(size_t)j]] / T) / z;
+                    pid.push_back(ord[(size_t)j]); pval.push_back((float)(lg[(size_t)ord[(size_t)j]] / T));
+                    cum += p;
+                }
+                /* the head's reranked top 8 */
+                std::vector<int> ho(NV);
+                for (int i = 0; i < NV; ++i) ho[(size_t)i] = i;
+                std::sort(ho.begin(), ho.end(), [&](int a, int b) { return hl[(size_t)a] > hl[(size_t)b]; });
+                int32_t qid[8]; float qval[8];
+                for (int i = 0; i < 8; ++i) { qid[i] = ho[(size_t)i]; qval[i] = (float)hl[(size_t)ho[(size_t)i]]; }
+                RadMtpCoupleState q0{};
+                CHECK(rad_mtp_couple_build_q(qid, qval, 1000, &q0));
+                for (int k = 1; k <= 3; ++k)
+                    for (int scheme = 0; scheme < 2; ++scheme) {
+                        double hits = 0;
+                        for (int s = 0; s < DRAWS; ++s) {
+                            RadMtpCoupleState st = q0;
+                            st.draw = make_draw(H(h + (uint64_t)s * 7 + 1), (uint64_t)s);
+                            st.status = 1; st.round = 1; st.pos = 5;
+                            if (scheme) rad_mtp_rrs_draw_rheo(&st, 0, k, k - 1);
+                            else        rad_mtp_rrs_draw(&st, 0, k);
+                            const int y = verify_raw(st, pid.data(), pval.data(), (int)pid.size(), st.draw.seed, 5, -1);
+                            for (int c = 0; c < st.nkids; ++c) hits += st.ids[c] == y;
+                        }
+                        (scheme ? hit_r : hit_g)[k] += hits / DRAWS / NODES;
+                    }
+            }
+            std::printf("  synthetic T=%.1f sigma=%.1f: children accepted per node (k children) gumbel %.4f %.4f %.4f | "
+                        "rheo(m=k-1) %.4f %.4f %.4f\n", T, sigma, hit_g[1], hit_g[2], hit_g[3], hit_r[1], hit_r[2], hit_r[3]);
+        }
+}
+
+/* (5) Flag off: scheme 0 is the old draw and the old verify, bit for bit; a rheo state differs only by
+ * `scheme` and the order of its children. */
+TEST(the_default_scheme_is_the_gumbel_one_bit_for_bit) {
+    Tree a, b;
+    g_scheme = 0;
+    draft_chain(&a, 99, 4, 3, 3, 1.0);
+    draft_chain(&b, 99, 4, 3, 3, 1.0);
+    for (int k = 0; k < 3; ++k) {
+        CHECK_EQ(a.st[k].scheme, 0);
+        CHECK(std::memcmp(&a.st[k], &b.st[k], sizeof(RadMtpCoupleState)) == 0);
+    }
+    CHECK_EQ(a.st[0].nkids, 4);
+    draft_grow(&a, 5, 1, 2, 3, 7, 1.0);
+    for (int k = 0; k < 7; ++k) CHECK_EQ(a.st[k].scheme, 0);
+    g_scheme = 2;
+    draft_chain(&b, 99, 4, 3, 3, 1.0);
+    g_scheme = 0;
+    CHECK_EQ(b.st[0].scheme, 2);
+    CHECK_EQ(b.st[0].nkids, 2);
+    CHECK_EQ(b.st[1].scheme, 0);   /* the chain's later rounds are single draws */
+}
+
+/* ------------------------------------------------------------------ online calibration
+ *
+ * (2) The controller changes the draw's per-depth draft temperature and calibration codes between
+ * steps. The state stores the Q that was drawn from and the verify reads it, so the output law
+ * stays P whatever sequence of words the draws carry: chain, stage 1 and stage 2, over words that
+ * differ per depth class and per trial (every tau code, every calibration code, the one-hot limit),
+ * with the adaptive rule on so the calibration codes act on the tree's shape too. */
+std::vector<uint32_t> all_words() {
+    std::vector<uint32_t> w;
+    uint64_t h = 12345;
+    for (int i = 0; i < 64; ++i) {
+        uint32_t x = 0;
+        for (int d = 0; d < RAD_MTP_DRAW_DEPTHS; ++d) {
+            h = rad_mtp_rrs_mix(h + (uint64_t)i * 31 + (uint64_t)d);
+            const unsigned tau = (unsigned)(h % 16), cal = (unsigned)((h >> 8) % 16);
+            x |= (tau | cal << 4) << (8 * d);
+        }
+        if (i % 2) x |= RAD_MTP_DRAW_EXPORT_BIT;   /* the verify also exports P: it must not touch the decision */
+        w.push_back(x);
+    }
+    w.push_back(0);   /* a step with no online word at all */
+    w.push_back(0x010101u);   /* tau 0.05 (the greedy limit) at every depth */
+    return w;
+}
+
+TEST(a_draft_law_that_changes_every_step_stays_exact) {
+    g_word_cycle = all_words();
+    g_recipe = LawRecipe{};
+    const int trials = 150000;
+    const Result chain = run_kind(CHAIN, trials, 1.0);
+    const Result s1    = run_kind(STAGE1, trials, 1.0);
+    const Result s2    = run_kind(STAGE2, trials, 1.0);
+    const Result far   = run_kind(STAGE1, trials / 2, 3.0);
+    std::printf("  changing tau_d / T_d per step: chain z=%.2f acc=%.3f | stage1 z=%.2f | stage2 z=%.2f | far z=%.2f\n",
+                chain.z, chain.mean_acc, s1.z, s2.z, far.z);
+    CHECK(chain.z < 4.5 && chain.first_z < 4.5);
+    CHECK(s1.z < 4.5 && s1.first_z < 4.5);
+    CHECK(s2.z < 4.5 && s2.first_z < 4.5);
+    CHECK(far.z < 4.5 && far.first_z < 4.5);
+    /* with a base recipe underneath (the words override dscale only where a tau code is set) */
+    g_recipe = { 1.0f / 0.7f, 0.9f, 4 };
+    const Result rc = run_kind(STAGE2, trials, 1.0);
+    CHECK(rc.z < 4.5 && rc.first_z < 4.5);
+    g_recipe = LawRecipe{};
+    g_word_cycle.clear();
+}
+
+/* The word picks the Q only: tau codes name the table's temperature at their depth class, the
+ * deepest class repeats, code 0 keeps dscale, and a draw with no word is build_law bit for bit. */
+TEST(the_online_word_names_the_draft_temperature_per_depth) {
+    const Law L = law_at(777, 1.0);
+    RadMtpCoupleDraw d0{};
+    d0.mode = 1;
+    RadMtpCoupleState a{}, b{};
+    CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d0, &a));
+    for (int depth = 1; depth <= 6; ++depth) {
+        CHECK(rad_mtp_couple_build_law_at(L.qid, L.qval, 1000, d0, depth, &b));
+        CHECK(std::memcmp(a.q, b.q, sizeof a.q) == 0);   /* no word: the legacy law, at every depth */
+    }
+    RadMtpCoupleDraw d = d0;
+    d.dpad_ = 4u | (8u << 8) | (11u << 16);   /* tau 0.6, 0.9, 1.15 */
+    const float taus[3] = { 0.6f, 0.9f, 1.15f };
+    for (int depth = 1; depth <= 6; ++depth) {
+        const float tau = taus[std::min(depth, 3) - 1];
+        RadMtpCoupleDraw e = d0;
+        e.dscale = 1.0f / tau;
+        CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, e, &a));
+        CHECK(rad_mtp_couple_build_law_at(L.qid, L.qval, 1000, d, depth, &b));
+        CHECK(a.count == b.count && std::memcmp(a.q, b.q, sizeof a.q) == 0);
+    }
+    /* code 0 at a depth keeps the draw's own dscale */
+    d.dscale = 2.0f;
+    d.dpad_ = 8u << 8;
+    RadMtpCoupleDraw f = d0;
+    f.dscale = 2.0f;
+    CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, f, &a));
+    CHECK(rad_mtp_couple_build_law_at(L.qid, L.qval, 1000, d, 1, &b));
+    CHECK(std::memcmp(a.q, b.q, sizeof a.q) == 0);
+    /* the code tables: nearest-in-log lookups invert them */
+    for (unsigned c = 1; c < 16; ++c) {
+        CHECK_EQ(rad_mtp_tau_code_of(rad_mtp_tau_of_code(c)), c);
+        CHECK_EQ(rad_mtp_cal_code_of(rad_mtp_cal_of_code(c), rad_mtp_cal_lift_of_code(c)), c);
+    }
+}
+
+/* The calibration word reaches the adaptive rule's temperatures: set codes replace the static list
+ * at their depth class, the deepest repeats, and an unset word (or adaptive off) leaves it alone. */
+TEST(the_calibration_word_overrides_the_static_temperatures) {
+    RadMtpAdapt ad{};
+    rad_mtp_adapt_parse("on=1;temp=1.3,1.1", &ad);
+    RadMtpCoupleDraw d{};
+    RadMtpAdapt a1 = ad;
+    rad_mtp_calib_apply(&a1, d);   /* no word: untouched */
+    CHECK(std::memcmp(&a1, &ad, sizeof ad) == 0);
+    d.dpad_ = (3u << 4) | (10u << 20);   /* depth 1: T 1.0, depth 2: static, depth 3: T 2.0 lift 0.2 */
+    a1 = ad;
+    rad_mtp_calib_apply(&a1, d);
+    CHECK(std::fabs(rad_mtp_adapt_temp(&a1, 1) - 1.0f) < 1e-6f);
+    CHECK(std::fabs(rad_mtp_adapt_temp(&a1, 2) - 1.1f) < 1e-6f);
+    CHECK(std::fabs(rad_mtp_adapt_temp(&a1, 3) - 2.0f) < 1e-6f);
+    CHECK(std::fabs(rad_mtp_adapt_temp(&a1, 7) - 2.0f) < 1e-6f);
+    CHECK(rad_mtp_adapt_lift(&a1, 1) == 0.0f && rad_mtp_adapt_lift(&a1, 2) == 0.0f);
+    CHECK(std::fabs(rad_mtp_adapt_lift(&a1, 3) - 0.2f) < 1e-6f);
+    CHECK(std::fabs(rad_mtp_adapt_lift(&a1, 9) - 0.2f) < 1e-6f);
+    RadMtpAdapt off{};
+    rad_mtp_adapt_parse("temp=1.3", &off);   /* adaptive off: never touched */
+    RadMtpAdapt o1 = off;
+    rad_mtp_calib_apply(&o1, d);
+    CHECK(std::memcmp(&o1, &off, sizeof off) == 0);
+}
+
+/* (4) The acceptance label against brute force. A chain row: alpha = sum_x q(x) P(accept | x), the
+ * acceptance probability of each drafted token measured by running the real decide over a fine grid
+ * of acceptance uniforms. */
+double brute_alpha_chain(const RadMtpCoupleState& s, const Law& L) {
+    double alpha = 0;
+    for (int k = 0; k < s.count; ++k) {
+        RadMtpCoupleState t = s;
+        t.x = s.ids[k];
+        int acc = 0;
+        const int G = 4000;
+        for (int g = 0; g < G; ++g) {
+            const double u = (g + 0.5) / G;
+            int32_t out = -1;
+            CHECK(rad_mtp_couple_decide(t, L.pid, L.pval, L.pn, 1000, u, 0.5, &out));
+            if (out == t.x) ++acc;
+        }
+        alpha += s.q[k] * (double)acc / G;
+    }
+    return alpha;
+}
+
+void p_on_support(const RadMtpCoupleState& s, const Law& L, double* pq) {
+    double z = 0;
+    for (int j = 0; j < L.pn; ++j) z += std::exp((double)L.pval[j]);
+    for (int k = 0; k < s.count; ++k) {
+        pq[k] = 0;
+        for (int j = 0; j < L.pn; ++j) if (L.pid[j] == s.ids[k]) pq[k] += std::exp((double)L.pval[j]) / z;
+    }
+}
+
+TEST(the_alpha_label_equals_the_brute_force_acceptance) {
+    for (int t = 0; t < 12; ++t) {
+        const Law L = law_at(5000 + (uint64_t)t, 0.6 + 0.2 * t);
+        RadMtpCoupleDraw d{};
+        d.mode = 1;
+        d.dscale = t % 3 == 0 ? 0.0f : 1.0f / (0.6f + 0.15f * t);
+        RadMtpCoupleState s{};
+        CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &s));
+        s.status = 1; s.round = 1; s.x = s.ids[0];
+        double pq[8], alpha[8];
+        p_on_support(s, L, pq);
+        CHECK_EQ(rad_calib_labels(s, pq, alpha), 1);
+        const double bf = brute_alpha_chain(s, L);
+        CHECK(std::fabs(alpha[0] - bf) < 2.5e-3);
+        /* and it is exactly sum min(P, Q) */
+        double mn = 0;
+        for (int k = 0; k < s.count; ++k) mn += std::min(pq[k], s.q[k]);
+        CHECK(std::fabs(alpha[0] - mn) < 1e-12);
+    }
+}
+
+/* A tree row's later labels: child i's label is the acceptance probability of the child in slot i
+ * given the rows before it rejected, averaged over the token the draw put there. Estimated by
+ * running the real recursive decide over many seeds with the children drawn without replacement
+ * (Gumbel order) and counting, per slot, accepted / reached. The label function is evaluated on the
+ * same drawn histories, weighted by the probability that the drafted children before the slot were
+ * rejected (their own acceptance), and the two must agree. */
+TEST(the_sibling_labels_equal_the_recursive_rejection_frequencies) {
+    for (int t = 0; t < 4; ++t) {
+        const Law L = law_at(6000 + (uint64_t)t, 1.0 + 0.4 * t);
+        RadMtpCoupleDraw d{};
+        d.mode = 1;
+        d.dscale = 1.0f;
+        RadMtpCoupleState s{};
+        CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &s));
+        s.status = 1; s.round = 1;
+        const int m = 3;
+        const int N = 300000;
+        double reach[3] = {}, hit[3] = {};
+        double e[3] = {}, w[3] = {};   /* label-side: reach-weighted mean label of slot i */
+        for (int n = 0; n < N; ++n) {
+            RadMtpCoupleState c = s;
+            c.draw.seed = 1000 + (uint64_t)n; c.draw.base = 77;
+            rad_mtp_rrs_draw(&c, 0, m);
+            c.status = 1; c.x = c.ids[0];
+            int32_t out = -1;
+            if (!rad_mtp_rrs_decide(c, L.pid, L.pval, L.pn, 1000, c.draw.seed, 5, &out)) continue;
+            int at = m;
+            for (int i = 0; i < m; ++i) if (out == c.ids[i]) { at = i; break; }
+            for (int i = 0; i < m && i <= at; ++i) {
+                reach[i] += 1;
+                if (i == at) hit[i] += 1;
+            }
+            if (n < 60000) {
+                double pc[8], al[8], ar[8];
+                p_on_support(c, L, pc);
+                rad_calib_labels(c, pc, al, ar);
+                double reached = 1.0;
+                for (int i = 0; i < m; ++i) {
+                    e[i] += reached * al[i];
+                    w[i] += reached;
+                    reached *= 1.0 - ar[i];   /* the drafted token's own rejection */
+                }
+            }
+        }
+        for (int i = 0; i < m; ++i) {
+            const double freq = hit[i] / reach[i], lab = e[i] / w[i];
+            std::printf("  case %d slot %d: frequency %.4f label %.4f\n", t, i, freq, lab);
+            CHECK(std::fabs(freq - lab) < 0.02);
+        }
+    }
+}
+
+/* The export: the verify with the export bit set decides exactly as without it (tokens bit for bit),
+ * and rewrites q with P's mass on the state's ids, status 2; a state with no export bit is left
+ * alone. */
+TEST(the_verify_export_leaves_the_decision_alone_and_reports_p) {
+    for (int t = 0; t < 20; ++t) {
+        const Law L = law_at(7000 + (uint64_t)t, 1.0);
+        for (int kids = 1; kids <= 3; ++kids) {
+            RadMtpCoupleDraw d = make_draw(500 + (uint64_t)t, 40);
+            RadMtpCoupleState s{};
+            CHECK(rad_mtp_couple_build_law(L.qid, L.qval, 1000, d, &s));
+            s.draw = d; s.status = 1; s.round = 1; s.pos = 9; s.x = s.ids[0];
+            if (kids > 1) rad_mtp_rrs_draw(&s, 0, kids); else s.nkids = 0;
+            RadMtpCoupleState plain = s, expo = s;
+            expo.draw.dpad_ |= RAD_MTP_DRAW_EXPORT_BIT;
+            const int tok_plain = verify(plain, L, d.seed, 9, -7);
+            const int tok_expo = verify(expo, L, d.seed, 9, -7);
+            CHECK_EQ(tok_plain, tok_expo);
+            CHECK(plain.status == 1 && std::memcmp(plain.q, s.q, sizeof s.q) == 0);
+            CHECK_EQ(expo.status, RAD_MTP_COUPLE_STATUS_EXPORTED);
+            double pq[8];
+            p_on_support(s, L, pq);
+            for (int k = 0; k < s.count; ++k) CHECK(std::fabs(expo.q[k] - pq[k]) < 1e-12);
+        }
+    }
+}
+
+
+RAD_TEST_MAIN()

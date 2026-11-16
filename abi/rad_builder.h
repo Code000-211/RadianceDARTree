@@ -300,6 +300,15 @@ typedef struct RadBuildCtx {
      * the same rule to stage 1's leaves. See abi/rad_mtp_tree.h. */
     float    draft_tree_prune_abs;
     float    draft_tree_prune_rel;
+    /* ---- appended (--draft-adaptive). A "key=value;..." text (abi/rad_mtp_adapt.h) for the head's
+     * tree grower: cost-aware node selection and per-depth calibration. Null or empty: off. The
+     * plugin hands it to mtp_tree_grow's `adapt` parameter. Owned by the engine's Config. */
+    const char* draft_adapt;
+    /* ---- appended (--draft-siblings rheo). With draft_coupling and a serial tree: 0 = Gumbel-top-k
+     * siblings (the default), m + 1 = RheoSampling's siblings with m deterministic top-q children
+     * (--draft-rheo-m m) plus one sampled from the tail law. The plugin hands `rheo_m` = m to its
+     * propose / grower ops only when this is non-zero. */
+    int      draft_rheo;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */

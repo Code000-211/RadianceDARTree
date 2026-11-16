@@ -540,10 +540,21 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
+        { "--draft-adaptive", { "on" } }, { "--draft-adaptive-margin", { "1.5" } },
+        { "--draft-adaptive-floor", { "2" } }, { "--draft-adaptive-cont", { "0.6" } },
+        { "--draft-cost-draft-ms", { "1.2" } }, { "--draft-cost-table", { "9.3,10.3,11.3" } },
+        { "--draft-calib", { "1.3,1.1" } },
+        { "--draft-verify", { "traversal" } },
+        { "--draft-coupling-temp", { "0.7" } },
+        { "--draft-coupling-temp-mul", { "0.9" } }, { "--draft-coupling-truncate", { "on" } },
+        { "--draft-siblings", { "rheo" } }, { "--draft-rheo-m", { "2" } },
+        { "--draft-calib-log", { "/tmp/calib.log" } }, { "--draft-calib-ece", { "on" } },
+        { "--draft-calib-interval", { "128" } }, { "--draft-coupling-temp-autofit", { "on" } },
         { "--draft-tree", { "on" } }, { "--draft-tree-leaves", { "4" } },
         { "--draft-tree-nodes", { "8" } }, { "--draft-tree-width", { "2" } },
         { "--draft-tree-prune", { "0.1" } }, { "--draft-tree-prune-rel", { "0.3" } },
         { "--draft-tree-rows", { "1" } }, { "--draft-tree-chain", { "2" } },
+        { "--draft-ngram-leaves", { "2" } }, { "--draft-ngram-min-match", { "6" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -1017,6 +1028,65 @@ TEST(the_dynamic_row_flags_default_off_and_parse) {
     for (const char* bad : { "-1", "3", "yes", "" }) CHECK_EQ(parse_fresh({ "--draft-tree-chain", bad }), RAD_E_INVAL);
 }
 
+/* --draft-adaptive: off unless asked for; its numbers and lists are validated at parse. */
+TEST(the_adaptive_draft_flags_parse_and_refuse_bad_values) {
+    Config d;
+    CHECK(!d.draft_adaptive);
+    CHECK_EQ(d.draft_adaptive_floor, 1);
+    Config c;
+    CHECK_EQ(parse({ "--draft-adaptive", "on", "--draft-adaptive-margin", "1.4", "--draft-adaptive-floor", "3",
+                     "--draft-cost-table", "9.3,10.3,11.3", "--draft-calib", "1.3,1.1,1",
+                     "--draft-cost-draft-ms", "1.5", "--draft-adaptive-cont", "0.5" }, &c), RAD_OK);
+    CHECK(c.draft_adaptive);
+    CHECK(c.draft_adaptive_margin == 1.4 && c.draft_adaptive_floor == 3);
+    CHECK_EQ(c.draft_cost_table, std::string("9.3,10.3,11.3"));
+    CHECK_EQ(c.draft_calib, std::string("1.3,1.1,1"));
+    CHECK(c.draft_cost_draft_ms == 1.5 && c.draft_adaptive_cont == 0.5);
+    for (const char* bad : { "yes", "" }) CHECK_EQ(parse_fresh({ "--draft-adaptive", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "-1", "30", "x" }) CHECK_EQ(parse_fresh({ "--draft-adaptive-margin", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "1", "1.5" }) CHECK_EQ(parse_fresh({ "--draft-adaptive-cont", bad }), RAD_E_INVAL);
+    for (const char* bad : { "9.3,,10", "a,b", "1;2" }) CHECK_EQ(parse_fresh({ "--draft-cost-table", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-calib", "1.2x" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-adaptive-floor", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-cost-table", "" }, &c), RAD_OK);   /* empty: back to the default table */
+    CHECK(c.draft_cost_table.empty());
+}
+
+/* --draft-calib takes the mode words beside the old list: static (the default and the old
+ * behaviour), online, off; "online:1.3,1.1" keeps the list as the prior. The two new switches and
+ * the log default off. */
+TEST(draft_calib_takes_a_mode_beside_the_list) {
+    Config d;
+    CHECK_EQ(d.draft_calib_mode, 0);
+    CHECK(!d.draft_coupling_autofit && !d.draft_calib_ece && d.draft_calib_log.empty());
+    CHECK_EQ(d.draft_calib_interval, 256);
+    Config c;
+    CHECK_EQ(parse({ "--draft-calib", "1.3,1.1" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_mode, 0);
+    CHECK(c.draft_calib == "1.3,1.1");
+    CHECK_EQ(parse({ "--draft-calib", "online:1.2" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_mode, 1);
+    CHECK(c.draft_calib == "1.2");
+    CHECK_EQ(parse({ "--draft-calib", "online" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_mode, 1);
+    CHECK(c.draft_calib == "1.2");   /* the list was kept */
+    CHECK_EQ(parse({ "--draft-calib", "off" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_mode, 2);
+    CHECK(c.draft_calib.empty());
+    CHECK_EQ(parse({ "--draft-calib", "static" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_calib_mode, 0);
+    CHECK(parse({ "--draft-calib", "online:x" }, &c) != RAD_OK);
+    CHECK(parse({ "--draft-calib", "off:1.2" }, &c) != RAD_OK);
+    CHECK(parse({ "--draft-calib", "sideways" }, &c) != RAD_OK);
+    CHECK_EQ(parse({ "--draft-coupling-temp-autofit", "on", "--draft-calib-ece", "on",
+                     "--draft-calib-log", "/tmp/x.log", "--draft-calib-interval", "64" }, &c), RAD_OK);
+    CHECK(c.draft_coupling_autofit && c.draft_calib_ece);
+    CHECK(c.draft_calib_log == "/tmp/x.log");
+    CHECK_EQ(c.draft_calib_interval, 64);
+    CHECK(parse({ "--draft-coupling-temp-autofit", "maybe" }, &c) != RAD_OK);
+    CHECK(parse({ "--draft-calib-interval", "1" }, &c) != RAD_OK);
+}
+
 /* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not
  * start a server on the other path. */
 TEST(the_draft_coupling_is_off_or_on) {
@@ -1031,6 +1101,80 @@ TEST(the_draft_coupling_is_off_or_on) {
     for (const char* bad : { "On", "1", "yes", "true", "" })
         CHECK_EQ(parse({ "--draft-coupling", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-coupling" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-verify is token (alias rowwise) unless asked for; block and traversal parse, block
+ * implies the coupled drafting and refuses a draft tree or coupling off. */
+TEST(the_draft_verify_is_token_block_or_traversal) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_verify_block);
+    CHECK(!d.draft_verify_traversal);
+    Config c;
+    CHECK_EQ(parse({ "--draft-verify", "block" }, &c), RAD_OK);
+    CHECK(c.draft_verify_block);
+    CHECK(!c.draft_verify_traversal);
+    CHECK(c.draft_coupling);
+    CHECK_EQ(c.draft_tree, 0);
+    Config t;
+    CHECK_EQ(parse({ "--draft-verify", "traversal" }, &t), RAD_OK);
+    CHECK(t.draft_verify_traversal);
+    CHECK(!t.draft_verify_block);
+    CHECK_EQ(parse({ "--draft-verify", "rowwise" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_traversal);
+    CHECK_EQ(parse({ "--draft-verify", "token" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_block);
+    Config b;
+    for (const char* bad : { "Block", "Traversal", "on", "" })
+        CHECK_EQ(parse({ "--draft-verify", bad }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-verify" }, &b), RAD_E_INVAL);
+    Config off;
+    CHECK_EQ(parse({ "--draft-verify", "block", "--draft-coupling", "off" }, &off), RAD_E_INVAL);
+    Config tr;
+    CHECK_EQ(parse({ "--draft-verify", "block", "--draft-tree", "on" }, &tr), RAD_E_INVAL);
+}
+
+/* The draft law's flags: the legacy law (T 1, no cut) by default; auto and request mean the request's
+ * own temperature; a bad number or mode is refused rather than measured as the default. */
+TEST(the_draft_coupling_law_flags_parse) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_coupling_req_temp && d.draft_coupling_temp == 1.0f &&
+          d.draft_coupling_temp_mul == 1.0f && !d.draft_coupling_truncate);
+    Config c;
+    CHECK_EQ(parse({ "--draft-coupling-temp", "request" }, &c), RAD_OK);
+    CHECK(c.draft_coupling_req_temp);
+    Config a;
+    CHECK_EQ(parse({ "--draft-coupling-temp", "auto", "--draft-coupling-temp-mul", "0.8",
+                     "--draft-coupling-truncate", "on" }, &a), RAD_OK);
+    CHECK(a.draft_coupling_req_temp && a.draft_coupling_temp_mul == 0.8f && a.draft_coupling_truncate);
+    Config f;
+    CHECK_EQ(parse({ "--draft-coupling-temp", "0.7" }, &f), RAD_OK);
+    CHECK(!f.draft_coupling_req_temp && f.draft_coupling_temp == 0.7f);
+    for (const char* bad : { "0", "-1", "x", "", "0.7x", "inf", "1000" }) {
+        Config b;
+        CHECK_EQ(parse({ "--draft-coupling-temp", bad }, &b), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--draft-coupling-temp-mul", bad }, &b), RAD_E_INVAL);
+    }
+    Config t;
+    CHECK_EQ(parse({ "--draft-coupling-truncate", "maybe" }, &t), RAD_E_INVAL);
+}
+
+/* --draft-siblings is gumbel (the old behaviour) unless rheo is asked for; --draft-rheo-m is 0..7. */
+TEST(the_draft_siblings_are_gumbel_or_rheo) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_siblings_rheo);
+    CHECK_EQ(d.draft_rheo_m, 1);
+    Config c;
+    CHECK_EQ(parse({ "--draft-siblings", "rheo", "--draft-rheo-m", "2" }, &c), RAD_OK);
+    CHECK(c.draft_siblings_rheo);
+    CHECK_EQ(c.draft_rheo_m, 2);
+    CHECK_EQ(parse({ "--draft-siblings", "gumbel" }, &c), RAD_OK);
+    CHECK(!c.draft_siblings_rheo);
+    for (const char* bad : { "Rheo", "on", "" }) CHECK_EQ(parse({ "--draft-siblings", bad }, &c), RAD_E_INVAL);
+    for (const char* bad : { "-1", "8", "x", "" }) CHECK_EQ(parse({ "--draft-rheo-m", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-siblings" }, &c), RAD_E_INVAL);
 }
 
 /* An unknown policy name is refused; falling through to the default would make a comparison
@@ -1614,7 +1758,7 @@ TEST(usage_names_every_flag_it_documents) {
      * for, so a flag added without a help line is caught. */
     const std::string text = stderr_of([] { config_usage("radiance"); });
     for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
-                           "--num-speculative-tokens", "--draft-window", "--draft-coupling",
+                           "--num-speculative-tokens", "--draft-window", "--draft-coupling", "--draft-verify",
                            "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
                            "--embedding-placement", "--ngram-placement",
@@ -1648,6 +1792,18 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
+}
+
+/* The prompt-lookup graft flags: off by default; leaves 0..16, min match 1..64. */
+TEST(the_draft_ngram_flags_default_off_and_parse) {
+    Config c;
+    CHECK_EQ(c.draft_ngram_leaves, 0);
+    CHECK_EQ(c.draft_ngram_min_match, 8);
+    CHECK_EQ(parse({ "--draft-ngram-leaves", "3", "--draft-ngram-min-match", "5" }, &c), RAD_OK);
+    CHECK_EQ(c.draft_ngram_leaves, 3);
+    CHECK_EQ(c.draft_ngram_min_match, 5);
+    for (const char* bad : { "-1", "17", "many", "" }) CHECK_EQ(parse_fresh({ "--draft-ngram-leaves", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "65", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-ngram-min-match", bad }), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

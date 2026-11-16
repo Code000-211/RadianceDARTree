@@ -163,6 +163,16 @@ struct SchedMetrics {
      * prediction cost). Only the steps the predictor shaped count. */
     int64_t tree_chain_steps = 0;
     int64_t tree_rows_cut = 0;
+    /* Prompt-lookup nodes grafted onto host-built tree verifies (--draft-ngram-leaves): trees that
+     * took a graft, the nodes added, the model's nodes displaced for them; and of the tree
+     * verifies that carried one, how many accepted through a grafted node (the path's last node)
+     * and how many grafted nodes the paths took in all. */
+    int64_t ngram_graft_steps = 0;
+    int64_t ngram_graft_nodes = 0;
+    int64_t ngram_graft_displaced = 0;
+    int64_t ngram_graft_verifies = 0;
+    int64_t ngram_graft_hits = 0;
+    int64_t ngram_graft_hit_nodes = 0;
     int64_t tree_active_cut = 0;
     int64_t tree_active_hist [RAD_METRICS_MAX_SPEC + 1] = {};
     int64_t tree_accdepth_hist[RAD_METRICS_MAX_SPEC + 1] = {};

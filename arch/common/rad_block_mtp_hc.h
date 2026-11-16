@@ -188,9 +188,13 @@ struct MtpHcBlock {
      * leaves beside the trunk token (abi/rad_mtp_rrs.h). A stage-2 tree (tree_rounds) declares no
      * propose op: its grower draws and writes the states. */
     int couple_leaves = 0;
+    /* --draft-siblings rheo: 0 = Gumbel-top-k siblings, m + 1 = RheoSampling with m top-q children
+     * and one tail-sampled one (RadBuildCtx::draft_rheo), for the propose op's leaves. */
+    int couple_rheo = 0;
     /* Stage 1's confidence pruning under coupling (round 1's propose op, with `leaves`): the same
      * two thresholds as the grower's, decided by the slot priorities (the j-th largest q) only. */
     double couple_prune_abs = 0.0, couple_prune_rel = 0.0;
+    const char* couple_adapt = "";   /* --draft-adaptive's text (RadBuildCtx::draft_adapt), "" off */
 
     /* rad_arch.h's vocab-head rule, asked through the block by whoever sizes `dlog` and the pair
      * planes. */
@@ -495,27 +499,27 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
             for (int round = 1; round <= depth; ++round) {
                 /* The whole vocabulary: `row_topk` reports global ids and the merge keeps them,
                  * while `g.n_vocab` is this rank's shard. */
+                const bool cadapt = couple_adapt && *couple_adapt;
                 const bool cprune = couple_prune_abs > 0.0 || couple_prune_rel > 0.0;
-                op_couple[round - 1] = round == 1 && couple_leaves > 0 && cprune
-                    ? rw(b, RAD_OP(b, "mtp_couple_propose",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
-                                   RAD_INT("round", round), RAD_INT("max_rounds", depth),
-                                   RAD_INT("leaves", couple_leaves),
-                                   RAD_F64("prune_abs", couple_prune_abs),
-                                   RAD_F64("prune_rel", couple_prune_rel)),
-                        RAD_NOWEIGHTS),
-                        { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state })
-                : round == 1 && couple_leaves > 0
-                    ? rw(b, RAD_OP(b, "mtp_couple_propose",
-                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
-                                   RAD_INT("round", round), RAD_INT("max_rounds", depth),
-                                   RAD_INT("leaves", couple_leaves)),
-                        RAD_NOWEIGHTS),
-                        { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state })
-                    : rw(b, RAD_OP(b, "mtp_couple_propose",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("n_vocab", g.n_vocab_all),
-                               RAD_INT("round", round), RAD_INT("max_rounds", depth)),
-                    RAD_NOWEIGHTS),
+                /* The params are built in a list so the optional ones (leaves, pruning, the rheo
+                 * scheme) appear only when on: the default graph is the one it always was. */
+                RadParam ps[10];
+                int      np = 0;
+                ps[np++] = RAD_RANGE("M", 1, g.max_seqs);
+                ps[np++] = RAD_INT("n_vocab", g.n_vocab_all);
+                ps[np++] = RAD_INT("round", round);
+                ps[np++] = RAD_INT("max_rounds", depth);
+                if (round == 1 && couple_leaves > 0) {
+                    ps[np++] = RAD_INT("leaves", couple_leaves);
+                    if (cprune || cadapt) {
+                        ps[np++] = RAD_F64("prune_abs", couple_prune_abs);
+                        ps[np++] = RAD_F64("prune_rel", couple_prune_rel);
+                    }
+                    if (cadapt) ps[np++] = RAD_STR("adapt", couple_adapt);
+                    if (couple_rheo > 0) ps[np++] = RAD_INT("rheo_m", couple_rheo - 1);
+                }
+                op_couple[round - 1] = rw(b, rad_decl_op(b, "mtp_couple_propose", ps, np,
+                                                         RAD_NOWEIGHTS),
                     { w.didx, w.dval, w.couple_draws }, { w.didx, w.couple_state });
                 if (!op_couple[round - 1]) return RAD_E_INVAL;
             }

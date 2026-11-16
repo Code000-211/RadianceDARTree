@@ -5,6 +5,7 @@
  */
 #include "rad_core.h"
 #include "kld.h"
+#include "rad_mtp_adapt.h"
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
@@ -229,6 +230,34 @@ static const Flag g_flags[] = {
     { "--draft-tree-chain",   "H",      "a serial head's tree: issue a step as a plain chain verify\n"
                                         "(no tree operands, the fused delta-net op) when the last H\n"
                                         "trees of every sequence were pure chains (default 0 = off)" },
+    { "--draft-adaptive",     "MODE",   "off (default) | on -- a serial head's tree (or chain, with\n"
+    "                                    --draft-tree-width 1 and --draft-tree-nodes = rounds): keep adding\n"
+    "                                    a node only while its marginal expected accepted tokens per\n"
+    "                                    marginal verify cost beats the tree's current tokens per time\n"
+    "                                    (--draft-cost-table). Lossless with --draft-coupling" },
+    { "--draft-adaptive-margin", "F",   "adaptive selection: > 1 admits fewer nodes, < 1 more (default 1)" },
+    { "--draft-adaptive-floor", "N",    "adaptive selection: nodes always created (default 1)" },
+    { "--draft-adaptive-cont", "P",     "adaptive stage-1 leaves: the chain's per-level continuation\n"
+                                        "probability assumed (default 0.7)" },
+    { "--draft-cost-draft-ms", "MS",    "adaptive selection: the head's rounds per step, ms (default 0.5 a round)" },
+    { "--draft-cost-table",   "LIST",   "adaptive selection: verify step ms for 0,1,2.. nodes, comma\n"
+                                        "separated (default 12.3 ms at 3 nodes, +1.0 ms a node)" },
+    { "--draft-calib",        "LIST",   "adaptive selection: per-depth temperature of the head's top-8 law,\n"
+                                        "comma separated (> 1 flattens an overconfident head; default off).\n"
+                                        "Also static (default) | online | off, optionally with :LIST (the\n"
+                                        "prior): online refits the temperatures from the verified rows'\n"
+                                        "exact acceptance (needs --draft-coupling on)" },
+    { "--draft-calib-log",    "PATH",   "write the replay log of the coupled verify rows (needs --draft-coupling\n"
+    "                                    on): per reached row the law Q, P on its support, the exact\n"
+    "                                    acceptance, the features and the step time; tools/calib_sim\n"
+    "                                    replays it. Default none" },
+    { "--draft-calib-ece",    "MODE",   "off (default) | on -- add the calibration error (ECE) per depth of the\n"
+    "                                    static and the live calibration to the coupled stats line" },
+    { "--draft-calib-interval", "N",    "verify steps between two refits of the online calibration and of\n"
+    "                                    --draft-coupling-temp-autofit (default 256)" },
+    { "--draft-coupling-temp-autofit", "MODE", "off (default) | on -- fit the draft temperature of each depth online\n"
+    "                                    to the measured overlap sum min(P, Q) over {0.05, 0.6, 0.75,\n"
+    "                                    0.9, 1.0, 1.15} (needs --draft-coupling on)" },
     { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
     "                                    samples each proposal from its own shortlist and the sampler\n"
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
@@ -236,6 +265,36 @@ static const Flag g_flags[] = {
     "                                    seed. With a draft tree the siblings are drawn without\n"
     "                                    replacement from the head's law and verified by recursive\n"
     "                                    rejection sampling" },
+    { "--draft-verify",       "MODE",   "token (default, alias rowwise) | block | traversal -- how a coupled draft is verified:\n"
+    "                                    token decides each row on its own (maximal coupling on a chain,\n"
+    "                                    recursive rejection sampling over siblings); block decides a whole\n"
+    "                                    linear chain at once (Block Verification, arXiv 2403.10444; switches\n"
+    "                                    --draft-coupling on; not with --draft-tree on); traversal decides a\n"
+    "                                    root-to-leaf path bottom-up (Traversal Verification, arXiv\n"
+    "                                    2505.12398; chain or tree; needs --draft-coupling on). Same output\n"
+    "                                    law in every mode, more tokens accepted per step in block/traversal" },
+    { "--draft-ngram-leaves", "N",      "a serial head's tree: graft up to N prompt-lookup nodes (a\n"
+                                        "branch off the root or a chain extension) onto a host-built\n"
+                                        "tree verify when the lookup's match is long enough; lossless,\n"
+                                        "also with --draft-coupling (default 0 = off)" },
+    { "--draft-ngram-min-match", "L",   "shortest lookup match, in tokens, --draft-ngram-leaves grafts\n"
+                                        "(default 8)" },
+    { "--draft-coupling-temp", "T",     "the temperature of the coupled draft law Q (the head's top-8\n"
+    "                                    scores / T, softmax): a number (default 1 = the legacy law), or\n"
+    "                                    request / auto = each request's own temperature (times\n"
+    "                                    --draft-coupling-temp-mul). Exactness does not depend on it" },
+    { "--draft-coupling-temp-mul", "F",  "with --draft-coupling-temp request: draft at F x the request\n"
+    "                                    temperature (default 1)" },
+    { "--draft-coupling-truncate", "MODE", "off (default) | on -- cut the draft law's support to the request's\n"
+    "                                    top-k / top-p before drawing" },
+    { "--draft-siblings",     "KIND",   "gumbel (default) | rheo -- with --draft-coupling on and a draft tree:\n"
+    "                                    how a node's sibling drafts are chosen. gumbel: sampled without\n"
+    "                                    replacement from the head's law (Gumbel-top-k). rheo: the top-N\n"
+    "                                    tokens of the head's law plus one sampled from the rest\n"
+    "                                    (N = --draft-rheo-m), verified by the greedy multi-draft\n"
+    "                                    verifier; the output law is unchanged either way" },
+    { "--draft-rheo-m",       "N",      "--draft-siblings rheo: the number of deterministic top-q children\n"
+    "                                    per node, 0..7 (default 1; the sampled tail child is extra)" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -905,6 +964,72 @@ int config_parse(int argc, char** argv, Config* c) {
             else c->draft_tree_rows = (int)n;
         }
         else if (S("--draft-tree-chain"))      { if (!num(0, 2, &c->draft_tree_chain)) return RAD_E_INVAL; }
+        else if (S("--draft-adaptive")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_adaptive = false;
+            else if (!std::strcmp(v, "on"))  c->draft_adaptive = true;
+            else {
+                RAD_ERR("--draft-adaptive takes off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-adaptive-margin") || S("--draft-adaptive-cont") || S("--draft-cost-draft-ms")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            const bool ms = S("--draft-cost-draft-ms"), cont = S("--draft-adaptive-cont");
+            if (ms ? !(d >= 0.0 && d <= 100.0) : cont ? !(d > 0.0 && d < 1.0) : !(d >= 0.05 && d <= 20.0)) {
+                RAD_ERR("%s: '%s' is out of range", a.c_str(), v);
+                return RAD_E_INVAL;
+            }
+            (ms ? c->draft_cost_draft_ms : cont ? c->draft_adaptive_cont : c->draft_adaptive_margin) = d;
+        }
+        else if (S("--draft-adaptive-floor"))  { if (!num(1, 16, &c->draft_adaptive_floor)) return RAD_E_INVAL; }
+        else if (S("--draft-calib-log")) { if (!(v = need(i))) return RAD_E_INVAL; c->draft_calib_log = v; }
+        else if (S("--draft-calib-interval")) { if (!num(8, 1000000, &c->draft_calib_interval)) return RAD_E_INVAL; }
+        else if (S("--draft-calib-ece") || S("--draft-coupling-temp-autofit")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            bool b = false;
+            if      (!std::strcmp(v, "off")) b = false;
+            else if (!std::strcmp(v, "on"))  b = true;
+            else { RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v); return RAD_E_INVAL; }
+            (S("--draft-calib-ece") ? c->draft_calib_ece : c->draft_coupling_autofit) = b;
+        }
+        else if (S("--draft-cost-table") || S("--draft-calib")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* --draft-calib online|static|off[:LIST]: the mode, then the list as before */
+            std::string calib_v = v;
+            bool no_list = false;
+            if (S("--draft-calib")) {
+                const size_t colon = calib_v.find(':');
+                const std::string head = calib_v.substr(0, colon);
+                if (head == "online" || head == "static" || head == "off") {
+                    c->draft_calib_mode = head == "online" ? 1 : head == "off" ? 2 : 0;
+                    calib_v = colon == std::string::npos ? std::string() : calib_v.substr(colon + 1);
+                    if (head == "off") {
+                        if (!calib_v.empty()) { RAD_ERR("--draft-calib off takes no list"); return RAD_E_INVAL; }
+                        c->draft_calib.clear();
+                    }
+                    no_list = calib_v.empty();
+                }
+            }
+            if (!no_list) {
+                v = calib_v.c_str();
+                /* "a,b,c": numbers only (validated by the same parser the plugin uses) */
+                RadMtpAdapt probe;
+                const std::string key = S("--draft-cost-table") ? "cost=" : "temp=";
+                if (!*v) (S("--draft-cost-table") ? c->draft_cost_table : c->draft_calib).clear();
+                else if (std::strchr(v, ';') || std::strchr(v, '=') || !rad_mtp_adapt_parse((key + v).c_str(), &probe) ||
+                         (key == "cost=" ? probe.ncost < 1 : probe.ntemp < 1)) {
+                    RAD_ERR("%s takes a comma-separated list of numbers, not '%s'", a.c_str(), v);
+                    return RAD_E_INVAL;
+                } else {
+                    (S("--draft-cost-table") ? c->draft_cost_table : c->draft_calib) = v;
+                }
+            }
+        }
+        else if (S("--draft-ngram-leaves"))    { if (!num(0, 16, &c->draft_ngram_leaves)) return RAD_E_INVAL; }
+        else if (S("--draft-ngram-min-match")) { if (!num(1, 64, &c->draft_ngram_min_match)) return RAD_E_INVAL; }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -913,6 +1038,67 @@ int config_parse(int argc, char** argv, Config* c) {
                 RAD_ERR("--draft-coupling takes off or on, not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--draft-verify")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "token") || !std::strcmp(v, "rowwise")) {
+                c->draft_verify_block = false;
+                c->draft_verify_traversal = false;
+            }
+            else if (!std::strcmp(v, "block"))     { c->draft_verify_block = true;  c->draft_verify_traversal = false; }
+            else if (!std::strcmp(v, "traversal")) { c->draft_verify_block = false; c->draft_verify_traversal = true; }
+            else {
+                RAD_ERR("--draft-verify takes token (rowwise), block or traversal, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-coupling-temp")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto") || !std::strcmp(v, "request")) c->draft_coupling_req_temp = true;
+            else {
+                char* end = nullptr;
+                const double t = std::strtod(v, &end);
+                if (end == v || *end || !(t > 0.0) || t > 100.0) {
+                    RAD_ERR("--draft-coupling-temp takes auto, request or a number in (0, 100], not '%s'", v);
+                    return RAD_E_INVAL;
+                }
+                c->draft_coupling_req_temp = false;
+                c->draft_coupling_temp = (float)t;
+            }
+        }
+        else if (S("--draft-coupling-temp-mul")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* end = nullptr;
+            const double t = std::strtod(v, &end);
+            if (end == v || *end || !(t > 0.0) || t > 100.0) {
+                RAD_ERR("--draft-coupling-temp-mul takes a number in (0, 100], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_coupling_temp_mul = (float)t;
+        }
+        else if (S("--draft-coupling-truncate")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_coupling_truncate = false;
+            else if (!std::strcmp(v, "on"))  c->draft_coupling_truncate = true;
+            else {
+                RAD_ERR("--draft-coupling-truncate takes off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-siblings")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "gumbel")) c->draft_siblings_rheo = false;
+            else if (!std::strcmp(v, "rheo"))   c->draft_siblings_rheo = true;
+            else {
+                RAD_ERR("--draft-siblings takes gumbel or rheo, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-rheo-m")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 0, 7, &n)) return RAD_E_INVAL;
+            c->draft_rheo_m = (int)n;
         }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
@@ -1370,6 +1556,22 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --draft-verify block verifies a linear chain with the coupled drafting's states. */
+    if (c->draft_verify_block) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-verify block needs the coupled drafting (--draft-coupling on); "
+                    "--draft-coupling off contradicts it");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_tree > 0) {
+            RAD_ERR("--draft-verify block verifies a linear chain; it cannot be combined with "
+                    "--draft-tree on (a tree's siblings are verified by recursive rejection "
+                    "sampling, --draft-verify token)");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+        c->draft_tree = 0;
+    }
     /* --host-pool-mib is what the model pins for its weights in all; Config::host_pool_mib is a
      * rank's share of it, whichever of the two options came first. */
     if (pool_all) c->host_pool_mib /= std::max(c->tp, 1);
@@ -1504,7 +1706,34 @@ const ShowRow kShow[] = {
           return c.draft_tree_rows >= 0 ? num(c.draft_tree_rows) : std::string("off"); } },
     { "--draft-tree-chain",   [](const Config& c) {
           return c.draft_tree_chain > 0 ? num(c.draft_tree_chain) : std::string("off"); } },
+    { "--draft-adaptive",     [](const Config& c) { return onoff(c.draft_adaptive); } },
+    { "--draft-adaptive-margin", [](const Config& c) { return fnum(c.draft_adaptive_margin); } },
+    { "--draft-adaptive-floor", [](const Config& c) { return num(c.draft_adaptive_floor); } },
+    { "--draft-adaptive-cont", [](const Config& c) { return fnum(c.draft_adaptive_cont); } },
+    { "--draft-cost-draft-ms", [](const Config& c) {
+          return c.draft_cost_draft_ms >= 0 ? fnum(c.draft_cost_draft_ms) : std::string("auto"); } },
+    { "--draft-cost-table",   [](const Config& c) {
+          return c.draft_cost_table.empty() ? std::string("auto") : c.draft_cost_table; } },
+    { "--draft-calib",        [](const Config& c) {
+          const char* m = c.draft_calib_mode == 1 ? "online" : c.draft_calib_mode == 2 ? "off" : "static";
+          return c.draft_calib_mode == 0 ? (c.draft_calib.empty() ? std::string("off") : c.draft_calib)
+                                         : std::string(m) + (c.draft_calib.empty() ? "" : ":" + c.draft_calib); } },
+    { "--draft-calib-log",    [](const Config& c) { return or_none(c.draft_calib_log, "none"); } },
+    { "--draft-calib-ece",    [](const Config& c) { return onoff(c.draft_calib_ece); } },
+    { "--draft-calib-interval", [](const Config& c) { return num(c.draft_calib_interval); } },
+    { "--draft-coupling-temp-autofit", [](const Config& c) { return onoff(c.draft_coupling_autofit); } },
+    { "--draft-ngram-leaves", [](const Config& c) {
+          return c.draft_ngram_leaves > 0 ? num(c.draft_ngram_leaves) : std::string("off"); } },
+    { "--draft-ngram-min-match", [](const Config& c) { return num(c.draft_ngram_min_match); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
+    { "--draft-verify",       [](const Config& c) {
+          return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },
+    { "--draft-coupling-temp", [](const Config& c) {
+          return c.draft_coupling_req_temp ? std::string("request") : fnum(c.draft_coupling_temp); } },
+    { "--draft-coupling-temp-mul", [](const Config& c) { return fnum(c.draft_coupling_temp_mul); } },
+    { "--draft-coupling-truncate", [](const Config& c) { return onoff(c.draft_coupling_truncate); } },
+    { "--draft-siblings",     [](const Config& c) { return std::string(c.draft_siblings_rheo ? "rheo" : "gumbel"); } },
+    { "--draft-rheo-m",       [](const Config& c) { return num(c.draft_rheo_m); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

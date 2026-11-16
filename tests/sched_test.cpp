@@ -8734,3 +8734,190 @@ TEST(a_chain_form_step_issued_ahead_tells_the_sampler_how_much_of_the_arriving_t
         CHECK_EQ(rq->draft_chain, arriving == 0 ? 3 : arriving == 1 ? 2 : 1);
     }
 }
+
+/* ================================================================== prompt-lookup grafts
+ * --draft-ngram-leaves (core/sched/ngram_tree.h): a host-built tree verify takes the sequence's
+ * lookup proposal as extra nodes, marked past Request::draft_extra. */
+
+#include "sched/ngram_tree.h"
+
+namespace {
+/* A request whose prompt repeats 100..107, so the lookup continues the cycle: after the commit of
+ * 100 it proposes 101 102 103 with the longest match the index counts. */
+uint64_t ngram_cycle_request(Fixture& f) {
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    const uint64_t a = r->id;
+    CHECK_OK(f.sch.add(std::move(r)));
+    return a;
+}
+}  // namespace
+
+TEST(ngram_tree_merge_follows_extends_and_branches) {
+    using namespace rad;
+    NgramTreeCfg c;
+    c.leaves = 3; c.min_match = 4; c.max_nodes = 8; c.max_depth = 4;
+    const int32_t prop[4] = { 21, 22, 23, 24 };
+    /* a proposal that continues the drafted chain: a chain extension, one node */
+    int32_t tok[16] = { 21, 22, 23 }, par[16] = { 0, 1, 2 };
+    NgramTreeOut o = ngram_tree_merge(tok, par, 3, 3, prop, 4, 8, c);
+    CHECK_EQ(o.added, 1); CHECK_EQ(o.n, 4); CHECK_EQ(o.n_model, 3); CHECK_EQ(o.displaced, 0);
+    CHECK_EQ(tok[3], 24); CHECK_EQ(par[3], 3);
+    /* one that leaves the tree at the root: a branch of up to `leaves` nodes */
+    const int32_t other[4] = { 90, 91, 92, 93 };
+    int32_t tok2[16] = { 21, 22, 23 }, par2[16] = { 0, 1, 2 };
+    o = ngram_tree_merge(tok2, par2, 3, 3, other, 4, 8, c);
+    CHECK_EQ(o.added, 3); CHECK_EQ(o.n, 6); CHECK_EQ(o.n_model, 3);
+    CHECK_EQ(tok2[3], 90); CHECK_EQ(par2[3], 0); CHECK_EQ(par2[4], 4); CHECK_EQ(par2[5], 5);
+    /* one that diverges below a drafted node: the branch hangs there */
+    const int32_t mid[4] = { 21, 22, 77, 78 };
+    int32_t tok3[16] = { 21, 22, 23 }, par3[16] = { 0, 1, 2 };
+    o = ngram_tree_merge(tok3, par3, 3, 3, mid, 4, 8, c);
+    CHECK_EQ(o.added, 2); CHECK_EQ(par3[3], 2); CHECK_EQ(par3[4], 4);
+    /* a short match, a proposal the tree already holds, and a depth limit change nothing */
+    int32_t tok4[16] = { 21, 22, 23 }, par4[16] = { 0, 1, 2 };
+    CHECK_EQ(ngram_tree_merge(tok4, par4, 3, 3, other, 4, 3, c).added, 0);
+    CHECK_EQ(ngram_tree_merge(tok4, par4, 3, 3, prop, 3, 8, c).added, 0);
+    NgramTreeCfg shallow = c;
+    shallow.max_depth = 3;
+    CHECK_EQ(ngram_tree_merge(tok4, par4, 3, 3, prop, 4, 8, shallow).added, 0);
+    /* inert duplicates are free room; a full tree displaces its last real nodes, never the matched path */
+    int32_t tok5[16] = { 21, 22, 23, 21, 21, 21 }, par5[16] = { 0, 1, 2, 0, 0, 0 };
+    NgramTreeCfg tight = c;
+    tight.max_nodes = 6; tight.leaves = 2;
+    o = ngram_tree_merge(tok5, par5, 6, 3, other, 4, 8, tight);
+    CHECK_EQ(o.added, 2); CHECK_EQ(o.n, 5); CHECK_EQ(o.n_model, 3); CHECK_EQ(o.displaced, 0);
+    int32_t tok6[16] = { 21, 22, 23, 31, 32, 33 }, par6[16] = { 0, 1, 2, 0, 0, 0 };
+    o = ngram_tree_merge(tok6, par6, 6, 6, other, 4, 8, tight);
+    CHECK_EQ(o.added, 2); CHECK_EQ(o.n, 6); CHECK_EQ(o.n_model, 4); CHECK_EQ(o.displaced, 2);
+    CHECK_EQ(tok6[3], 31); CHECK_EQ(tok6[4], 90); CHECK_EQ(par6[5], 5);
+    int32_t tok7[16] = { 21, 22, 23, 31, 32, 33 }, par7[16] = { 0, 1, 2, 0, 0, 0 };
+    const int32_t deep[4] = { 21, 22, 23, 24 };   /* the matched path is all of the first three nodes */
+    NgramTreeCfg one = tight;
+    one.max_depth = 4;
+    o = ngram_tree_merge(tok7, par7, 6, 6, deep, 4, 8, one);
+    /* the cut is made for the proposal's nominal two nodes whether or not it matches the drawn
+     * tokens (a cut that read the draw would not be exact): three nodes match, one is new */
+    CHECK_EQ(o.added, 1); CHECK_EQ(o.displaced, 2); CHECK_EQ(o.n, 5); CHECK_EQ(o.n_model, 4);
+    CHECK_EQ(tok7[4], 24); CHECK_EQ(par7[4], 3);
+    /* a proposal the tree already holds still cuts when the tree is full: nothing is grafted */
+    int32_t tok8[16] = { 21, 22, 23, 31, 32, 33 }, par8[16] = { 0, 1, 2, 0, 0, 0 };
+    const int32_t held[3] = { 21, 22, 23 };
+    o = ngram_tree_merge(tok8, par8, 6, 6, held, 3, 8, one);
+    CHECK_EQ(o.added, 0); CHECK_EQ(o.displaced, 2); CHECK_EQ(o.n, 4); CHECK_EQ(o.n_model, 4);
+}
+
+TEST(a_host_built_tree_takes_the_lookups_nodes_past_draft_extra) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_ngram_leaves = 2;
+    f.cfg.draft_ngram_min_match = 4;
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    /* room: the chain's inert duplicates are free, nothing is displaced */
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    CHECK_EQ(rq->n_draft, 5);
+    CHECK_EQ(rq->draft_extra, 3);
+    CHECK_EQ(rq->draft[3], 101);
+    CHECK_EQ(rq->draft[4], 102);
+    CHECK_EQ(rq->draft_parent[3], 0);
+    CHECK_EQ(rq->draft_parent[4], 4);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 5);
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK_EQ(f.sch.metrics().ngram_graft_steps, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().ngram_graft_nodes, (int64_t)2);
+    CHECK_EQ(f.sch.metrics().ngram_graft_displaced, (int64_t)0);
+    /* the walk took the lookup's branch: nodes 4 and 5 */
+    const int32_t path[2] = { 4, 5 };
+    commit_one(f, 2, 900, path, 2);
+    CHECK_EQ(f.sch.metrics().ngram_graft_verifies, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().ngram_graft_hits, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().ngram_graft_hit_nodes, (int64_t)2);
+    rq = f.sch.find(a);
+    REQUIRE(rq->output.size() >= 4);
+    CHECK_EQ(rq->output[rq->output.size() - 3], 101);
+    CHECK_EQ(rq->output[rq->output.size() - 2], 102);
+    CHECK_EQ(rq->output[rq->output.size() - 1], 900);
+}
+
+TEST(a_full_host_built_tree_gives_up_its_last_nodes_to_a_long_match) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_ngram_leaves = 2;
+    f.cfg.draft_ngram_min_match = 4;
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    CHECK_EQ(rq->n_draft, 6);
+    CHECK_EQ(rq->draft_extra, 4);
+    const int32_t want[6] = { 21, 22, 23, 31, 101, 102 };
+    for (int j = 0; j < 6; ++j) CHECK_EQ(rq->draft[j], want[j]);
+    CHECK_EQ(rq->draft_parent[4], 0);
+    CHECK_EQ(rq->draft_parent[5], 5);
+    CHECK_EQ(f.sch.metrics().ngram_graft_displaced, (int64_t)2);
+    /* a rejected lookup leaves no trace in the output: the verify's own token */
+    REQUIRE(f.sch.step() != nullptr);
+    commit_one(f, 0, 77);
+    CHECK_EQ(f.sch.metrics().ngram_graft_verifies, (int64_t)1);   /* every verify that carried one counts */
+    CHECK_EQ(f.sch.metrics().ngram_graft_hits, (int64_t)0);
+    /* the next proposal is the model's again: nothing carries over */
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    CHECK_EQ(f.sch.find(a)->draft_extra, -1);
+}
+
+TEST(the_lookup_graft_is_off_by_default_and_gated_by_the_match_length) {
+    for (int mode = 0; mode < 2; ++mode) {
+        Fixture f;
+        serial_tree_setup(f);
+        if (mode == 1) { f.cfg.draft_ngram_leaves = 2; f.cfg.draft_ngram_min_match = 9; }   /* the index counts 8 */
+        CHECK_OK(f.start());
+        const uint64_t a = ngram_cycle_request(f);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(100);
+        CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+        const Request* rq = f.sch.find(a);
+        REQUIRE(rq != nullptr);
+        CHECK_EQ(rq->n_draft, 6);
+        CHECK_EQ(rq->draft_extra, -1);
+        for (int j = 0; j < 6; ++j) CHECK_EQ(rq->draft[j], kTreeDraft[j]);
+        CHECK_EQ(f.sch.metrics().ngram_graft_steps, (int64_t)0);
+    }
+}
+
+TEST(a_graft_mark_does_not_outlive_its_verify) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_ngram_leaves = 2;
+    f.cfg.draft_ngram_min_match = 4;
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    CHECK(rq->draft_extra >= 0);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(rq->draft_extra, 4);   /* the step's own copy is what the verify carries */
+    const int32_t path[2] = { 5, 6 };
+    commit_one(f, 2, 900, path, 2);
+    CHECK_EQ(f.sch.metrics().ngram_graft_verifies, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().ngram_graft_hits, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().ngram_graft_hit_nodes, (int64_t)2);
+    /* nothing carries over to a step built without a set_draft */
+    CHECK_EQ(f.sch.find(a)->draft_extra, -1);
+    if (f.sch.step()) CHECK_EQ(f.sch.find(a)->draft_extra, -1);
+}

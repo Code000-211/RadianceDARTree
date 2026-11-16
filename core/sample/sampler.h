@@ -80,6 +80,7 @@
 #include "rad_spechub.h"
 
 #include "../rad_core.h"
+#include "../sched/draft.h"
 #include "grammar.h"
 #include "host_ref.h"
 #include "vocab_view.h"
@@ -127,6 +128,18 @@ struct SamplerConfig {
     /* --draft-coupling: declare the coupled verify (`mtp_couple_verify`) behind the pick and the
      * per-row state plane it reads. */
     bool    draft_coupling = false;
+    /* --draft-verify block: the chain rows of a coupled request are verified as one block
+     * (abi/rad_mtp_block.h) instead of one at a time. Needs draft_coupling. */
+    bool    draft_verify_block = false;
+
+    /* --draft-verify traversal: `mtp_trav_verify` replaces the row-wise verify behind the pick
+     * (needs draft_coupling) and a per-row tree plane rides with the state plane. */
+    bool    draft_verify_traversal = false;
+
+    /* The coupled rows' P export (rad_mtp_couple_export_p) is read back to the host, rank 0 only,
+     * for the exact acceptance labels of --draft-calib online / --draft-calib-log. Needs
+     * draft_coupling; off, nothing is copied. */
+    bool    couple_export = false;
 };
 
 /* ================================================================== the driver */
@@ -234,7 +247,7 @@ public:
      * verify op at all. Cleared by build_greedy: a gate for run(), not for evidence. */
     bool staged_any_couple() const { return any_couple_; }
     /* The verify op the last build resolved, for naming its kernel in a log line. */
-    rad_op staged_couple_op() const { return op_couple_; }
+    rad_op staged_couple_op() const { return trav_ ? op_trav_ : op_couple_; }
 
     /* What build_step staged for the coupled verify. build_greedy, which runs between that build
      * and the step's wait, clears any_couple_ but leaves this snapshot. */
@@ -245,6 +258,31 @@ public:
         std::vector<std::pair<uint64_t, int64_t>> seqs;
     };
     const CoupleBuild& couple_build() const { return couple_build_; }
+
+    /* One coupled row the build staged, for the calibration (core/sched/mtp_calib.h): the sampled
+     * row, its request and temperature, draft index k, the Q the verify judged (as staged) and the
+     * nodes of its drafted children. */
+    struct CoupleRow {
+        int64_t   row = 0;
+        uint64_t  seq = 0;
+        float     temp = 1.0f;
+        int32_t   k = 0, dk = 0, nk = 0;
+        int32_t   kid_node[RAD_SCHED_MAX_SPEC] = {};
+        RadMtpCoupleState q{};
+    };
+    /* A step's coupled rows and the plane the verify wrote P into (status 2 = exported). */
+    struct CoupleExport {
+        int64_t                step = -1;
+        bool                   issued = false;
+        std::vector<CoupleRow> rows;
+        RadMtpCoupleState*     post = nullptr;   /* pinned [capacity], filled by an async copy */
+    };
+    /* The export of engine step `step`, or null when it was not staged, not copied or already
+     * overwritten (a ring of four steps). Read only after the step's stream has been waited on. */
+    const CoupleExport* couple_export(int64_t step) const {
+        const CoupleExport& e = couple_ring_[(size_t)(step & 3)];
+        return couple_ring_ok_ && e.step == step && e.issued ? &e : nullptr;
+    }
     /* The engine step whose build run() last issued the verify op for, or -1. */
     int64_t staged_couple_issued_step() const { return couple_issued_step_; }
 
@@ -303,6 +341,10 @@ private:
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
     rad_op op_couple_    = RAD_NULL_HANDLE;   /* --draft-coupling only */
+    rad_op op_trav_      = RAD_NULL_HANDLE;   /* --draft-verify traversal: replaces op_couple_ */
+    rad_buf buf_trav_    = RAD_NULL_HANDLE;   /* [rows, 2] i32: parent row (-1 root), draft token */
+    int32_t* trav_stage_ = nullptr;           /* pinned, 2 words a sampled row */
+    bool    trav_        = false;
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
 
@@ -328,6 +370,9 @@ private:
     bool    any_couple_  = false;   /* does any row this step carry a bound state? */
     CoupleBuild couple_build_{};    /* what the last build_step staged, for the evidence line */
     int64_t couple_issued_step_ = -1;   /* step whose verify op run() last issued */
+    CoupleExport couple_ring_[4];       /* cfg_.couple_export: the last four steps' labelled rows */
+    bool    couple_ring_ok_ = false;
+    CoupleExport* couple_cur_ = nullptr;   /* the ring entry this build fills */
 
     /* Pinned staging, allocated once at declare. */
     DeviceSampleParams* params_stage_ = nullptr;

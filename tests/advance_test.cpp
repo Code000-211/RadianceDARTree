@@ -1198,6 +1198,41 @@ TEST(a_pruned_serial_tree_keeps_only_the_leaves_the_distribution_backs) {
     }
 }
 
+/* --draft-adaptive's stage 1 without coupling (abi/rad_mtp_adapt.h): a leaf is kept while its
+ * calibrated probability beats the marginal verify-row cost, with the one-round chain it joins. Same
+ * row as above (.66 .243 .0895 .0045): default cost, depth 1: E 1.66, thresholds .141 / .148 / ... */
+TEST(an_adaptive_serial_tree_keeps_the_leaves_that_pay_for_their_rows) {
+    const int32_t ids[8] = { 500, 601, 602, 603, 604, 605, 606, 607 };
+    const float   val[8] = { 5, 4, 3, 0, -1, -2, -3, -4 };
+    auto run = [&](const char* txt, int depth = 1) {
+        Slab s(ADV_TAKE);
+        s.a.round = 1; s.a.src_pitch = 8;
+        s.a.tree_nodes = 4; s.a.leaves = 3; s.a.vocab = 1000; s.a.depth = depth;
+        CHECK(rad_mtp_adapt_parse(txt, &s.a.adapt));
+        float v[8];
+        std::memcpy(v, val, sizeof v);
+        s.a.src_val = v;
+        std::memset(&s.st[0], 0, sizeof s.st[0]);
+        s.row(0, true, 0, 1, 0, 0, 0, 0, 0);
+        std::memcpy(s.src, ids, sizeof ids);
+        s.run();
+        return s.st[0];
+    };
+    CHECK_EQ(run("on=1").nalt, 1);                    /* .243 passes .141, .0895 fails .148 */
+    CHECK_EQ(run("on=1").tok[2], 601);
+    CHECK_EQ(run("on=1;margin=0.5").nalt, 2);         /* thresholds halve */
+    CHECK_EQ(run("on=1;margin=3").nalt, 0);
+    CHECK_EQ(run("on=1;margin=0.01").nalt, 3);        /* every valid leaf, as unpruned */
+    CHECK_EQ(run("on=1;cost=10,10,10,10,10,10;row=0;draft=0").nalt, 3);   /* free rows: all */
+    /* calibration: a flatter head (T 2) raises the runner-ups' probabilities */
+    CHECK(run("on=1;margin=1;temp=2.0").nalt >= run("on=1;margin=1").nalt);
+    /* off: untouched */
+    CHECK_EQ(run("on=0").nalt, 3);
+    /* the leaves are the prefix of the columns, never a later one over an earlier */
+    const StepSlot a = run("on=1;margin=0.5");
+    CHECK_EQ(a.tok[2], 601); CHECK_EQ(a.tok[3], 602);
+}
+
 TEST(a_pruned_serial_tree_never_prunes_the_rows_best_candidate_and_drops_invalid_ones) {
     const int32_t ids[8] = { 500, 601, 602, 603, 604, 605, 606, 607 };
     /* the largest logit is column 2, not the pick's column 0: it is the row's best, so a leaf the

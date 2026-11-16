@@ -1528,7 +1528,7 @@ struct HostChain {
 
     HostChain(int64_t n_vocab, int64_t max_seqs, int max_spec, const VocabView* vocab = nullptr,
               int64_t max_candidates = 8, const char* second_plugin = nullptr,
-              bool draft_coupling = false)
+              bool draft_coupling = false, bool verify_block = false, bool verify_traversal = false)
         : nv(n_vocab) {
         /* libref alone: it is the implementation under test, and a directory scan would also
          * pick up whatever else was built beside it. */
@@ -1571,6 +1571,8 @@ struct HostChain {
         cfg.max_hist = 64;
         cfg.max_candidates = max_candidates;
         cfg.draft_coupling = draft_coupling;
+        cfg.draft_verify_block = verify_block;
+        cfg.draft_verify_traversal = verify_traversal;
         if (s.declare(&b, cfg) < 0) return;
         if (b.finish() < 0) return;
         prog = std::move(b.program());
@@ -3518,6 +3520,52 @@ TEST(the_coupled_state_is_staged_only_at_the_row_it_was_bound_for) {
     CHECK(!ch.s.staged_any_couple());
 }
 
+/* --draft-verify block: the chain rows bound from round 1 on, consecutively, carry the block's
+ * length in `blk` (what the verify's round-1 row decides from); the bonus row and a row after a
+ * gap do not, and without the flag nothing is marked. */
+TEST(block_verification_marks_the_consecutive_bound_rows_of_a_chain) {
+    HostChain ch(64, 2, 3, nullptr, 8, "spechub.so", true, true);
+    if (!ch.ok) {
+        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
+                ::radtest::current(), home().c_str());
+        return;
+    }
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    const int32_t draft[3] = { 21, 22, 23 };
+    Request r = make_req(7, { 1, 2, 3 }, sp);
+    r.draft = draft;
+    r.n_draft = 3;
+    std::string err;
+    CHECK_OK(ch.s.begin_request(r.id, r.sp, &err));
+    const uint64_t n_out = r.output.size();
+    RadMtpCoupleState bound[3];
+    couple_states(r.id, r.sp.seed, draft, 3, rad_mtp_couple_verify_pos(n_out, 1), bound);
+    CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3));
+    std::vector<Request*> reqs = { &r };
+    CHECK_OK(ch.s.build_step(reqs));
+    for (int k = 0; k < 3; ++k) CHECK_EQ(ch.s.staged_couple(k).blk, 3);
+    CHECK_EQ(ch.s.staged_couple(3).blk, 0);
+
+    /* row 1 stale: the block is row 0 alone; row 2 is bound but past the gap, so token-wise */
+    bound[1].pos += 1;
+    CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3));
+    CHECK_OK(ch.s.build_step(reqs));
+    CHECK_EQ(ch.s.staged_couple(0).blk, 1);
+    CHECK_EQ(ch.s.staged_couple(1).round, 0);
+    CHECK_EQ(ch.s.staged_couple(2).round, 3);
+    CHECK_EQ(ch.s.staged_couple(2).blk, 0);
+
+    /* the same chain without the flag is not marked */
+    HostChain plain(64, 2, 3, nullptr, 8, "spechub.so", true, false);
+    CHECK(plain.ok);
+    CHECK_OK(plain.s.begin_request(r.id, r.sp, &err));
+    couple_states(r.id, r.sp.seed, draft, 3, rad_mtp_couple_verify_pos(n_out, 1), bound);
+    CHECK_OK(plain.s.set_mtp_couple(r.id, bound, 3));
+    CHECK_OK(plain.s.build_step(reqs));
+    for (int k = 0; k < 3; ++k) CHECK_EQ(plain.s.staged_couple(k).blk, 0);
+}
+
 /* A DRAFT TREE'S COUPLED ROWS (recursive rejection sampling over the siblings, abi/rad_mtp_rrs.h).
  *
  * The tree is the chain 1..3 plus two leaves under the root (nodes 4, 5). Row 0 (the root) drafted
@@ -3589,6 +3637,66 @@ TEST(a_draft_trees_coupled_rows_keep_the_prefix_of_their_drafted_children) {
     CHECK_EQ(ch.s.staged_couple(0).round, 0);
     /* A greedy request binds nothing. */
     ch.s.end_request(r.id);
+}
+
+/* TRAVERSAL VERIFICATION THROUGH THE SAMPLER (--draft-verify traversal, abi/rad_mtp_traversal.h).
+ *
+ * The same tree as above (the trunk chain 21, 22, 23 and the root's leaves 31, 32; the root drafted
+ * 21, 31, 32 in that order from a uniform q). The sampler stages the per-row tree plane (parent row,
+ * draft token) and issues `mtp_trav_verify` instead of the row-wise verify. With the target peaked
+ * on the leaf 31 at every row the walk rejects the trunk (its sequence-level ratio is ~e^-20 / 0.25)
+ * and accepts the leaf: the root row's token is the leaf's token, written by the walk. The same
+ * step with a target peaked on the trunk walks the chain and accepts all three trunk nodes. */
+TEST(traversal_verification_walks_the_staged_tree_through_the_sampler) {
+    HostChain ch(64, 2, 5, nullptr, 8, "spechub.so", true, false, true);
+    if (!ch.ok) {
+        fprintf(stderr, "  SKIP %s: libref/spechub did not load from %s/kernels\n",
+                ::radtest::current(), home().c_str());
+        return;
+    }
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    const int32_t draft[5] = { 21, 22, 23, 31, 32 };
+    const int32_t par[5]   = { 0, 1, 2, 0, 0 };
+    Request r = make_req(7, { 1, 2, 3 }, sp);
+    r.draft = draft;
+    r.draft_parent = par;
+    r.n_draft = 5;
+    std::string err;
+    CHECK_OK(ch.s.begin_request(r.id, r.sp, &err));
+    const uint64_t n_out = r.output.size();
+    RadMtpCoupleState bound[3];
+    couple_states(r.id, r.sp.seed, draft, 3, n_out, bound);
+    for (int k = 0; k < 3; ++k) bound[k].pos = n_out + (uint64_t)k;
+    RadMtpCoupleState& root = bound[0];
+    root.count = 4;
+    root.ids[0] = 21; root.ids[1] = 31; root.ids[2] = 32; root.ids[3] = 40;
+    root.q[0] = root.q[1] = root.q[2] = root.q[3] = 0.25;
+    root.nkids = 3;
+    CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3, true));
+
+    std::vector<float> lg(6 * 64, 0.0f);
+    for (int row = 0; row < 6; ++row) lg[(size_t)row * 64 + 31] = 20.0f;
+    std::vector<int32_t> tok;
+    CHECK_OK(ch.step({ &r }, lg, &tok));
+    REQUIRE_EQ(tok.size(), (size_t)6);
+    CHECK_EQ(tok[0], 31);   /* the accepted leaf */
+    CHECK_EQ(tok[4], 31);   /* the final token at the leaf's row: the pick, the target's mode */
+
+    /* A target peaked on the trunk, chain rows peaked on their drafts: 21, 22, 23, then the bonus. */
+    CHECK_OK(ch.s.set_mtp_couple(r.id, bound, 3, true));
+    std::vector<float> lg2(6 * 64, 0.0f);
+    lg2[0 * 64 + 21] = 20.0f;
+    lg2[1 * 64 + 22] = 20.0f;
+    lg2[2 * 64 + 23] = 20.0f;
+    lg2[3 * 64 + 9]  = 20.0f;
+    lg2[4 * 64 + 9]  = 20.0f;
+    lg2[5 * 64 + 9]  = 20.0f;
+    CHECK_OK(ch.step({ &r }, lg2, &tok));
+    CHECK_EQ(tok[0], 21);
+    CHECK_EQ(tok[1], 22);
+    CHECK_EQ(tok[2], 23);
+    CHECK_EQ(tok[3], 9);
 }
 
 /* THE SNAPSHOT THE EVIDENCE READS.

@@ -31,6 +31,7 @@ struct MtpTreeArgs {
   const unsigned* cdraw;  long cdraw_stride;
   const int* cseq;        long cseq_stride;
   unsigned* cstate;       long cst_node, cst_seq;  int cst_rows;  long cvocab;
+  int cscheme;            // 0: Gumbel siblings; m + 1: RheoSampling with m top-q children
 };
 
 __global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
@@ -44,7 +45,7 @@ __global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
     cpl.draw = a.cdraw + (long)m * a.cdraw_stride;
     cpl.card = a.cseq[(long)m * a.cseq_stride];
     cpl.state = a.cstate; cpl.st_node = a.cst_node; cpl.st_seq = a.cst_seq;
-    cpl.rows = a.cst_rows; cpl.vocab = a.cvocab;
+    cpl.rows = a.cst_rows; cpl.vocab = a.cvocab; cpl.scheme = a.cscheme;
   }
   rad_mtp_tree_grow_seq_cpl(&a.cfg, a.state + (long)m * a.state_stride, a.didx, a.dval,
                         (long)m * a.per, a.row_stride, 1, head,
@@ -77,6 +78,7 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
   k.cfg.block  = (int)r4d_geti_or(a, "block_size", 0);
   k.cfg.sel_pitch = (int)r4d_geti_or(a, "sel_pitch", 0);
   rad_mtp_tree_set_prune(&k.cfg, r4d_getf(a, "prune_abs", 0.0), r4d_getf(a, "prune_rel", 0.0));
+  if (!rad_mtp_adapt_parse_cached(r4d_gets(a, "adapt"), &k.cfg.ad)) return R4D_NO(RAD_E_INVAL);
   if (st->rank != 2 || tok->rank != 2 || par->rank != 2 || didx->rank != 2 || dval->rank != 2)
     return R4D_NO(RAD_E_SHAPE);
   const long long M = st->shape[0];
@@ -142,6 +144,7 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
     k.cstate = (unsigned*)cst->data;       k.cst_node = (long)cst->stride[0];
     k.cst_seq = (long)cst->stride[1];      k.cst_rows = (int)cst->shape[0];
     k.cvocab = (long)r4d_geti_or(a, "n_vocab", 0);
+    k.cscheme = (int)r4d_geti_or(a, "rheo_m", -1) + 1;
   }
   k.M = (int)M;
   hipLaunchKernelGGL(r4d_mtp_tree_grow_kernel, dim3((unsigned)((M + 63) / 64)), dim3(64), 0,

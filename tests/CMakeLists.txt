@@ -89,6 +89,7 @@ set_target_properties(harness_fixture PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 # Binaries registered as several entries, <bin>_shard<k> running `<bin> --shard k/n`, so their
 # cases run in parallel and no entry is the fast tier's long pole.
 set(RAD_TEST_SHARDS_gbnf_test 4)
+set(RAD_TEST_SHARDS_mtp_rrs_test 8)  # chi-square statistics: ~3 CPU minutes in all, so eight ctest entries of under a minute each
 
 # ------------------------------------------------------------------ the environment of every test
 #
@@ -132,7 +133,8 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 
 # Binaries that need more CPU than the default budget, and what costs it. Lower an entry when its
 # cost comes down, so the tripwire stays tight.
-set(RAD_TEST_CPU_BUDGET_mtp_rrs_test 50)  # chi-square over 3e5 seeds a tree kind: coupling ~31 s, coupling + pruning ~12 s more
+set(RAD_TEST_CPU_BUDGET_mtp_rrs_test 100)  # chi-square over 3e5 seeds a tree kind: coupling ~31 s, coupling + pruning ~12 s more
+set(RAD_TEST_CPU_BUDGET_mtp_block_test 40)  # exact enumeration (g up to 4) plus ~1.6e6 chi-square steps over the real shared verify code
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
@@ -303,6 +305,11 @@ foreach(t ${RAD_TESTS})
            "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
   endif()
 endforeach()
+# The coupling's chi-square tests spend ~150 s of CPU (the prior packages' recipes and the online
+# calibration's changing-law cases); the default 120 s wall timeout is below that.
+if(TEST mtp_rrs_test)
+  set_tests_properties(mtp_rrs_test PROPERTIES TIMEOUT 600)
+endif()
 
 # ================================================================== perf_ cases
 #

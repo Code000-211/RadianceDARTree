@@ -4771,7 +4771,7 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change. */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
                               bool i8 = false, bool f32w = false, bool had = false,
-                              bool wide = false) {
+                              bool wide = false, bool single = false) {
     /* `had`: the rotated row, against the pair writing `o` and had_quant_act_i8g over it. `wide`:
      * at IQ8R's group, one scale per 256 columns (two value heads), against had_quant_act_iq8r. */
     if (had) i8 = true;
@@ -4787,7 +4787,13 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
     const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 4, W = 4, MQ = 4, SL = W - 2 + MQ;
     const int64_t conv_dim = (2 * Hg * K + H * V), in_w = conv_dim + H * V;
     const int64_t COLS = 6, SSLOTS = N * COLS, CSLOTS = 5;
-    const int32_t lens[N] = { 4, 2, 3, 1 }, nacc[N] = { 2, 1, 3, 1 }, cidx[N] = { 3, 0, 1, -1 };
+    /* `single`: one row a sequence (plain decode); the previous step's accepted counts still differ,
+     * so the replay is exercised. */
+    static const int32_t lens_[2][N] = { { 4, 2, 3, 1 }, { 1, 1, 1, 1 } },
+                         nacc_[2][N] = { { 2, 1, 3, 1 }, { 1, 3, 2, 1 } };
+    const int32_t (&lens)[N] = lens_[single ? 1 : 0];
+    const int32_t (&nacc)[N] = nacc_[single ? 1 : 0];
+    const int32_t cidx[N] = { 3, 0, 1, -1 };
     int64_t Td = 0;
     std::vector<int32_t> cu(1, 0);
     for (int64_t n = 0; n < N; ++n) { Td += lens[n]; cu.push_back((int32_t)Td); }
@@ -4969,11 +4975,17 @@ static void gdn_conv_fold(const Plugin& pl) {
                           "per_candidate", true);
     }
     if (sel(row) || sel(nma)) gdn_conv_fold_run(pl, nma, "anchor");
+    if (sel(row) || sel(nma))
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update is byte-identical to the pair, anchor, one "
+                              "row a sequence", "anchor", false, false, false, false, true);
     if (sel(row) || sel("gdn_conv_recurrent_update_had")) {
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had is byte-identical to the pair then "
                               "had_quant_act_i8g, per_candidate", "per_candidate", true, false, true);
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had is byte-identical to the pair then "
                               "had_quant_act_i8g, anchor", "anchor", true, false, true);
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had is byte-identical to the pair then "
+                              "had_quant_act_i8g, anchor, one row a sequence", "anchor", true, false,
+                          true, false, true);
         /* IQ8R's group: the second workgroup of a pair of value heads quantises both. */
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had at one scale a 256 is byte-identical "
                               "to the pair then had_quant_act_iq8r, per_candidate", "per_candidate",
@@ -10741,8 +10753,8 @@ void mtp_tree_coupled_cases(const Plugin& pl);
  * others. Returns the number of inert (token -1) entries in the final trees, -1 on a launch or
  * allocation failure. */
 static int mtp_tree_run(const RadKernelInfo* r, double pa, double pr, const char* label,
-                        uint32_t seed0 = 12345) {
-    const bool pruned = pa > 0.0 || pr > 0.0;
+                        uint32_t seed0 = 12345, const char* adapt = nullptr) {
+    const bool pruned = pa > 0.0 || pr > 0.0 || adapt;
     const int M = 5, W = 3, R = 3, N = 6, K = RAD_MTP_TREE_K, B = 4, SP = 9, PITCH = 8;
     const int sw = rad_mtp_tree_state_words(N, W, R);
     uint32_t seed = seed0;
@@ -10796,6 +10808,7 @@ static int mtp_tree_run(const RadKernelInfo* r, double pa, double pr, const char
                                      PI("sel_pitch", SP) };
         if (pa > 0.0) ps.push_back(PF("prune_abs", pa));
         if (pr > 0.0) ps.push_back(PF("prune_rel", pr));
+        if (adapt) ps.push_back(RAD_STR("adapt", adapt));
         const bool first = round == 1;
         const int rc = launch(r, { T(didx, RAD_I32, { rows, K }), T(dval, RAD_F32, { rows, K }),
                                    T(dst, RAD_I32, { M, sw }),
@@ -10813,6 +10826,7 @@ static int mtp_tree_run(const RadKernelInfo* r, double pa, double pr, const char
         cfg.round = round; cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = B;
         cfg.sel_pitch = SP; cfg.pitch = PITCH;
         rad_mtp_tree_set_prune(&cfg, pa, pr);
+        if (adapt) rad_mtp_adapt_parse(adapt, &cfg.ad);
         std::vector<int32_t> hsel((size_t)M * W * SP, 0), hnsel((size_t)M * W, 0), hrb((size_t)M, 0);
         std::vector<long long> hvm((size_t)M * W, 0);
         std::vector<int32_t> hsrc((size_t)M * W, 0), hdst((size_t)M * W, 0);
@@ -10891,6 +10905,23 @@ void mtp_tree_cases(const Plugin& pl) {
         if (pa == 0.0 && pr == 0.0) pr = 0.25;
         mtp_tree_run(r, pa, pr, "mtp_tree_grow pruned, another seed", 7919u * sd + 17u);
     }
+    /* --draft-adaptive (abi/rad_mtp_adapt.h): the cost-aware rule and the calibration on the card
+     * against the same host walk; margins that cut some or most of each row's candidates, a
+     * calibration, a cost table, beside pruning */
+    mtp_tree_run(r, 0.0, 0.0, "mtp_tree_grow adaptive (margin 1) matches the host walk", 4242u,
+                 "on=1;margin=1");
+    mtp_tree_run(r, 0.0, 0.0, "mtp_tree_grow adaptive (margin 0.4) matches the host walk", 4243u,
+                 "on=1;margin=0.4;floor=2");
+    mtp_tree_run(r, 0.0, 0.0, "mtp_tree_grow adaptive with calibration matches the host walk", 4244u,
+                 "on=1;margin=0.6;temp=1.6,1.2,0.9");
+    mtp_tree_run(r, 0.02, 0.1, "mtp_tree_grow adaptive beside pruning matches the host walk", 4245u,
+                 "on=1;margin=0.5;cost=9.3,10.1,11.2,12.0");
+    for (uint32_t sd = 1; sd <= 16; ++sd) {
+        char t[96];
+        std::snprintf(t, sizeof t, "on=1;margin=%g;floor=%d%s", 0.25 + 0.15 * (double)(sd % 7),
+                      1 + (int)(sd % 3), sd % 2 ? ";temp=1.3,1" : "");
+        mtp_tree_run(r, 0.0, 0.0, "mtp_tree_grow adaptive, another seed", 6151u * sd + 5u, t);
+    }
     mtp_tree_coupled_cases(pl);
 }
 
@@ -10900,15 +10931,32 @@ void mtp_tree_cases(const Plugin& pl) {
  * another card's draw: their states stay untouched and their trees are the uncoupled ones. Tokens,
  * parents, the children counts and the drawn order of every state are exact; Q's FP64 weights
  * match to the last bits of the double exp (ocml against libm). */
-static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label);
+static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label,
+                                 float dscale = 0.0f, float dtop_p = 0.0f, int dtop_k = 0,
+                                 uint32_t word = 0, const char* adapt = nullptr);
 void mtp_tree_coupled_cases(const Plugin& pl) {
     mtp_tree_coupled_run(pl, 0.0, 0.0, "mtp_tree_grow coupled matches the host walk (tree, draft orders, child counts)");
     /* with confidence pruning: decided by the slot priorities (DESIGN-coupling.md 3.5) */
     mtp_tree_coupled_run(pl, 0.05, 0.3, "mtp_tree_grow coupled and pruned matches the host walk");
     mtp_tree_coupled_run(pl, 0.0, 0.5, "mtp_tree_grow coupled and rel-pruned matches the host walk");
+    /* the draft law's recipe (--draft-coupling-temp / -truncate): temperature-scaled and truncated Q */
+    mtp_tree_coupled_run(pl, 0.0, 0.0, "mtp_tree_grow coupled with a draft temperature 0.7 matches the host walk",
+                         1.0f / 0.7f);
+    mtp_tree_coupled_run(pl, 0.05, 0.3, "mtp_tree_grow coupled with T 0.7, top-k 4, top-p 0.9 and pruning matches the host walk",
+                         1.0f / 0.7f, 0.9f, 4);
+    /* the online word (--draft-calib online, --draft-coupling-temp-autofit): per-depth draft
+     * temperatures drawn from, and per-depth calibration temperature / lift read by the adaptive
+     * rule of the same pass, device against the host walk */
+    mtp_tree_coupled_run(pl, 0.0, 0.0, "mtp_tree_grow coupled with a per-depth tau word matches the host walk",
+                         0.0f, 0.0f, 0, 4u | (6u << 8) | (8u << 16));
+    mtp_tree_coupled_run(pl, 0.0, 0.0,
+                         "mtp_tree_grow coupled, adaptive, with a per-depth tau and calibration word matches the host walk",
+                         0.0f, 0.0f, 0, (6u | 3u << 4) | ((8u | 10u << 4) << 8) | ((1u | 14u << 4) << 16),
+                         "on=1;floor=1;margin=0.8;draft=1.0;temp=1.2");
 }
 
-static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label) {
+static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label,
+                                 float dscale, float dtop_p, int dtop_k, uint32_t word, const char* adapt) {
     const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
     if (!r) { ok("mtp_tree_grow coupled", false, "row absent"); return; }
     const int M = 6, W = 3, R = 3, N = 8, K = RAD_MTP_TREE_K, PITCH = 8, VOC = 50000;
@@ -10925,6 +10973,7 @@ static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const c
                                              (uint64_t)(m + 1), m, 1u };
         cards[(size_t)m] = m;
     }
+    for (auto& d : draws) { d.dscale = dscale; d.dtop_p = dtop_p; d.dtop_k = dtop_k; d.dpad_ = word; }
     draws[4].mode = 0;           /* greedy */
     cards[5] = 99;               /* another card's draw */
     std::vector<int32_t> dwords((size_t)M * DWORDS);
@@ -10972,6 +11021,7 @@ static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const c
         std::vector<RadParam> ps = { PI("M", M), PI("round", round), PI("rounds", R),
                                      PI("nodes", N), PI("width", W), PI("n_vocab", VOC) };
         if (pa > 0.0 || pr > 0.0) { ps.push_back(PF("prune_abs", pa)); ps.push_back(PF("prune_rel", pr)); }
+        if (adapt) ps.push_back(RAD_STR("adapt", adapt));
         const int rc = launch(r, { T(didx, RAD_I32, { rows, K }), T(dval, RAD_F32, { rows, K }),
                                    T(dst, RAD_I32, { M, sw }), T(nullptr, RAD_I32, { 1 }),
                                    T(nullptr, RAD_I32, { 1 }), T(nullptr, RAD_I32, { 1 }),
@@ -10986,6 +11036,7 @@ static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const c
         RadMtpTreeCfg cfg{};
         cfg.round = round; cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.pitch = PITCH;
         rad_mtp_tree_set_prune(&cfg, pa, pr);
+        if (adapt) rad_mtp_adapt_parse(adapt, &cfg.ad);
         for (int m = 0; m < M; ++m) {
             RadMtpTreeCpl cpl{};
             cpl.draw = reinterpret_cast<const uint32_t*>(&draws[(size_t)m]);

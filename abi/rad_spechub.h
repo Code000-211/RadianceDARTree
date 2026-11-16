@@ -27,6 +27,22 @@ typedef struct RadMtpCoupleDraw {
     uint64_t seed, base, seq;
     int32_t  card;
     uint32_t mode;
+    /* The DRAFT LAW's recipe (rad_mtp_couple_build_law). Any Q is a valid draft law as long as the
+     * verify reads the very Q the draft was drawn from, which the state stores; these only choose
+     * which Q. All zero (a zero-initialised draw) is the legacy law: the T1 softmax of the
+     * shortlist. dscale multiplies the shortlist's scores before the softmax (1 / the draft
+     * temperature; 0 = 1); dtop_k / dtop_p truncate the support first (0 = off, dtop_p >= 1 = off):
+     * the request's top-k / top-p applied to the eight.
+     *
+     * dpad_ is the per-depth ONLINE word (--draft-calib online, --draft-coupling-temp-autofit),
+     * zero = off: bytes 0..2 are depth classes 1, 2, 3+ (the deepest repeats), each byte
+     * `tau_code | cal_code << 4` (tables below; code 0 = keep dscale / the static --draft-calib
+     * temperature); bit 31 asks the verify to export P (rad_mtp_couple_export_p). Whatever the
+     * word says only picks which Q is drawn from; the state keeps that Q. */
+    float    dscale;
+    float    dtop_p;
+    int32_t  dtop_k;
+    uint32_t dpad_;
 } RadMtpCoupleDraw;
 /* status 1: x sampled from the exact q[] stored here; 0: greedy proposal kept; -1: malformed
  * shortlist or row identity, greedy proposal kept. `pos` is the verify row's output position, bound
@@ -41,8 +57,25 @@ typedef struct RadMtpCoupleState {
      * replacement from q, and ids[0 .. nkids) are them in draft order (x == ids[0]; ids[nkids ..
      * count) the rest of the support). nkids <= 1 is the linear chain's single draw, whose ids
      * keep the shortlist's order. Zero from every writer that is not a tree's. */
-    int32_t  nkids, pad_;
+    int32_t  nkids;
+    /* The sibling scheme the node's children were drawn with: 0 = Gumbel-top-k without replacement
+     * (abi/rad_mtp_rrs.h, the original), m + 1 = RheoSampling's m deterministic top-q children plus one
+     * sampled from the tail law (rad_mtp_rrs_draw_rheo), verified by rad_mtp_rrs_decide_rheo. Zero
+     * from every writer that is not a rheo draw, so an old state is a Gumbel one. */
+    int32_t  scheme;
+    /* --draft-verify block (abi/rad_mtp_block.h): the length g of the block this row's chain is
+     * verified as one (the rows 0 .. g-1 bound to rounds 1 .. g, staged on every row of it); 0 for
+     * token-by-token verification. Written by the sampler's staging only; zero from the device. A
+     * chain has no sibling scheme and a rheo tree no block, but each has its own word, so neither
+     * can be mistaken for the other. */
+    int32_t  blk;
+    int32_t  pad_;
 } RadMtpCoupleState;
+#define RAD_MTP_COUPLE_MAX_RHEO_M 7
+/* status 2 (device plane only, never staged): the verify decided the row and, when its draw's
+ * export bit was set, rewrote q[0 .. count) with P's mass on the same ids (rad_mtp_couple_export_p),
+ * for the host's exact acceptance labels. A verify writes nothing the decision reads. */
+#define RAD_MTP_COUPLE_STATUS_EXPORTED 2
 #define RAD_MTP_COUPLE_DRAW_WORDS  (sizeof(RadMtpCoupleDraw) / 4)
 #define RAD_MTP_COUPLE_STATE_WORDS (sizeof(RadMtpCoupleState) / 4)
 #define RAD_MTP_COUPLE_MAX_ROUNDS 8
@@ -53,8 +86,8 @@ typedef struct RadMtpCoupleState {
  * residual draw use RAD_SAMPLE_KEY_ACCEPT / RAD_SAMPLE_KEY_RESID at the verify position. */
 #define RAD_MTP_COUPLE_KEY_DRAFT 0x4d5450434f55504cull
 #ifdef __cplusplus
-static_assert(sizeof(RadMtpCoupleDraw) == 32, "MTP coupling draw wire");
-static_assert(sizeof(RadMtpCoupleState) == 160, "MTP coupling state wire");
+static_assert(sizeof(RadMtpCoupleDraw) == 48, "MTP coupling draw wire");
+static_assert(sizeof(RadMtpCoupleState) == 184, "MTP coupling state wire");
 static_assert(offsetof(RadMtpCoupleState, q) % 8 == 0, "MTP coupling q alignment");
 #endif
 
@@ -110,6 +143,8 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_state_valid(const RadMtpCoupleS
         has_x |= s.ids[i] == s.x;
     }
     if (s.nkids < 0 || s.nkids > s.count || (s.nkids >= 2 && s.ids[0] != s.x)) return false;
+    if (s.scheme < 0 || s.scheme > RAD_MTP_COUPLE_MAX_RHEO_M + 1 || (s.scheme && s.nkids >= 1 && s.ids[0] != s.x))
+        return false;
     return has_x && (sum - 1) <= 1e-12 && (1 - sum) <= 1e-12;
 }
 
@@ -176,6 +211,126 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_build_q(const int32_t* ids, con
         if (q > 0) { s->ids[s->count] = kid[j]; s->q[s->count++] = q; }
     }
     return s->count > 0;
+}
+
+/* The draft law of draw `d` over a shortlist of eight (id, score) slots: build_q on the scores scaled
+ * by d.dscale after the support was cut to d.dtop_k entries and to the smallest prefix of mass
+ * >= d.dtop_p (both over the descending scaled scores, ties to the lower slot; the mass is that of
+ * the scaled softmax over the shortlist's own entries). A cut entry carries no mass, exactly as a
+ * -inf score. The cut reads the shortlist only, never a drawn token, and the state stores the Q it
+ * produced, so the verify's exactness is untouched (abi/rad_mtp_rrs.h, DESIGN-coupling.md). A zero
+ * recipe is build_q bit for bit. */
+static inline RAD_SPECHUB_HD bool rad_mtp_couple_build_law(const int32_t* ids, const float* val,
+                                                           int64_t vocab, const RadMtpCoupleDraw& d,
+                                                           RadMtpCoupleState* s) {
+    const bool scale = d.dscale > 0 && d.dscale != 1.0f;
+    const bool cutk = d.dtop_k > 0 && d.dtop_k < 8;
+    const bool cutp = d.dtop_p > 0 && d.dtop_p < 1.0f;
+    if (!scale && !cutk && !cutp) return rad_mtp_couple_build_q(ids, val, vocab, s);
+    float v[8];
+    bool  clean = true;
+    for (int i = 0; i < 8; ++i) {
+        v[i] = scale ? val[i] * d.dscale : val[i];
+        if (ids[i] >= 0 && (v[i] != v[i] || v[i] == INFINITY)) clean = false;
+    }
+    if (clean && (cutk || cutp)) {
+        int rk[8], n = 0;
+        for (int i = 0; i < 8; ++i)
+            if (ids[i] >= 0 && v[i] != -INFINITY) {
+                int j = n++;
+                while (j > 0 && v[rk[j - 1]] < v[i]) { rk[j] = rk[j - 1]; --j; }
+                rk[j] = i;
+            }
+        int keep = n;
+        if (cutk && keep > d.dtop_k) keep = d.dtop_k;
+        if (cutp && keep > 1) {
+            double sum = 0, w[8];
+            for (int j = 0; j < keep; ++j) { w[j] = ::exp((double)v[rk[j]] - (double)v[rk[0]]); sum += w[j]; }
+            double cum = 0;
+            int m = 0;
+            while (m < keep) { cum += w[m++] / sum; if (cum >= (double)d.dtop_p) break; }
+            keep = m;
+        }
+        for (int j = keep; j < n; ++j) v[rk[j]] = -INFINITY;
+    }
+    return rad_mtp_couple_build_q(ids, v, vocab, s);
+}
+
+/* ---- the online word (RadMtpCoupleDraw::dpad_): per-depth draft temperature and calibration codes.
+ * Code 0 is "unset". The tables are shared by the host controller and the kernels, so a code names
+ * one number everywhere. */
+#define RAD_MTP_DRAW_EXPORT_BIT 0x80000000u
+#define RAD_MTP_DRAW_DEPTHS 3
+static inline RAD_SPECHUB_HD float rad_mtp_tau_of_code(unsigned c) {
+    static const float t[16] = { 0.f, 0.05f, 0.3f, 0.45f, 0.6f, 0.7f, 0.75f, 0.8f, 0.9f, 1.0f,
+                                 1.05f, 1.15f, 1.3f, 1.5f, 1.75f, 2.0f };
+    return t[c & 15u];
+}
+/* A calibration code names a pair (T, lift): the slot probabilities of a row are re-expressed as
+ * softmax(log q / T) and then p' = lift + (1 - lift) p (a floor: a sampled draft is accepted with
+ * some probability however small its slot's mass). Both are monotone maps of the row's own slot
+ * values, so the order of a node's children, and with it the prefix property the exactness needs, is
+ * untouched. Codes 1..15 are T in {0.5, 0.75, 1, 1.4, 2} times lift in {0, 0.2, 0.4}; code 0 keeps
+ * the static temperature (lift 0). */
+static inline RAD_SPECHUB_HD float rad_mtp_cal_of_code(unsigned c) {
+    static const float t[5] = { 0.5f, 0.75f, 1.0f, 1.4f, 2.0f };
+    c &= 15u;
+    return c ? t[(c - 1) % 5] : 0.0f;
+}
+static inline RAD_SPECHUB_HD float rad_mtp_cal_lift_of_code(unsigned c) {
+    static const float t[3] = { 0.0f, 0.2f, 0.4f };
+    c &= 15u;
+    return c ? t[(c - 1) / 5] : 0.0f;
+}
+static inline RAD_SPECHUB_HD unsigned rad_mtp_draw_byte(const RadMtpCoupleDraw& d, int depth) {
+    int i = depth < 1 ? 0 : depth - 1;
+    if (i >= RAD_MTP_DRAW_DEPTHS) i = RAD_MTP_DRAW_DEPTHS - 1;
+    return (d.dpad_ >> (8 * i)) & 0xffu;
+}
+/* The draft scale (1 / temperature) the draw asks for at `depth` (>= 1); 0 = the draw's dscale. */
+static inline RAD_SPECHUB_HD float rad_mtp_draw_dscale_at(const RadMtpCoupleDraw& d, int depth) {
+    const unsigned c = rad_mtp_draw_byte(d, depth) & 15u;
+    return c ? 1.0f / rad_mtp_tau_of_code(c) : d.dscale;
+}
+/* The calibration temperature and lift the draw asks for at `depth`; T 0 = the static one. */
+static inline RAD_SPECHUB_HD float rad_mtp_draw_cal_at(const RadMtpCoupleDraw& d, int depth) {
+    return rad_mtp_cal_of_code(rad_mtp_draw_byte(d, depth) >> 4);
+}
+static inline RAD_SPECHUB_HD float rad_mtp_draw_lift_at(const RadMtpCoupleDraw& d, int depth) {
+    return rad_mtp_cal_lift_of_code(rad_mtp_draw_byte(d, depth) >> 4);
+}
+/* The nearest table code (in the log of the value) of tau / cal temperature `v`; 0 for v <= 0. */
+static inline RAD_SPECHUB_HD unsigned rad_mtp_tau_code_of(float v) {
+    if (!(v > 0)) return 0;
+    unsigned best = 1;
+    double bd = 1e30;
+    for (unsigned c = 1; c < 16; ++c) {
+        const double d = ::fabs(::log((double)v / (double)rad_mtp_tau_of_code(c)));
+        if (d < bd) { bd = d; best = c; }
+    }
+    return best;
+}
+static inline RAD_SPECHUB_HD unsigned rad_mtp_cal_code_of(float T, float lift) {
+    unsigned best = 0;
+    double bd = 1e30;
+    for (unsigned c = 1; c < 16; ++c) {
+        const double d = ::fabs(::log((double)T / (double)rad_mtp_cal_of_code(c))) +
+                         ::fabs((double)lift - (double)rad_mtp_cal_lift_of_code(c));
+        if (d < bd) { bd = d; best = c; }
+    }
+    return best;
+}
+
+/* build_law at the draft round `depth` (1 = the root's children): the draw's per-depth temperature
+ * code replaces dscale when set. The state's own draw stays the caller's. */
+static inline RAD_SPECHUB_HD bool rad_mtp_couple_build_law_at(const int32_t* ids, const float* val,
+                                                              int64_t vocab,
+                                                              const RadMtpCoupleDraw& d, int depth,
+                                                              RadMtpCoupleState* s) {
+    if (!(d.dpad_ & 0x00ffffffu)) return rad_mtp_couple_build_law(ids, val, vocab, d, s);
+    RadMtpCoupleDraw e = d;
+    e.dscale = rad_mtp_draw_dscale_at(d, depth);
+    return rad_mtp_couple_build_law(ids, val, vocab, e, s);
 }
 
 /* Inverse CDF over the stored q with a uniform in [0, 1); index into ids. */
@@ -272,6 +427,36 @@ static inline RAD_SPECHUB_HD bool rad_mtp_couple_decide(const RadMtpCoupleState&
     return true;
 }
 
+/* After a verify row decided (the draw's export bit set): P's mass on the state's own ids, in the
+ * state's order (the FP64 softmax of the sampler's candidates, normalised over all of them), over
+ * q[0 .. count), and status 2. The host reads the plane back and, with the Q it staged, derives the
+ * exact acceptance labels (abi/rad_mtp_calib.h). Reads what the decision read, writes only fields
+ * the decision does not read afterwards (the plane is dead until the next upload). A row whose
+ * candidate plane is invalid keeps status 1: no label. */
+static inline RAD_SPECHUB_HD void rad_mtp_couple_export_p(RadMtpCoupleState* s, const int32_t* ids,
+                                                          const float* val, int64_t n,
+                                                          int64_t vocab) {
+    if (!(s->draw.dpad_ & RAD_MTP_DRAW_EXPORT_BIT)) return;
+    float top = -INFINITY;
+    for (int64_t j = 0; j < n; ++j) {
+        if (ids[j] < 0) continue;
+        if (ids[j] >= vocab || val[j] != val[j] || val[j] == INFINITY) return;
+        if (val[j] > top) top = val[j];
+    }
+    if (top == -INFINITY) return;
+    double sum = 0, pq[8] = {};
+    for (int64_t j = 0; j < n; ++j) {
+        if (ids[j] < 0 || val[j] == -INFINITY) continue;
+        const double w = ::exp((double)val[j] - top);
+        sum += w;
+        for (int k = 0; k < s->count; ++k)
+            if (ids[j] == s->ids[k]) { pq[k] += w; break; }
+    }
+    if (!(sum > 0) || !rad_spechub_finite(sum)) return;
+    for (int k = 0; k < s->count; ++k) s->q[k] = pq[k] / sum;
+    s->status = RAD_MTP_COUPLE_STATUS_EXPORTED;
+}
+
 /* ================================================================== DFlash2's coupled walk
  *
  * The block drafter's counterpart of mtp_couple_propose (`dflash_couple_propose`). DFlash2 proposes
@@ -337,7 +522,7 @@ static inline RAD_SPECHUB_HD int32_t rad_dflash_couple_step(const float* sc, con
     s->round = round;
     s->count = 0;
     s->nkids = 0;   /* a walk's position is one draw: the chain's wire */
-    s->pad_ = 0;
+    s->scheme = 0;
     for (int i = 0; i < 8; ++i) { s->ids[i] = -1; s->q[i] = 0; }
     if (d.mode != 1) {
         s->status = 0;

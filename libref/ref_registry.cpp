@@ -358,7 +358,7 @@ static const RadParamSpec pMtpTreeGrow[] = { P_INT("M"), P_INT("round"), P_INT("
                                              P_INT("nodes"), P_INT("width"),
                                              P_INTO("block_size"), P_INTO("sel_pitch"),
                                              P_F64O("prune_abs"), P_F64O("prune_rel"),
-                                             P_INTO("n_vocab") };
+                                             P_INTO("n_vocab"), P_STRO("adapt"), P_INTO("rheo_m") };
 static const RadOperandSpec oMtpTreeGrow[] = { OPD("didx"), OPD("dval"), INOUT("state"),
                                                OPD_O("head_pos"), OPD_O("head_row"),
                                                OPD_O("table"), OUT("tok"), OUT("par"),

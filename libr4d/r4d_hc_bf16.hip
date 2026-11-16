@@ -3993,7 +3993,9 @@ __device__ __forceinline__ void mtp_enter_tiled_body(MTP_ENTER_TILED_PARAMS) {
      * The embedding's scale is per token, since a token's hc output rows share `e`.
      *
      * Bit-identical: each row is summed by one wave, lane j = lane, lane + 32, ... ascending. */
-    constexpr int kSsPre = 8, kSsRows = 4;
+    /* A 16-row tile gives a wave two rows, so two rows' worth of registers hold a longer run of
+     * loads in flight: 80 loads a lane (n = 2560) are two dependent rounds, not ten. */
+    constexpr int kSsPre = RT <= 16 ? 40 : 8, kSsRows = RT <= 16 ? 2 : 4;
     auto sumsq = [&](const unsigned short* const* p, int nr, long len, float* out) {
         float acc[kSsRows];
 #pragma unroll

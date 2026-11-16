@@ -85,6 +85,71 @@ __device__ void couple_live(const int32_t* ids, const float* val, int64_t n, int
     __syncthreads();
 }
 
+/* --draft-verify block (abi/rad_mtp_block.h). The workgroup of a block's round-1 row decides the
+ * whole block and writes the tokens of rows 0 .. tau; the block's other rows return. Per row the
+ * live candidates are compacted by the workgroup (couple_live) and thread 0 runs the shared helpers
+ * over them in ascending slot order, so the result is the host reference's bit for bit. Called by
+ * every thread of the workgroup (couple_live synchronises); `lj` is the kMaxCand scratch. */
+__device__ void block_verify(const RadMtpCoupleVerifyCall& c, int64_t row, short* lj) {
+    __shared__ RadMtpCoupleState sst[RAD_MTP_BLOCK_MAX];
+    __shared__ RadBlockStat      sstat[RAD_MTP_BLOCK_MAX];
+    __shared__ RadBlockPlan      plan;
+    __shared__ int   g_s, ok_s, tau_s, nl_s, valid_s;
+    __shared__ float top_s;
+    __shared__ int32_t y_s;
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        const auto& s0 = *reinterpret_cast<const RadMtpCoupleState*>(c.state + row * c.ld[3]);
+        g_s = s0.blk;
+        ok_s = s0.round == 1 && g_s >= 1 && g_s <= RAD_MTP_BLOCK_MAX && row + g_s <= c.M;
+        if (ok_s) {
+            const auto& p0 = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
+            for (int i = 0; i < g_s && ok_s; ++i) {
+                sst[i] = *reinterpret_cast<const RadMtpCoupleState*>(c.state + (row + i) * c.ld[3]);
+                const auto& p = *reinterpret_cast<const RadSampleParams*>(c.params + (row + i) * c.ld[2]);
+                ok_s = rad_mtp_block_row_ok(sst[0], sst[i], p0, p, i, g_s, c.vocab);
+            }
+        }
+    }
+    __syncthreads();
+    if (!ok_s) return;
+    const int g = g_s;
+    for (int i = 0; i < g; ++i) {
+        couple_live(c.idx + (row + i) * c.ld[0], c.val + (row + i) * c.ld[1], c.n_cand, c.vocab, lj,
+                    &nl_s, &valid_s, &top_s);
+        if (tid == 0) {
+            const RadBlockRow r{ c.idx + (row + i) * c.ld[0], c.val + (row + i) * c.ld[1], lj,
+                                 (int64_t)nl_s, valid_s, top_s };
+            if (!rad_mtp_block_stat(r, sst[i], &sstat[i])) ok_s = 0;
+        }
+        __syncthreads();
+    }
+    if (!ok_s) return;
+    const auto& p0 = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
+    if (tid == 0) {
+        rad_mtp_block_plan(sst, sstat, g, &plan);
+        tau_s = rad_mtp_block_tau(plan, p0.seed, p0.pos);
+        y_s = -1;
+    }
+    __syncthreads();
+    const int tau = tau_s;
+    if (tau < g) {
+        couple_live(c.idx + (row + tau) * c.ld[0], c.val + (row + tau) * c.ld[1], c.n_cand, c.vocab,
+                    lj, &nl_s, &valid_s, &top_s);
+        if (tid == 0) {
+            const RadBlockRow r{ c.idx + (row + tau) * c.ld[0], c.val + (row + tau) * c.ld[1], lj,
+                                 (int64_t)nl_s, valid_s, top_s };
+            if (!rad_mtp_block_resid_draw(r, sst[tau], sstat[tau], plan.p[tau],
+                                          rad_spechub_uniform(p0.seed, p0.pos + (uint64_t)tau,
+                                                              RAD_SAMPLE_KEY_RESID), &y_s))
+                ok_s = 0;
+        }
+        __syncthreads();
+        if (!ok_s) return;
+    }
+    if (tid == 0) rad_mtp_block_write(c, row, sst, tau, g, y_s);
+}
+
 __global__ void couple_verify(const int32_t* idx, const float* values, const uint32_t* params,
                               const uint32_t* state, int32_t* token, int64_t M, int64_t n_cand,
                               int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2, int64_t ld3,
@@ -115,9 +180,14 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
                    s.pos == p.pos && rad_mtp_couple_state_valid(s, c.vocab);
     __syncthreads();
     if (!eligible) return;
+    /* A chain row of a block-verified draft (--draft-verify block). */
+    if (s.blk >= 1) {
+        block_verify(c, row, lj);
+        return;
+    }
     /* A tree node with several drafted children (abi/rad_mtp_rrs.h): one thread runs the shared
      * serial helper, which is the host reference itself. Only rows of a draft tree take it. */
-    if (s.nkids >= 2) {
+    if (s.nkids >= 2 || s.scheme != 0) {
         if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
         return;
     }
@@ -197,6 +267,13 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
         }
     }
     c.token[row * c.ld[4]] = out;
+    /* The export (rad_mtp_couple_export_p): P on Q's support, from the shared pq, after the decision
+     * and after every other thread's last read of the state (they passed the barrier above). */
+    if (s.draw.dpad_ & RAD_MTP_DRAW_EXPORT_BIT) {
+        RadMtpCoupleState* sm = const_cast<RadMtpCoupleState*>(&s);
+        for (int k = 0; k < s.count; ++k) sm->q[k] = pq[k];
+        sm->status = RAD_MTP_COUPLE_STATUS_EXPORTED;
+    }
 }
 
 /* DFlash2's coupled walk: one workgroup a sequence. Per step the workgroup forms the
@@ -361,7 +438,7 @@ __global__ __launch_bounds__(kDfThreads) void dflash_couple(
             s.status = -1;
             s.count = 0;
             s.nkids = 0;   /* the walk's position is one draw: the chain's wire */
-            s.pad_ = 0;
+            s.scheme = 0;
             for (int i = 0; i < 8; ++i) { s.ids[i] = -1; s.q[i] = 0; }
             for (int i = 0; i < sn; ++i)
                 if (wq[i] > 0) { s.ids[s.count] = lid[i]; s.q[s.count++] = wq[i]; }
@@ -408,6 +485,29 @@ int rad_mine_mtp_couple_propose_launch(const RadArgs* a, RadStream stream) {
     const int rc = rad_mtp_couple_propose_args(a, &c);
     if (rc != RAD_OK) return rc;
     return R4D_EMIT(stream, propose, dim3((unsigned)((c.M + 63) / 64)), dim3(64), 0, c);
+}
+
+/* The traversal walk: one thread a row, only a request's root row (topo parent -1) does work. The
+ * walk is serial and short (a tree of at most 60 rows), and it is the host reference itself, so
+ * device and host cannot differ. */
+__global__ void trav_verify(const int32_t* idx, const float* values, const uint32_t* params,
+                            const uint32_t* state, int32_t* token, const int32_t* topo, int64_t M,
+                            int64_t n_cand, int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2,
+                            int64_t ld3, int64_t ld4, int64_t ld_topo) {
+    const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+    RadMtpTravCall c{ { idx, values, params, state, token, M, n_cand, vocab, { ld0, ld1, ld2, ld3, ld4 } },
+                      topo, ld_topo };
+    rad_mtp_trav_verify_root(c, row);
+}
+
+int rad_mine_mtp_trav_verify_launch(const RadArgs* a, RadStream stream) {
+    RadMtpTravCall c{};
+    const int rc = rad_mtp_trav_verify_args(a, &c);
+    if (rc != RAD_OK) return rc;
+    return R4D_EMIT(stream, trav_verify, dim3((unsigned)((c.v.M + 31) / 32)), dim3(32), 0,
+                    c.v.idx, c.v.val, c.v.params, c.v.state, c.v.token, c.topo, c.v.M, c.v.n_cand,
+                    c.v.vocab, c.v.ld[0], c.v.ld[1], c.v.ld[2], c.v.ld[3], c.v.ld[4], c.ld_topo);
 }
 
 int rad_mine_mtp_couple_verify_launch(const RadArgs* a, RadStream stream) {

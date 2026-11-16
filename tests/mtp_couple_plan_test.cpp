@@ -19,6 +19,7 @@
 #include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
 
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -380,3 +381,87 @@ TEST(a_round_without_a_valid_shortlist_binds_uncoupled) {
 }
 
 RAD_TEST_MAIN()
+
+/* ================================================== THE DRAFT LAW RECIPE
+ *
+ * --draft-coupling-temp / -temp-mul / -truncate reach the plugin as three fields of the draw. A null
+ * law (and the default one) is the legacy law (scale 1 or 0, no cut), a greedy row carries none. */
+TEST(the_draw_carries_the_draft_law_recipe_of_its_request) {
+    Request r;
+    StepPlan plan;
+    plan.e.push_back(entry(&r, 11, 3, 7, false));
+    r.sp.temp = 0.7f;
+    r.sp.top_k = 5;
+    r.sp.top_p = 0.9f;
+    const Scheduler::SerialRow rows[] = { row(11, 3) };
+    std::vector<RadMtpCoupleDraw> by_card(8);
+    RadMtpCoupleDraw stage[1];
+    std::string why;
+
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, &why), RAD_OK);   /* no law */
+    CHECK(stage[0].dscale == 0.0f && stage[0].dtop_k == 0 && stage[0].dtop_p == 0.0f);
+
+    MtpCoupleLaw legacy;   /* fixed T 1, no cut */
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, &why, &legacy), RAD_OK);
+    CHECK(stage[0].dscale == 1.0f && stage[0].dtop_k == 0 && stage[0].dtop_p == 0.0f);
+
+    MtpCoupleLaw req;
+    req.request_temp = true;
+    req.mul = 0.5f;
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, &why, &req), RAD_OK);
+    CHECK(std::fabs(stage[0].dscale - 1.0f / (0.7f * 0.5f)) < 1e-5f);
+    CHECK(stage[0].dtop_k == 0 && stage[0].dtop_p == 0.0f);
+
+    MtpCoupleLaw cut = req;
+    cut.truncate = true;
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, &why, &cut), RAD_OK);
+    CHECK_EQ(stage[0].dtop_k, 5);
+    CHECK(stage[0].dtop_p == 0.9f);
+    /* a top-k of 8 or more (the head reports eight) and top-p 1 cut nothing */
+    r.sp.top_k = 20;
+    r.sp.top_p = 1.0f;
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, &why, &cut), RAD_OK);
+    CHECK(stage[0].dtop_k == 0 && stage[0].dtop_p == 0.0f);
+
+    MtpCoupleLaw fixed;
+    fixed.temp = 2.0f;
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 1, &by_card, stage, &why, &fixed), RAD_OK);
+    CHECK(stage[0].dscale == 0.5f);
+
+    /* a greedy request: mode 0, and the recipe is not applied */
+    Request g;
+    StepPlan gp;
+    gp.e.push_back(entry(&g, 12, 2, 4, true));
+    const Scheduler::SerialRow grows[] = { row(12, 2) };
+    REQUIRE_EQ(mtp_couple_plan_stage(gp, 8, grows, 1, &by_card, stage, &why, &cut), RAD_OK);
+    CHECK_EQ(stage[0].mode, 0u);
+    CHECK(stage[0].dscale == 0.0f && stage[0].dtop_k == 0);
+}
+
+/* A batch of two sampled requests and a greedy one: each card's draw carries its OWN request's
+ * recipe (no cross-talk through the shared law), the greedy one carries none. */
+TEST(each_sequence_of_a_batch_gets_its_own_draft_law_recipe) {
+    Request a, b, g;
+    StepPlan plan;
+    plan.e.push_back(entry(&a, 21, 0, 4, false));
+    plan.e.push_back(entry(&b, 22, 1, 4, false));
+    plan.e.push_back(entry(&g, 23, 2, 4, true));
+    a.sp.temp = 0.7f; a.sp.top_k = 3; a.sp.top_p = 0.8f;   /* entry() resets them: set after */
+    b.sp.temp = 1.0f; b.sp.top_k = 20; b.sp.top_p = 0.95f;
+    const Scheduler::SerialRow rows[] = { row(21, 0), row(22, 1), row(23, 2) };
+    std::vector<RadMtpCoupleDraw> by_card(8);
+    RadMtpCoupleDraw stage[3];
+    std::string why;
+    MtpCoupleLaw law;
+    law.request_temp = true;
+    law.truncate = true;
+    REQUIRE_EQ(mtp_couple_plan_stage(plan, 8, rows, 3, &by_card, stage, &why, &law), RAD_OK);
+    CHECK(std::fabs(stage[0].dscale - 1.0f / 0.7f) < 1e-5f);
+    CHECK_EQ(stage[0].dtop_k, 3);
+    CHECK(stage[0].dtop_p == 0.8f);
+    CHECK(stage[1].dscale == 1.0f);
+    CHECK_EQ(stage[1].dtop_k, 0);
+    CHECK(stage[1].dtop_p == 0.95f);
+    CHECK_EQ(stage[2].mode, 0u);
+    CHECK(stage[2].dscale == 0.0f && stage[2].dtop_k == 0 && stage[2].dtop_p == 0.0f);
+}

@@ -994,6 +994,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
         bc.draft_tree_width  = tree_width_;
         bc.draft_tree_prune_abs = (float)cfg_.draft_tree_prune;
         bc.draft_tree_prune_rel = (float)cfg_.draft_tree_prune_rel;
+        bc.draft_adapt = draft_adapt_.empty() ? nullptr : draft_adapt_.c_str();
     }
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
@@ -1010,6 +1011,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.gen_max_refs   = cfg_.image_gen_max_refs;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
+    bc.draft_rheo     = cfg_.draft_siblings_rheo ? cfg_.draft_rheo_m + 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.expert_file_tier = cfg_.weights_disk_tier ? 1 : 0;
     bc.scope      = "";
@@ -1323,6 +1325,26 @@ int Engine::declare() {
             tree_leaves_   = std::min(cfg_.draft_tree_leaves, nodes - rounds);
             tree_width_    = std::max(1, std::min(cfg_.draft_tree_width, nodes));
             tree_prune_    = cfg_.draft_tree_prune > 0.0 || cfg_.draft_tree_prune_rel > 0.0;
+            draft_adapt_.clear();
+            adapt_ = RadMtpAdapt{};
+            if (cfg_.draft_adaptive) {
+                char buf[64];
+                std::string s = "on=1";
+                std::snprintf(buf, sizeof buf, ";floor=%d;margin=%g;cont=%g", cfg_.draft_adaptive_floor,
+                              cfg_.draft_adaptive_margin, cfg_.draft_adaptive_cont);
+                s += buf;
+                std::snprintf(buf, sizeof buf, ";draft=%g",
+                              cfg_.draft_cost_draft_ms >= 0 ? cfg_.draft_cost_draft_ms : 0.5 * rounds);
+                s += buf;
+                if (!cfg_.draft_cost_table.empty()) s += ";cost=" + cfg_.draft_cost_table;
+                if (!cfg_.draft_calib.empty()) s += ";temp=" + cfg_.draft_calib;
+                if (s.size() > 250 || !rad_mtp_adapt_parse(s.c_str(), &adapt_)) {
+                    RAD_ERR("--draft-adaptive: the cost table / calibration list is too long or malformed");
+                    return RAD_E_INVAL;
+                }
+                draft_adapt_ = s;
+                RAD_INFO("draft trees: adaptive node selection -- %s", s.c_str());
+            }
             cfg_.n_spec    = nodes;
             RAD_INFO("draft trees: a serial head -- %d round(s) of greedy chain, %d runner-up "
                      "leaf(s), width %d, up to %d node(s) a verify", rounds, tree_leaves_,
@@ -1596,6 +1618,30 @@ int Engine::declare() {
     } else if (cfg_.draft_tree > 0 && cfg_.n_spec > 0 && !tree_ && draft_tree_) {
         RAD_WARN("--draft-tree on: '%s' declared no tree, so it proposes a chain",
                  drafter_.name ? drafter_.name : "(none)");
+    }
+    /* --draft-siblings rheo is a sibling scheme of a coupled serial tree: refused, not ignored, where
+     * there is no such tree. */
+    if (cfg_.draft_siblings_rheo) {
+        if (!cfg_.draft_coupling) {
+            RAD_ERR("--draft-siblings rheo requires --draft-coupling on (the siblings are drawn from the "
+                    "head's law and verified against the target's)");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (!serial_tree_) {
+            RAD_ERR("--draft-siblings rheo requires a serial draft tree (--draft-tree on with a head that "
+                    "proposes one); '%s' serves none here", drafter_.name ? drafter_.name : "(none)");
+            return RAD_E_UNSUPPORTED;
+        }
+        /* Stage 1 (width 1) draws the siblings of the root only: with fewer leaves than top-q children
+         * the sampled tail child is cut by the budget, and the node degrades to a deterministic top-q
+         * set verified against P (still exact, but it loses the chain's sampled trunk for nothing). */
+        if (tree_width_ <= 1 && tree_leaves_ < cfg_.draft_rheo_m) {
+            RAD_WARN("--draft-siblings rheo: --draft-rheo-m %d needs --draft-tree-leaves >= %d to keep its sampled "
+                     "tail child (have %d leaf(s)); with 0 leaves the flag does nothing, with fewer the root drafts top-q tokens only", cfg_.draft_rheo_m,
+                     cfg_.draft_rheo_m, tree_leaves_);
+        }
+        RAD_INFO("draft trees: RheoSampling siblings -- per node the top-%d tokens of the head's law plus "
+                 "one sampled from the rest (--draft-rheo-m)", cfg_.draft_rheo_m);
     }
     /* Confidence pruning applies to a serial head's tree only; say so rather than ignore it. */
     if (cfg_.draft_tree_prune > 0.0 || cfg_.draft_tree_prune_rel > 0.0) {

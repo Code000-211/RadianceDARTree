@@ -121,19 +121,56 @@ static inline RAD_RRS_HD void rad_mtp_rrs_slot_logq(const RadMtpCoupleState& s, 
  * non-increasing in j, so the kept slots are a PREFIX of the draft order; and they depend on Q only,
  * never on the drawn token's value, which is what keeps recursive rejection sampling exact. A
  * zeroed cfg keeps all `want`. */
+static inline RAD_RRS_HD void rad_mtp_rrs_slot_logq_rheo(const RadMtpCoupleState& s, int m, float* ov);
 static inline RAD_RRS_HD int rad_mtp_rrs_slot_keep_count(const RadMtpCoupleState& s,
-                                                         const RadMtpTreeCfg* pc, int want) {
+                                                         const RadMtpTreeCfg* pc, int want,
+                                                         int scheme = 0) {
     if (want > s.count) want = s.count;
-    if (want < 1 || !pc || !pc->prune) return want;
+    if (scheme > 0 && want > scheme) want = scheme;   /* RheoSampling: m + 1 slots */
+    if (want < 1 || !pc || (!pc->prune && !pc->ad.on)) return want;
     float ov[8], lp[8], mx = 0.0f, lse = 0.0f;
     int ids[8];
-    rad_mtp_rrs_slot_logq(s, ov);
-    for (int c = 0; c < 8; ++c) ids[c] = c < s.count ? c : -1;
+    if (scheme > 0) rad_mtp_rrs_slot_logq_rheo(s, scheme - 1, ov);
+    else            rad_mtp_rrs_slot_logq(s, ov);
+    for (int c = 0; c < 8; ++c) ids[c] = ov[c] != -INFINITY ? c : -1;
     const int best = rad_mtp_tree_row_logp(ids, ov, lp, &mx, &lse);
     if (best < 0) return 1;
     int m = 1;
-    while (m < want && rad_mtp_tree_keep(pc, m, best, 0.0f, lp[m], ov[m], mx)) ++m;
+    if (pc->prune) {
+        while (m < want && rad_mtp_tree_keep(pc, m, best, 0.0f, lp[m], ov[m], mx)) ++m;
+    } else {
+        m = want;
+    }
+    /* --draft-adaptive (abi/rad_mtp_adapt.h): a leaf stays only while its calibrated slot
+     * probability beats its verify row's marginal cost; the slots are sorted, so again a prefix.
+     * `pc->rounds` is the chain the leaves join. */
+    if (pc->ad.on && m > 1) {
+        float cl[8];
+        for (int c = 0; c < 8; ++c) cl[c] = lp[c];
+        rad_mtp_adapt_recal(cl, 8, rad_mtp_adapt_temp(&pc->ad, 1));
+        rad_mtp_adapt_floor(cl, 8, rad_mtp_adapt_lift(&pc->ad, 1));
+        const int ma = 1 + rad_mtp_adapt_leaf_count(&pc->ad, cl, pc->rounds, m - 1);
+        if (ma < m) m = ma;
+    }
     return m;
+}
+
+/* The online calibration word of a draw (RadMtpCoupleDraw::dpad_, --draft-calib online): the
+ * calibration temperature of depths 1, 2, 3+ replaces the static one where a code is set. The
+ * calibration is a monotone per-depth map of a row's own slot values and is read by the
+ * best-first / leaf rules only, never by the verify, so changing it between steps cannot reach the
+ * output law (docs/DESIGN-online-calib.md). A draw with no calibration code leaves `ad` untouched. */
+static inline RAD_RRS_HD void rad_mtp_calib_apply(RadMtpAdapt* ad, const RadMtpCoupleDraw& d) {
+    if (!ad->on || !(d.dpad_ & 0x00f0f0f0u)) return;
+    float t[RAD_MTP_DRAW_DEPTHS], l[RAD_MTP_DRAW_DEPTHS];
+    for (int i = 0; i < RAD_MTP_DRAW_DEPTHS; ++i) {
+        const float c = rad_mtp_draw_cal_at(d, i + 1);
+        t[i] = c > 0.0f ? c : rad_mtp_adapt_temp(ad, i + 1);
+        l[i] = c > 0.0f ? rad_mtp_draw_lift_at(d, i + 1) : rad_mtp_adapt_lift(ad, i + 1);
+    }
+    for (int i = 0; i < RAD_MTP_DRAW_DEPTHS; ++i) { ad->temp[i] = t[i]; ad->lift[i] = l[i]; }
+    ad->ntemp = RAD_MTP_DRAW_DEPTHS;
+    ad->nlift = RAD_MTP_DRAW_DEPTHS;
 }
 
 /* The longest prefix of the state's children that are the first `n` of `kid[]` (the tree's
@@ -233,6 +270,186 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, con
     }
     *out = last;
     return last >= 0;
+}
+
+/* ================================================================== RheoSampling siblings
+ *
+ * --draft-siblings rheo (--draft-rheo-m m). Hu et al. 2025 (arXiv 2502.18779, Thm 8, the greedy
+ * multi-draft verifier) and RheoSampling (arXiv 2609.21827): instead of Gumbel-top-k siblings, a node's
+ * children are
+ *     T  = the m tokens of largest Q, in descending q order (deterministic, rank slots 0 .. m-1), and
+ *     u  ~ Qt, ONE token sampled from the tail law Qt(x) = Q(x) / z over the support outside T,
+ *          z = Q(outside T), in slot m;
+ * the draft order stored in the state is ids = [T..., u, the rest of the support in descending q],
+ * scheme = m + 1. A node whose support has no more than m tokens has no tail child (all of it is T).
+ *
+ * Verify (derived here, not quoted; the law is checked by tests/mtp_rrs_test.cpp by exhaustive
+ * enumeration). P = the target's law, children present = the first nkids of the draft order.
+ *   tail child present (nkids > |T|, which with a prefix draft order means every T token is a child):
+ *       accept u with probability min(1, P(u) / Qt(u))                       -> emit u
+ *       else emit y ~ R / |R|,   R(y) = P(y)               y in T or off Q's support,
+ *                                R(y) = max(P(y) - Qt(y), 0)  y in the tail support (R(u) = 0 here)
+ *   otherwise (the tail slot was pruned or cut by a window, or Q has no tail): emit y ~ P directly.
+ * Exactness: P(emit y) = min(P, Qt)(y) [y in tail] + (1 - A) R(y) / |R| with |R| = 1 - A,
+ * A = sum_tail min(P, Qt), and min(P, Qt) + R = P on the tail, R = P elsewhere: P(emit y) = P(y).
+ * It needs only that u ~ Qt independently of the verifier's uniforms (a separate draft stream), and
+ * that WHICH slots exist depends on Q and the tree's budget alone (never on the value of u): both
+ * hold, the slot priorities are rad_mtp_rrs_slot_logq_rheo. The emitted token is a child with
+ * probability P(T) + A = sum_T P + sum_tail min(P, Qt), Thm 8's value, and a residual draw never
+ * lands on u (R(u) = 0 when u was rejected), so the core's "follow the first child whose token is
+ * the sampler's" walks the decision made here.
+ * m = 0 is the single-draft maximal coupling of the chain (rad_mtp_couple_decide) with the sampled
+ * child in slot 0.
+ */
+#define RAD_MTP_RRS_KEY_TAIL_C 8   /* candidate index of the tail draw in the draft stream (0..7 are Gumbel's) */
+
+/* Slot priorities of a rheo node (functions of Q alone, non-increasing): slots 0 .. m-1 carry the
+ * log of the j-th largest q, slot m RheoSampling's proxy log min{q_(m-1), z} (z = the tail mass; with
+ * m = 0, z = 1), -inf for the other slots and for slots past the support. */
+static inline RAD_RRS_HD void rad_mtp_rrs_slot_logq_rheo(const RadMtpCoupleState& s, int m, float* ov) {
+    double qs[8];
+    const int n = s.count < 8 ? s.count : 8;
+    for (int i = 0; i < n; ++i) qs[i] = s.q[i];
+    for (int i = 1; i < n; ++i) {
+        const double v = qs[i];
+        int j = i;
+        while (j > 0 && qs[j - 1] < v) { qs[j] = qs[j - 1]; --j; }
+        qs[j] = v;
+    }
+    const int nt = m < n ? m : n;
+    for (int c = 0; c < 8; ++c) ov[c] = c < nt ? (float)::log(qs[c]) : -INFINITY;
+    if (n > nt) {
+        double z = 0;
+        for (int i = nt; i < n; ++i) z += qs[i];
+        if (z > 1) z = 1;
+        const double ref = nt > 0 ? qs[nt - 1] : 1.0;
+        ov[nt] = (float)::log(z < ref ? z : ref);
+    }
+}
+
+/* Draw a rheo node's children: reorder Q's support into [top-m by q desc, the sampled tail child,
+ * the rest by q desc], set x = ids[0], scheme = m + 1 and nkids = min(nkids, children possible). The
+ * tail child is the inverse-CDF draw of Qt with the draft stream's uniform of (seed, base, node). */
+static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo_u(RadMtpCoupleState* s, double ut, int nkids, int m) {
+    int ord[8];
+    const int n = s->count;
+    for (int i = 0; i < n; ++i) ord[i] = i;
+    for (int i = 1; i < n; ++i) {   /* descending q, stable */
+        const int o = ord[i];
+        int j = i;
+        while (j > 0 && s->q[ord[j - 1]] < s->q[o]) { ord[j] = ord[j - 1]; --j; }
+        ord[j] = o;
+    }
+    const int nt = m < n ? m : n;
+    if (n > nt) {
+        double z = 0;
+        for (int i = nt; i < n; ++i) z += s->q[ord[i]];
+        double c = ut * z;
+        int pick = n - 1;
+        for (int i = nt; i < n; ++i) { c -= s->q[ord[i]]; if (c < 0) { pick = i; break; } }
+        const int o = ord[pick];
+        for (int i = pick; i > nt; --i) ord[i] = ord[i - 1];
+        ord[nt] = o;
+    }
+    int32_t ids[8];
+    double  q[8];
+    for (int i = 0; i < n; ++i) { ids[i] = s->ids[ord[i]]; q[i] = s->q[ord[i]]; }
+    for (int i = 0; i < n; ++i) { s->ids[i] = ids[i]; s->q[i] = q[i]; }
+    const int cap = nt + (n > nt ? 1 : 0);
+    s->x = s->ids[0];
+    s->scheme = m + 1;
+    s->nkids = nkids < cap ? nkids : cap;
+}
+static inline RAD_RRS_HD void rad_mtp_rrs_draw_rheo(RadMtpCoupleState* s, uint64_t node, int nkids, int m) {
+    rad_mtp_rrs_draw_rheo_u(s, rad_mtp_rrs_gumbel_u(s->draw.seed, s->draw.base, node, RAD_MTP_RRS_KEY_TAIL_C),
+                            nkids, m);
+}
+
+/* The verify of a rheo node (any nkids >= 0): the rule above. Same contract as rad_mtp_rrs_decide. */
+static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo_u(const RadMtpCoupleState& s, const int32_t* ids,
+                                                        const float* val, int64_t n, int64_t vocab,
+                                                        double u_accept, double u_resid, int32_t* out) {
+    float top = -INFINITY;
+    for (int64_t j = 0; j < n; ++j) {
+        if (ids[j] < 0) continue;
+        if (ids[j] >= vocab || val[j] != val[j] || val[j] == INFINITY) return false;
+        if (val[j] > top) top = val[j];
+    }
+    if (top == -INFINITY) return false;
+    double sum = 0, pq[8] = {};
+    for (int64_t j = 0; j < n; ++j) {
+        if (ids[j] < 0 || val[j] == -INFINITY) continue;
+        const double w = ::exp((double)val[j] - top);
+        sum += w;
+        for (int k = 0; k < s.count; ++k)
+            if (ids[j] == s.ids[k]) { pq[k] += w; break; }
+    }
+    if (!(sum > 0) || !rad_spechub_finite(sum)) return false;
+    const int m = s.scheme - 1;
+    const int nt = m < s.count ? m : s.count;
+    const bool tail = m >= 0 && s.count > nt && s.nkids > nt;
+    double qt[8] = {}, r[8] = {};
+    bool dominated = true;
+    for (int k = 0; k < s.count; ++k) pq[k] /= sum;
+    if (tail) {
+        double z = 0;
+        for (int k = nt; k < s.count; ++k) z += s.q[k];
+        for (int k = nt; k < s.count; ++k) {
+            const double v = nt == 0 ? s.q[k] : s.q[k] / z;
+            qt[k] = v > 1 ? 1 : v;   /* clamp: rounding must not push a one-token tail past 1 */
+            dominated = dominated && pq[k] >= qt[k];
+        }
+        for (int k = 0; k < s.count; ++k) r[k] = k < nt ? pq[k] : rad_spechub_positive(pq[k] - qt[k]);
+    }
+    /* mass of candidate j in R (the tail case) or in P (otherwise); Q tokens count once. */
+    unsigned seen = 0;
+    auto mass = [&](int64_t j) -> double {
+        if (ids[j] < 0 || val[j] == -INFINITY) return 0;
+        for (int k = 0; k < s.count; ++k)
+            if (s.ids[k] == ids[j]) {
+                if (seen & (1u << k)) return 0;
+                seen |= 1u << k;
+                return tail ? r[k] : pq[k];
+            }
+        return ::exp((double)val[j] - top) / sum;
+    };
+    double resid = 0;
+    if (tail) {
+        for (int64_t j = 0; j < n; ++j) resid += mass(j);
+        seen = 0;
+    }
+    if (!tail || (!dominated && !(resid > 0 && rad_spechub_finite(resid)))) {
+        double  c = u_resid * sum;   /* P itself, in the sampler's candidate order */
+        int32_t last = -1;
+        for (int64_t j = 0; j < n; ++j)
+            if (ids[j] >= 0 && val[j] != -INFINITY) {
+                const double w = ::exp((double)val[j] - top);
+                if (w > 0) { last = ids[j]; c -= w; if (c < 0) { *out = last; return true; } }
+            }
+        *out = last;
+        return last >= 0;
+    }
+    const int iu = nt;
+    if (pq[iu] >= qt[iu] || u_accept * qt[iu] < pq[iu]) {
+        *out = s.ids[iu];
+        return true;
+    }
+    double  c = u_resid * resid;
+    int32_t last = -1;
+    for (int64_t j = 0; j < n; ++j) {
+        if (ids[j] == s.ids[iu]) continue;
+        const double mm = mass(j);
+        if (mm > 0) { last = ids[j]; c -= mm; if (c < 0) { *out = last; return true; } }
+    }
+    *out = last;
+    return last >= 0;
+}
+static inline RAD_RRS_HD bool rad_mtp_rrs_decide_rheo(const RadMtpCoupleState& s, const int32_t* ids,
+                                                      const float* val, int64_t n, int64_t vocab,
+                                                      uint64_t seed, uint64_t pos, int32_t* out) {
+    return rad_mtp_rrs_decide_rheo_u(s, ids, val, n, vocab,
+                                     rad_spechub_uniform(seed, pos, RAD_SAMPLE_KEY_ACCEPT),
+                                     rad_spechub_uniform(seed, pos, RAD_SAMPLE_KEY_RESID), out);
 }
 
 #endif /* __cplusplus */

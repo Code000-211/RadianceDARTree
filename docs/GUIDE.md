@@ -1675,6 +1675,14 @@ chain-form step after a tree verify still closes that verify's path. The step is
 (the tree it verifies is still being grown), so a surprise costs acceptance, never correctness: the nodes beyond
 the prediction are dropped and counted (`radiance:spec_tree_rows_cut_total`, `..._active_cut_total` for the real
 ones, `..._chain_steps_total`). Design and the cost model: `DESIGN-dynrows.md`.
+**Prompt-lookup nodes in the tree: `draft-ngram-leaves`, `draft-ngram-min-match`.** `draft-ngram-leaves: N`
+(default 0 = off) grafts up to N nodes of the sequence's own prompt-lookup proposal (the `--spec-ngram` matcher)
+onto a **host-built** tree verify -- a branch off the root, or the extension of a drafted chain -- when the
+lookup's match runs at least `draft-ngram-min-match` tokens back (default 8). Room is the pruned slots, the unused
+budget, then up to N of the tree's last nodes. Lossless with and without `draft-coupling`: a lookup node is only a
+successor the walk takes when the row's emitted token is its own, and the coupled draw never sees it
+(`Request::draft_extra`); `DESIGN-ngram.md` has the argument and the tests that check it. Steps issued ahead of
+the commit (the fast path) carry no graft: the lookup needs the committed end. Counters: `SchedMetrics::ngram_graft_*`.
 Every draft is verified, so the thresholds change how many drafts land a step and what a step costs, not
 what the model says (up to the last-bit differences any change of the verify batch's rows can make to the
 target's logits, as between a chain and a tree).

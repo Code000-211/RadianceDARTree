@@ -33,6 +33,8 @@ typedef struct RadMtpTreeCpl {
     int64_t         st_seq;    /* words between sequences */
     int             rows;      /* node rows the plane holds */
     int64_t         vocab;     /* the whole vocabulary */
+    int             scheme;    /* 0: Gumbel-top-k siblings; m + 1: RheoSampling with m top-q children
+                                * and one tail-sampled one (--draft-siblings rheo, abi/rad_mtp_rrs.h) */
 } RadMtpTreeCpl;
 
 RAD_MTP_HD static inline int rad_mtp_tree_grow_seq_cpl(
@@ -47,6 +49,11 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq_cpl(
         cfg->nodes < 1 || cfg->nodes > RAD_MTP_TREE_MAX_NODES || cfg->round < 1 || cfg->round > cfg->rounds)
         return rad_mtp_tree_grow_seq(cfg, st, didx, dval, row0, row_stride, stride, head_in, table,
                                      tok, par, sel, nsel, vmask, rb_out, seq, src_out, dst_out);
+    /* --draft-calib online: this step's per-depth calibration temperatures (the draw's), for the
+     * pool scores and the adaptive rule alike */
+    RadMtpTreeCfg lcfg = *cfg;
+    rad_mtp_calib_apply(&lcfg.ad, draw);
+    cfg = &lcfg;
     const int N = cfg->nodes;
     int*  nd = st + 4 + W;
     const int round1 = cfg->round == 1;
@@ -66,16 +73,27 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq_cpl(
         RadMtpCoupleState s{};
         s.draw = draw;
         s.round = depth + 1;
-        const bool ok = rad_mtp_couple_build_q(ids, vals, cpl->vocab, &s);
+        const bool ok = rad_mtp_couple_build_law_at(ids, vals, cpl->vocab, draw, depth + 1, &s);
         if (ok) {
             s.status = 1;
             /* the slots: priorities from the descending q, tokens from the draft order */
             float slot[8];
-            rad_mtp_rrs_slot_logq(s, slot);
-            rad_mtp_rrs_draw(&s, (uint64_t)f, 0);
-            for (int c = 0; c < K; ++c) {
-                od[c] = c < s.count ? s.ids[c] : -1;
-                ov[c] = slot[c];
+            if (cpl->scheme > 0) {
+                /* RheoSampling: slots 0 .. m-1 the top-q tokens, slot m the tail-sampled one, no
+                 * other slot; every priority is a function of Q alone. */
+                rad_mtp_rrs_slot_logq_rheo(s, cpl->scheme - 1, slot);
+                rad_mtp_rrs_draw_rheo(&s, (uint64_t)f, 0, cpl->scheme - 1);
+                for (int c = 0; c < K; ++c) {
+                    od[c] = c < s.count && slot[c] != -INFINITY ? s.ids[c] : -1;
+                    ov[c] = slot[c];
+                }
+            } else {
+                rad_mtp_rrs_slot_logq(s, slot);
+                rad_mtp_rrs_draw(&s, (uint64_t)f, 0);
+                for (int c = 0; c < K; ++c) {
+                    od[c] = c < s.count ? s.ids[c] : -1;
+                    ov[c] = slot[c];
+                }
             }
         } else {
             s.status = -1;

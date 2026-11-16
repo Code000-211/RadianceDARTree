@@ -144,20 +144,36 @@ RAD_ADV_FN void adv_capture(const AdvanceArgs& a, StepSlot& S, const int32_t* ro
     const int32_t pick = row[0];
     /* Confidence pruning (abi/rad_mtp_tree.h's rule, the grower's arithmetic): a leaf the row's
      * distribution does not back is no leaf. The row's best candidate is never pruned. */
-    const bool prune = a.prune != 0 && val != nullptr && a.src_pitch >= RAD_MTP_TREE_K;
+    const bool adapt = a.adapt.on != 0 && val != nullptr && a.src_pitch >= RAD_MTP_TREE_K;
+    const bool prune = (a.prune != 0 || adapt) && val != nullptr && a.src_pitch >= RAD_MTP_TREE_K;
     float lp[RAD_MTP_TREE_K], mx = 0.0f, lse = 0.0f;
     int best = -1;
     RadMtpTreeCfg pc{};
+    float E = 1.0f, tcal = 1.0f;
     if (prune) {
-        pc.prune = 1; pc.log_abs = a.prune_log_abs; pc.log_rel = a.prune_log_rel;
+        pc.prune = a.prune != 0; pc.log_abs = a.prune_log_abs; pc.log_rel = a.prune_log_rel;
         best = rad_mtp_tree_row_logp(row, val, lp, &mx, &lse);
+        if (adapt && best >= 0) {
+            /* the cost-aware rule (abi/rad_mtp_adapt.h): the chain's expected tokens from its first
+             * node's calibrated probability, each level continuing with chain_cont */
+            tcal = rad_mtp_adapt_temp(&a.adapt, 1);
+            rad_mtp_adapt_recal(lp, RAD_MTP_TREE_K, tcal);
+            float lvl = expf(lp[best]);
+            for (int i = 0; i < a.depth; ++i) { E += lvl; lvl *= a.adapt.chain_cont; }
+        }
     }
     for (int64_t c = 1; c < a.src_pitch && S.nalt < a.leaves && S.nalt < kAdvMaxLeaves; ++c) {
         const int32_t id = row[c];
         if (id < 0 || (a.vocab > 0 && id >= a.vocab) || id == pick) continue;
         if (prune && (best < 0 || c >= RAD_MTP_TREE_K || !(lp[c] == lp[c]) ||
-                      !rad_mtp_tree_keep(&pc, (int)c, best, 0.0f, lp[c], val[c], mx)))
+                      !rad_mtp_tree_keep(&pc, (int)c, best, 0.0f, lp[c],
+                                         tcal == 1.0f ? val[c] : mx + (val[c] - mx) / tcal, mx)))
             continue;
+        if (adapt) {
+            const float pj = expf(lp[c]);
+            if (!rad_mtp_adapt_admit(&a.adapt, a.depth + S.nalt, E, pj)) continue;
+            E += pj;   /* only a leaf that is kept is a row; a duplicate below may waste one */
+        }
         bool dup = false;
         for (int32_t q = 0; q < S.nalt; ++q) dup = dup || S.alt[q] == id;
         if (!dup) S.alt[S.nalt++] = id;

@@ -13,12 +13,41 @@
 #include "scheduler.h"   /* Scheduler::SerialRow */
 
 #include "rad_spechub.h"
+#include "mtp_calib.h"
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace rad {
+
+/* The draft law recipe (--draft-coupling-temp / -temp-mul / -truncate): how a request's sampling
+ * parameters become the draw's dscale / dtop_k / dtop_p (rad_mtp_couple_build_law). A default
+ * recipe is the legacy law (scale 1, no cut). Any recipe is exact: the verify reads the Q it made. */
+struct MtpCoupleLaw {
+    bool  request_temp = false;   /* draft at the request's temperature (times `mul`), else `temp` */
+    float temp = 1.0f;
+    float mul = 1.0f;
+    bool  truncate = false;       /* the request's top-k / top-p cut the draft law's support */
+    /* The online controller (--draft-calib online, --draft-coupling-temp-autofit, the replay log):
+     * its per-depth word rides the draw. Null = the draws are exactly what they were. */
+    MtpCalibCtl* calib = nullptr;
+};
+
+/* The draw of a request under `law` (a null law: the legacy one). */
+inline RadMtpCoupleDraw mtp_couple_draw_of(const Request& r, uint64_t seq, int32_t card,
+                                           const MtpCoupleLaw* law) {
+    RadMtpCoupleDraw d{ r.sp.seed, (uint64_t)r.output.size(), seq, card, r.sp.greedy() ? 0u : 1u };
+    if (!law || d.mode != 1) return d;
+    const double t = law->request_temp ? (double)r.sp.temp * (double)law->mul : (double)law->temp;
+    d.dscale = t > 0.0 && t < 1e6 ? (float)(1.0 / t) : 0.0f;
+    if (law->truncate) {
+        d.dtop_k = r.sp.top_k > 0 && r.sp.top_k < 8 ? r.sp.top_k : 0;
+        d.dtop_p = r.sp.top_p > 0.0f && r.sp.top_p < 1.0f ? r.sp.top_p : 0.0f;
+    }
+    if (law->calib && law->calib->enabled()) d.dpad_ = law->calib->word(r.sp.temp, d.dscale);
+    return d;
+}
 
 /* Fills `by_card[0, n_card)` from the plan and writes one draw per drafting row to `stage[0, n)`.
  * RAD_OK, or RAD_E_STATE with `why` set: the plane is too small for the card slots, or a drafting
@@ -27,7 +56,8 @@ namespace rad {
 template <class Row>   /* Scheduler::SerialRow or Scheduler::BlockRow: a sequence and its card */
 inline int mtp_couple_plan_stage(const StepPlan& plan, int n_card, const Row* rows,
                                  int n, std::vector<RadMtpCoupleDraw>* by_card,
-                                 RadMtpCoupleDraw* stage, std::string* why) {
+                                 RadMtpCoupleDraw* stage, std::string* why,
+                                 const MtpCoupleLaw* law = nullptr) {
     if (!by_card || !stage || !why) return RAD_E_INVAL;
     if ((int)by_card->size() < n_card) {
         *why = "the draw plane holds " + std::to_string(by_card->size()) +
@@ -37,8 +67,7 @@ inline int mtp_couple_plan_stage(const StepPlan& plan, int n_card, const Row* ro
     for (int c = 0; c < n_card; ++c) (*by_card)[(size_t)c] = RadMtpCoupleDraw{};
     for (const StepEntry& e : plan.e)
         if (e.req && e.card >= 0 && e.card < n_card)
-            (*by_card)[(size_t)e.card] = { e.req->sp.seed, (uint64_t)e.req->output.size(), e.seq,
-                                           e.card, e.req->sp.greedy() ? 0u : 1u };
+            (*by_card)[(size_t)e.card] = mtp_couple_draw_of(*e.req, e.seq, e.card, law);
     for (int i = 0; i < n; ++i) {
         const Row& row = rows[i];
         if (row.card < 0 || row.card >= n_card || (*by_card)[(size_t)row.card].seq != row.seq) {

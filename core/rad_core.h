@@ -745,6 +745,12 @@ struct Request {
      * next token is then the row's own child, not a sibling that happens to carry the same id);
      * every other row keeps the ordinary pick, which is exact. -1: the proposal is a chain. */
     int32_t              draft_chain = -1;
+    /* A tree's prompt-lookup nodes (--draft-ngram-leaves): nodes past draft_extra (the count of
+     * the model's own nodes) are grafted from the sequence's history. The coupled sampler leaves
+     * them out of every row's child list, so the recursive rejection draw sees the model's
+     * children only and a lookup node is followed only when the row's emitted token is its own
+     * (core/sched/ngram_tree.h). -1: none. */
+    int32_t              draft_extra = -1;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -1054,12 +1060,75 @@ struct Config {
      * only. */
     int         draft_tree_rows = -1;
     int         draft_tree_chain = 0;
+    /* --draft-adaptive: cost-aware, calibrated node selection of a serial head's tree
+     * (abi/rad_mtp_adapt.h, docs/DESIGN-adaptive.md). A candidate becomes a node only while its
+     * marginal expected accepted tokens per marginal verify-row cost beats the tree's current
+     * tokens per time. draft_cost_table: "ms,ms,..." the verify step's cost for 0,1,2.. nodes (empty:
+     * 12.3 ms at 3 nodes, +1.0 ms a node); draft_cost_draft_ms the head's rounds a step (< 0:
+     * 0.5 ms a round); draft_calib "T1,T2,.." per-depth calibration temperatures of the head's
+     * top-8 law (empty: none). Lossless with --draft-coupling (decisions read slot priorities only). */
+    bool        draft_adaptive = false;
+    double      draft_adaptive_margin = 1.0;
+    int         draft_adaptive_floor = 1;
+    double      draft_adaptive_cont = 0.7;
+    double      draft_cost_draft_ms = -1.0;
+    std::string draft_cost_table;
+    std::string draft_calib;
+    /* --draft-calib online|static|off[:LIST] (default static = draft_calib's list as it always was):
+     * online refits the per-depth calibration temperature from the exact acceptance labels of the
+     * verified rows (prior: the static list); off ignores the list. --draft-coupling-temp-autofit
+     * on refits the per-depth DRAFT temperature the same way; --draft-calib-log PATH writes the
+     * replay log; --draft-calib-ece adds the calibration error per depth to the periodic stats
+     * line; --draft-calib-interval N verify steps between refits (core/sched/mtp_calib.h). All of
+     * them need --draft-coupling on, and with every one at its default the engine runs the old
+     * path. */
+    int         draft_calib_mode = 0;           /* 0 static, 1 online, 2 off */
+    bool        draft_coupling_autofit = false;
+    std::string draft_calib_log;
+    bool        draft_calib_ece = false;
+    int         draft_calib_interval = 256;
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify
      * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
+    /* --draft-coupling-temp auto|request|<float>, --draft-coupling-temp-mul F,
+     * --draft-coupling-truncate off|on: the DRAFT LAW the coupled drafter samples from. Q is the
+     * softmax of the head's top-8 scores times 1 / T_draft, T_draft the fixed value (default 1 =
+     * the legacy law) or the request's own temperature (request; auto is the same) times the mul;
+     * truncate cuts the eight to the request's top-k / top-p first. Any Q is exact (the verify
+     * reads the Q the draft was drawn from); this is acceptance tuning only (sched/mtp_couple_plan.h). */
+    bool        draft_coupling_req_temp = false;
+    float       draft_coupling_temp = 1.0f;
+    float       draft_coupling_temp_mul = 1.0f;
+    bool        draft_coupling_truncate = false;
+
+    /* --draft-verify token|block: how a coupled linear chain is verified. token (default): each
+     * row's maximal coupling (above). block: Block Verification (arXiv 2403.10444,
+     * abi/rad_mtp_block.h), the chain's drafts accepted jointly; the same output law, at least as
+     * many accepted tokens. block switches --draft-coupling on (the drafting half is shared) and
+     * is for a linear chain, so it excludes --draft-tree on. */
+    bool        draft_verify_block = false;
+    /* --draft-verify rowwise|traversal: how a coupled draft step is verified. rowwise decides
+     * every row on its own (maximal coupling on a chain, recursive rejection sampling over a
+     * node's siblings); traversal decides a root-to-leaf path at once, bottom-up (Traversal
+     * Verification, arXiv 2505.12398, abi/rad_mtp_traversal.h): the same output law, more
+     * accepted tokens. Needs --draft-coupling on. */
+    bool        draft_verify_traversal = false;
+    /* --draft-ngram-leaves N / --draft-ngram-min-match L (core/sched/ngram_tree.h): on a host-built
+     * tree verify, graft up to N prompt-lookup nodes (a branch or a chain extension) when the
+     * lookup's match runs at least L tokens back. 0 (default) off. Lossless, also under
+     * --draft-coupling. */
+    int         draft_ngram_leaves = 0;
+    int         draft_ngram_min_match = 8;
+    /* --draft-siblings gumbel|rheo, --draft-rheo-m N: the sibling scheme of a coupled draft tree.
+     * gumbel (default): Gumbel-top-k without replacement, verified by recursive rejection
+     * sampling. rheo: the top-N tokens of the node's law Q plus ONE sampled from the tail law,
+     * verified by the greedy multi-draft verifier (abi/rad_mtp_rrs.h; Hu et al. 2025 Thm 8,
+     * RheoSampling). Needs --draft-coupling on and a serial draft tree. */
+    bool        draft_siblings_rheo = false;
+    int         draft_rheo_m = 1;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

@@ -896,6 +896,7 @@ int ref_mtp_tree_grow(const RadArgs* a, RadStream) {
     cfg.sel_pitch = (int)p_int(a, "sel_pitch", 0);
     rad_mtp_tree_set_prune(&cfg, (double)p_f32(a, "prune_abs", 0.0f),
                            (double)p_f32(a, "prune_rel", 0.0f));
+    if (!rad_mtp_adapt_parse_cached(p_str(a, "adapt", ""), &cfg.ad)) return RAD_E_INVAL;
     const int64_t M = band_rows(st->rank >= 2 ? st->shape[0] : numel(st), p_int(a, "M", 0));
     cfg.pitch = (int)(tok->rank >= 2 ? tok->shape[tok->rank - 1] : cfg.nodes);
     if (M <= 0 || cfg.round < 1 || cfg.rounds < 1 || cfg.nodes < 1 || cfg.width < 1 ||
@@ -960,6 +961,7 @@ int ref_mtp_tree_grow(const RadArgs* a, RadStream) {
             cpl.st_seq = cstt->stride[1];
             cpl.rows = (int)cstt->shape[0];
             cpl.vocab = n_vocab_c;
+            cpl.scheme = (int)p_int(a, "rheo_m", -1) + 1;
         }
         const int rc = rad_mtp_tree_grow_seq_cpl(
             &cfg, sp, ip, fp, m * per, drs, 1, head,
