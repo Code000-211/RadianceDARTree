@@ -85,6 +85,18 @@ __device__ void couple_live(const int32_t* ids, const float* val, int64_t n, int
     __syncthreads();
 }
 
+/* The live candidates of a row as the shared decisions read them (rad_mtp_rrs_decide_over,
+ * rad_mtp_trav_*): the sampler's ids, the compaction (`lj`, ascending candidate order), each live
+ * candidate's FP64 weight exp(val - top) and its slot in the node's support (count when outside),
+ * all computed by the workgroup and stored in LDS. */
+struct LiveCands {
+    const int32_t* ids; const short* lj; const double* w; const unsigned char* k; int L;
+    template <class F> __device__ void each(F&& f) const {
+        for (int i = 0; i < L; ++i)
+            if (!f(ids[lj[i]], w[i], (int)k[i])) return;
+    }
+};
+
 /* --draft-verify block (abi/rad_mtp_block.h). The workgroup of a block's round-1 row decides the
  * whole block and writes the tokens of rows 0 .. tau; the block's other rows return. Per row the
  * live candidates are compacted by the workgroup (couple_live) and thread 0 runs the shared helpers
@@ -185,9 +197,9 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
         block_verify(c, row, lj);
         return;
     }
-    /* A tree node with several drafted children (abi/rad_mtp_rrs.h): one thread runs the shared
-     * serial helper, which is the host reference itself. Only rows of a draft tree take it. */
-    if (s.nkids >= 2 || s.scheme != 0) {
+    /* A RheoSampling node (abi/rad_mtp_rrs.h): one thread runs the shared serial helper, which is
+     * the host reference itself. Only rows of a --draft-siblings rheo tree take it. */
+    if (s.scheme != 0) {
         if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
         return;
     }
@@ -195,6 +207,36 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
     if (!valid || top == -INFINITY) return;
     const int L = nl;
     for (int i = threadIdx.x; i < L; i += blockDim.x) weight[i] = ::exp((double)val[lj[i]] - top);
+    /* A tree node with several drafted children (abi/rad_mtp_rrs.h, recursive rejection sampling):
+     * the workgroup has compacted the live candidates and computed every weight and every
+     * candidate's slot in the node's support; one lane then runs the host reference's own decision
+     * (rad_mtp_rrs_decide_over) over those stored values, in the same order, so the token is the
+     * host's bit for bit. */
+    if (s.nkids >= 2) {
+        __shared__ unsigned char kslot[kMaxCand];
+        __shared__ double        pq_x[8], sum_x;
+        for (int i = threadIdx.x; i < L; i += blockDim.x) {
+            const int32_t id = ids[lj[i]];
+            int k = 0;
+            while (k < s.count && id != s.ids[k]) ++k;
+            kslot[i] = (unsigned char)k;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int32_t out = -1;
+            if (rad_mtp_rrs_decide_over(s, LiveCands{ ids, lj, weight, kslot, L }, p.seed, p.pos, &out,
+                                        pq_x, &sum_x)) {
+                c.token[row * c.ld[4]] = out;
+                /* the export (rad_mtp_couple_export_p): P on the node's support, from the same sums */
+                if (s.draw.dpad_ & RAD_MTP_DRAW_EXPORT_BIT) {
+                    RadMtpCoupleState* sm = const_cast<RadMtpCoupleState*>(&s);
+                    for (int k = 0; k < s.count; ++k) sm->q[k] = pq_x[k] / sum_x;
+                    sm->status = RAD_MTP_COUPLE_STATUS_EXPORTED;
+                }
+            }
+        }
+        return;
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         sum = 0;
@@ -487,25 +529,73 @@ int rad_mine_mtp_couple_propose_launch(const RadArgs* a, RadStream stream) {
     return R4D_EMIT(stream, propose, dim3((unsigned)((c.M + 63) / 64)), dim3(64), 0, c);
 }
 
-/* The traversal walk: one thread a row, only a request's root row (topo parent -1) does work. The
- * walk is serial and short (a tree of at most 60 rows), and it is the host reference itself, so
- * device and host cannot differ. */
+/* The traversal walk (abi/rad_mtp_traversal.h): one workgroup a row, only a request's root row (topo
+ * parent -1) does work. The walk itself is the host reference's, run by every lane of the workgroup
+ * redundantly (it is serial, short -- a tree of at most 60 rows -- and its control flow reads only
+ * data every lane reads alike); what costs is the candidate scans, one per visited node over the
+ * sampler's whole plane (1024 slots, FP64 exp each, at top_k 0), and those are the workgroup's: live()
+ * compacts the node's live candidates and computes every weight and support slot in parallel, after
+ * which the ordered sums run over the stored values on each lane, in the host's order. Tokens and
+ * accepted paths are the host's bit for bit. Above kMaxCand candidates one lane walks as before. */
+struct DevTravRows : RadMtpTravRows {
+    short* lj; double* w; unsigned char* kk; int* nl; int* valid; float* top;
+    __device__ void live(int v, const int32_t* sid, int cnt, RadTravLaw* out) const {
+        const int32_t* ids; const float* val; int64_t nc;
+        cand(v, &ids, &val, &nc);
+        __syncthreads();   /* every lane is done with the previous gather */
+        couple_live(ids, val, nc, vocab(), lj, nl, valid, top);
+        const int L = *nl;
+        out->valid = *valid && *top != -INFINITY;
+        out->top = *top; out->L = L; out->ids = ids; out->lj = lj; out->w = w; out->k = kk;
+        if (out->valid) {
+            const float t = *top;
+            for (int i = threadIdx.x; i < L; i += blockDim.x) {
+                const int32_t id = ids[lj[i]];
+                w[i] = ::exp((double)val[lj[i]] - t);
+                int k = 0;
+                while (k < cnt && id != sid[k]) ++k;
+                kk[i] = (unsigned char)k;
+            }
+        }
+        __syncthreads();
+    }
+};
+
 __global__ void trav_verify(const int32_t* idx, const float* values, const uint32_t* params,
                             const uint32_t* state, int32_t* token, const int32_t* topo, int64_t M,
                             int64_t n_cand, int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2,
                             int64_t ld3, int64_t ld4, int64_t ld_topo) {
-    const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.x;
     if (row >= M) return;
     RadMtpTravCall c{ { idx, values, params, state, token, M, n_cand, vocab, { ld0, ld1, ld2, ld3, ld4 } },
                       topo, ld_topo };
-    rad_mtp_trav_verify_root(c, row);
+    if (c.topo[row * c.ld_topo] >= 0) return;   /* not a request's root */
+    if (n_cand > kMaxCand) {
+        if (threadIdx.x == 0) rad_mtp_trav_verify_root(c, row);
+        return;
+    }
+    __shared__ short         lj[kMaxCand];
+    __shared__ double        wt[kMaxCand];
+    __shared__ unsigned char kk[kMaxCand];
+    __shared__ int           nl, valid;
+    __shared__ float         top;
+    int64_t n = 1;
+    while (row + n < c.v.M && c.topo[(row + n) * c.ld_topo] >= 0) ++n;
+    const DevTravRows T{ RadMtpTravRows{ c, row, n }, lj, wt, kk, &nl, &valid, &top };
+    const auto& p = *reinterpret_cast<const RadSampleParams*>(c.v.params + row * c.v.ld[2]);
+    RadMtpTravOut o;
+    if (!rad_mtp_trav_walk(T, 0, p.seed, p.pos, &o)) return;
+    if (threadIdx.x != 0) return;
+    for (int i = 0; i + 1 < o.n; ++i)
+        c.v.token[(row + o.node[i]) * c.v.ld[4]] = c.topo[(row + o.node[i + 1]) * c.ld_topo + 1];
+    if (o.has_y) c.v.token[(row + o.node[o.n - 1]) * c.v.ld[4]] = o.y;
 }
 
 int rad_mine_mtp_trav_verify_launch(const RadArgs* a, RadStream stream) {
     RadMtpTravCall c{};
     const int rc = rad_mtp_trav_verify_args(a, &c);
     if (rc != RAD_OK) return rc;
-    return R4D_EMIT(stream, trav_verify, dim3((unsigned)((c.v.M + 31) / 32)), dim3(32), 0,
+    return R4D_EMIT(stream, trav_verify, dim3((unsigned)c.v.M), dim3(kThreads), 0,
                     c.v.idx, c.v.val, c.v.params, c.v.state, c.v.token, c.topo, c.v.M, c.v.n_cand,
                     c.v.vocab, c.v.ld[0], c.v.ld[1], c.v.ld[2], c.v.ld[3], c.v.ld[4], c.ld_topo);
 }

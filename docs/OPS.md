@@ -2630,14 +2630,17 @@ sequential decode of its root-to-row path computes, in the same kernel family, b
   windows whose reader does not gather: PLE's token and convolution windows.)
 - **Bounds.** At most 16 rows a sequence on the pair `gdn_conv_update` + `gdn_recurrent_update`
   (the factor block's records) and 8 on the fold (its register window; libref's 16 x 16 head holds
-  7); a longer block is refused (libref: `RAD_E_SHAPE`; libr4d: the `q_len` parameter against the
+  7). The fold's register window is the step's tokens, not the conv window: libr4d serves any window
+  (18 entries after steps that accepted 9 to 16 rows included, `r4d_selftest`), while libhalo's and
+  libr3d's still refuse one past 8 entries of block (`max_spec + 1 > 8`), so the plugin issues the fold
+  only below that: a refusal at issue stops the engine. A longer block is refused (libref: `RAD_E_SHAPE`; libr4d: the `q_len` parameter against the
   bound, since the device cannot refuse what it reads). A parent at or after its child is
   `RAD_E_INVAL` in libref; libr4d reads it as the row before. A committed row at or past the number
   of records the block holds, or past the window, is `RAD_E_SHAPE` in libref and clamped or skipped
   on the device.
 
 libref and libavx serve all four forms (libavx for the three it has). libr4d serves the anchor form
-over an f32 state (`state_fp16` and `chain` are declined), bf16 a/b, and one workgroup a head; the
+over an f32 state (`state_fp16` is declined; the folded form launches chained, like its chain form), bf16 a/b, and one workgroup a head; the
 rows are walked depth first, a leaf (a row with no children) is computed from the live state without
 advancing it, and a node's second and later non-leaf children restart from the node's state, which
 is rebuilt from the published anchor by replaying the node's ancestors' records (kept in LDS) with

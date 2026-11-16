@@ -13574,6 +13574,204 @@ TEST(flashnext_tree_steps_route_the_decode_half_through_the_tree_ops) {
     }
 }
 
+/* Every op the plugin can issue is accepted by the kernel row the engine selects for it. The folded
+ * delta-net op takes its conv window as a register preload (libr4d RU_CVT = 8 tokens), and the core
+ * sizes the window conv_width - 1 + max_spec; a deployment whose window outgrows the preload must not
+ * issue the fold at all, since a refusal at issue stops the engine (a draft tree of 8 or more nodes
+ * ran into this on every decode step of 8 rows or fewer: dynamic rows, chain form, a draftless step,
+ * the end of the context). The test declares a deployment of N nodes, builds every step shape a tree
+ * engine issues and launches each issued fold on the shipped row with shape tensors; a refusal
+ * (RAD_E_UNSUPPORTED) is the failure. The launch only gets past the shape checks on a build with a
+ * device; there the pointers must be real, so the launch is left to a host-only run
+ * (ROCR_VISIBLE_DEVICES=99, as ctest sets it) and skipped when hipMalloc succeeds. */
+namespace {
+const RadKernelInfo* r4d_row(const char* name) {
+    static void* h = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const char* home = std::getenv("RADIANCE_HOME");
+        if (home) h = dlopen((std::string(home) + "/kernels/libr4d.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!h) return nullptr;
+    auto count = (int (*)(void))dlsym(h, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+    if (!count || !at) return nullptr;
+    for (int i = 0; i < count(); ++i)
+        if (!std::strcmp(at(i)->name, name)) return at(i);
+    return nullptr;
+}
+bool r4d_has_device() {
+    void* h = dlopen("libamdhip64.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) return false;
+    auto alloc = (int (*)(void**, size_t))dlsym(h, "hipMalloc");
+    void* p = nullptr;
+    return alloc && alloc(&p, 256) == 0;
+}
+RadTensor shape_tensor(void* p, uint32_t dt, std::vector<int64_t> shape, int64_t row_pitch = 0) {
+    RadTensor t{};
+    t.data = p; t.dtype = dt; t.rank = (uint32_t)shape.size();
+    int64_t acc = 1;
+    for (size_t i = 0; i < shape.size(); ++i) t.shape[i] = shape[i];
+    for (int i = (int)shape.size() - 1; i >= 0; --i) { t.stride[i] = acc; acc *= shape[i]; }
+    if (row_pitch) t.stride[0] = row_pitch;
+    return t;
+}
+/* Launch `row` as the fold's issue of `rows` rows against a conv window of conv_width - 1 + N. */
+int fold_launch(const RadKernelInfo* row, const RecOp& op, int64_t rows, int64_t N, int64_t qband = 0) {
+    static char dummy[64];
+    const int64_t K = 128, V = 128, H = 24, Hg = 8, W = 4, CD = 2 * Hg * K + H * V, INW = CD + H * V;
+    const int64_t SL = (W - 1) + N, Q = rows;
+    RadTensor none{};
+    const bool had = op.op == "gdn_conv_recurrent_update_had";
+    std::vector<RadTensor> t = {
+        shape_tensor(dummy, RAD_BF16, { Q, CD }, INW), shape_tensor(dummy, RAD_BF16, { CD, W }), none,
+        shape_tensor(dummy, RAD_BF16, { 2, CD, SL }), shape_tensor(dummy, RAD_I32, { 1 }),
+        shape_tensor(dummy, RAD_BF16, { Q, H }, 2 * H), shape_tensor(dummy, RAD_BF16, { Q, H }, 2 * H),
+        shape_tensor(dummy, RAD_F32, { H }), shape_tensor(dummy, RAD_F32, { H }),
+        shape_tensor(dummy, RAD_F32, { 4, H, V, K }), shape_tensor(dummy, RAD_I32, { 1, 16 }),
+        shape_tensor(dummy, RAD_I32, { 1 }), shape_tensor(dummy, RAD_I32, { 2 }),
+        shape_tensor(dummy, RAD_BF16, { Q, H * V }, INW), shape_tensor(dummy, RAD_F32, { V }),
+        shape_tensor(dummy, RAD_BF16, { Q, H, V }), shape_tensor(dummy, RAD_I8, { Q, H * V }),
+        shape_tensor(dummy, RAD_F32, { Q, H }) };
+    (void)had;
+    std::vector<RadParam> p;
+    for (const RecParam& q : op.p) {
+        RadParam r{};
+        r.key = q.key.c_str(); r.kind = q.kind;
+        if (q.kind == RAD_P_RANGE) { r.kind = RAD_P_INT; r.ival = qband ? qband : q.ihi; }
+        else { r.ival = q.ival; r.dval = q.dval; r.sval = q.sval.c_str(); }
+        if (q.key == "n_head_v") r.ival = H;
+        if (q.key == "head_k" || q.key == "head_v") r.ival = 128;
+        p.push_back(r);
+    }
+    RadArgs a{};
+    a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+    return row->launch(&a, (RadStream) nullptr);
+}
+}  /* namespace */
+
+TEST(flashnext_every_issued_gdn_fold_is_accepted_by_the_selected_kernel_row) {
+    const RadKernelInfo* plain = r4d_row("gdn_conv_recurrent_update_k128_v128_bf16");
+    const RadKernelInfo* had = r4d_row("gdn_conv_recurrent_update_had_k128_v128_bf16");
+    if (!plain || !had) {
+        fprintf(stderr, "    SKIP: libr4d.so (fold rows) not found under $RADIANCE_HOME/kernels\n");
+        return;
+    }
+    const bool dev = r4d_has_device();
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (const int N : { 7, 8, 15 }) {
+        const int R = 3;
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, N - R, 1);
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+        /* the shapes a tree engine issues: a full verify (parents), the same cut to a prefix (dynamic
+         * rows), its chain form (no parents), a draftless step, and the node budget's own rows */
+        std::vector<TreeKit> kits;
+        kits.push_back(tree_kit(b, 2, N, R, true, true));
+        for (const int rows : { 1, 2, R + 1, 8 }) {
+            if (rows > N + 1) continue;
+            TreeKit t;
+            t.k = kit(b, std::vector<int>(2, rows), {});
+            kits.push_back(std::move(t));
+        }
+        size_t folds = 0, refused = 0;
+        for (const TreeKit& tk : kits) {
+            const auto v = run_passes(b, qwen4exp_fp8::step, { tk.k.get() });
+            CHECK_PASSES(b, v);
+            for (const char* name : { "gdn_conv_recurrent_update", "gdn_conv_recurrent_update_had" })
+                for (const RecIssue* is : issues_of(b, *v[0], name)) {
+                    ++folds;
+                    if (dev) continue;
+                    const RecOp* op = b.op_of(is->op);
+                    const int rc = fold_launch(std::string(name) == "gdn_conv_recurrent_update_had" ? had : plain,
+                                               *op, is->n, N);
+                    if (rc == RAD_E_UNSUPPORTED) {
+                        ++refused;
+                        fprintf(stderr, "    %s refused at %lld rows, N=%d (window %d)\n", name,
+                                (long long)is->n, N, 3 + N);
+                    }
+                }
+        }
+        CHECK_EQ(refused, (size_t)0);
+        /* the check reaches the kernel's own refusal: a band past the 8 tokens its registers hold */
+        if (!dev) {
+            const RecOp* any = nullptr;
+            for (const RecOp& o : b.ops)
+                if (o.op == "gdn_conv_recurrent_update" || o.op == "gdn_conv_recurrent_update_had") any = &o;
+            if (any) CHECK_EQ(fold_launch(any->op == "gdn_conv_recurrent_update" ? plain : had, *any, 6, N, /*q_len band*/ 16),
+                              (int)RAD_E_UNSUPPORTED);
+        }
+        /* one lone N=7 verify of 8 rows is the fold's own band: it is still issued there */
+        if (N == 7) CHECK(folds > 0);
+        if (N > 7) CHECK_EQ(folds, (size_t)0);
+    }
+}
+
+/* A decode sequence without drafts beside a tree verify (concurrent requests: one may not speculate,
+ * one is at its context limit). The core stages it as the one-node tree (parent -1), so every decode
+ * row of the step is a tree row and the attention's tree form (which reads each listed page in full)
+ * gets tables that stop at the row's anchor. The step lints clean, selects with the tree operands over
+ * all three rows' sequences and attends through the tree form for every QSA layer. */
+TEST(flashnext_a_draftless_decode_sequence_in_a_tree_step_is_a_tree_row) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3;
+    RadBuilder b;
+    b.encs = { { "draft_head", u2_head() } };
+    RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 4, 1);
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    const int qsa = count_op(b, "qsa_tail_compact");
+    REQUIRE(qsa > 0);
+    /* sequence 0 verifies a tree of N + 1 rows, sequence 1 one row, sequence 2 a short tree */
+    TreeKit t;
+    t.k = kit(b, { N + 1, 1, 4 }, {});
+    for (int j = 0; j <= N; ++j) t.par.push_back(j == 0 ? -1 : j <= R ? j - 1 : 0);
+    t.par.push_back(-1);                                  /* the draftless row: the one-node tree */
+    for (int j = 0; j < 4; ++j) t.par.push_back(j == 0 ? -1 : j - 1);
+    t.k->b.spec_parent = t.par.data();
+    t.k->b.n_spec = N;
+    const auto v = run_passes(b, qwen4exp_fp8::step, { t.k.get() });
+    CHECK_PASSES(b, v);
+    const size_t tsel = issues_of(b, *v[0], "attn_paged_tree_sel").size() +
+                        issues_of(b, *v[0], "attn_paged_tree_sel_gate_quant").size() +
+                        issues_of(b, *v[0], "attn_paged_tree_sel_gate_had_quant").size();
+    CHECK_EQ(tsel, (size_t)qsa);
+    for (const RecIssue* is : issues_of(b, *v[0], "qsa_select")) {
+        REQUIRE(is->opd.size() >= 11);
+        CHECK(!absent(is->opd[8]) && !absent(is->opd[9]) && !absent(is->opd[10]));
+    }
+    CHECK_EQ(issues_of(b, *v[0], "attn_paged").size() +
+             issues_of(b, *v[0], "attn_paged_gate_quant").size(), (size_t)0);
+}
+
+/* Stage 2 with --draft-coupling numbers each node's drafting state round = depth + 1, and the engine's
+ * bind refuses a state past RAD_MTP_COUPLE_MAX_ROUNDS (8): the step fails and the engine stops. An
+ * unpruned tree of N <= 15 at width 2 is at most 8 deep, but pruning or an adaptive budget lets a
+ * round add the trunk node alone and the tree grows R deep. The deployment is refused at declare, as
+ * the chain's and stage 1's already are (tests/mtp_couple_plan_test.cpp pins the bind's side). */
+TEST(flashnext_refuses_a_pruned_coupled_stage_two_tree_deeper_than_the_coupling_state) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    auto declared = [&](int R, bool prune, const char* adapt) {
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_tree_ctx(0, 1, 15, R, 1, 2);
+        ctx.draft_coupling = 1;
+        if (prune) ctx.draft_tree_prune_rel = 0.3f;
+        ctx.draft_adapt = adapt;
+        return qwen4exp_fp8::declare(&b, &meta, &ctx);
+    };
+    CHECK_EQ(declared(8, true, ""), RAD_OK);                          /* within the state's rounds */
+    CHECK_EQ(declared(9, false, ""), RAD_OK);                         /* unpruned: depth <= 8 */
+    CHECK_EQ(declared(12, false, ""), RAD_OK);
+    CHECK_EQ(declared(9, true, ""), RAD_E_UNSUPPORTED);               /* depth 9 reachable */
+    CHECK_EQ(declared(16, true, ""), RAD_E_UNSUPPORTED);
+    CHECK(declared(9, false, "on=1;margin=1.2;cost=9.3,10.3,11.3") != RAD_OK);                        /* an adaptive budget too */
+}
+
 /* Dynamic rows (DESIGN-dynrows.md): a step whose tree is a pure chain is issued by the core in the
  * chain's form -- spec_parent null and, when no earlier tree verify's path is owed, spec_path null
  * -- and a tree deployment's plugin then issues exactly what a chain deployment's does: the same ops

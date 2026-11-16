@@ -18,6 +18,7 @@
 
 #include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
+#include "rad_mtp_tree_rrs.h"
 
 #include <cmath>
 #include <cstring>
@@ -464,4 +465,84 @@ TEST(each_sequence_of_a_batch_gets_its_own_draft_law_recipe) {
     CHECK(stage[1].dtop_p == 0.95f);
     CHECK_EQ(stage[2].mode, 0u);
     CHECK(stage[2].dscale == 0.0f && stage[2].dtop_k == 0 && stage[2].dtop_p == 0.0f);
+}
+
+/* ------------------------------------------------------------------ the coupled stage-2 tree's bind
+ *
+ * The real grower (abi/rad_mtp_tree_rrs.h) writes a node's drafting state with round = depth + 1; the
+ * engine's bind (mtp_couple_bind_tree) refuses a state past RAD_MTP_COUPLE_MAX_ROUNDS and the step
+ * with it, which stops the engine. Pruning (or an adaptive budget) lets a round add the trunk node
+ * alone, so the tree grows R deep: with R > 8 the bind refuses. The plugin therefore refuses that
+ * deployment at declare (arch_test: flashnext_refuses_a_pruned_coupled_stage_two_tree_deeper_...);
+ * this pins the two limits together: a tree of R <= 8 rounds always binds, and the first deployment
+ * the plugin lets through beyond 8 rounds (unpruned) binds too. */
+namespace {
+/* 0 when the bind accepts every state the grower wrote, else the bind's return code. */
+int grown_tree_bind(int R, int W, int N, uint64_t seed, double prune, int* depth_out) {
+    const int K = 8, vocab = 1000;
+    RadMtpTreeCfg cfg{};
+    if (prune > 0) rad_mtp_tree_set_prune(&cfg, prune, 0.0);
+    cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = 4; cfg.sel_pitch = 0; cfg.pitch = N;
+    std::vector<int> st((size_t)rad_mtp_tree_state_words(N, W, R), 0);
+    std::vector<int> tok((size_t)N, 0), par((size_t)N, 0);
+    RadMtpCoupleDraw draw{};
+    draw.seed = seed; draw.base = 7; draw.seq = 42; draw.card = 0; draw.mode = 1;
+    std::vector<RadMtpCoupleState> plane((size_t)N);
+    RadMtpTreeCpl cpl{};
+    cpl.draw = reinterpret_cast<const uint32_t*>(&draw);
+    cpl.state = reinterpret_cast<uint32_t*>(plane.data());
+    cpl.st_node = RAD_MTP_COUPLE_STATE_WORDS; cpl.st_seq = RAD_MTP_COUPLE_STATE_WORDS;
+    cpl.rows = N; cpl.vocab = vocab; cpl.scheme = 0;
+    uint32_t rng = (uint32_t)seed * 2654435761u + 1u;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    for (int rd = 1; rd <= R; ++rd) {
+        cfg.round = rd;
+        std::vector<int> didx((size_t)(W * K)); std::vector<float> dval((size_t)(W * K));
+        for (int w = 0; w < W; ++w)
+            for (int c = 0; c < K; ++c) {
+                didx[(size_t)(w * K + c)] = 1 + w * 100 + c * 10 + (int)(next() % 9);
+                dval[(size_t)(w * K + c)] = c == 0 ? 6.0f : (float)(next() % 100) / 50.0f;  /* a confident trunk */
+            }
+        const int rc = rad_mtp_tree_grow_seq_cpl(&cfg, st.data(), didx.data(), dval.data(), 0, K, 1,
+                                                 rd == 1 ? 100 : -1, nullptr, tok.data(), par.data(),
+                                                 nullptr, nullptr, nullptr, nullptr, 0, nullptr,
+                                                 nullptr, &cpl);
+        if (rc < 0) return rc;
+    }
+    StepSlot S{};
+    int dep[65] = { 0 }, maxdep = 0;
+    for (int j = 1; j <= N; ++j) {
+        S.tok[j] = tok[(size_t)j - 1] >= 0 ? tok[(size_t)j - 1] : S.tok[1];
+        S.par[j - 1] = tok[(size_t)j - 1] >= 0 ? par[(size_t)j - 1] : 0;
+        dep[j] = dep[S.par[j - 1]] + 1;
+        if (dep[j] > maxdep) maxdep = dep[j];
+    }
+    S.ntree = N;
+    if (depth_out) *depth_out = maxdep;
+    MtpCoupleBindPoint bp;
+    bp.found = true; bp.live = true; bp.n_out = 10;
+    RadMtpCoupleState out[RAD_MTP_COUPLE_MAX_ROWS];
+    int n_bound = 0, n_mal = 0;
+    std::string why;
+    return mtp_couple_bind_tree(bp, draw, plane.data(), 1, N, S, N, vocab, out, &n_bound, &why, &n_mal);
+}
+}  /* namespace */
+
+TEST(a_coupled_stage_two_tree_binds_up_to_the_coupling_states_round_limit) {
+    int depth = 0;
+    /* inside the limit, with and without pruning */
+    for (const double pr : { 0.0, 0.3 })
+        for (const uint64_t seed : { 1ull, 2ull, 3ull }) {
+            CHECK_EQ(grown_tree_bind(8, 2, 15, seed, pr, &depth), (int)RAD_OK);
+            CHECK(depth <= 8);
+        }
+    /* unpruned, beyond 8 rounds: the budget ends the tree by depth 8 */
+    for (const int R : { 9, 12 }) {
+        CHECK_EQ(grown_tree_bind(R, 2, 15, 1, 0.0, &depth), (int)RAD_OK);
+        CHECK(depth <= RAD_MTP_COUPLE_MAX_ROUNDS);
+    }
+    /* pruned, 9 rounds: the tree is 9 deep and the bind refuses -- which is why the plugin does */
+    const int rc = grown_tree_bind(9, 2, 15, 1, 0.3, &depth);
+    CHECK_EQ(depth, 9);
+    CHECK(rc < 0);
 }

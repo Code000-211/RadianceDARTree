@@ -192,27 +192,29 @@ static inline RAD_RRS_HD double rad_mtp_rrs_uaccept(uint64_t seed, uint64_t pos,
 
 /* The verify of a node with nkids >= 2 children: the recursion above over the sampler's surviving
  * candidates (ids/val, n of them, FP64 P = softmax of val). Writes the emitted token to *out and
- * returns true, or false for an invalid target (the row keeps the ordinary token). */
-static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, const int32_t* ids,
-                                                     const float* val, int64_t n, int64_t vocab,
-                                                     uint64_t seed, uint64_t pos, int32_t* out) {
-    float top = -INFINITY;
-    for (int64_t j = 0; j < n; ++j) {
-        if (ids[j] < 0) continue;
-        if (ids[j] >= vocab || val[j] != val[j] || val[j] == INFINITY) return false;
-        if (val[j] > top) top = val[j];
-    }
-    if (top == -INFINITY) return false;
+ * returns true, or false for an invalid target (the row keeps the ordinary token).
+ *
+ * The decision reads the live candidates (id >= 0, value not -inf) in ascending order through a view
+ * `C::each(f)`, f(id, w, k) -> bool (false stops): w = exp(val - top) in FP64, k the id's slot in the
+ * state's support (the first match) or s.count when it is outside. The host view (RadRrsHostCands)
+ * computes them on the fly; the device verify (plugin/spechub/spechub.hip) compacts the live
+ * candidates and computes every w and k with the whole workgroup, then runs this same function on one
+ * lane over the stored values, so the ordered sums, and with them the token, are the host's. `pq_out`
+ * and `sum_out` (optional) hand back P's masses on the support and their normaliser (the export). */
+template <class C>
+static inline RAD_RRS_HD bool rad_mtp_rrs_decide_over(const RadMtpCoupleState& s, const C& cs,
+                                                      uint64_t seed, uint64_t pos, int32_t* out,
+                                                      double* pq_out = nullptr,
+                                                      double* sum_out = nullptr) {
     double sum = 0, pq[8] = {}, wout = 0;
-    for (int64_t j = 0; j < n; ++j) {
-        if (ids[j] < 0 || val[j] == -INFINITY) continue;
-        const double w = ::exp((double)val[j] - top);
+    cs.each([&](int32_t, double w, int k) {
         sum += w;
-        int k = 0;
-        while (k < s.count && ids[j] != s.ids[k]) ++k;
         if (k < s.count) pq[k] += w; else wout += w;
-    }
+        return true;
+    });
     if (!(sum > 0) || !rad_spechub_finite(sum)) return false;
+    if (pq_out) for (int k = 0; k < 8; ++k) pq_out[k] = pq[k];
+    if (sum_out) *sum_out = sum;
     /* P over Q's support (normalised), and the off-support mass's scale `so` (P_i(y) = so * w / sum
      * there). qr: the draft law with the drawn children removed. */
     double r[8], qr[8], so = 1.0;
@@ -241,12 +243,13 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, con
     int32_t last = -1;
     if (direct) {
         c = u * sum;
-        for (int64_t j = 0; j < n; ++j)
-            if (ids[j] >= 0 && val[j] != -INFINITY) {
-                const double w = ::exp((double)val[j] - top);
-                if (w > 0) { last = ids[j]; c -= w; if (c < 0) { *out = last; return true; } }
-            }
+        bool hit = false;
+        cs.each([&](int32_t id, double w, int) {
+            if (w > 0) { last = id; c -= w; if (c < 0) { hit = true; return false; } }
+            return true;
+        });
         *out = last;
+        (void)hit;
         return true;
     }
     double total = 0;
@@ -254,22 +257,49 @@ static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, con
     total += so * pout;
     c = u * total;
     unsigned seen = 0;
-    for (int64_t j = 0; j < n; ++j) {
-        if (ids[j] < 0 || val[j] == -INFINITY) continue;
-        int k = 0;
-        while (k < s.count && ids[j] != s.ids[k]) ++k;
+    bool hit = false;
+    cs.each([&](int32_t id, double w, int k) {
         double m;
         if (k < s.count) {
-            if (seen & (1u << k)) continue;
+            if (seen & (1u << k)) return true;
             seen |= 1u << k;
             m = r[k];
         } else {
-            m = so * (::exp((double)val[j] - top) / sum);
+            m = so * (w / sum);
         }
-        if (m > 0) { last = ids[j]; c -= m; if (c < 0) { *out = last; return true; } }
-    }
+        if (m > 0) { last = id; c -= m; if (c < 0) { hit = true; return false; } }
+        return true;
+    });
     *out = last;
+    (void)hit;
     return last >= 0;
+}
+
+/* The host view: the candidates as the sampler wrote them, weights computed as they are read. */
+struct RadRrsHostCands {
+    const RadMtpCoupleState& s;
+    const int32_t* ids; const float* val; int64_t n; float top;
+    template <class F> RAD_RRS_HD void each(F&& f) const {
+        for (int64_t j = 0; j < n; ++j) {
+            if (ids[j] < 0 || val[j] == -INFINITY) continue;
+            int k = 0;
+            while (k < s.count && ids[j] != s.ids[k]) ++k;
+            if (!f(ids[j], ::exp((double)val[j] - top), k)) return;
+        }
+    }
+};
+
+static inline RAD_RRS_HD bool rad_mtp_rrs_decide(const RadMtpCoupleState& s, const int32_t* ids,
+                                                     const float* val, int64_t n, int64_t vocab,
+                                                     uint64_t seed, uint64_t pos, int32_t* out) {
+    float top = -INFINITY;
+    for (int64_t j = 0; j < n; ++j) {
+        if (ids[j] < 0) continue;
+        if (ids[j] >= vocab || val[j] != val[j] || val[j] == INFINITY) return false;
+        if (val[j] > top) top = val[j];
+    }
+    if (top == -INFINITY) return false;
+    return rad_mtp_rrs_decide_over(s, RadRrsHostCands{ s, ids, val, n, top }, seed, pos, out);
 }
 
 /* ================================================================== RheoSampling siblings

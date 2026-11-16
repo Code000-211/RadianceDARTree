@@ -4947,7 +4947,11 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change. */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
                               bool i8 = false, bool f32w = false, bool had = false,
-                              bool wide = false, bool single = false) {
+                              bool wide = false, bool single = false, bool deep = false) {
+    /* `deep`: the conv window of a draft tree of 15 nodes (conv_width - 1 + 15 = 18 entries, which the
+     * fold must serve although its register preload holds 8 tokens: the plugin issues it on every
+     * step of up to 8 rows) and previous steps that accepted 9 .. 16 rows, so the replay takes the
+     * records directly (nacc > RU_CVT: the !viaLds path) as well as through LDS. */
     /* `had`: the rotated row, against the pair writing `o` and had_quant_act_i8g over it. `wide`:
      * at IQ8R's group, one scale per 256 columns (two value heads), against had_quant_act_iq8r. */
     if (had) i8 = true;
@@ -4960,15 +4964,15 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
                                   : nullptr;
     if (!rf || !rc || !rr || (had && !rh)) { ok(nm, false, "a row is absent"); return; }
 
-    const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 4, W = 4, MQ = 4, SL = W - 2 + MQ;
+    const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 4, W = 4, MQ = deep ? 16 : 4, SL = W - 2 + MQ;
     const int64_t conv_dim = (2 * Hg * K + H * V), in_w = conv_dim + H * V;
     const int64_t COLS = 6, SSLOTS = N * COLS, CSLOTS = 5;
     /* `single`: one row a sequence (plain decode); the previous step's accepted counts still differ,
      * so the replay is exercised. */
-    static const int32_t lens_[2][N] = { { 4, 2, 3, 1 }, { 1, 1, 1, 1 } },
-                         nacc_[2][N] = { { 2, 1, 3, 1 }, { 1, 3, 2, 1 } };
-    const int32_t (&lens)[N] = lens_[single ? 1 : 0];
-    const int32_t (&nacc)[N] = nacc_[single ? 1 : 0];
+    static const int32_t lens_[3][N] = { { 4, 2, 3, 1 }, { 1, 1, 1, 1 }, { 8, 5, 2, 1 } },
+                         nacc_[3][N] = { { 2, 1, 3, 1 }, { 1, 3, 2, 1 }, { 9, 16, 12, 3 } };
+    const int32_t (&lens)[N] = lens_[single ? 1 : deep ? 2 : 0];
+    const int32_t (&nacc)[N] = nacc_[deep ? 2 : single ? 1 : 0];
     const int32_t cidx[N] = { 3, 0, 1, -1 };
     int64_t Td = 0;
     std::vector<int32_t> cu(1, 0);
@@ -5059,6 +5063,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
                                  PI("n_head_v", H), PF("scale", 0.088388), PF("eps", 1e-6),
                                  PS("act", "silu"), PS("state_form", form) };
     std::vector<RadParam> pf = pr;
+    if (deep) pf[0] = PI("q_len", 8);   /* the fold's band; the window it is handed is the tree's */
     pf.push_back(PI("conv_width", W));
     if (wide) pf.push_back(PI("group", qg));
     auto run = [&](const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam>& ps) {
@@ -5171,6 +5176,20 @@ static void gdn_conv_fold(const Plugin& pl) {
                           true, true);
     }
     if (sel(row) || sel(nmf)) gdn_conv_fold_run(pl, nmf, "per_candidate", false, true);
+    /* A tree deployment's window (18 entries, a 15-node tree) under steps of up to 8 rows, after steps
+     * that accepted 9 .. 16 rows: the fold must serve it, and leave the pair's bytes. */
+    const char* nmd = "gdn_conv_recurrent_update serves an 18-entry conv window after steps that accepted 9 to 16 rows, "
+                      "byte-identical to the pair, anchor";
+    if (sel(row) || sel(nmd)) {
+        gdn_conv_fold_run(pl, nmd, "anchor", false, false, false, false, false, true);
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update serves an 18-entry conv window, one row a sequence, "
+                              "byte-identical to the pair, anchor", "anchor", false, false, false, false, true, true);
+    }
+    if (sel(row) || sel("gdn_conv_recurrent_update_had")) {
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had serves an 18-entry conv window after steps that "
+                              "accepted 9 to 16 rows, byte-identical to the pair then had_quant_act_i8g, anchor",
+                          "anchor", true, false, true, false, false, true);
+    }
 }
 
 /* ------------------------------------------------------------------ tree verification of the delta net
@@ -5194,7 +5213,10 @@ static void gdn_conv_fold(const Plugin& pl) {
  * window width 4, up to 8 rows a sequence (the fold's bound). Slots are the engine's non-paged linear
  * pool: anchor slot s, factor slot NS + s, all three columns of each naming the same slot. */
 namespace gdnt {
-constexpr int64_t K = 128, V = 128, H = 2, Hg = 1, W = 4, MQ = 8, SL = W - 2 + MQ;
+constexpr int64_t K = 128, V = 128, H = 2, Hg = 1, W = 4;
+/* the conv window's longest block (MQ) and its entries: 8 for a tree of 7 nodes; the same cases also run
+ * at 16 (an 18-entry window, a tree of 15 nodes) under the fold's 8-row band */
+static int64_t MQ = 8, SL = W - 2 + MQ;
 constexpr int64_t CD = 2 * Hg * K + H * V, INW = CD + H * V, NS = 2, COLS = 6, PITCH = 16;
 
 struct Rows { std::vector<uint16_t> in, ab; };
@@ -5850,13 +5872,19 @@ static void gdn_tree(const Plugin& pl) {
                       "committed paths equal the chain, byte-identical to the pair, libref";
     const char* nmh = "gdn tree verify (gdn_conv_recurrent_update_had): rows equal their chains "
                       "(o, codes and scales), committed paths equal the chain";
-    if (sel("gdn_conv_update_w4_h128_bf16") || sel("gdn_recurrent_update_k128_v128_bf16_fp32state") ||
-        sel(nmp))
-        gdn_tree_check(pl, nmp, false, false);
-    if (sel("gdn_conv_recurrent_update_k128_v128_bf16") || sel(nmf))
-        gdn_tree_check(pl, nmf, true, false);
-    if (sel("gdn_conv_recurrent_update_had_k128_v128_bf16") || sel(nmh))
-        gdn_tree_check(pl, nmh, true, true);
+    for (const int64_t mq : { (int64_t)8, (int64_t)16 }) {
+        gdnt::MQ = mq; gdnt::SL = gdnt::W - 2 + gdnt::MQ;
+        const std::string sfx = mq == 16 ? " at an 18-entry conv window" : "";
+        const std::string p_ = std::string(nmp) + sfx, f_ = std::string(nmf) + sfx, h_ = std::string(nmh) + sfx;
+        if (sel("gdn_conv_update_w4_h128_bf16") || sel("gdn_recurrent_update_k128_v128_bf16_fp32state") ||
+            sel(p_.c_str()))
+            gdn_tree_check(pl, p_.c_str(), false, false);
+        if (sel("gdn_conv_recurrent_update_k128_v128_bf16") || sel(f_.c_str()))
+            gdn_tree_check(pl, f_.c_str(), true, false);
+        if (sel("gdn_conv_recurrent_update_had_k128_v128_bf16") || sel(h_.c_str()))
+            gdn_tree_check(pl, h_.c_str(), true, true);
+    }
+    gdnt::MQ = 8; gdnt::SL = gdnt::W - 2 + gdnt::MQ;
     kv_window_compact_check(pl);
 }
 
@@ -11063,6 +11091,7 @@ static int mtp_tree_run(const RadKernelInfo* r, double pa, double pr, const char
 }
 
 static void mtp_tree_engine_run(const Plugin& pl);
+static void mtp_tree_grow_bench(const Plugin& pl);
 
 void mtp_tree_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
@@ -11132,6 +11161,7 @@ void mtp_tree_coupled_cases(const Plugin& pl) {
                          0.0f, 0.0f, 0, (6u | 3u << 4) | ((8u | 10u << 4) << 8) | ((1u | 14u << 4) << 16),
                          "on=1;floor=1;margin=0.8;draft=1.0;temp=1.2");
     mtp_tree_engine_run(pl);
+    if (std::getenv("RAD_BENCH_GROW")) mtp_tree_grow_bench(pl);
 }
 
 static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label,
@@ -11395,6 +11425,74 @@ static void mtp_tree_engine_run(const Plugin& pl) {
        bad == 0 && nbound > 0, fmt("%d entries differ, %d coupled node state(s)", bad, nbound));
     ok("mtp_tree_grow refuses the coupled operands out of slot order (cseq in cdraw's slot)",
        swapped_rc != RAD_OK, "the swapped launch ran");
+}
+
+/* Microbenchmark of the coupled stage-2 grower (RAD_BENCH_GROW=1): time per call of rounds 1 and 2 at
+ * the engine's geometry, each launch followed by a stream sync (the constant part of that is the same
+ * before and after a change to the kernel). Prints microseconds; checks nothing. */
+static void mtp_tree_grow_bench(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
+    if (!r) return;
+    for (const int W : { 2, 3 }) {
+        const int M = 1, R = 4, N = 15, K = RAD_MTP_TREE_K, B = 4, SP = 513, PITCH = 16, VOC = 248320;
+        const int sw = rad_mtp_tree_state_words(N, W, R);
+        const int SWORDS = (int)RAD_MTP_COUPLE_STATE_WORDS, DWORDS = (int)RAD_MTP_COUPLE_DRAW_WORDS;
+        std::vector<int32_t> hstate((size_t)M * sw, 0), table(1024), hpos = { 5, 6, 7 }, hrow = { 2 };
+        for (int i = 0; i < 1024; ++i) table[(size_t)i] = 1000 + i;
+        RadMtpCoupleDraw draw{ 0x1000ull, 40ull, 1ull, 0, 1u };
+        std::vector<int32_t> dwords(DWORDS), cards = { 0 };
+        std::memcpy(dwords.data(), &draw, dwords.size() * 4);
+        std::vector<int32_t> pwords((size_t)N * M * SWORDS, 0);
+        void* dst = up_i32(hstate); void* dtab = up_i32(table); void* dhpos = up_i32(hpos);
+        void* dhrow = up_i32(hrow); void* ddraw = up_i32(dwords); void* dcard = up_i32(cards);
+        void* dplane = up_i32(pwords);
+        void* dtok = dalloc((size_t)M * PITCH * 4); void* dpar = dalloc((size_t)M * PITCH * 4);
+        void* dsel = dalloc((size_t)M * W * SP * 4); void* dnsel = dalloc((size_t)M * W * 4);
+        void* dvm = dalloc((size_t)M * W * 8); void* drb = dalloc((size_t)M * 4);
+        void* dsrc = dalloc((size_t)M * W * 4); void* ddst = dalloc((size_t)M * W * 4);
+        uint32_t seed = 99;
+        auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xffffff; };
+        std::vector<void*> didx(2), dval(2);
+        for (int round = 1; round <= 2; ++round) {
+            const int rows = round == 1 ? M : M * W;
+            std::vector<int32_t> idx((size_t)rows * K);
+            std::vector<float> val((size_t)rows * K);
+            for (int i = 0; i < rows; ++i)
+                for (int c = 0; c < K; ++c) {
+                    idx[(size_t)i * K + c] = (int)((rnd() + 997u * (uint32_t)c) % VOC) | 0;
+                    val[(size_t)i * K + c] = 6.0f - 0.9f * c - (rnd() % 100) * 0.01f;
+                }
+            didx[(size_t)round - 1] = up_i32(idx); dval[(size_t)round - 1] = up_f32(val);
+        }
+        auto call = [&](int round) {
+            const int rows = round == 1 ? M : M * W;
+            std::vector<RadParam> ps = { PI("M", M), PI("round", round), PI("rounds", R), PI("nodes", N),
+                                         PI("width", W), PI("block_size", B), PI("sel_pitch", SP),
+                                         PI("n_vocab", VOC) };
+            const bool first = round == 1;
+            return launch(r, { T(didx[(size_t)round - 1], RAD_I32, { rows, K }),
+                               T(dval[(size_t)round - 1], RAD_F32, { rows, K }), T(dst, RAD_I32, { M, sw }),
+                               T(first ? dhpos : nullptr, RAD_I32, { 3 }), T(first ? dhrow : nullptr, RAD_I32, { M }),
+                               T(dtab, RAD_I32, { M, 1024 }), T(dtok, RAD_I32, { M, PITCH }), T(dpar, RAD_I32, { M, PITCH }),
+                               T(dsel, RAD_I32, { M * W, SP }), T(dnsel, RAD_I32, { M * W }), T(dvm, RAD_I64, { M * W }),
+                               T(drb, RAD_I32, { M }), T(dsrc, RAD_I32, { M * W }), T(ddst, RAD_I32, { M * W }),
+                               T(ddraw, RAD_U32, { M, DWORDS }), T(dcard, RAD_I32, { M }),
+                               T(dplane, RAD_U32, { N, M, SWORDS }) }, ps);
+        };
+        for (int i = 0; i < 20; ++i) { call(1); call(2); }
+        const int iters = 400;
+        double t[2] = { 0, 0 };
+        for (int round = 1; round <= 2; ++round) {
+            for (int i = 0; i < iters; ++i) {
+                if (round == 2) call(1);        /* a fresh frontier for round 2 (untimed) */
+                const auto t0 = std::chrono::steady_clock::now();
+                call(round);
+                t[round - 1] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            }
+        }
+        std::printf("BENCH mtp_tree_grow coupled W=%d N=%d sel_pitch=%d: round 1 %.1f us, round 2 %.1f us per call (incl. launch + sync)\n",
+                    W, N, SP, t[0] / iters, t[1] / iters);
+    }
 }
 
 /* iota with and without a period. Exact. */

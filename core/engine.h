@@ -751,6 +751,7 @@ private:
      * to the budget; `done` for a chain. What expect_draft and set_draft must agree on. */
     int     serial_nodes(int done) const;
     int     tree_compact(int rows);
+    int     tree_compact_check();
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
     /* The block and proposal count this step's query pass runs at: the drafter's own, or its short

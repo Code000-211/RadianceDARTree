@@ -432,8 +432,8 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   (`--draft-tree-*`) where `RadArchProbe::tree_nodes` was nonzero and the engine asked for a tree.
   Requirements: the plugin's trunk honours `spec_parent` on every decode row, and its recurrent
   (`RAD_KV_LINEAR`) and rolling-window (`RAD_KV_CONV`) state follows `RadBatch::spec_path`
-  (`RadArchProbe::tree_linear_ok`; a program with such a group is refused without it, as is
-  `--draft-coupling`). **Break for block-drafter trees:** this refusal applies to every tree, so an
+  (`RadArchProbe::tree_linear_ok`; a program with such a group is refused without it; `--draft-coupling` is served by
+  serial trees, stage 1 and stage 2). **Break for block-drafter trees:** this refusal applies to every tree, so an
   existing plugin with a block tree and a linear/conv group must now set `tree_linear_ok`. The final
   tree of a serial tree is checked on the card (`ADV_BTAKE`): a parent that is not an earlier node
   or a depth above R replaces the whole tree with the chain prefix (same node count). A paged group whose entries are not one per token slot (QSA's block keys) sets
@@ -443,7 +443,8 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   `rad_block_gdn_fp8.h`, `rad_block_ple.h`, `rad_block_attn_gated_fp8.h`): it advertises N = 6
   (`RadArchProbe::tree_nodes`, `tree_linear_ok`), sizes every window, ring and logits row by N, and on a
   step with `spec_parent` issues the decode half through the tree forms (the delta net's pair with
-  both planes, never the fold; the PLE and QSA windows closed by `kv_window_compact` and
+  both planes, or the fold with both planes as its trailing operands where its window fits
+  (`max_spec + 1 <= 8`, rows past the band run the pair); the PLE and QSA windows closed by `kv_window_compact` and
   `qsa_tail_compact`; QSA's `qsa_work` tree mode, scratch block keys, region score and `qsa_select`
   with `vmask`; `attn_paged_tree_sel` in every attention launch, dense and sparse), and on the step
   after a tree the window and tail compactions and QSA's heal. Stage 2 (`--draft-tree-width` > 1) adds

@@ -885,7 +885,8 @@ int rad_drafter_tree(RadBuilder* b, rad_buf parents);
  * driver then publishes the nodes with their parents, verifies them in the rows of RadBatch::
  * spec_parent, and after the acceptance moves every accepted node's K and V into place in every
  * paged group not flagged RadKVGroupDecl::no_tree_compact. A program with RAD_KV_LINEAR or
- * RAD_KV_CONV groups is refused unless RadArchProbe::tree_linear_ok; --draft-coupling is refused.
+ * RAD_KV_CONV groups is refused unless RadArchProbe::tree_linear_ok. A serial tree is served with --draft-coupling (recursive
+ * rejection sampling over the siblings, abi/rad_mtp_rrs.h; stage 2 needs round depth + 1 <= RAD_MTP_COUPLE_MAX_ROUNDS).
  * Additive; RAD_ABI_VERSION does not move. */
 
 /* The model's routing counts live in `table`: an i32 RAD_BUF_PERSIST device buffer of at least

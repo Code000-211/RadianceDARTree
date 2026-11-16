@@ -658,8 +658,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "region mask (60 at most)\n", ctx->max_spec);
             return RAD_E_UNSUPPORTED;
         }
-        /* The delta net's tree verify walks at most 16 rows a sequence (8 on the fold, which the
-         * tree steps do not issue). */
+        /* The delta net's tree verify walks at most 16 rows a sequence; the fold takes 8 (and
+         * only a deployment whose conv window fits it, max_spec + 1 <= 8: GdnFP8::declare), the
+         * pair serves the rest. */
         if (ctx->max_spec + 1 > 16) {
             fprintf(stderr, "radiance: qwen4exp: a draft tree of %d nodes exceeds the delta net's "
                             "16 rows a verify\n", ctx->max_spec);
@@ -687,6 +688,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (m.tree_w <= 1 && ctx->draft_rounds > RAD_MTP_COUPLE_MAX_ROUNDS) {
                 fprintf(stderr, "radiance: qwen4exp: --draft-coupling with a draft tree of %d head "
                                 "rounds (%d at most)\n", ctx->draft_rounds,
+                        RAD_MTP_COUPLE_MAX_ROUNDS);
+                return RAD_E_UNSUPPORTED;
+            }
+            /* Stage 2 numbers a node's drafting state round = depth + 1 and the engine's bind
+             * (core/sched/mtp_couple_bind.h) refuses any state past RAD_MTP_COUPLE_MAX_ROUNDS,
+             * which stops the engine on the step. Unpruned, N <= 15 nodes at width >= 2 reach
+             * depth 8 at most; with pruning or an adaptive budget a round can add the trunk node
+             * alone and the tree grows R deep, so the rounds must fit the state's. */
+            if (m.tree_w > 1 && ctx->draft_rounds > RAD_MTP_COUPLE_MAX_ROUNDS &&
+                (ctx->draft_tree_prune_abs > 0.0f || ctx->draft_tree_prune_rel > 0.0f ||
+                 (ctx->draft_adapt && *ctx->draft_adapt))) {
+                fprintf(stderr, "radiance: qwen4exp: --draft-coupling with a pruned or adaptive "
+                                "stage-2 draft tree of %d head rounds (%d at most: a node's state "
+                                "carries its depth)\n", ctx->draft_rounds,
                         RAD_MTP_COUPLE_MAX_ROUNDS);
                 return RAD_E_UNSUPPORTED;
             }

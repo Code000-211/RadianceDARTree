@@ -13738,3 +13738,138 @@ TEST(mtp_tree_grow_adaptive_fuzz_keeps_the_structure_and_shrinks_with_the_margin
     CHECK(shrunk > 100);
     CHECK(strict < loose);
 }
+
+static void qsa_draftless_row_beside_a_tree(bool one_node, int* moved_tree_row, int* diff_out) {
+    Rng r(7);
+    const int64_t topk = 40, ratio = 4;
+    QWorld bw(16, topk, 0, 2);
+    std::vector<std::unique_ptr<QWorld>> alone;
+    const int64_t bases[2] = { 20, 21 };
+    for (int s = 0; s < 2; ++s) {
+        alone.push_back(std::make_unique<QWorld>(16, topk, 0));
+        std::vector<std::vector<float>> pk;
+        for (int64_t t = 0; t < bases[s]; ++t) pk.push_back(qkey(r, bw.n, false));
+        qsa_chain(*alone.back(), pk, {}, 0, false, nullptr);
+        qsa_place(bw, s, *alone.back());
+    }
+    auto rows = [&](int64_t R, QSeq& q) {
+        for (int64_t j = 0; j < R; ++j) {
+            q.K.push_back(qkey(r, bw.n, false));
+            std::vector<float> x;
+            for (int64_t h = 0; h < bw.heads; ++h) { auto y = qkey(r, bw.n, false); x.insert(x.end(), y.begin(), y.end()); }
+            q.Q.push_back(x);
+        }
+    };
+    QSeq s0; s0.tree = true;  s0.base = 20; s0.na = 1; s0.par = { -1, 0, 0 }; rows(3, s0);
+    QSeq s1; s1.tree = one_node; s1.base = 21; s1.na = 1; if (one_node) s1.par = { -1 }; rows(1, s1);   /* one row, no drafts */
+    BOut B;
+    qsa_batch_step(bw, { s0, s1 }, true, &B);
+    const int64_t row = 3;                              /* the draftless decode row */
+    /* What the same row gets on a chain step (the sequential decode): the classic table, the committed
+     * pages and then the partial page (page id == 40 * sequence + block here), and its causal bound
+     * in seqused. As a one-node tree the row's list has no partial page and `vmask` names its keys
+     * there. */
+    std::vector<int32_t> classic((size_t)topk + 1, -1);
+    int32_t classic_su = (int32_t)B.su[(size_t)row];
+    if (one_node) {
+        int k = 0;
+        for (; k < B.nsel[(size_t)row]; ++k) classic[(size_t)k] = (int32_t)B.sel[(size_t)row][(size_t)k];
+        classic[(size_t)k] = (int32_t)(40 * 1 + B.nc[1]);
+        classic_su = (int32_t)(s1.base + 1);
+    } else {
+        for (int64_t i = 0; i <= topk; ++i) classic[(size_t)i] = (int32_t)B.sel[(size_t)row][(size_t)i];
+    }
+    const int64_t crow = row;
+    const BOut& CR = B;
+    /* The attention cache: page id == the table's (s * 40 + block), random K and V everywhere,
+     * the never-written slots of the partial page included (stale data in a real cache). */
+    const int64_t HD = 8, G = 2, KVH = 1, NH = G * KVH, NB = 80, Rn = 4;
+    uint32_t rng = 4242u;
+    auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return ((rng >> 9) & 0x7fff) / 16384.0f - 1.0f; };
+    T kv(RAD_F32, { NB, KVH, ratio, 2 * HD });
+    for (int64_t i = 0; i < NB * KVH * ratio * 2 * HD; ++i) st_dt(RAD_F32, kv.t.data, i, rnd());
+    T q(RAD_F32, { Rn, NH, HD });
+    for (int64_t i = 0; i < Rn * NH * HD; ++i) st_dt(RAD_F32, q.t.data, i, rnd() * 2.0f);
+    T sel(RAD_I32, { Rn, topk + 1 }), nsel(RAD_I32, { Rn }), vm(RAD_I64, { Rn });
+    for (int64_t j = 0; j < Rn; ++j) {
+        for (int64_t i = 0; i <= topk; ++i) st_int(RAD_I32, sel.t.data, j * (topk + 1) + i, B.sel[(size_t)j][(size_t)i]);
+        st_int(RAD_I32, nsel.t.data, j, B.nsel[(size_t)j]);
+        st_int(RAD_I64, vm.t.data, j, B.vmask[(size_t)j]);
+    }
+    T rb(RAD_I32, { 2 }); rb.n({ ratio * B.nc[0], ratio * B.nc[1] });      /* op_rb: rb = ratio * nc */
+    T cu(RAD_I32, { 3 }); cu.n({ 0, 3, 4 });
+    auto params = [&](A& a, int64_t qlen, bool tree) {
+        a.i("q_len", qlen).i("head_dim", HD).i("gqa", G).i("block_size", ratio).i("causal", 1)
+         .i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", NH);
+        if (tree) a.i("sel_pitch", topk + 1);
+    };
+    /* (1) what AttnGatedFP8::step issues for the decode half of a tree step. */
+    auto tree_issue = [&](T& out) {
+        A a; a.t(q).t(kv).t(sel).t(nsel).tnull().tnull().tnull().t(out).t(vm).t(bw.tab).t(rb).t(cu);
+        params(a, 1, true);
+        REQUIRE_EQ(run("attn_paged_tree_sel", a), RAD_OK);
+    };
+    /* (2) what the same row gets on a chain step: attn_paged over (qsa_sel, qsa_sequ). */
+    auto chain_issue = [&](T& o1) {
+        T tab(RAD_I32, { 1, topk + 1 }), su(RAD_I32, { 1 }), q1(RAD_F32, { 1, NH, HD });
+        for (int64_t i = 0; i <= topk; ++i) st_int(RAD_I32, tab.t.data, i, classic[(size_t)i]);
+        su.n({ classic_su });
+        std::memcpy(q1.t.data, (const float*)q.t.data + row * NH * HD, sizeof(float) * NH * HD);
+        A b; b.t(q1).t(kv).t(tab).t(su).tnull().tnull().tnull().t(o1);
+        params(b, 1, false);
+        REQUIRE_EQ(run("attn_paged", b), RAD_OK);
+    };
+    T out_t(RAD_F32, { Rn, NH, HD }), out_c(RAD_F32, { 1, NH, HD });
+    tree_issue(out_t);
+    chain_issue(out_c);
+    int diff = 0;
+    double maxd = 0.0, maxv = 0.0;
+    for (int e = 0; e < NH * HD; ++e) {
+        const double a_ = out_t.at(row * NH * HD + e), b_ = out_c.at(e);
+        /* the same key set; the order the keys accumulate in differs (tree: committed keys then the
+         * region, sequential: the region's page among them), so equal to the last bits, not bytes */
+        diff += std::fabs(a_ - b_) > 1e-5 * (1.0 + std::fabs(b_));
+        maxd = std::max(maxd, std::fabs(a_ - b_)); maxv = std::max(maxv, std::fabs(b_));
+    }
+    fprintf(stderr, "    max |tree - chain| = %.3g (max |out| %.3g)\n", maxd, maxv);
+    fprintf(stderr, "    tree-step issue vs chain issue of the same row: %d of %d outputs differ\n",
+            diff, (int)(NH * HD));
+    *diff_out = diff;
+    /* The keys after the row's position in its partial page (positions 22, 23: never written by
+     * this sequence) must not matter. */
+    const int64_t part = one_node ? 40 * 1 + B.nc[1] : B.sel[(size_t)row][(size_t)(B.nsel[(size_t)row] - 1)];
+    (void)crow; (void)CR;
+    for (int64_t slot = 2; slot < 4; ++slot)
+        for (int64_t d = 0; d < 2 * HD; ++d)
+            st_dt(RAD_F32, kv.t.data, ((part * KVH) * ratio + slot) * 2 * HD + d, 5.0f + (float)d);
+    T out_t2(RAD_F32, { Rn, NH, HD }), out_c2(RAD_F32, { 1, NH, HD });
+    tree_issue(out_t2);
+    chain_issue(out_c2);
+    int moved_t = 0, moved_c = 0;
+    for (int e = 0; e < NH * HD; ++e) {
+        moved_t += out_t2.at(row * NH * HD + e) != out_t.at(row * NH * HD + e);
+        moved_c += out_c2.at(e) != out_c.at(e);
+    }
+    fprintf(stderr, "    after rewriting the unwritten slots: tree-step row moved in %d outputs, chain row in %d\n",
+            moved_t, moved_c);
+    *moved_tree_row = moved_t;
+    CHECK_EQ(moved_c, 0);
+}
+
+/* A decode row without drafts beside a tree verify goes through attn_paged_tree_sel with the tree
+ * step's (sel, nsel, vmask): that form reads every listed page in full and ignores seqused. Staged as
+ * a chain row (parent -2) its table is the classic one, partial page last, and it attends over the
+ * 1-3 slots behind its own position (stale K/V: 16 of 16 outputs differ from the chain's issue of the
+ * same row and move when those slots change). The core stages it as the one-node tree (parent -1):
+ * no partial page, vmask the committed prefix, the row's output is the chain's and independent of the
+ * slots past its position. The first call shows the test's sensitivity, the second is the contract. */
+TEST(qsa_draftless_decode_row_beside_a_tree_is_a_one_node_tree_and_reads_nothing_past_its_position) {
+    int moved = -1, diff = -1;
+    qsa_draftless_row_beside_a_tree(false, &moved, &diff);
+    CHECK(diff > 0);          /* a chain row through the tree form: wrong keys */
+    CHECK(moved > 0);
+    moved = -1; diff = -1;
+    qsa_draftless_row_beside_a_tree(true, &moved, &diff);
+    CHECK_EQ(diff, 0);
+    CHECK_EQ(moved, 0);
+}

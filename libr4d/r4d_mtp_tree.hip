@@ -34,30 +34,78 @@ struct MtpTreeArgs {
   int cscheme;            // 0: Gumbel siblings; m + 1: RheoSampling with m top-q children
 };
 
-__global__ __launch_bounds__(64) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
-  const int m = blockIdx.x * 64 + threadIdx.x;
-  if (m >= a.M) return;
+// One workgroup a sequence. The walk itself (the pool, the best-first creation, the node table) is
+// the host's serial algorithm on lane 0, unchanged; what is independent of it runs on the whole
+// workgroup: each frontier row's law, draws and state (lanes 0 .. W-1, coupled form) before it, and
+// the next pass's page lists (W identical rows of up to sel_pitch entries, 513 a row at the shipped
+// geometry) after it. Same operations in the same order per value, so the result is the host's bit
+// for bit; only who executes them changed.
+constexpr int kTreeThreads = 128;
+
+__global__ __launch_bounds__(kTreeThreads) void r4d_mtp_tree_grow_kernel(MtpTreeArgs a) {
+  const int m = blockIdx.x;
+  const int tid = threadIdx.x;
+  __shared__ int   cd[RAD_MTP_RRS_MAX_WIDTH * RAD_MTP_TREE_K];
+  __shared__ float cv[RAD_MTP_RRS_MAX_WIDTH * RAD_MTP_TREE_K];
+  __shared__ int   s_p0, s_n, s_lists;
   int head = -1;
   if (a.cfg.round == 1 && a.head_pos && a.head_row) head = a.head_pos[a.head_row[m]];
   const bool att = a.cfg.sel_pitch > 0 && a.sel && a.nsel && a.vmask && a.rb && a.table;
   RadMtpTreeCpl cpl{};
-  if (a.cdraw && a.cseq && a.cstate) {
+  const bool has_cpl = a.cdraw && a.cseq && a.cstate;
+  if (has_cpl) {
     cpl.draw = a.cdraw + (long)m * a.cdraw_stride;
     cpl.card = a.cseq[(long)m * a.cseq_stride];
     cpl.state = a.cstate; cpl.st_node = a.cst_node; cpl.st_seq = a.cst_seq;
     cpl.rows = a.cst_rows; cpl.vocab = a.cvocab; cpl.scheme = a.cscheme;
   }
-  rad_mtp_tree_grow_seq_cpl(&a.cfg, a.state + (long)m * a.state_stride, a.didx, a.dval,
-                        (long)m * a.per, a.row_stride, 1, head,
-                        att ? a.table + (long)m * a.table_stride : nullptr,
-                        a.tok + (long)m * a.tok_stride, a.par + (long)m * a.par_stride,
-                        att ? a.sel + (long)m * a.cfg.width * a.cfg.sel_pitch : nullptr,
-                        att ? a.nsel + (long)m * a.cfg.width : nullptr,
-                        att ? a.vmask + (long)m * a.cfg.width : nullptr,
-                        att ? a.rb + m : nullptr,
-                        (long)m, a.src ? a.src + (long)m * a.cfg.width : nullptr,
-                        a.dst ? a.dst + (long)m * a.cfg.width : nullptr,
-                        (a.cdraw && a.cseq && a.cstate) ? &cpl : nullptr);
+  int* st = a.state + (long)m * a.state_stride;
+  RadMtpCoupleDraw draw{};
+  const bool coupled = has_cpl && rad_mtp_tree_cpl_active(&a.cfg, &cpl, &draw);
+  const long row0 = (long)m * a.per;
+  // the frontier rows' laws: independent across rows, one lane each
+  if (coupled) {
+    const int nfront = rad_mtp_tree_cpl_nfront(&a.cfg, st);
+    if (tid < nfront)
+      rad_mtp_tree_cpl_row(&a.cfg, &cpl, draw, st, a.didx, a.dval, row0, a.row_stride, 1, (long)m,
+                           tid, cd + tid * RAD_MTP_TREE_K, cv + tid * RAD_MTP_TREE_K);
+    __syncthreads();
+  }
+  if (tid == 0) {
+    RadMtpTreeCfg cfg = a.cfg;
+    cfg.skip_sel_lists = 1;
+    int before = 0;
+    const int* didx = a.didx; const float* dval = a.dval;
+    long r0 = row0, rs = a.row_stride;
+    if (coupled) {
+      rad_mtp_calib_apply(&cfg.ad, draw);
+      before = cfg.round == 1 ? 0 : st[1];
+      didx = cd; dval = cv; r0 = 0; rs = RAD_MTP_TREE_K;
+    }
+    rad_mtp_tree_grow_seq(&cfg, st, didx, dval, r0, rs, 1, head,
+                          att ? a.table + (long)m * a.table_stride : nullptr,
+                          a.tok + (long)m * a.tok_stride, a.par + (long)m * a.par_stride,
+                          att ? a.sel + (long)m * a.cfg.width * a.cfg.sel_pitch : nullptr,
+                          att ? a.nsel + (long)m * a.cfg.width : nullptr,
+                          att ? a.vmask + (long)m * a.cfg.width : nullptr,
+                          att ? a.rb + m : nullptr,
+                          (long)m, a.src ? a.src + (long)m * a.cfg.width : nullptr,
+                          a.dst ? a.dst + (long)m * a.cfg.width : nullptr);
+    if (coupled) rad_mtp_tree_cpl_post(&cfg, &cpl, st, before, (long)m);
+    // the page lists the walk left to the workgroup: only a pass that has a next one writes them
+    s_lists = att && a.cfg.round < a.cfg.rounds && a.cfg.block > 0;
+    s_n = s_lists ? rad_mtp_tree_sel_span(&a.cfg, st[0], &s_p0) : 0;
+  }
+  __syncthreads();
+  if (s_lists) {
+    const int pitch = a.cfg.sel_pitch, W = a.cfg.width;
+    const int* tab = a.table + (long)m * a.table_stride + s_p0;
+    int* sel = a.sel + (long)m * W * pitch;
+    for (int e = tid; e < W * pitch; e += kTreeThreads) {
+      const int k = e % pitch;
+      sel[e] = k < s_n ? tab[k] : -1;
+    }
+  }
 }
 
 extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
@@ -149,7 +197,7 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
     k.cscheme = (int)r4d_geti_or(a, "rheo_m", -1) + 1;
   }
   k.M = (int)M;
-  hipLaunchKernelGGL(r4d_mtp_tree_grow_kernel, dim3((unsigned)((M + 63) / 64)), dim3(64), 0,
+  hipLaunchKernelGGL(r4d_mtp_tree_grow_kernel, dim3((unsigned)M), dim3(kTreeThreads), 0,
                      (hipStream_t)s, k);
   return R4D_RAW((int)hipGetLastError());
 }

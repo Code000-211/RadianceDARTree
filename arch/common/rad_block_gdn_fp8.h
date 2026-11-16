@@ -340,6 +340,7 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     /* The conv + recurrent fold. Its window is a register preload, so the band stops at eight
      * tokens per sequence. Optional (no RAD_ARCH_TRY): without it the pair runs. */
     {
+        constexpr int64_t kFoldWindow = 8;   /* libr4d RU_CVT: tokens the fold holds in registers */
         const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
         /* The fold's rotated epilogue writes one scale per (row, 128), or per 256 for an IQ8R
          * trunk's codes (ActFP8::g8; `group`, stated to that form alone: last, and cut off
@@ -363,7 +364,13 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
             const rad_buf oq[2] = { w.o.cq(), w.o.cs() };
             RAD_ARCH_TRY(rad_op_writes(b, op_cr, oq, 2));
         }
-        if (op_cr) cr_rows = hi;
+        /* The kernels' window check: the conv state holds conv_width - 1 + max_spec entries, and
+         * libhalo's and libr3d's fold still takes it only when max_spec + 1 fits its 8 preloaded
+         * tokens (RU_CVT; libr4d's now takes any window, its selftest runs an 18-entry one). A
+         * deployment past that (a chain of 8 or more drafts, a tree of 8 or more nodes) therefore
+         * does not issue the fold: a refusal at issue is not recoverable, the step and the engine
+         * stop. Lift this when every library that serves the op has followed libr4d. */
+        if (op_cr) cr_rows = (g.max_spec + 1 <= kFoldWindow) ? hi : 0;
     }
 
     RAD_ARCH_TRY(q_o.declare(b, g, w.o, v_dim));
@@ -518,9 +525,10 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     }
     /* Tree verification (RadBatch::spec_parent, spec_path; docs/OPS.md "Tree verification of the
      * delta net"): the decode half's rows follow their ancestors and the committed state replays
-     * the previous verify's accepted rows. Absent planes are today's operand lists. The fold is
-     * folded too (its tree form takes the planes as its trailing operands and chains like the chain form; only
-     * rows past the fold's band run the pair). The conv
+     * the previous verify's accepted rows. Absent planes are today's operand lists. The fold takes
+     * the planes as its trailing operands too (its tree form chains like the chain form) where it is
+     * declared (cr_rows: the conv window fits its register preload); rows past its band, or every
+     * row where it is not declared, run the pair. The conv
      * window needs no kv_window_compact, the conv op gathers by spec_path itself. */
     const RadOperand spar  = tree_verify_step(batch)
                                  ? praw(batch->spec_parent, RAD_I32, DT) : RAD_NONE;

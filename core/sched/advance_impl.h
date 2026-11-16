@@ -262,8 +262,12 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         if (a.parent_off >= 0) {
             int32_t* par = adv_i32(a, a.parent_off);
             /* A row verifying fewer nodes than the drafter proposed (a window cut it) verifies
-             * their prefix, which is a tree too: every parent precedes its child. */
-            if (n > 1 && S.ntree >= n - 1) {
+             * their prefix, which is a tree too: every parent precedes its child. A row with no
+             * drafts at all is the one-node tree (parent -1): every decode row of a tree step is a
+             * tree row, since the attention's tree form reads whole pages and only a tree row's
+             * tables hold the page back to the anchor (a chain row beside a tree would read the
+             * stale slots behind its own position). */
+            if (n >= 1 && S.ntree >= n - 1) {
                 /* A tree: node j stores its K and V at base + j (siblings share a depth, so the
                  * position cannot address them) and rotates at base + its depth, the position the
                  * token would have if its path were committed. Attention reads spec_parent to see

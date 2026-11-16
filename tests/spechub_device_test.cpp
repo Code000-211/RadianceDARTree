@@ -23,7 +23,9 @@
 #include <dlfcn.h>
 
 #include <cmath>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -39,6 +41,7 @@ struct Plugin {
     int (*count)() = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     bool open(const char* path) {
+        if (const char* o = std::getenv("RAD_SPECHUB_LIB_OVERRIDE")) path = o;   /* a baseline build, for RAD_BENCH */
         handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!handle) return false;
         count = (int (*)())dlsym(handle, "rad_kernel_count");
@@ -188,9 +191,12 @@ TEST(the_device_rows_of_the_trees_coupled_ops_agree_with_the_host_rows) {
         }
     }
 
-    /* ---- verify over states with 1..4 children */
-    {
-        const int M = 64, NC = 24;
+    /* ---- verify over states with 1..4 children, at a 24-slot plane and at the sampler's full 1024-slot
+     * plane (top_k 0: every slot live on even rows, 40 live slots and holes on odd rows) -- the
+     * workgroup's compaction and weights over several chunks, then the host's decision over them */
+    for (const int NC : { 24, 1024, 1100 }) {
+        const int M = 64;
+        const bool wide = NC > 64;      /* 1100: past the workgroup's plane, one lane decides */
         Buf cid(RAD_I32, { M, NC }, 4), cval(RAD_F32, { M, NC }, 4), prm(RAD_U32, { M, 24 }, 4);
         Buf sts(RAD_U32, { M, SW }, 4), tok(RAD_I32, { M }, 4);
         int32_t* pi = (int32_t*)cid.host.data();
@@ -199,20 +205,26 @@ TEST(the_device_rows_of_the_trees_coupled_ops_agree_with_the_host_rows) {
         RadMtpCoupleState* ps_ = (RadMtpCoupleState*)sts.host.data();
         int32_t* pt = (int32_t*)tok.host.data();
         for (int m = 0; m < M; ++m) {
+            const int live = !wide || m % 2 == 0 ? NC : 40;
             for (int c = 0; c < NC; ++c) {
+                if (c >= live) { pi[m * NC + c] = -1; pv[m * NC + c] = -INFINITY; continue; }
                 int id;
                 bool dup;
                 do {
-                    id = (int)(rnd() % 40);
+                    id = (int)(rnd() % (wide ? VOC : 40));
                     dup = false;
                     for (int q = 0; q < c; ++q) dup = dup || pi[m * NC + q] == id;
                 } while (dup);
                 pi[m * NC + c] = id;
-                pv[m * NC + c] = 2.0f - 0.25f * c - (rnd() % 100) * 0.01f;
+                pv[m * NC + c] = 2.0f - (wide ? 0.01f : 0.25f) * c - (rnd() % 100) * 0.01f;
             }
             int32_t qid[8];
             float qv[8];
-            for (int c = 0; c < 8; ++c) { qid[c] = (int)(rnd() % 40); qv[c] = 2.0f - 0.3f * c; }
+            for (int c = 0; c < 8; ++c) {
+                /* Q's support among the candidates (wide) or the 40-token universe */
+                qid[c] = wide ? pi[m * NC + (int)(rnd() % (uint32_t)(live < 60 ? live : 60))] : (int)(rnd() % 40);
+                qv[c] = 2.0f - 0.3f * c;
+            }
             for (int c = 0; c < 8; ++c)
                 for (int q = 0; q < c; ++q) if (qid[q] == qid[c]) qid[c] = 100 + c;
             RadMtpCoupleState s0{};
@@ -393,7 +405,9 @@ TEST(the_device_traversal_verify_agrees_with_the_host_row) {
     REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
     const int SW = (int)RAD_MTP_COUPLE_STATE_WORDS;
     const int64_t VOC = 50000;
-    const int RQ = 12, NR = 7, M = RQ * NR, NC = 12;
+  for (const int NC : { 12, 1024, 1100 }) {
+    const bool wide = NC > 64;
+    const int RQ = 12, NR = 7, M = RQ * NR;
     const int par[NR] = { -1, 0, 0, 1, 1, 2, 5 };
     const int nkid[NR] = { 2, 2, 1, 0, 0, 1, 0 };
     Buf cid(RAD_I32, { M, NC }, 4), cval(RAD_F32, { M, NC }, 4), prm(RAD_U32, { M, 24 }, 4);
@@ -411,20 +425,27 @@ TEST(the_device_traversal_verify_agrees_with_the_host_row) {
         for (int n = 0; n < NR; ++n) {
             const int m = q * NR + n;
             depth[n] = n ? depth[par[n]] + 1 : 0;
+            /* wide: the sampler's full plane at top_k 0 on even requests, 40 live slots and holes on odd */
+            const int live = !wide || q % 2 == 0 ? NC : 40;
             for (int c = 0; c < NC; ++c) {
+                if (wide && c >= live) { pi[m * NC + c] = -1; pv[m * NC + c] = -INFINITY; continue; }
                 int id;
                 bool dup;
                 do {
-                    id = (int)(rnd() % 14);
+                    id = (int)(rnd() % (wide ? VOC : 14));
                     dup = false;
                     for (int z = 0; z < c; ++z) dup = dup || pi[m * NC + z] == id;
                 } while (dup);
                 pi[m * NC + c] = id;
-                pv[m * NC + c] = (c < 10 ? 2.0f - 0.25f * c : -INFINITY) - (rnd() % 100) * 0.01f;
+                pv[m * NC + c] = wide ? 2.0f - 0.01f * c - (rnd() % 100) * 0.01f
+                                      : (c < 10 ? 2.0f - 0.25f * c : -INFINITY) - (rnd() % 100) * 0.01f;
             }
             int32_t qid[8];
             float qv[8];
-            for (int c = 0; c < 8; ++c) { qid[c] = (int)(rnd() % 14); qv[c] = 2.0f - 0.3f * c - (rnd() % 50) * 0.01f; }
+            for (int c = 0; c < 8; ++c) {
+                qid[c] = wide ? pi[m * NC + (int)(rnd() % (uint32_t)(live < 60 ? live : 60))] : (int)(rnd() % 14);
+                qv[c] = 2.0f - 0.3f * c - (rnd() % 50) * 0.01f;
+            }
             for (int c = 0; c < 8; ++c)
                 for (int z = 0; z < c; ++z) if (qid[z] == qid[c]) qid[c] = 100 + c;
             RadMtpCoupleState s0{};
@@ -472,6 +493,105 @@ TEST(the_device_traversal_verify_agrees_with_the_host_row) {
     }
     CHECK(written >= RQ);
     CHECK_EQ(greedy_kept, NR);
+  }
+    rad_stream_destroy(s);
+}
+
+/* RAD_BENCH=1: microseconds per call (launch + sync included, the same constant before and after a
+ * change) of the verify at a node of 3 drafted children (recursive rejection sampling) and of the
+ * traversal walk of a 7-row tree, on the sampler's 1024-slot plane with 20 live slots (top_k 20) and
+ * with every slot live (top_k 0). Prints; checks nothing. */
+TEST(spechub_bench_tree_verify_and_traversal) {
+    if (!std::getenv("RAD_BENCH")) return;
+    RadDeviceProps dp{};
+    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) return;
+    Plugin pl;
+    if (!pl.open(RAD_SPECHUB_LIB)) return;
+    const RadKernelInfo* dver = pl.row("spechub_mtp_couple_verify");
+    const RadKernelInfo* dtr = pl.row("spechub_mtp_trav_verify");
+    if (!dver || !dtr) return;
+    RadStream s{};
+    REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
+    const int SW = (int)RAD_MTP_COUPLE_STATE_WORDS;
+    const int64_t VOC = 50000;
+    const int NC = 1024, NR = 7, M = 16;
+    const int par[NR] = { -1, 0, 0, 1, 1, 2, 5 };
+    const int nkid[NR] = { 2, 2, 1, 0, 0, 1, 0 };
+    for (const int live : { 20, 1024 }) {
+        /* rows of requests of NR rows: M rows for the verify, one request for the traversal */
+        Buf cid(RAD_I32, { M, NC }, 4), cval(RAD_F32, { M, NC }, 4), prm(RAD_U32, { M, 24 }, 4);
+        Buf sts(RAD_U32, { M, SW }, 4), tok(RAD_I32, { M }, 4), topo(RAD_I32, { M, 2 }, 4);
+        Buf tcid(RAD_I32, { NR, NC }, 4), tcval(RAD_F32, { NR, NC }, 4), tprm(RAD_U32, { NR, 24 }, 4);
+        Buf tsts(RAD_U32, { NR, SW }, 4), ttok(RAD_I32, { NR }, 4);
+        auto fill = [&](int32_t* pi, float* pv, int m) {
+            for (int c = 0; c < NC; ++c) {
+                if (c >= live) { pi[m * NC + c] = -1; pv[m * NC + c] = -INFINITY; continue; }
+                pi[m * NC + c] = (int)((rnd() % 40) * 1000 + (unsigned)c);
+                pv[m * NC + c] = 2.0f - 0.005f * c - (rnd() % 100) * 0.01f;
+            }
+        };
+        auto state = [&](const int32_t* pi, int m, int depth, int nk, RadSampleParams* pp, RadMtpCoupleState* ps_) {
+            int32_t qid[8]; float qv[8];
+            for (int c = 0; c < 8; ++c) { qid[c] = pi[m * NC + c * 2]; qv[c] = 2.0f - 0.3f * c; }
+            RadMtpCoupleState s0{};
+            rad_mtp_couple_build_q(qid, qv, VOC, &s0);
+            s0.draw = make_draw(0x900ull + (uint64_t)m, 3, 1, 0, 1u);
+            s0.status = 1; s0.round = depth + 1; s0.pos = 11 + (uint64_t)depth;
+            if (nk >= 2) rad_mtp_rrs_draw(&s0, (uint64_t)m, nk); else { s0.x = s0.ids[0]; s0.nkids = 0; }
+            ps_[m] = s0;
+            pp[m].seed = s0.draw.seed; pp[m].pos = s0.pos; pp[m].flags = 0;
+        };
+        int32_t* pi = (int32_t*)cid.host.data(); float* pv = (float*)cval.host.data();
+        for (int m = 0; m < M; ++m) {
+            fill(pi, pv, m);
+            state(pi, m, 0, 3, (RadSampleParams*)prm.host.data(), (RadMtpCoupleState*)sts.host.data());
+            ((int32_t*)tok.host.data())[m] = -9;
+        }
+        int32_t* ti = (int32_t*)tcid.host.data(); float* tv = (float*)tcval.host.data();
+        int32_t* ptopo = (int32_t*)topo.host.data();
+        int depth[NR] = {}, seen[NR] = {};
+        int32_t childtok[NR][4] = {};
+        for (int n = 0; n < NR; ++n) {
+            fill(ti, tv, n);
+            depth[n] = n ? depth[par[n]] + 1 : 0;
+            if (nkid[n] > 0) {
+                state(ti, n, depth[n], nkid[n], (RadSampleParams*)tprm.host.data(), (RadMtpCoupleState*)tsts.host.data());
+                for (int c = 0; c < nkid[n]; ++c) childtok[n][c] = ((RadMtpCoupleState*)tsts.host.data())[n].ids[c];
+            } else {
+                ((RadMtpCoupleState*)tsts.host.data())[n].status = 0;
+                ((RadSampleParams*)tprm.host.data())[n].seed = 0x900ull + (uint64_t)n;
+                ((RadSampleParams*)tprm.host.data())[n].pos = 11 + (uint64_t)depth[n];
+            }
+            ((int32_t*)ttok.host.data())[n] = -9;
+        }
+        for (int n = 0; n < M; ++n) { ptopo[2 * n] = -1; ptopo[2 * n + 1] = 0; }
+        for (int n = 0; n < NR; ++n) {
+            ptopo[2 * n] = n ? par[n] : -1;
+            ptopo[2 * n + 1] = n ? childtok[par[n]][seen[par[n]]++] : 0;
+        }
+        const std::vector<RadParam> pv_ = { P("M", M), P("n_cand", NC), P("n_vocab", (int)VOC) };
+        const std::vector<RadParam> pt_ = { P("M", NR), P("n_cand", NC), P("n_vocab", (int)VOC) };
+        RadTensor tv_[5] = { cid.on_dev(s), cval.on_dev(s), prm.on_dev(s), sts.on_dev(s), tok.on_dev(s) };
+        RadTensor tt_[6] = { tcid.on_dev(s), tcval.on_dev(s), tprm.on_dev(s), tsts.on_dev(s), ttok.on_dev(s), topo.on_dev(s) };
+        RadArgs av{}; av.t = tv_; av.n_t = 5; av.p = pv_.data(); av.n_p = (int)pv_.size();
+        RadArgs at{}; at.t = tt_; at.n_t = 6; at.p = pt_.data(); at.n_p = (int)pt_.size();
+        REQUIRE_EQ(rad_stream_sync(s), RAD_OK);
+        for (int i = 0; i < 20; ++i) { dver->launch(&av, s); dtr->launch(&at, s); }
+        REQUIRE_EQ(rad_stream_sync(s), RAD_OK);
+        const int iters = 300;
+        double tv_us = 0, tt_us = 0;
+        for (int i = 0; i < iters; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
+            dver->launch(&av, s); rad_stream_sync(s);
+            auto t1 = std::chrono::steady_clock::now();
+            dtr->launch(&at, s); rad_stream_sync(s);
+            auto t2 = std::chrono::steady_clock::now();
+            tv_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            tt_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+        }
+        std::printf("BENCH live=%4d: rrs-node verify (%d rows x 3 children) %.1f us, traversal (%d-row tree) %.1f us per call\n",
+                    live, M, tv_us / iters, NR, tt_us / iters);
+    }
     rad_stream_destroy(s);
 }
 

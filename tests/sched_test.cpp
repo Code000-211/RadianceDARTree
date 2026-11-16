@@ -7777,6 +7777,30 @@ TEST(a_serial_trees_verify_rows_carry_spec_parent_and_the_identity_path) {
     for (int t = 0; t < 7; ++t) CHECK_EQ(b->spec_path[t], t);
 }
 
+/* A decode row with no drafts beside a tree verify is a tree row too, the one-node tree (parent -1).
+ * The attention's tree form reads every page its table lists in full, and only a tree row's table
+ * ends at the anchor: a row left a chain (-2) read the stale slots behind its own position. */
+TEST(a_draftless_decode_row_beside_a_tree_verify_is_staged_as_a_one_node_tree) {
+    Fixture f;
+    serial_tree_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64), c = f.submit(161, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));      /* c: no draft */
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_seq, 2);
+    CHECK_EQ(b->n_spec, 6);
+    REQUIRE(b->spec_parent != nullptr);
+    const int32_t want[8] = { -1, 0, 1, 2, 0, 0, 0, -1 };
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 7);
+    CHECK_EQ(f.sch.plan().e[1].n_tokens, 1);
+    for (int j = 0; j < 8; ++j) CHECK_EQ(b->spec_parent[j], want[j]);
+    CHECK_EQ(b->positions[7], 161);   /* its own position */
+    (void)c;
+}
+
 /* A chain deployment stages no path plane and no parents: bit-identical to before. */
 TEST(a_serial_chain_stages_no_path_plane) {
     Fixture f;

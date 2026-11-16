@@ -81,6 +81,10 @@ typedef struct RadMtpTreeCfg {
     float log_rel;   /* log(prune_rel), -inf when off: keep one whose logit - max logit >= it */
     /* Cost-aware node selection and calibration (abi/rad_mtp_adapt.h); a zeroed cfg is off. */
     RadMtpAdapt ad;
+    /* Nonzero: the grower leaves the W page lists (sel) to the caller (the device grower writes them
+     * with a whole workgroup, rad_mtp_tree_sel_span names what to write) and still writes nsel,
+     * vmask and rb. Zero (every host caller): it writes them itself. */
+    int skip_sel_lists;
 } RadMtpTreeCfg;
 
 static inline int rad_mtp_tree_state_words(int nodes, int width, int rounds) {
@@ -133,6 +137,17 @@ RAD_MTP_HD static inline int rad_mtp_tree_keep(const RadMtpTreeCfg* cfg, int c, 
                                                float base, float lp, float v, float mx) {
     if (!cfg->prune || c == best) return 1;
     return (base + lp) >= cfg->log_abs && (v - mx) >= cfg->log_rel;
+}
+
+/* The page list a pass's attention operands carry: the head's pages table[p0 .. p0 + n), then -1 up to
+ * sel_pitch, the same for every frontier row of the sequence (it depends on the head's position and
+ * the table alone, not on the node). Returns n, the nsel value. */
+RAD_MTP_HD static inline int rad_mtp_tree_sel_span(const RadMtpTreeCfg* cfg, int head, int* p0_out) {
+    const int rb = cfg->block * (head / cfg->block);
+    const int nb = rb / cfg->block;
+    const int p0 = nb > cfg->sel_pitch ? nb - cfg->sel_pitch : 0;
+    *p0_out = p0;
+    return nb - p0;
 }
 
 RAD_MTP_HD static inline float rad_mtp_tree_bits_f(int v) { float f; memcpy(&f, &v, 4); return f; }
@@ -284,8 +299,9 @@ RAD_MTP_HD static inline int rad_mtp_tree_grow_seq(
         *rb_out = rb;
         const long long own = ((long long)1 << (head - rb + 1)) - 1;   /* [rb, head], the root */
         for (int w = 0; w < W; ++w) {
-            for (int k = 0; k < cfg->sel_pitch; ++k)
-                sel[(long)w * cfg->sel_pitch + k] = (k < nb - p0) ? table[p0 + k] : -1;
+            if (!cfg->skip_sel_lists)
+                for (int k = 0; k < cfg->sel_pitch; ++k)
+                    sel[(long)w * cfg->sel_pitch + k] = (k < nb - p0) ? table[p0 + k] : -1;
             nsel[w] = nb - p0;
             if (w < n_made) {
                 const int id = made[w];

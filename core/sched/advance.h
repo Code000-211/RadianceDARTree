@@ -86,6 +86,14 @@ enum AdvMode : int32_t {
  * drafter's own, with room). */
 enum { kAdvMaxPools = 6 };
 
+/* Whether ADV_COMPACT can move a paged cache's row (it copies 16-byte chunks): the element width is a
+ * byte, a half or a word and the row a whole number of chunks. The int8 KV cache's row (512 codes and
+ * a 4-byte scale, 516 bytes) is not, so a tree with it is refused at start (Engine::tree_compact_check)
+ * instead of at the first tree verify. */
+inline bool adv_row_movable(int bits, int64_t row_bytes) {
+    return row_bytes > 0 && row_bytes % 16 == 0 && (bits == 8 || bits == 16 || bits == 32);
+}
+
 /* One paged group's cache on one rank, as ADV_COMPACT addresses it: `n_layers` caches of
  * [n_blocks, n_head, block_size, row_bytes] bytes, `layer_stride` apart from `base`
  * (core/runtime/kvbind.cpp composes that shape). `grp` indexes the batch's AdvGroup array, whose

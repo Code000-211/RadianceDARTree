@@ -1028,6 +1028,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                     s.h_parent[k + a0 + j] = a0 + p;
                     s.h_pos[k + a0 + j] = e.ctx_len + a0 + dep[j];
                 }
+            } else if (e.produces_token && !e.is_prefill && e.n_spec == 0 && e.n_tokens == 1) {
+                /* A decode row with no drafts beside a tree verify: the one-node tree. Every
+                 * decode row of a tree step must be a tree row (the attention's tree form reads
+                 * whole pages; a chain row would read the stale slots behind its position). */
+                s.h_parent[k] = -1;
             }
         }
         /* Every row of a sequence runs with its request's adapter (RadBatch::lora_slot), fixed at

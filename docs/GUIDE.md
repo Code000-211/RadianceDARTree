@@ -1662,7 +1662,8 @@ by the token that happened to be drawn into the slot. That is what keeps the cou
 read the drawn token's own probability would favour the tokens it keeps and bias the output (the test
 suite shows the statistic that catches it).
 **Paying only for the real nodes: `draft-tree-rows`, `draft-tree-chain`.** Pruned slots verify as inert
-duplicates, and a tree step costs 3 to 8 ms more than a chain step of the same rows. Two switches (both off by
+duplicates, and a tree step costs about 0.7 ms more than a chain step of the same rows (measured after the kernel optimisations,
+plus ~0.9 ms for each verified row). Two switches (both off by
 default, which is today's step bit for bit) recover that:
 `draft-tree-rows: M` verifies a **prefix** of the grown tree, as many nodes as the larger real-node count of the
 sequence's last two trees plus M (the nodes are numbered in creation order, a suffix of a tree is a tree, and with

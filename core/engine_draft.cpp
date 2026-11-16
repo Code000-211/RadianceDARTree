@@ -282,6 +282,51 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
     return RAD_OK;
 }
 
+/* One paged KV group's cache as a tree's acceptance moves it (ADV_COMPACT copies a row in 16-byte
+ * chunks): the binding on this rank (null for a zero group), its row bytes and bound layers. Refuses
+ * a cache whose rows are not a multiple of 16 bytes -- the int8 cache's 516-byte rows (512 codes and
+ * a 4-byte scale) -- and one the pool does not cover. */
+template <class RankT>
+static int tree_pool_row(RankT& rk, size_t g, const KVPoolBinding** out, int64_t* row_out,
+                         int32_t* layers_out) {
+    *out = nullptr;
+    const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
+    if (!b || !b->base || b->rank != 4) return RAD_OK;
+    const int bits = rad_dtype_bits(b->dtype);
+    const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
+    int32_t layers = 0;
+    for (int32_t s : b->layer_slot) layers += s >= 0;
+    if (!adv_row_movable(bits, row) ||
+        (b->bytes && (int64_t)layers * b->layer_stride > b->bytes)) {
+        RAD_ERR("speculation: KV group %zu's cache (%s, %lld-byte rows) is not one a tree's "
+                "acceptance can move: a draft tree needs 16-byte-multiple rows, which the int8 "
+                "KV cache's 516-byte rows are not (use a bf16/fp8 KV cache with --draft-tree)",
+                g, rad_dtype_name(b->dtype), (long long)row);
+        return RAD_E_UNSUPPORTED;
+    }
+    *out = b; *row_out = row; *layers_out = layers;
+    return RAD_OK;
+}
+
+/* The same check for every paged group, at start: a deployment whose cache a tree cannot move is
+ * refused before the first step instead of stopping the engine at the first tree verify. */
+int Engine::tree_compact_check() {
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        Rank& rk = *ranks_[i];
+        const Program& p = rk.program;
+        for (size_t g = 1; g < p.kv_groups.size(); ++g) {
+            const int kind = p.kv_groups[g].decl.kind;
+            if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) continue;
+            if (p.kv_groups[g].decl.no_tree_compact) continue;
+            const KVPoolBinding* b = nullptr;
+            int64_t row = 0;
+            int32_t layers = 0;
+            RAD_TRY(tree_pool_row(rk, g, &b, &row, &layers));
+        }
+    }
+    return RAD_OK;
+}
+
 /* ADV_COMPACT on every rank, against the scheduler's latest build (the tree step just accepted):
  * the accepted paths' K and V into place in every paged group. Each rank's pools are its own. */
 int Engine::tree_compact(int rows) {
@@ -301,18 +346,12 @@ int Engine::tree_compact(int rows) {
             /* A paged group whose entries are not one per token slot (the QSA block keys) is not
              * K and V to move: the plugin heals it from the accepted path instead. */
             if (p.kv_groups[g].decl.no_tree_compact) continue;
-            const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
-            if (!b || !b->base || b->rank != 4) continue;   /* a zero group on this rank */
-            const int bits = rad_dtype_bits(b->dtype);
-            const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
+            const KVPoolBinding* b = nullptr;
+            int64_t row = 0;
             int32_t layers = 0;
-            for (int32_t s : b->layer_slot) layers += s >= 0;
-            if (row <= 0 || row % 16 || (bits != 8 && bits != 16 && bits != 32) ||
-                (b->bytes && (int64_t)layers * b->layer_stride > b->bytes)) {
-                RAD_ERR("speculation: KV group %zu's cache (%s, %lld-byte rows) is not one a tree's "
-                        "acceptance can move", g, rad_dtype_name(b->dtype), (long long)row);
-                return RAD_E_UNSUPPORTED;
-            }
+            const int prc = tree_pool_row(rk, g, &b, &row, &layers);
+            if (prc != RAD_OK) return prc;
+            if (!b) continue;                                 /* a zero group on this rank */
             if (a.n_pool >= kAdvMaxPools) {
                 RAD_ERR("speculation: more than %d paged KV groups for a tree's acceptance",
                         (int)kAdvMaxPools);

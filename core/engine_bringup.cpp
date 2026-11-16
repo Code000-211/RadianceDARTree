@@ -5303,6 +5303,7 @@ int Engine::start() {
     }
 
     RAD_TRY(step_state_init());
+    if (tree_) RAD_TRY(tree_compact_check());   /* an int8 KV cache cannot move a tree's rows */
 
     /* ---- the budget, checked against the card --------------------------------------------
      *

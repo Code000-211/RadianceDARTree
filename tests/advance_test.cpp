@@ -9,9 +9,12 @@
 
 #include "sample/accept.h"
 #include "sched/advance_impl.h"
+#include "rad_mtp_tree.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <vector>
 #include <string>
 
 using namespace rad;
@@ -1420,6 +1423,186 @@ TEST(a_chain_form_verify_of_a_grown_tree_takes_its_first_nodes_as_the_chain) {
     nx.row(0, true, 0, 3, 102, 0, 0, 0, 2);
     nx.run();
     for (int t = 0; t < Slab::kPathPitch; ++t) CHECK_EQ(nx.w[Slab::PATH + t], t);
+}
+
+/* A card row with no drafts beside a tree verify (a request that may not speculate, one at its context
+ * limit): on a step that carries a parent plane every decode row is a tree row, so it is the
+ * one-node tree (parent -1), not a chain (-2). The attention's tree form reads whole pages and only
+ * a tree row's tables stop at the anchor; a chain row read the stale slots behind its position. */
+TEST(a_card_row_without_drafts_on_a_tree_step_is_the_one_node_tree) {
+    Slab v(ADV_TRUNK);
+    v.a.parent_off = Slab::PAR * 4;
+    v.a.path_off = Slab::PATH * 4; v.a.path_pitch = Slab::kPathPitch;
+    for (int j = 0; j < Slab::kTok; ++j) v.w[Slab::PAR + j] = -7;
+    v.st[0].tok[0] = 9;
+    v.st[0].ctx = 100; v.st[0].n_acc = 1; v.st[0].npath = 0; v.st[0].ntree = 0;
+    v.row(0, true, 0, 1, 100, 0, 0, 0, 0);
+    v.run();
+    CHECK_EQ(v.w[Slab::TOK], 9);
+    CHECK_EQ(v.w[Slab::PAR], -1);
+    CHECK_EQ(v.w[Slab::POS], 100);
+    CHECK_EQ(v.slot(0, 0), 100);
+    CHECK_EQ(v.w[Slab::ACC], 1);
+}
+
+/* A tree's acceptance moves K and V rows in 16-byte chunks. bf16 and fp8 rows are multiples of 16; the
+ * int8 cache's 516-byte rows (512 codes and a scale) are not, and the engine refuses the deployment at
+ * start (Engine::tree_compact_check) instead of stopping at the first tree verify. */
+TEST(a_tree_moves_only_cache_rows_that_are_whole_16_byte_chunks) {
+    CHECK(adv_row_movable(16, 256 * 2));      /* bf16, head_dim 256 */
+    CHECK(adv_row_movable(8, 512));           /* fp8 */
+    CHECK(adv_row_movable(32, 64));
+    CHECK(!adv_row_movable(8, 516));          /* int8 codes + a 4-byte scale */
+    CHECK(!adv_row_movable(16, 2 * 130));
+    CHECK(!adv_row_movable(4, 512));          /* sub-byte elements */
+    CHECK(!adv_row_movable(8, 0));
+}
+
+namespace gs {
+struct GSlab {
+    static constexpr int kSeq = 8, kTok = 64, kPitch = 64, kGroups = 1;
+    enum : int32_t {
+        ROWS = 0, TOK = ROWS + 4 * kSeq, POS = TOK + kTok, CTX = POS + kTok, ACC = CTX + kSeq,
+        OUT = ACC + kSeq, SID = OUT + kTok, CU = SID + kSeq, Q = CU + kSeq + 8,
+        GRP = Q + kSeq, SLOT = GRP + (int)(sizeof(AdvGroup) / 4) * kGroups, USED = SLOT + kGroups * kTok,
+        BT = USED + kGroups * kSeq, FIRST = BT + kGroups * kSeq * kPitch, PAR = FIRST + kGroups * kSeq,
+        END = PAR + kTok
+    };
+    alignas(16) int32_t w[END] = {};
+    StepSlot st[kSeq];
+    int32_t eog[8] = {};
+    AdvanceArgs a;
+    GSlab(int block) {
+        std::memset(st, 0, sizeof st);
+        a.n_groups = 1; a.slab = (char*)w;
+        a.row_off = ROWS * 4; a.row_pitch = kSeq; a.tok_off = TOK * 4; a.pos_off = POS * 4;
+        a.ctx_off = CTX * 4; a.acc_off = ACC * 4; a.out_off = OUT * 4; a.sid_off = SID * 4;
+        a.cu_off = CU * 4; a.q_off = Q * 4; a.grp_off = GRP * 4; a.st = st; a.eog = eog;
+        AdvGroup G{};
+        G.block_size = block; G.paged = 1; G.pitch = kPitch;
+        G.slot_off = (int64_t)SLOT * 4; G.used_off = (int64_t)USED * 4; G.bt_off = (int64_t)BT * 4;
+        G.first_off = (int64_t)FIRST * 4;
+        std::memcpy((char*)w + GRP * 4, &G, sizeof G);
+        for (int i = 0; i < kSeq; ++i) for (int b = 0; b < kPitch; ++b) w[BT + i * kPitch + b] = b;
+    }
+    void row(int i, int k, int n, int card) {
+        w[ROWS + i] = 1; w[ROWS + kSeq + i] = 0; w[ROWS + 2 * kSeq + i] = 0; w[ROWS + 3 * kSeq + i] = 0;
+        w[CU + i] = k; w[CU + i + 1] = k + n; w[Q + i] = n; w[SID + i] = card;
+        if (i + 1 > a.n_seq) a.n_seq = i + 1;
+    }
+};
+
+static uint32_t rs = 12345;
+static uint32_t lcg() { rs = rs * 1664525u + 1013904223u; return rs >> 8; }
+
+struct Res { int bad = 0; int inert_passes = 0; int inert_rows = 0; int real_rows = 0; int created = 0; };
+
+/* One step. sharp: logits spread (bigger = peakier rows -> pruning bites). */
+static Res one(int N, int R, int W, double pabs, double prel, float sharp, int head, bool verbose) {
+    Res res;
+    const int K = RAD_MTP_TREE_K, B = 4, SP = 16;
+    RadMtpTreeCfg cfg{};
+    cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = B; cfg.sel_pitch = SP; cfg.pitch = std::max(N, 8);
+    rad_mtp_tree_set_prune(&cfg, pabs, prel);
+    std::vector<int> st((size_t)rad_mtp_tree_state_words(N, W, R), 0);
+    std::vector<int> tok(cfg.pitch, -7), par(cfg.pitch, -7), sel(W * SP), nsel(W), src(W), dst(W), table(256);
+    std::vector<long long> vmask(W);
+    for (int i = 0; i < 256; ++i) table[i] = 1000 + i;
+    int rb = 0;
+    GSlab s(B);
+    StepSlot& S = s.st[0];
+    S.head = head; S.tok[0] = 5;
+    S.ntree = 3;   /* stale, from the last step */
+    std::vector<int> didx(W * K), prevtok;
+    std::vector<float> dval(W * K);
+    int nfront = 1;
+    for (int round = 1; round <= R; ++round) {
+        /* the head pass that just ran: candidates for each embedded row (inert rows too) */
+        const int rows = round == 1 ? 1 : W;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < K; ++c) {
+                didx[r * K + c] = 100 + (int)(lcg() % 100000);
+                dval[r * K + c] = -(float)c * sharp - (float)(lcg() % 1000) * 0.0005f;
+            }
+        cfg.round = round;
+        const int rc = rad_mtp_tree_grow_seq(&cfg, st.data(), didx.data(), dval.data(), 0, K, 1,
+                                             round == 1 ? head : -1, table.data(), tok.data(), par.data(),
+                                             sel.data(), nsel.data(), vmask.data(), &rb, 0, src.data(), dst.data());
+        if (rc) { ++res.bad; printf("grow rc %d\n", rc); return res; }
+        const int* nd = st.data() + 4 + W;
+        if (round < R) {
+            /* the core stages the next pass from tok/par */
+            s.a.mode = ADV_ROUND_TREE; s.a.round = round + 1; s.a.src = tok.data(); s.a.par = par.data();
+            s.a.src_pitch = cfg.pitch; s.a.tree_nodes = N; s.a.width = W; s.a.parent_off = GSlab::PAR * 4;
+            s.a.n_seq = 0; s.row(0, 0, W, 0);
+            adv_row(s.a, 0);
+            /* sync: the card's node count and every node's token/parent are the grower's */
+            if (S.ntree != st[1]) { ++res.bad; if (verbose) printf("  round %d: card ntree %d, grower %d\n", round, S.ntree, st[1]); }
+            for (int j = 1; j <= st[1] && j <= S.ntree; ++j)
+                if (S.tok[j] != nd[6 * j] || S.par[j - 1] != nd[6 * j + 1]) { ++res.bad; if (verbose) printf("  node %d differs\n", j); }
+            /* each frontier row: position, slot, vmask, routing */
+            int real = 0;
+            for (int w = 0; w < W; ++w) {
+                const int f = w < st[2] ? st[4 + w] : -1;
+                const int slot = s.w[GSlab::SLOT + w], pos = s.w[GSlab::POS + w];
+                if (f > 0) {
+                    ++real;
+                    if (pos != head + nd[6 * f + 2]) { ++res.bad; if (verbose) printf("  pos\n"); }
+                    if (slot != head + f) { ++res.bad; if (verbose) printf("  slot %d want %d\n", slot, head + f); }
+                    if (!((vmask[w] >> (head - rb + f)) & 1)) { ++res.bad; if (verbose) printf("  vmask self\n"); }
+                    if (!((vmask[w] >> (head - rb)) & 1)) { ++res.bad; if (verbose) printf("  vmask root\n"); }
+                    /* exactly: [rb, head] and ancestors-or-self */
+                    long long want = ((1ll << (head - rb + 1)) - 1);
+                    for (int x = f; x > 0; x = nd[6 * x + 1]) want |= 1ll << (head - rb + x);
+                    if (vmask[w] != want) { ++res.bad; if (verbose) printf("  vmask %llx want %llx\n", vmask[w], want); }
+                    if (s.w[GSlab::PAR + w] != nd[6 * f + 1]) { ++res.bad; if (verbose) printf("  spec_parent\n"); }
+                    if (src[w] != nd[6 * f + 1] || dst[w] != f) { ++res.bad; if (verbose) printf("  routing\n"); }
+                } else {
+                    if (slot != -1 || s.w[GSlab::TOK + w] != 0) { ++res.bad; if (verbose) printf("  inert row not inert\n"); }
+                    if (dst[w] != -1) { ++res.bad; }
+                }
+            }
+            res.real_rows += real; res.inert_rows += W - real;
+            if (real == 0) ++res.inert_passes;
+            nfront = real;
+        } else {
+            s.a.mode = ADV_BTAKE; s.a.round = N; s.a.src = tok.data(); s.a.par = par.data();
+            s.a.src_pitch = cfg.pitch; s.a.tree_nodes = N; s.a.depth = R; s.a.vocab = 200000;
+            s.a.n_seq = 0; s.row(0, 0, 1, 0);
+            adv_row(s.a, 0);
+            if (S.ntree != N) ++res.bad;
+            if (!adv_tree_valid(S.par, N, R)) { ++res.bad; if (verbose) printf("  final tree invalid\n"); }
+            for (int j = 1; j <= N; ++j) {
+                if (j <= st[1]) {
+                    if (S.tok[j] != nd[6 * j] || S.par[j - 1] != nd[6 * j + 1]) { ++res.bad; if (verbose) printf("  final node %d differs\n", j); }
+                } else if (S.par[j - 1] != 0 || S.tok[j] != S.tok[1]) { ++res.bad; if (verbose) printf("  inert %d\n", j); }
+            }
+            res.created = st[1];
+        }
+    }
+    (void)nfront;
+    return res;
+}
+
+}  /* namespace gs */
+
+/* The stage-2 loop on the host, with the shared headers: the grower (rad_mtp_tree_grow_seq) round by
+ * round, each round's frontier through ADV_ROUND_TREE and the final tree through ADV_BTAKE. The
+ * numbering of nodes, their depths and parents, the flat slots, `vmask`, the hidden-state routing and
+ * the final tree must agree between the grower's table and what the card's slots hold, over random
+ * rows, geometries (width past the pool, (R - 1) * W against N, N 15 at R 8) and pruning. */
+TEST(the_stage_two_growers_node_numbering_stays_in_sync_with_the_cards_round_and_take_kernels) {
+    struct C { int N, R, W; double pa, pr; float sharp; } cs[] = {
+        { 6, 3, 2, 0, 0, 0.5f }, { 7, 3, 3, 0, 0, 0.5f }, { 6, 3, 3, 0, 0, 0.5f }, { 6, 4, 3, 0, 0, 0.5f },
+        { 4, 3, 2, 0, 0, 0.5f }, { 15, 7, 2, 0, 0, 0.5f }, { 15, 8, 2, 0, 0, 0.5f },
+        { 15, 7, 2, 0.05, 0, 0.5f }, { 15, 7, 2, 0.05, 0, 3.0f }, { 15, 7, 2, 0.2, 0, 3.0f },
+        { 10, 5, 2, 0.0, 0.5, 3.0f }, { 15, 3, 9, 0, 0, 0.5f } };
+    for (const C& c : cs) {
+        int bad = 0;
+        for (int t = 0; t < 300; ++t)
+            bad += gs::one(c.N, c.R, c.W, c.pa, c.pr, c.sharp, 40 + (int)(gs::lcg() % 4), false).bad;
+        CHECK_EQ(bad, 0);
+    }
 }
 
 /* The same cut on a tree-form step: a prefix of the grown tree is the tree the verify carries, the

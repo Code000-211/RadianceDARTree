@@ -1958,12 +1958,20 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
         if (!r4d_contig(oq)) return R4D_NO(RAD_E_STRIDE);
     }
 
-    /* The window as in gdn_conv_update: max_query_len = state_len_max - (width - 2), and it must
-     * fit RU_CVT, since the fold holds the tokens in registers. */
+    /* The window as in gdn_conv_update: max_query_len = state_len_max - (width - 2). What the fold
+     * holds in registers is THIS step's tokens of a sequence, at most RU_CVT: the issue's `q_len`
+     * (the band the core selected it for, which bounds the rows a sequence has this step) must fit
+     * it. The window's own length does not matter to the kernel: the history it reads is
+     * conv_width - 1 entries at an offset (ru_hist_entry, up to the previous step's accepted count
+     * past the window's start) and the rewrite stores conv_width - 2 + T entries, all inside any
+     * window of at least that many. A window longer than RU_CVT is a draft tree's or a long
+     * chain's (conv_width - 1 + max_spec entries), and the fold serves its short steps. */
     if (r4d_geti_or(a, "conv_width", 0) != R4D_GDN_CONV_W) return R4D_NO(RAD_E_UNSUPPORTED);
     const long long mql = cst->shape[2] - (R4D_GDN_CONV_W - 2);
     if (mql < 1) return R4D_NO(RAD_E_SHAPE);
-    if (mql > RU_CVT) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long qband = r4d_geti_or(a, "q_len", 0);
+    if (qband < 1 || qband > RU_CVT) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (T > (long long)RU_CVT * N) return R4D_NO(RAD_E_UNSUPPORTED);
 
     /* The recurrent half's checks, as in r4d_rad_gdn_recurrent_update. */
     const int anc = ru_state_form(a);

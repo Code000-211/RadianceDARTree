@@ -41,6 +41,8 @@
 #include "rad_spechub.h"
 #include "rad_mtp_rrs.h"
 
+#include <type_traits>
+
 #ifdef __cplusplus
 
 #define RAD_MTP_TRAV_MAX_DEPTH 16
@@ -58,6 +60,26 @@ struct RadMtpTravOut {
     int32_t y = -1;                          /* the final token ... */
     bool    has_y = false;                   /* ... when the last node carries a valid state */
 };
+
+/* A tree whose candidate scans are done by a workgroup (the device walk, plugin/spechub/spechub.hip)
+ * also provides
+ *   void live(int v, const int32_t* sid, int cnt, RadTravLaw* out) const
+ * which, for node v's candidate row, gathers the live candidates (id >= 0, value not -inf) in ascending
+ * order, each one's FP64 weight exp(val - top) and its slot among `sid[0 .. cnt)` (cnt when outside),
+ * and the row's validity and top. The ordered sums below then run over those stored values: the same
+ * operations in the same order as the scan they replace, so the walk is the host's bit for bit. The
+ * result is valid until the next live() call. A tree without it (the host's) scans the row itself. */
+struct RadTravLaw {
+    bool valid = false;               /* no id past the vocabulary, no NaN or +inf, a finite top */
+    float top = -INFINITY;
+    int   L = 0;
+    const int32_t* ids = nullptr;     /* the row's ids; entry i is ids[lj[i]] */
+    const short* lj = nullptr;
+    const double* w = nullptr;
+    const unsigned char* k = nullptr;
+};
+template <class T, class = void> struct RadTravLive : std::false_type {};
+template <class T> struct RadTravLive<T, std::void_t<decltype(&T::live)>> : std::true_type {};
 
 /* The tree the walk reads (a Tree type provides):
  *   const RadMtpCoupleState* state(int v)   the node's bound state, or null (node is a leaf)
@@ -92,20 +114,33 @@ static inline RAD_RRS_HD bool rad_mtp_trav_push(const Tree& T, int v, double p,
         const double  tq = s.q[0];   s.q[0]   = s.q[k];   s.q[k]   = tq;
     }
     float top = -INFINITY;
-    for (int64_t j = 0; j < n; ++j) {
-        if (ids[j] < 0) continue;
-        if (ids[j] >= T.vocab() || val[j] != val[j] || val[j] == INFINITY) return true;
-        if (val[j] > top) top = val[j];
-    }
-    if (top == -INFINITY) return true;
     double sum = 0, pq[8] = {}, wout = 0;
-    for (int64_t j = 0; j < n; ++j) {
-        if (ids[j] < 0 || val[j] == -INFINITY) continue;
-        const double w = ::exp((double)val[j] - top);
-        sum += w;
-        int k = 0;
-        while (k < s.count && ids[j] != s.ids[k]) ++k;
-        if (k < s.count) pq[k] += w; else wout += w;
+    if constexpr (RadTravLive<Tree>::value) {
+        RadTravLaw lw;
+        T.live(v, s.ids, s.count, &lw);
+        if (!lw.valid) return true;
+        top = lw.top;
+        for (int i = 0; i < lw.L; ++i) {
+            const double w = lw.w[i];
+            sum += w;
+            const int k = lw.k[i];
+            if (k < s.count) pq[k] += w; else wout += w;
+        }
+    } else {
+        for (int64_t j = 0; j < n; ++j) {
+            if (ids[j] < 0) continue;
+            if (ids[j] >= T.vocab() || val[j] != val[j] || val[j] == INFINITY) return true;
+            if (val[j] > top) top = val[j];
+        }
+        if (top == -INFINITY) return true;
+        for (int64_t j = 0; j < n; ++j) {
+            if (ids[j] < 0 || val[j] == -INFINITY) continue;
+            const double w = ::exp((double)val[j] - top);
+            sum += w;
+            int k = 0;
+            while (k < s.count && ids[j] != s.ids[k]) ++k;
+            if (k < s.count) pq[k] += w; else wout += w;
+        }
     }
     if (!(sum > 0) || !rad_spechub_finite(sum)) return true;
     for (int k = 0; k < 8; ++k) {
@@ -147,6 +182,37 @@ static inline RAD_RRS_HD bool rad_mtp_trav_final(const RadMtpTravFrame& f, doubl
     return last >= 0;
 }
 
+/* The same over a tree whose rows are scanned by a workgroup (RadTravLive): the frame's node is
+ * gathered again (one live() call) and the candidates walked from the stored weights and slots. */
+template <class Tree>
+static inline RAD_RRS_HD bool rad_mtp_trav_final_live(const Tree& T, const RadMtpTravFrame& f,
+                                                      double u, int32_t* out) {
+    double total = f.so * f.pout;
+    for (int k = 0; k < 8; ++k) total += f.r[k];
+    if (!(total > 0) || !rad_spechub_finite(total)) return false;
+    int cnt = 0;
+    while (cnt < 8 && f.ids[cnt] >= 0) ++cnt;
+    RadTravLaw lw;
+    T.live(f.node, f.ids, cnt, &lw);
+    double c = u * total;
+    int32_t last = -1;
+    unsigned seen = 0;
+    for (int i = 0; i < lw.L; ++i) {
+        const int k = lw.k[i];
+        double m;
+        if (k < cnt) {
+            if (seen & (1u << k)) continue;
+            seen |= 1u << k;
+            m = f.r[k];
+        } else {
+            m = f.so * (lw.w[i] / f.sum);
+        }
+        if (m > 0) { last = lw.ids[lw.lj[i]]; c -= m; if (c < 0) { *out = last; return true; } }
+    }
+    *out = last;
+    return last >= 0;
+}
+
 /* One tree, root `root`: the accepted path and the final token. Returns false when nothing was
  * decided (an invalid root state: every row keeps the pick). `pos0` is the root row's output
  * position, the coordinate of the acceptance uniforms. */
@@ -183,7 +249,8 @@ static inline RAD_RRS_HD bool rad_mtp_trav_walk(const Tree& T, int root, uint64_
             out->has_y = false;
             if (f.ok) {
                 const double ur = rad_spechub_uniform(seed, pos0 + (uint64_t)top, RAD_SAMPLE_KEY_RESID);
-                out->has_y = rad_mtp_trav_final(f, ur, &out->y);
+                if constexpr (RadTravLive<Tree>::value) out->has_y = rad_mtp_trav_final_live(T, f, ur, &out->y);
+                else out->has_y = rad_mtp_trav_final(f, ur, &out->y);
             }
             return true;
         }
