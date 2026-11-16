@@ -79,6 +79,21 @@ struct AttnGatedFP8 {
     /* `sel`'s row pitch is `topk + 1`; the extra slot is the partial page
      * (r4d_qsa_select_bf16.hip). */
     int64_t     qsa_topk = 0;
+    /* The architecture's word that a sequence with one row in the step has that row at its
+     * context's last position (`seqused - 1`: a plain decode row, a serial head's round), so at or
+     * below `qsa_exact_to` such a row's selection is the head of the sequence's block table and its
+     * `seqused` the sequence's (qsa_select: every complete block in block order, then the partial
+     * page, and `pos + 1`). The sparse row is then issued over the table and the indexer selects
+     * nothing (qsa_use). Off: such a step keeps the selection. */
+    bool        qsa_table_rows = false;
+    /* The architecture's pass key carries whether this group's exact host bound
+     * (RadBatch::kv_used_max_h, the furthest context any row of the step can read) is within
+     * `qsa_exact_to`, so that bound may say whether the step needs scores (qsa_within) in place of
+     * the rounded `max_ctx_len + max_q_len`, which a 4-row step leaves at 1025 tokens. It never
+     * moves the choice between the dense and the sparse kernel, which stays the rounded bound's:
+     * the two agree on the keys, not on the last bit of the sum. Off: the rounded bound, which the
+     * core's key holds. */
+    bool        qsa_exact_host = false;
     /* Query rows per sparse attention launch, a scratch budget. The decode kernel's split-KV
      * partials are sized at declare from `max_seqs` and `q_len`, so issuing more rows than
      * `max_seqs` means declaring a larger value, which grows the scratch arena (the maximum over
@@ -210,6 +225,48 @@ struct AttnGatedFP8 {
      * components agree, so plane 0 of an M-RoPE batch's positions is each token's position) and
      * the gate quantised by gate_quant_fp8. A streamed group never takes it: the pieces path's
      * plain store never writes the host mirror. */
+    /* The rounded host bound of the furthest context a row of the step reads; by it a step of
+     * several rows a sequence takes the dense or the sparse kernel (step(), `sparse`). */
+    int64_t qsa_reach(const RadBatch* batch) const {
+        return (int64_t)batch->max_ctx_len + batch->max_q_len;
+    }
+    /* Whether every row of the step is at or below the exactness bound, by the tightest host
+     * ceiling there is: the group's exact one where the pass key holds its side of the bound
+     * (qsa_exact_host), else the rounded one. Every row's position + 1 is at most either. */
+    bool qsa_within(const RadBatch* batch, const RadKVGroupBatch* kvb) const {
+        if (qsa_exact_to <= 0) return false;
+        int64_t reach = qsa_reach(batch);
+        if (qsa_exact_host && kvb && batch->kv && batch->kv_used_max_h) {
+            const int64_t tight = batch->kv_used_max_h[kvb - batch->kv];
+            if (tight > 0 && tight < reach) reach = tight;
+        }
+        return reach <= qsa_exact_to;
+    }
+    /* What this step's attention reads of the selection (QsaUse, rad_arch.h); the architecture
+     * hands it to the indexer, which runs first, and step() takes its path by the same call. */
+    int qsa_use(const RadBatch* batch) const {
+        if (!qsa_sel || !qsa_sequ || op_fill || qsa_eager()) return kQsaSelect;
+        const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+        /* A streamed group may be ring-bound, where every pass is sparse and the resolve rewrites
+         * the selection; it keeps the selection at every context. */
+        if (!kvb || kvb->stream || !kvb->block_table || !kvb->seqused) return kQsaSelect;
+        if (!qsa_within(batch, kvb)) return kQsaSelect;
+        int64_t D = 0, DT = 0;
+        batch_split(batch, &D, &DT);
+        const bool tree = tree_any ? (batch->spec_parent != nullptr && D > 0)
+                                   : tree_verify_step(batch);
+        /* The trunk's tree verify reads the indexer's selection and mask; a head's tree rounds
+         * read the grower's and run no indexer. */
+        if (tree) return (tree_any || tree_sel || tree_nsel) ? kQsaSelect : kQsaOnce;
+        /* One row a sequence is the sparse row at every context: over the table where the
+         * architecture vouches for it, else over a selection. */
+        if (batch->n_tok == batch->n_seq)
+            return (qsa_table_rows && batch->max_q_len == 1) ? kQsaUnread : kQsaOnce;
+        /* Several rows a sequence: the dense attention, which reads the table, where the rounded
+         * bound is within the budget too, else the sparse row a query over a selection. */
+        return qsa_reach(batch) <= qsa_exact_to ? kQsaUnread : kQsaOnce;
+    }
+
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
         const int64_t T = batch->n_tok;
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
@@ -767,7 +824,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * Launches are chunked because the split-KV scratch is sized at declare from `max_seqs` and
      * `q_len` (rows = max_seqs * q_len_max * heads); more rows are refused as RAD_E_SCRATCH at
      * issue. Rows of q_len 1 up to the declared max_seqs always fit. */
-    const int64_t reach  = (int64_t)batch->max_ctx_len + batch->max_q_len;
+    const int64_t reach  = qsa_reach(batch);
     /* A pass on a streamed group's ring (a ring smaller than the id space, and not staged) must
      * take the sparse path: on the ring a block id is not a pool address, so the dense path would
      * read ring slots as pages. `T == n_seq` alone misses a verify pass, whose T is
@@ -804,6 +861,19 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const bool    sparse = qsa_sel && qsa_sequ &&
                            (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
                             reach > qsa_exact_to);
+    /* At or below the bound a step of one row a sequence has no selection (qsa_use): the sparse
+     * row reads the sequence's own block table and length, which is what qsa_select would have
+     * written for it (the field says why), so the launch, its kernel and its bytes are the sparse
+     * row's. */
+    const bool by_table = sparse && !tree && T == batch->n_seq && qsa_use(batch) == kQsaUnread;
+    const int64_t tpitch = kvb ? kvb->block_table_pitch : 0;
+    auto sel_rows = [&](int64_t off, int64_t rows) {
+        return by_table ? praw2(table + off * tpitch, RAD_I32, rows, tpitch)
+                        : brow_slice(qsa_sel, off, rows, qsa_topk + 1);
+    };
+    auto sequ_rows = [&](int64_t off, int64_t rows) {
+        return by_table ? praw(used + off, RAD_I32, rows) : brow_slice(qsa_sequ, off, rows, 1);
+    };
     const bool tree_gated = tree && tree_rows == T && op_tsel_gq;
     const bool gated = tree ? tree_gated : (sparse && op_attn_gq);
     /* A streamed group's selection, per launch: make the rows' blocks resident and rewrite `sel`
@@ -812,6 +882,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * and never resolves, so a prefill cannot overflow the ring. */
     const KVStreamLayer res_l = op_resolve ? kv_stream_layer(c, kv, layer, kvb) : KVStreamLayer{};
     auto resolve_sel = [&](int64_t off, int64_t rows) {
+        if (by_table) return;                   /* never a streamed group (qsa_use) */
         if (kv_stage_layer(c, kv, kvb, layer)) return;
         if (!res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || rows <= 0) return;
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
@@ -876,8 +947,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 RAD_ISSUE_N(c, op_attn_gq, 1,
                             brow_slice(w.q, off, rows, qw),
                             kv_cache(kv, layer),
-                            brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                            brow_slice(qsa_sequ, off, rows, 1),
+                            sel_rows(off, rows), sequ_rows(off, rows),
                             RAD_NONE, RAD_NONE, RAD_NONE,
                             brow_slice(w.attn.x, off, rows, qw),
                             bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
@@ -900,8 +970,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             RAD_ISSUE_N(c, op_attn_gq, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
-                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                        brow_slice(qsa_sequ, off, rows, 1),
+                        sel_rows(off, rows), sequ_rows(off, rows),
                         RAD_NONE, RAD_NONE, RAD_NONE,
                         brow_slice(w.attn.x, off, rows, qw),
                         bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
@@ -917,8 +986,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             RAD_ISSUE_N(c, op_attn, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
-                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
-                        brow_slice(qsa_sequ, off, rows, 1),
+                        sel_rows(off, rows), sequ_rows(off, rows),
                         RAD_NONE, RAD_NONE, RAD_NONE,
                         brow_slice(w.attn.x, off, rows, qw));
         }

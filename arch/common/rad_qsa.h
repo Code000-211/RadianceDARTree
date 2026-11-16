@@ -9,7 +9,8 @@
  * Contents: the projection and query path, the block-key path with its two states, and the score
  * and selection. Below `budget + ratio - 1` tokens of context every visible block is selected, so
  * the sparse path must reproduce the dense path's text byte for byte; that is the test for any
- * change here.
+ * change here. A step entirely at or below that bound therefore needs no selection at all, and
+ * step() issues only the block-key path for it (its `use`; docs/QSA.md, "Below the bound").
  */
 #ifndef RAD_QSA_H
 #define RAD_QSA_H
@@ -151,13 +152,22 @@ struct QsaIndexer {
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Config& cfg,
                 const Wire& wire, const ActFP8& in, rad_kvgroup* bk);
     /* `win_cu`, device: {0, plane_rows}, the one sequence of a window of a step wider than the
-     * score plane (Config::plane_rows); null where no step is. */
+     * score plane (Config::plane_rows); null where no step is.
+     *
+     * `use` is what the layer's attention reads of the selection this step (QsaUse, rad_arch.h;
+     * AttnGatedFP8::qsa_use): the default issues the query, the scores and the selection as every
+     * step did before. `first` is whether this is the first full-attention layer the pass issues:
+     * what does not depend on the layer -- a tree step's region bases, and at or below the bound
+     * the whole selection -- is made there once and read by every layer after it (the buffers
+     * are the model's, live across its layers, and nothing else writes them). The default makes
+     * them at every layer. */
     void step(RadCtx* c, const ActFP8& in, const RadBatch* batch,
-              const int32_t* win_cu = nullptr) const;
+              const int32_t* win_cu = nullptr, int use = kQsaSelect, bool first = true) const;
     /* Stores the pass's block keys and tail exactly as step() does, with no query, score or
      * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
-    bool store_keys(RadCtx* c, const RadBatch* batch) const;
+    /* `scratch`: a tree step's scratch block keys, which only its region score reads. */
+    bool store_keys(RadCtx* c, const RadBatch* batch, bool scratch = true) const;
 };
 
 inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -373,7 +383,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
 /* Stores the block keys of the blocks the pass completes and the tail of raw keys after them,
  * from the projection's raw-key head. False when the step has no batch for the indexer's
  * groups. */
-inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
+inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scratch) const {
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t nw = (c.heads + 1) * c.head_dim;
     const int64_t koff = c.heads * c.head_dim;   /* the raw-key head, after the query heads */
@@ -468,8 +478,10 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
                 brows(w.page, work), bpos,
                 kv_cache(kv_bk, layer));
     /* The scratch block keys: one launch row per step row, and a row that completes no block is
-     * skipped on its `spage` of -1. */
-    if (tree)
+     * skipped on its `spage` of -1. Only the region score reads them, so a step that scores no
+     * region (`scratch` false) builds none; qsa_work still stages their rows, which costs no
+     * launch. */
+    if (tree && scratch)
         RAD_ISSUE_N(c_, op_bkey2, T,
                     brows(w.sstage, T * c.ratio), RAD_W(w_kn),
                     brows(w.spage, T), sbpos, brows(w.skey, T));
@@ -498,13 +510,37 @@ inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batc
 }
 
 inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch,
-                             const int32_t* win_cu) const {
+                             const int32_t* win_cu, int use, bool first) const {
     if (!on()) return;
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t qw = c.heads * c.head_dim;
     const int64_t nw = (c.heads + 1) * c.head_dim;
 
+    /* What the attention reads this step (QsaUse). A tree verify's attention always reads a
+     * selection; anything else asked of a step that cannot give it is the full issue, which
+     * every reader accepts.
+     *
+     * kQsaOnce: the attention reads a selection on a step entirely at or below the exactness
+     * bound. A row there has at most `topk` complete blocks (a tree's region included), so
+     * qsa_select takes every one whose key is not 0 -- every block with a page and a score that
+     * is a number, whatever the number -- and what it writes (the pages in block order, the
+     * partial page, their count, seqused, a tree row's mask) is a function of the positions, the
+     * parents and the block table: the same bytes from every layer's scores. So the pass's first
+     * full-attention layer issues the selection exactly as it always did, and every later layer
+     * reads that one and issues none of its own: no query, no score, no scratch block keys. */
+    const bool tree_step = c.tree && tree_verify_step(batch);
+    const int64_t PR = c.plane_rows > 0 ? c.plane_rows : T;
+    if (use == kQsaUnread && tree_step) use = kQsaSelect;
+    if (use == kQsaOnce) use = first ? kQsaSelect : kQsaUnread;
+    if (use != kQsaUnread) use = kQsaSelect;
+    /* RADIANCE_DEBUG_QSA_EAGER: the issue sequence as it was, every layer its own. */
+    const bool eager = qsa_eager();
+    if (eager) first = true;
+
+    /* The projection always: its raw-key head is the block keys' and the tail's. */
     proj.step(c_, in, w.qk, T);
+    /* The query heads are read by the score alone. */
+    if (use == kQsaSelect) {
     /* One fused launch or `heads` + 1 unfused. The fused form takes the whole projection at its
      * row pitch and writes the query heads contiguous and rotated. `n_head` 0 is the k-only form:
      * no q_gate, q_w or q_out, and `gate_out` absent. `T <= qprep_rows` is a correctness bound
@@ -521,16 +557,22 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                         bcol_at(w.q,  0, qw, h * c.head_dim, c.head_dim, T));
         RAD_ISSUE_N(c_, op_rope, T, brows(w.q, T), rope_posmc(g, batch, T));
     }
+    }
 
-    /* The keys first: the selection below reads the blocks they complete. */
+    /* The keys first: the selection below reads the blocks they complete. The stateful half runs
+     * whatever the attention reads: later steps score the block keys and build on the tail. */
     const RadKVGroupBatch* bkb = kv_batch(batch, kv_bk);
     const RadKVGroupBatch* atb = kv_batch(batch, c.kv_attn);
-    if (!atb || !store_keys(c_, batch)) return;
+    if (!atb || !store_keys(c_, batch, use == kQsaSelect)) return;
 
     /* Score and select per query: both ops take `cu`, the block table stays per sequence, and `m`
      * is a query row, so each query of a prefill chunk selects from the shared history, as the
      * checkpoint does. */
     if (!c.emit_sel) return;
+    /* Nothing reads a selection of this layer's: the step is at or below the exactness bound and
+     * its attention reads the block table, or the selection the pass's first full-attention layer
+     * made (AttnGatedFP8::qsa_use). */
+    if (use == kQsaUnread) return;
 
     /* Narrow the score columns to the live history. Both kernels size their grid from the
      * operand's width (the live count is device data), so the full `max_ctx` width would make a
@@ -553,7 +595,6 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * block table and complete-block count are the step's, so each row is scored and selected as
      * in one pass over the step, and a row two windows share is written twice with the same
      * bytes. */
-    const int64_t PR = c.plane_rows > 0 ? c.plane_rows : T;
     if (T > PR && c.tree && tree_verify_step(batch)) {
         rad_step_fail(c_, "qsa: a tree verify beside a prefill wider than the score plane has no "
                           "windowed form");
@@ -583,12 +624,35 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
         }
         return;
     }
+    /* The decode half, whose rows a tree step's tree operands are for (a prefix of the step). */
+    int64_t D = 0, DT = 0;
+    batch_split(batch, &D, &DT);
+    /* The region bases, rb = ratio * nc: the positions' alone, so the pass's first full-attention
+     * layer makes them for every layer (nc is each layer's qsa_work's, the same numbers). */
+    auto region_bases = [&] {
+        for (int64_t o = 0; o < S; o += kRbRows)
+            RAD_ISSUE(c_, op_rb, brow_slice(w.nc, o, kRbRows, 1), brow_slice(w.rb, o, kRbRows, 1));
+    };
+    /* The tree form of the selection over the decode half's rows and sequences (the whole step's
+     * under the instrument above, as it was): the committed pages taken, and the region's
+     * visibility mask. */
+    const int64_t TR = eager ? T : DT, TS = eager ? S : D;
+    auto select_tree = [&](int64_t cols) {
+        RAD_ISSUE_N(c_, op_select, TR,
+                    bcol_at(w.score, 0, c.max_blocks, 0, cols, TR),
+                    praw2(atb->block_table, RAD_I32, TS, atb->block_table_pitch),
+                    brows(w.nc, TS), praw(batch->positions, RAD_I32, TR),
+                    praw(batch->cu_seqlens, RAD_I32, TS + 1),
+                    brows(w.sel, TR), brows(w.nsel, TR), brows(w.sequ, TR),
+                    praw(batch->spec_parent, RAD_I32, TR), brows(w.rscore, TR),
+                    brows(w.vmask, TR));
+    };
     RAD_ISSUE_N(c_, op_score, T,
                 brows(w.q, T), kv_cache(kv_bk, layer),
                 praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
                 praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S),
                 bcol_at(w.score, 0, c.max_blocks, 0, live, T));
-    if (c.tree && tree_verify_step(batch)) {
+    if (tree_step) {
         /* The region's blocks, scored per row over its own scratch keys (rows are one-row
          * sequences: `seqs` is max_tok), then the union ranked and the region's visibility masked.
          * `nc` of a tree sequence is its committed block count, which is also its region base
@@ -596,16 +660,19 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
         RAD_ISSUE_N(c_, op_score_region, T,
                     brows(w.q, T), brows(w.skey, T), brows(w.rtab, T), brows(w.rcu, T + 1),
                     brows(w.rnc, T), brows(w.rscore, T));
-        for (int64_t o = 0; o < S; o += kRbRows)
-            RAD_ISSUE(c_, op_rb, brow_slice(w.nc, o, kRbRows, 1), brow_slice(w.rb, o, kRbRows, 1));
-        RAD_ISSUE_N(c_, op_select, T,
-                    bcol_at(w.score, 0, c.max_blocks, 0, live, T),
-                    praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
-                    brows(w.nc, S), praw(batch->positions, RAD_I32, T),
-                    praw(batch->cu_seqlens, RAD_I32, S + 1),
-                    brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T),
-                    praw(batch->spec_parent, RAD_I32, T), brows(w.rscore, T),
-                    brows(w.vmask, T));
+        if (first) region_bases();
+        /* A mixed step's prefill half selects as on any other step, in the launch forms a wide
+         * step has (the tree form is one workgroup a row with no wide or split form); that launch
+         * covers the whole step, since a classic launch's rows are the step's by `cu`, and the
+         * tree launch then rewrites the decode half's rows. */
+        if (DT < T && !eager)
+            RAD_ISSUE_N(c_, op_select, T,
+                        bcol_at(w.score, 0, c.max_blocks, 0, live, T),
+                        praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch),
+                        brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1),
+                        brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+        select_tree(live);
     } else
     RAD_ISSUE_N(c_, op_select, T,
                 bcol_at(w.score, 0, c.max_blocks, 0, live, T),

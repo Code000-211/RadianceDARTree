@@ -9125,6 +9125,72 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
 }
 
+/* At or below the exactness bound (every complete block fits in topk) a row at the end of its
+ * sequence's context selects the head of the block table, in table order, then the partial page,
+ * and its seqused is the context's length, whatever the blocks score. The attention block issues
+ * such a row over the sequence's own table and length and the indexer selects nothing
+ * (AttnGatedFP8::qsa_use, docs/QSA.md "Below the bound"); this is the equality that rests on. */
+TEST(qsa_select_below_the_bound_is_the_block_table_and_the_context_length) {
+    const int64_t ratio = 4, topk = 8, nb = 12;
+    std::vector<int64_t> bt;
+    for (int64_t b = 0; b < nb; ++b) bt.push_back(100 + 7 * ((b * 5) % nb));   /* scattered pages */
+    uint32_t g = 12345;
+    for (int64_t p = 0; p <= topk * ratio + ratio - 2; ++p) {       /* every position up to the bound */
+        for (int variant = 0; variant < 3; ++variant) {
+            std::vector<float> sc((size_t)nb);
+            for (int64_t b = 0; b < nb; ++b) {
+                g = g * 1664525u + 1013904223u;
+                /* scores as they come: positive, equal ones, and exact zeros (a relu's) */
+                sc[(size_t)b] = variant == 0 ? (float)((g >> 20) % 7) * 0.25f
+                              : variant == 1 ? 0.0f : 3.5f;
+            }
+            const int64_t n = (p + 1) / ratio;                      /* complete blocks, this row's */
+            const Sel r = qsa_select_run(sc, nb, bt, n, { p }, topk, ratio);
+            REQUIRE_EQ(r.sel.size(), (size_t)(topk + 1));
+            const int64_t pages = (p + ratio) / ratio;              /* ceil((p + 1) / ratio) */
+            CHECK_EQ(r.nsel[0], pages);
+            CHECK_EQ(r.su[0], p + 1);
+            for (int64_t i = 0; i <= topk; ++i)
+                CHECK_EQ(r.sel[(size_t)i], i < pages ? bt[(size_t)i] : -1LL);
+        }
+    }
+}
+
+/* The rows of a chain verify or a prefill chunk at or below the bound select the same bytes
+ * whatever they score -- here over a plane of zeros against random scores: every row its own
+ * complete blocks in table order, the partial page, the count and seqused. The sparse attention of
+ * such a step (between 1025 and 2047 tokens of context a multi-row step is the sparse row a query)
+ * therefore reads, at every layer, the selection the pass's first full-attention layer issued
+ * (QsaIndexer::step, kQsaOnce). The last positions put a row on exactly `topk` blocks plus a
+ * partial page. */
+TEST(qsa_select_of_a_chains_rows_over_a_constant_plane_is_the_scored_selection_below_the_bound) {
+    const int64_t ratio = 4, topk = 8, nb = 16, M = 4;
+    std::vector<int64_t> bt;
+    for (int64_t b = 0; b < nb; ++b) bt.push_back(200 + 3 * ((b * 7) % nb));   /* scattered pages */
+    uint32_t g = 777;
+    int partial_at_topk = 0;
+    for (int64_t p0 = 0; p0 + M - 1 <= topk * ratio + ratio - 2; ++p0) {
+        std::vector<int64_t> pos;
+        for (int64_t j = 0; j < M; ++j) pos.push_back(p0 + j);
+        const int64_t nc = (pos.back() + 1) / ratio;                /* the sequence's, after the step */
+        std::vector<float> sc((size_t)(M * nb));
+        for (auto& v : sc) { g = g * 1664525u + 1013904223u; v = (float)((g >> 20) % 5) * 0.5f; }
+        const Sel scored = qsa_select_run(sc, nb, bt, nc, pos, topk, ratio);
+        const Sel flat = qsa_select_run(std::vector<float>((size_t)(M * (topk + 1)), 0.0f), topk + 1,
+                                        bt, nc, pos, topk, ratio);
+        REQUIRE_EQ(scored.sel.size(), (size_t)(M * (topk + 1)));
+        REQUIRE_EQ(flat.sel.size(), scored.sel.size());
+        CHECK(flat.sel == scored.sel);
+        CHECK(flat.nsel == scored.nsel);
+        CHECK(flat.su == scored.su);
+        for (int64_t j = 0; j < M; ++j) {
+            CHECK_EQ(flat.su[(size_t)j], pos[(size_t)j] + 1);
+            if ((pos[(size_t)j] + 1) / ratio == topk && flat.nsel[(size_t)j] == topk + 1) ++partial_at_topk;
+        }
+    }
+    CHECK(partial_at_topk > 0);
+}
+
 /* ================================================================== kv_resolve
  * The residency map of a streamed group: selected block ids in, ring slots out, a block copied in
  * from the host mirror when it is not resident (docs/OPS.md "kv_resolve",
@@ -10005,6 +10071,63 @@ TEST(qsa_tree_rows_equal_a_sequential_decode_below_the_bound) {
         for (uint64_t seed = 1; seed <= 3; ++seed)
             qsa_tree_scenario(seed * 10 + (uint64_t)base, base, 11, 40, tag++ % 2 ? 4 : 0, false, 4,
                               "below", nullptr);
+}
+
+/* At or below the bound the tree selection does not depend on the scores: qsa_select over other
+ * planes -- here the extreme, planes of zeros, and narrower than the block table -- writes the
+ * bytes it writes over a layer's two scores: the committed pages, their count, seqused and the
+ * mask of every row. So the selection the pass's first full-attention layer issues is every
+ * layer's, and the others issue none (QsaIndexer::step, kQsaOnce). topk 8 against at most 7
+ * complete blocks a row: below the bound. */
+TEST(qsa_tree_select_over_constant_planes_is_the_scored_selection_below_the_bound) {
+    int rows = 0;
+    for (int64_t base = 13; base <= 22; ++base)
+        for (uint64_t seed = 1; seed <= 4; ++seed) {
+            Rng r(seed * 31 + (uint64_t)base);
+            const int64_t topk = 8, R = 11, ring = 4 + 12;
+            QWorld w(ring, topk, seed % 2 ? 4 : 0);
+            const bool palette = seed % 2 == 0;
+            std::vector<std::vector<float>> pk;
+            for (int64_t t = 0; t < base; ++t) pk.push_back(qkey(r, w.n, palette));
+            qsa_chain(w, pk, {}, 0, false, nullptr);
+            std::vector<std::vector<float>> K, Q;
+            for (int64_t j = 0; j < R; ++j) {
+                K.push_back(qkey(r, w.n, palette));
+                std::vector<float> q;
+                for (int64_t h = 0; h < w.heads; ++h) { auto x = qkey(r, w.n, palette); q.insert(q.end(), x.begin(), x.end()); }
+                Q.push_back(q);
+            }
+            const std::vector<int64_t> par = qsa_rand_tree(r, R, seed & 1);
+            TreeOut o;
+            qsa_tree_step(w, K, Q, par, base, 0, nullptr, true, &o);
+
+            /* The same rows, selected over zeros: no state is read but the block table. */
+            std::vector<int64_t> depth((size_t)R, 0), pv, sv;
+            for (int64_t j = 0; j < R; ++j) {
+                depth[(size_t)j] = j ? depth[(size_t)par[(size_t)j]] + 1 : 0;
+                pv.push_back(base + depth[(size_t)j]);
+                sv.push_back(j ? par[(size_t)j] : -1);
+                REQUIRE((pv.back() + 1) / w.ratio <= topk);         /* the scenario is below the bound */
+            }
+            T pos(RAD_I32, { R }), cu(RAD_I32, { 2 }), sp(RAD_I32, { R }), nc(RAD_I32, { 1 });
+            pos.n(pv); cu.n({ 0, R }); sp.n(sv); nc.n({ base / w.ratio });
+            CHECK_EQ(o.nc[0], base / w.ratio);
+            T sc(RAD_F32, { R, topk + 1 }), rsc(RAD_F32, { R, w.RW });
+            sc.f(std::vector<float>((size_t)(R * (topk + 1)), 0.0f));
+            rsc.f(std::vector<float>((size_t)(R * w.RW), 0.0f));
+            T se(RAD_I32, { R, topk + 1 }), ns(RAD_I32, { R }), su(RAD_I32, { R }), vm(RAD_I64, { R });
+            A e; e.t(sc).t(w.tab).t(nc).t(pos).t(cu).t(se).t(ns).t(su).t(sp).t(rsc).t(vm)
+                  .i("M", R).i("blocks", w.nbmax).i("topk", topk).i("ratio", w.ratio).i("seqs", 1);
+            REQUIRE_EQ(run("qsa_select", e), RAD_OK);
+            for (int64_t j = 0; j < R; ++j, ++rows) {
+                CHECK_EQ(ns.iat(j), o.nsel[(size_t)j]);
+                CHECK_EQ(su.iat(j), o.su[(size_t)j]);
+                CHECK_EQ(vm.iat(j), o.vmask[(size_t)j]);
+                for (int64_t i = 0; i <= topk; ++i)
+                    CHECK_EQ(se.iat(j * (topk + 1) + i), o.sel[(size_t)j][(size_t)i]);
+            }
+        }
+    CHECK(rows > 400);
 }
 
 /* Above it (topk 3 of ~10 blocks) the sets differ per row; ties are common with the palette (no

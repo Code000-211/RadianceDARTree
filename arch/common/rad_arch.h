@@ -1487,6 +1487,30 @@ inline bool tree_path_step(const RadBatch* b) {
     return d > 0;
 }
 
+/* What a step's attention reads of the QSA selection (AttnGatedFP8::qsa_use), which decides what
+ * the indexer issues for the layer (QsaIndexer::step, docs/QSA.md "Below the bound"):
+ *
+ *   kQsaSelect  score and select, per layer: a step past the exactness bound, a streamed group,
+ *               and every step of a block that did not ask for the forms below;
+ *   kQsaUnread  nothing reads the selection: the step is entirely at or below the bound and its
+ *               attention is the dense one, or the sparse row over the sequence's own block table
+ *               (one row a sequence), which is what the selection would be. The indexer stores its
+ *               keys and tail and issues no query, score or select;
+ *   kQsaOnce    the attention reads a selection (the sparse row a query, or a tree verify's form)
+ *               on a step entirely at or below the bound: every complete block is taken whatever
+ *               it scores, so the selection (and a tree's mask and region bases) depends on the
+ *               positions, the parents and the block table alone and is the same bytes at every
+ *               layer. The first full-attention layer of the pass issues it as always; no later
+ *               layer issues a query, a score, a scratch block key or a select. */
+enum QsaUse : int { kQsaSelect = 0, kQsaUnread = 1, kQsaOnce = 2 };
+
+/* RADIANCE_DEBUG_QSA_EAGER: every step is kQsaSelect, the issue sequence before the forms above
+ * existed. An instrument for comparing the two (the text must not move); read once. */
+inline bool qsa_eager() {
+    static const bool on = std::getenv("RADIANCE_DEBUG_QSA_EAGER") != nullptr;
+    return on;
+}
+
 /* The step batch's entry for one declared KV group (built once per step by the core, spec §8). */
 inline const RadKVGroupBatch* kv_batch(const RadBatch* b, rad_kvgroup group) {
     for (int i = 0; i < b->n_kv_groups; ++i)

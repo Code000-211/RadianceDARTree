@@ -26095,7 +26095,7 @@ static void qsa_tree_exact_case(const Plugin& pl) {
     if (!w || !bk || !tl || !cm || !sc || !se) { ok(what, false, "a row is absent"); return; }
     const QRows R{ w, bk, tl, cm, sc, se, true };
     using namespace qsat;
-    int bad = 0, nodes = 0, above = 0, sc_bad = 0, mask_bad = 0;
+    int bad = 0, nodes = 0, above = 0, sc_bad = 0, mask_bad = 0, const_rows = 0, const_bad = 0;
     for (int64_t base = 33; base <= 40 && bad < 5; ++base)
         for (uint64_t seed = 1; seed <= 3 && bad < 5; ++seed)
             for (int64_t topk : { 3, 5, 40 }) {
@@ -26116,6 +26116,29 @@ static void qsa_tree_exact_case(const Plugin& pl) {
                 const std::vector<int64_t> par = qsa_rand_tree(g, Rn, seed & 1);
                 QTree T_(Rn, topk);
                 if (!qsa_tree(R, S, T_, K, Qr, par, base, 0, nullptr, true)) { ok(what, false, "tree step"); return; }
+                /* At or below the bound (topk 40 here: a row has at most 13 complete blocks) the
+                 * selection does not depend on the scores: over other planes -- the extreme, planes
+                 * of zeros, `topk` committed columns wide -- the kernel writes the bytes it wrote
+                 * over the two scores. So a pass issues it once, at its first full-attention layer,
+                 * for every layer (arch/common/rad_qsa.h, kQsaOnce). */
+                if (topk == 40) {
+                    QB zs(RAD_F32, { Rn, topk }), zr(RAD_F32, { Rn, RW });
+                    QB se2(RAD_I32, { Rn, topk + 1 }), ns2(RAD_I32, { Rn }), su2(RAD_I32, { Rn }), vm2(RAD_I64, { Rn });
+                    for (int64_t i = 0; i < Rn * (topk + 1); ++i) se2.seti(i, -9);
+                    if (qsa_launch(R.sel, { &zs, &S.tab, &T_.nc, &T_.pos, &T_.cu, &se2, &ns2, &su2, &T_.sp, &zr, &vm2 },
+                                   { PI("M", Rn), PI("blocks", nbmax), PI("topk", topk), PI("ratio", ratio),
+                                     PI("seqs", 1) }, R.dev) != RAD_OK) {
+                        ok(what, false, "the selection over constant planes");
+                        return;
+                    }
+                    for (int64_t x = 0; x < Rn; ++x, ++const_rows) {
+                        bool same = ns2.geti(x) == T_.ns.geti(x) && su2.geti(x) == T_.su.geti(x) &&
+                                    vm2.geti(x) == T_.vm.geti(x);
+                        for (int64_t i = 0; i <= topk && same; ++i)
+                            same = se2.geti(x * (topk + 1) + i) == T_.se.geti(x * (topk + 1) + i);
+                        if (!same) ++const_bad;
+                    }
+                }
                 std::vector<int64_t> depth((size_t)Rn, 0), pos;
                 for (int64_t j = 0; j < Rn; ++j) { depth[(size_t)j] = j ? depth[(size_t)par[(size_t)j]] + 1 : 0; pos.push_back(base + depth[(size_t)j]); }
                 const int64_t rb = base / ratio * ratio;
@@ -26163,9 +26186,10 @@ static void qsa_tree_exact_case(const Plugin& pl) {
                     }
                 }
             }
-    ok(what, bad == 0 && sc_bad == 0 && mask_bad == 0 && above > 100,
-       fmt("%d nodes, %d above the bound, %d visible-set mismatches, %d vmask mismatches, %d region scores off the chain's",
-           nodes, above, bad, mask_bad, sc_bad));
+    ok(what, bad == 0 && sc_bad == 0 && mask_bad == 0 && above > 100 && const_bad == 0 && const_rows > 100,
+       fmt("%d nodes, %d above the bound, %d visible-set mismatches, %d vmask mismatches, %d region scores off the chain's; "
+           "below it %d of %d rows select otherwise over constant planes",
+           nodes, above, bad, mask_bad, sc_bad, const_bad, const_rows));
 }
 
 /* Op by op on the same inputs, the device's integer outputs and copied key bytes against libref's:

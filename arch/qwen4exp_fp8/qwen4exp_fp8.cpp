@@ -1655,10 +1655,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 /* The tree form of the attention reads the selection's region mask and bases. */
                 lay.attn.qsa_vmask    = m.qsaw.vmask;
                 lay.attn.qsa_rb       = m.qsaw.rb;
-                /* The exactness bound, below which prefill issues the cheaper dense attention.
-                 * Decode ignores it and always takes the sparse path, keeping that path exercised
-                 * on every step. */
+                /* The exactness bound, at or below which a step of several rows a sequence
+                 * (prefill, a verify) issues the cheaper dense attention. Plain decode keeps the
+                 * sparse row's launch at every context, so that kernel is exercised on every
+                 * step. */
                 lay.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
+                /* At or below that bound the indexer scores nothing (AttnGatedFP8::qsa_use): a
+                 * row alone in its sequence is at the context's last position on this model (a
+                 * plain decode row; the core's and the card's `seqused` is its position + 1), and
+                 * pass_key() carries the exact bound's side of it. */
+                lay.attn.qsa_table_rows = true;
+                lay.attn.qsa_exact_host = true;
             }
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
             /* An attention-zero rank keeps no attention cache: its block is a fill of zeros
@@ -2001,6 +2008,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.mtp.attn.qsa_sequ     = m.qsaw.sequ;
             m.mtp.attn.qsa_topk     = m.qsacfg.topk;
             m.mtp.attn.qsa_exact_to = m.qsacfg.budget + m.qsacfg.ratio - 1;
+            /* As the trunk's layers: a round's row is the head's context's last position
+             * (ADV_ROUND), and the history pass is one row only where it commits one. */
+            m.mtp.attn.qsa_table_rows = true;
+            m.mtp.attn.qsa_exact_host = true;
             ts.qsa         = m.qsacfg;
             /* The head's tail is stored in committed order by its history pass: its layer keeps
              * the classic issue sequence (rad_qsa.h, Config::tree). */
@@ -2322,6 +2333,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         if (m.ple_layer == 0) m.ple.step(c, batch);
         for (int64_t p = 0; p < K; ++p) m.layers[0].hc_mix.read(c, T, r0(p), rn(p));
     }
+    /* The pass's first full-attention layer makes what every such layer shares of the indexer's
+     * step (QsaIndexer::step, `first`). */
+    bool qsa_first = true;
     for (int64_t li = 0; li < n; ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* The mixer finishes its output a piece at a time where its last stages are per row and
@@ -2330,7 +2344,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         MixAr ms{c, &l};
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
-        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
+        if (l.full) {
+            l.qsa.step(c, l.attn.w.h, batch, pcu, l.attn.qsa_use(batch), qsa_first);
+            qsa_first = false;
+            l.attn.step(c, batch, false, &pc);
+        }
         else        l.gdn.step(c, batch, false, &pc);
         auto ar_mix = [&](int64_t p) {
             if (l.full) l.attn.issue_ar(c, r0(p), rn(p));
@@ -2395,6 +2413,9 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
+    /* The pass's first full-attention layer makes what every such layer shares of the indexer's
+     * step (QsaIndexer::step, `first`). */
+    bool qsa_first = true;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
@@ -2405,7 +2426,11 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
         /* The indexer runs first, since the attention reads its selection. The block's input is
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
-        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
+        if (l.full) {
+            l.qsa.step(c, l.attn.w.h, batch, pcu, l.attn.qsa_use(batch), qsa_first);
+            qsa_first = false;
+            l.attn.step(c, batch);
+        }
         else        l.gdn.step(c, batch);
         if (l.cs_o >= 0) m.calib.tap(c, (size_t)l.cs_o, T);
         l.hc_mix.write(c, T, 0, T);
@@ -2542,23 +2567,37 @@ static void step(RadCtx* c, const RadBatch* batch) {
 uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
     if (batch->enc) return 1;
+    Model& m = g_model[rad_slot(c)];
+    /* Which side of the indexer's exactness bound the step is on by the attention group's exact
+     * host bound, by which the full-attention layers and the indexer decide whether the step
+     * needs scores (AttnGatedFP8::qsa_within, qsa_exact_host). The core's key holds only the
+     * rounded context bound, so the side is keyed here: one more recording of each pass kind as a
+     * request crosses the bound. `sel` is 2 within the bound and 0 past it or where it is
+     * unknown, which is where the blocks fall back to the rounded bound the core keys. */
+    uint64_t sel = 0;
+    if (used_max_h && batch->kv && m.kv_full && m.qsacfg.budget > 0 && m.qsacfg.ratio > 0)
+        for (int i = 0; i < batch->n_kv_groups; ++i)
+            if (batch->kv[i].group == m.kv_full) {
+                if (used_max_h[i] > 0 &&
+                    used_max_h[i] <= m.qsacfg.budget + m.qsacfg.ratio - 1) sel = 2;
+                break;
+            }
     /* A decode pass, a speculative verify or an MTP draft included, issues every launch at the
      * step's keyed context bound (RadArgs::kv_used_max_h), never the live maximum, so the core's
      * key holds its geometry. */
-    if (batch->phase == RAD_PHASE_DECODE) return 1;
+    if (batch->phase == RAD_PHASE_DECODE) return 1 | sel;
     /* Mixed batches split the query rows into decode and prefill subsets before attention, which
      * read the live maximum. The whole-batch host summary cannot key those subset geometries
      * exactly, nor a drafter's or a verify's rows inside a prefill pass. */
     if (batch->phase == RAD_PHASE_MIXED || batch->draft_pass != 0 || batch->n_spec > 0) return 0;
 
-    Model& m = g_model[rad_slot(c)];
     bool has_full_attention = false;
     for (const Layer& layer : m.layers) {
         if (!layer.full) continue;
         if (layer.attn.kv_block != 4) return 0;
         has_full_attention = true;
     }
-    if (!has_full_attention) return 1;
+    if (!has_full_attention) return 1 | sel;
     if (m.g.head_dim != 256 || (m.g.gqa() != 6 && m.g.gqa() != 12) || !m.kv_full ||
         !used_max_h || !batch->kv || batch->n_kv_groups <= 0)
         return 0;
@@ -2584,7 +2623,10 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     const int bq = nwarps * 16 / m.g.gqa();
     const int splits = rad_prefill_splits_for_live(bq, tile, q_len, total_q, num_seqs,
                                                     kv_heads, m.g.max_ctx, used, wgps);
-    return rad_prefill_grid_key(q_len, bq, splits, kv_heads, num_seqs, nwarps * 32);
+    const uint64_t grid = rad_prefill_grid_key(q_len, bq, splits, kv_heads, num_seqs, nwarps * 32);
+    /* 0 stays "unknown"; the side of the bound rides in a bit the grid key's mix does not leave
+     * meaningful, so two sides are two keys. */
+    return grid ? ((grid << 2) | 1 | sel) : 0;
 }
 
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {

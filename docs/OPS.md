@@ -587,7 +587,8 @@ alone: the architecture states `nsel` and `vmask` per row from QSA's selection (
 Two issue forms cover a QSA layer at a tree step. The sparse layer issues this op where it issues
 `attn_paged` over `qsa_sel`/`qsa_sequ`, with `sel` the committed pages below the region and `vmask`
 from the selection. A layer below `qsa_exact_to` (dense) issues it too, with `sel` every committed
-page below the region and `vmask` the row's visibility.
+page below the region and `vmask` the row's visibility; there the selection is one for the whole
+pass, made by the first full-attention layer without scores (docs/QSA.md, "Below the bound").
 
 | op | params | operands |
 |---|---|---|
