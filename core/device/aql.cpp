@@ -379,10 +379,12 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*);   /* the memory-f
  * step on the sampler/accept path. The runtime keeps a queue's scratch when told not to reclaim
  * it. The setting is read when the runtime loads, which something in the process may do before
  * init_devices runs, so this is a constructor of the first priority. A value the operator set
- * stays; RADIANCE_SCRATCH_RECLAIM=1 restores the runtime's default. */
+ * stays. OPT-IN for now (RADIANCE_SCRATCH_RECLAIM=0): resident scratch is not charged to the VRAM
+ * budget, and couple_verify's large private segment (1024 threads x ~17.8 KB) can then exhaust the
+ * last free MiBs and fault the queue (OUT_OF_RESOURCES) on coupled trees and occasionally chains. */
 __attribute__((constructor(101))) void keep_scratch() {
     const char* keep = std::getenv("RADIANCE_SCRATCH_RECLAIM");
-    if (!(keep && *keep == '1')) setenv("HSA_NO_SCRATCH_RECLAIM", "1", 0);
+    if (keep && *keep == '0') setenv("HSA_NO_SCRATCH_RECLAIM", "1", 0);
 }
 
 /* HIP's ordinals and HSA's agents are matched by PCI address rather than by position: the CPU's
