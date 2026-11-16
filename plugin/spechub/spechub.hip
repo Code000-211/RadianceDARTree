@@ -219,6 +219,19 @@ __device__ void block_verify(const RadMtpCoupleVerifyCall& c, int64_t row) {
     if (tid == 0) rad_mtp_block_write(c, row, sst, tau, g, y_s);
 }
 
+/* Above kMaxCand the LDS planes would overflow, so one thread runs the serial helper. The helper
+ * carries the block row's big private planes, which is why it is a kernel of its own: inside
+ * couple_verify it gave every launch of that kernel a 17.8 KB/lane scratch request (queue
+ * OUT_OF_RESOURCES on the first sampled tree). */
+__global__ void couple_verify_wide(const int32_t* idx, const float* values, const uint32_t* params,
+                                   const uint32_t* state, int32_t* token, int64_t M, int64_t n_cand,
+                                   int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2, int64_t ld3,
+                                   int64_t ld4) {
+    RadMtpCoupleVerifyCall c{ idx, values, params, state, token, M, n_cand, vocab,
+                              { ld0, ld1, ld2, ld3, ld4 } };
+    if (blockIdx.x < M && threadIdx.x == 0) rad_mtp_couple_verify_row<true>(c, blockIdx.x);
+}
+
 __global__ void couple_verify(const int32_t* idx, const float* values, const uint32_t* params,
                               const uint32_t* state, int32_t* token, int64_t M, int64_t n_cand,
                               int64_t vocab, int64_t ld0, int64_t ld1, int64_t ld2, int64_t ld3,
@@ -227,11 +240,7 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
                               { ld0, ld1, ld2, ld3, ld4 } };
     const int64_t row = blockIdx.x;
     if (row >= M) return;
-    /* Above kMaxCand the LDS planes would overflow, so one thread runs the serial helper. */
-    if (n_cand > kMaxCand) {
-        if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
-        return;
-    }
+    /* n_cand <= kMaxCand here: the launch sends wider planes to couple_verify_wide. */
     /* `weight` is P's unnormalised FP64 mass per live candidate and `mass` its residual (P-Q)+,
      * both indexed by the candidate's place in `lj`. */
     __shared__ double weight[kMaxCand], mass[kMaxCand], pq[8], sum;
@@ -262,7 +271,7 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
     /* A RheoSampling node (abi/rad_mtp_rrs.h): one thread runs the shared serial helper, which is
      * the host reference itself. Only rows of a --draft-siblings rheo tree take it. */
     if (s.scheme != 0) {
-        if (threadIdx.x == 0) rad_mtp_couple_verify_row(c, row);
+        if (threadIdx.x == 0) rad_mtp_couple_verify_row<false>(c, row);
         return;
     }
     couple_live(ids, val, c.n_cand, c.vocab, lj, &nl, &valid, &top);
@@ -668,6 +677,10 @@ int rad_mine_mtp_couple_verify_launch(const RadArgs* a, RadStream stream) {
     if (rc != RAD_OK) return rc;
     /* Separate pointer arguments let graph replay rebind each operand address independently: a
      * struct on the host would freeze the addresses it was built with. */
+    if (c.n_cand > kMaxCand)
+        return R4D_EMIT(stream, couple_verify_wide, dim3((unsigned)c.M), dim3(1), 0,
+                        c.idx, c.val, c.params, c.state, c.token, c.M, c.n_cand, c.vocab,
+                        c.ld[0], c.ld[1], c.ld[2], c.ld[3], c.ld[4]);
     return R4D_EMIT(stream, couple_verify, dim3((unsigned)c.M), dim3(kThreads), 0,
                     c.idx, c.val, c.params, c.state, c.token, c.M, c.n_cand, c.vocab,
                     c.ld[0], c.ld[1], c.ld[2], c.ld[3], c.ld[4]);

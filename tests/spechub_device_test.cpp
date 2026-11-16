@@ -13,6 +13,7 @@
  *   flock gpu.lock build/tests/spechub_device_test
  */
 #include "rad_test.h"
+#include "device/aql.h"
 
 #include "rad_abi.h"
 #include "rad_device.h"
@@ -96,6 +97,40 @@ RadMtpCoupleDraw make_draw(uint64_t seed, uint64_t base, uint64_t seq, int card,
 }
 
 }  /* namespace */
+
+/* The queue's scratch is sized by a kernel's private segment times every lane it may run: couple_verify
+ * once carried the block row's planes (17.8 KB a lane, with a workgroup of 128 lanes of which one
+ * works) and the first sampled tree (>= 5 rows) faulted the queue with OUT_OF_RESOURCES once
+ * HSA_NO_SCRATCH_RECLAIM kept the scratch resident. Pin the code object: the workgroup kernel keeps
+ * a small private segment (the serial helper that needs the big one is a kernel of its own). Runs
+ * without a card: it reads the plugin's own code object. */
+TEST(the_tree_verify_kernel_asks_for_little_scratch) {
+    FILE* f = std::fopen(RAD_SPECHUB_LIB, "rb");
+    if (!f) { fprintf(stderr, "  SKIP: %s not readable\n", RAD_SPECHUB_LIB); return; }
+    std::vector<unsigned char> img;
+    unsigned char buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) img.insert(img.end(), buf, buf + n);
+    std::fclose(f);
+    static const char kMagic[] = "__CLANG_OFFLOAD_BUNDLE__";
+    auto at = std::search(img.begin(), img.end(), kMagic, kMagic + sizeof kMagic - 1);
+    if (at == img.end()) { fprintf(stderr, "  SKIP: no device code in the plugin\n"); return; }
+    const void* co = nullptr;
+    size_t cosz = 0;
+    std::string why;
+    REQUIRE(rad::aql::bundle_code_object(&*at, { "hipv4-amdgcn-amd-amdhsa--gfx1201", "hip-amdgcn-amd-amdhsa--gfx1201",
+                                                 "amdgcn-amd-amdhsa--gfx1201" }, &co, &cosz, &why));
+    std::vector<rad::aql::KernelMeta> ks;
+    REQUIRE(rad::aql::code_object_kernels(co, cosz, &ks, &why));
+    int seen = 0;
+    for (const auto& k : ks) {
+        if (k.symbol.find("couple_verify") == std::string::npos || k.symbol.find("wide") != std::string::npos)
+            continue;
+        ++seen;
+        CHECK(k.private_size <= 256u);
+        fprintf(stderr, "  couple_verify private segment %u bytes\n", (unsigned)k.private_size);
+    }
+    CHECK_EQ(seen, 1);
+}
 
 TEST(the_device_rows_of_the_trees_coupled_ops_agree_with_the_host_rows) {
     RadDeviceProps dp{};

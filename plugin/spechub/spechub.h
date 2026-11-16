@@ -212,6 +212,7 @@ static inline RAD_SPECHUB_HD void rad_mtp_block_verify_row(const RadMtpCoupleVer
 }
 
 /* One verify row, after sample_pick. A row without a valid bound state keeps the ordinary token. */
+template <bool kBlock = true>
 static inline RAD_SPECHUB_HD void rad_mtp_couple_verify_row(const RadMtpCoupleVerifyCall& c,
                                                             int64_t row) {
     const auto& s = *reinterpret_cast<const RadMtpCoupleState*>(c.state + row * c.ld[3]);
@@ -220,7 +221,12 @@ static inline RAD_SPECHUB_HD void rad_mtp_couple_verify_row(const RadMtpCoupleVe
     if ((p.flags & RAD_SP_GREEDY) || s.draw.seed != p.seed || s.pos != p.pos ||
         !rad_mtp_couple_state_valid(s, c.vocab))
         return;
-    if (s.blk >= 1) { rad_mtp_block_verify_row(c, row); return; }
+    if (s.blk >= 1) {
+        /* kBlock = false: the caller has decided block rows already; the block row's planes are
+         * big private arrays and would put the whole kernel's scratch request up. */
+        if constexpr (kBlock) rad_mtp_block_verify_row(c, row);
+        return;
+    }
     int32_t out = -1;
     /* A RheoSampling node (--draft-siblings rheo): the greedy multi-draft verifier, any nkids. */
     if (s.scheme != 0) {
