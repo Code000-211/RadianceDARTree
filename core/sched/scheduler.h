@@ -17,6 +17,7 @@
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
+#include "suffix.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -87,6 +88,8 @@ struct SchedReq {
     void drafter_reset() {
         n_draft      = 0;
         draft_next   = 0;
+        draft_suffix = false;
+        suffix_hot   = false;
         chain_next   = false;
         draft_lead   = -1;
         dyn          = DynTree{};
@@ -101,6 +104,13 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    /* --draft-suffix (suffix.h): the proposal the step being planned carries is a suffix chain
+     * (StepEntry::suffix); and whether the last commit left the sequence's history ending in a
+     * recurring pattern, which keeps the next step from being issued ahead (it is built after the
+     * commit, where the lookup can run). */
+    bool        draft_suffix = false;
+    bool        suffix_hot = false;
+    SuffixIndex suffix_ix;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -700,6 +710,9 @@ private:
     int draft_ngram(SchedReq& s, int depth, int* match = nullptr) const;
     /* The same proposal into `out` (RAD_SCHED_MAX_SPEC entries) rather than s.draft. */
     int draft_ngram_into(SchedReq& s, int depth, int32_t* out, int* match) const;
+    /* --draft-suffix: the suffix proposal for `s`'s next step, over its committed history, into
+     * `out` (RAD_SCHED_MAX_SPEC entries). Returns its length, 0 for none. */
+    int suffix_propose(SchedReq& s, int32_t* out, int* match = nullptr);
     /* --draft-ngram-leaves: graft the lookup's proposal onto the host-built tree in s.draft. */
     void graft_ngram(SchedReq& s, int cap, const int32_t* parents);
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its

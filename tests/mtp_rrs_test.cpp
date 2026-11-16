@@ -1527,6 +1527,77 @@ TEST(a_lookup_node_under_a_coupled_row_stays_exact_only_while_hidden_from_it) {
     CHECK(worst > 8.0);
 }
 
+/* ------------------------------------------------------------------ a SuffixDecoding step
+ *
+ * --draft-suffix replaces the head's chain of a step by the sequence's own history (suffix.h): a
+ * chain of up to 8 rows chosen from the committed text alone. The head had drafted (and DRAWN, under
+ * --draft-coupling) a chain for the same positions, so the coupled states of that draft are still
+ * in the sampler when the step is built. The step is exact because the scheduler marks it
+ * draft_extra = 0 (no model node), which hides every proposed row from the coupled child list: no
+ * row binds a state, each row's emitted token is the target's plain draw and is followed iff it
+ * equals the proposal. Visible to the coupled rows, a proposal that happens to equal the head's
+ * unused draw x would select the row's coupling by the VALUE of that draw, which is biased
+ * (DESIGN-ngram.md point 3). Same statistic as the graft's: the first three tokens' joint law over
+ * 400000 steps, a negative control that must fail. */
+static void suffix_chain(Tree* t, int s, int how, int len, double noise) {
+    const int orig[4] = { 0, t->tok[1], t->tok[2], t->tok[3] };
+    uint64_t h = t->hash[0];
+    for (int i = 0; i < len; ++i) {
+        int tk = argmax_tok(law_at(h, noise));           /* a history that repeats the likely text */
+        if (how == 1 && i < 3) tk = orig[i + 1];         /* the head's own draw, by chance of the text */
+        if (H((uint64_t)s * 977 + (uint64_t)i * 31 + 5) % 4 == 0) tk = (tk + 1) % V;   /* a damaged copy */
+        t->tok[i + 1] = tk;
+        t->par[i + 1] = i;
+        h = child_hash(h, tk);
+        t->hash[i + 1] = h;
+    }
+    t->n = len;
+    t->n_model = 0;                                      /* Request::draft_extra = 0 */
+}
+
+TEST(a_suffix_chain_beside_the_heads_stale_coupled_states_emits_the_target_law) {
+    for (int how = 0; how < 2; ++how) {
+        for (int len : { 3, 6, 8 }) {
+            const std::function<void(Tree*, int)> h = [how, len](Tree* t, int s) { suffix_chain(t, s, how, len, 1.0); };
+            g_extras_visible = false;
+            const Result ok = run_kind(CHAIN, 400000, 1.0, &h);
+            std::printf("  suffix chain, rows %d, how %d, hidden: z=%.2f first=%.2f acc=%.2f\n", len, how,
+                        ok.z, ok.first_z, ok.mean_acc);
+            CHECK(ok.z < 4.5);
+            CHECK(ok.first_z < 4.5);
+        }
+    }
+    /* the negative control: the same chains with the rows visible to the coupled verify */
+    double worst = 0;
+    g_extras_visible = true;
+    for (int how = 0; how < 2; ++how) {
+        const std::function<void(Tree*, int)> h = [how](Tree* t, int s) { suffix_chain(t, s, how, 6, 1.0); };
+        const Result r = run_kind(CHAIN, 400000, 1.0, &h);
+        std::printf("  suffix chain visible to the coupled rows (known wrong), how %d: z=%.1f first=%.1f\n",
+                    how, r.z, r.first_z);
+        worst = std::max(worst, std::max(r.z, r.first_z));
+    }
+    g_extras_visible = false;
+    CHECK(worst > 8.0);
+}
+
+/* A suffix step is the plain rule: the row's draw is the target's and the proposal is followed iff
+ * it equals it. A chain whose first row is never the likeliest token still emits the target's law. */
+TEST(a_suffix_chain_with_a_wrong_first_row_stays_exact) {
+    const std::function<void(Tree*, int)> wrong = [](Tree* t, int s) {
+        suffix_chain(t, s, 0, 6, 1.0);
+        const Law L0 = law_at(t->hash[0], 1.0);
+        t->tok[1] = (argmax_tok(L0) + 1 + (int)(H((uint64_t)s) % (V - 1))) % V;   /* never the likeliest, any other */
+        t->hash[1] = child_hash(t->hash[0], t->tok[1]);
+        for (int i = 1; i < t->n; ++i) t->hash[i + 1] = child_hash(t->hash[i], t->tok[i + 1]);
+    };
+    g_extras_visible = false;
+    const Result r = run_kind(CHAIN, 300000, 1.0, &wrong);
+    std::printf("  suffix chain, first row wrong: z=%.2f first=%.2f\n", r.z, r.first_z);
+    CHECK(r.z < 4.5);
+    CHECK(r.first_z < 4.5);
+}
+
 /* ------------------------------------------------------------------ the draft law's recipe
  *
  * rad_mtp_couple_build_law: the draft temperature (dscale = 1 / T_draft) and the request's top-k /

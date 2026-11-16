@@ -1131,6 +1131,22 @@ struct Config {
      * --draft-coupling. */
     int         draft_ngram_leaves = 0;
     int         draft_ngram_min_match = 8;
+    /* --draft-suffix on (core/sched/suffix.h, DESIGN-suffix.md): SuffixDecoding as a step SELECTOR on
+     * a serial head's chain. On a host-built step, when the sequence's own history (prompt ++
+     * output) ends in a pattern of at least `draft_suffix_min_match` tokens that occurred before,
+     * the step verifies that earlier occurrence's continuation (a chain of at most
+     * `draft_suffix_max` rows (7: the delta-net fold's register window serves 8 query rows, so a
+     * Flash-Next verify window past 7 drafts leaves its kernels unsupported), cut where the path
+     * score falls under `draft_suffix_min_score`) in
+     * place of the head's draft. Lossless: the proposal's rows are never coupled. Off (default) is
+     * the engine as it was, bit for bit. */
+    bool        draft_suffix = false;
+    int         draft_suffix_min_match = 6;
+    int         draft_suffix_max = 7;
+    float       draft_suffix_min_score = 0.3f;
+    /* The head's own rounds when --draft-suffix raised `n_spec` (the verify window) past them; 0 =
+     * `n_spec` (set by the engine, not a flag). */
+    int         n_spec_head = 0;
     /* --draft-siblings gumbel|rheo, --draft-rheo-m N: the sibling scheme of a coupled draft tree.
      * gumbel (default): Gumbel-top-k without replacement, verified by recursive rejection
      * sampling. rheo: the top-N tokens of the node's law Q plus ONE sampled from the tail law,

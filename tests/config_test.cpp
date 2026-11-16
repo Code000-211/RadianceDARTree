@@ -556,6 +556,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-tree-rows", { "1" } }, { "--draft-tree-chain", { "2" } },
         { "--draft-tree-exact", { "on" } },
         { "--draft-ngram-leaves", { "2" } }, { "--draft-ngram-min-match", { "6" } },
+        { "--draft-suffix", { "on" } }, { "--draft-suffix-min-match", { "5" } },
+        { "--draft-suffix-max", { "6" } }, { "--draft-suffix-min-score", { "0.4" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -1832,6 +1834,29 @@ TEST(the_draft_ngram_flags_default_off_and_parse) {
     CHECK_EQ(c.draft_ngram_min_match, 5);
     for (const char* bad : { "-1", "17", "many", "" }) CHECK_EQ(parse_fresh({ "--draft-ngram-leaves", bad }), RAD_E_INVAL);
     for (const char* bad : { "0", "65", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-ngram-min-match", bad }), RAD_E_INVAL);
+}
+
+/* The SuffixDecoding selector: off by default (bit-identical engine), min match 1..12, rows 1..32,
+ * a score in [0, 1]. */
+TEST(the_draft_suffix_flags_default_off_and_parse) {
+    Config c;
+    CHECK(!c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 6);
+    CHECK_EQ(c.draft_suffix_max, 7);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.3, 1e-6);
+    CHECK_EQ(c.n_spec_head, 0);
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-suffix-min-match", "5", "--draft-suffix-max", "6",
+                     "--draft-suffix-min-score", "0.45" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 5);
+    CHECK_EQ(c.draft_suffix_max, 6);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.45, 1e-6);
+    CHECK_EQ(parse({ "--draft-suffix", "off" }, &c), RAD_OK);
+    CHECK(!c.draft_suffix);
+    for (const char* bad : { "yes", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "13", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-match", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "33", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-max", bad }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-score", bad }), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

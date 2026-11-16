@@ -207,6 +207,10 @@ void Metrics::sample(const SchedMetrics& m) {
     c_lookup_held_.advance_to(m.lookup_held);
     c_lookup_held_drafts_.advance_to(m.lookup_held_drafts);
     c_lookup_held_hits_.advance_to(m.lookup_held_hits);
+    c_suffix_steps_.advance_to(m.suffix_steps);
+    c_suffix_rows_.advance_to(m.suffix_rows);
+    c_suffix_accepted_.advance_to(m.suffix_accepted);
+    c_suffix_held_ahead_.advance_to(m.suffix_held_ahead);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_prefix_queries_.advance_to(m.prefix_queries);
@@ -486,6 +490,16 @@ std::string Metrics::render() const {
               "verify rows at the measured step cost.", L, c_lookup_held_.get());
     w.counter("radiance:lookup_held_drafts_total",
               "Drafts in the held-back proposals.", L, c_lookup_held_drafts_.get());
+    w.counter("radiance:suffix_steps_total",
+              "Verify steps that carried a --draft-suffix chain of the sequence's own history.",
+              L, c_suffix_steps_.get());
+    w.counter("radiance:suffix_rows_total",
+              "Draft rows those suffix steps verified.", L, c_suffix_rows_.get());
+    w.counter("radiance:suffix_accepted_total",
+              "Of those rows, the drafts accepted.", L, c_suffix_accepted_.get());
+    w.counter("radiance:suffix_held_ahead_total",
+              "Decode steps not issued ahead of the previous commit because the sequence's "
+              "history ended in a recurring pattern (--draft-suffix).", L, c_suffix_held_ahead_.get());
     w.counter("radiance:lookup_held_hits_total",
               "Of the held-back proposals scored against the text that followed, the drafts "
               "that came true: what verifying them would have accepted.",

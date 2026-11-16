@@ -9156,3 +9156,230 @@ TEST(a_graft_mark_does_not_outlive_its_verify) {
     CHECK_EQ(f.sch.find(a)->draft_extra, -1);
     if (f.sch.step()) CHECK_EQ(f.sch.find(a)->draft_extra, -1);
 }
+
+/* ================================================================== --draft-suffix (SuffixDecoding as a step selector) */
+
+namespace {
+/* A serial MTP head that drafts 3 rounds under a verify window of 8 rows (--draft-suffix on). */
+void suffix_setup(Fixture& f, int head = 3, int mx = 8, int min_match = 4, bool on = true) {
+    f.build(4096, 64);
+    f.cfg.n_spec = std::max(head, mx);
+    f.cfg.n_spec_head = on ? head : 0;
+    f.cfg.draft_suffix = on;
+    f.cfg.draft_suffix_min_match = min_match;
+    f.cfg.draft_suffix_max = mx;
+    f.cfg.draft_suffix_min_score = 0.3f;
+    if (!on) f.cfg.n_spec = head;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = f.cfg.n_spec;
+}
+const int32_t kHeadDraft[3] = { 21, 22, 23 };
+}  // namespace
+
+TEST(the_suffix_index_proposes_the_latest_recurrence_and_cuts_by_path_score) {
+    using namespace rad;
+    /* (1 2 3) was followed by 10, 11, 10: 10 two times in three. The longest recurring suffix of the
+     * history, (2 3 10 1 2 3), was followed by 11 at its earlier occurrence, which is what is
+     * proposed, at the frequency of 11 after (1 2 3): 1/3. */
+    const std::vector<int32_t> v = { 1, 2, 3, 10, 1, 2, 3, 11, 1, 2, 3, 10, 1, 2, 3 };
+    TokenSeq s;
+    s.a = v.data(); s.na = (int64_t)v.size();
+    SuffixIndex ix;
+    int32_t out[16];
+    SuffixIndex::Out o = ix.propose(s, 7, 3, 8, 0.3f, out);
+    CHECK(o.n >= 1);
+    CHECK_EQ(out[0], 11);
+    CHECK(o.match >= 6);
+    CHECK_NEAR(o.score, 1.0 / 3.0, 1e-4);
+    /* a stricter score keeps nothing: the first token's own path score is 1/3 */
+    SuffixIndex ix2;
+    CHECK_EQ(ix2.propose(s, 7, 3, 8, 0.4f, out).n, 0);
+    /* a context that never occurred before proposes nothing */
+    const std::vector<int32_t> u = { 5, 6, 7, 8, 9, 40, 41, 42 };
+    TokenSeq su;
+    su.a = u.data(); su.na = (int64_t)u.size();
+    SuffixIndex ix3;
+    CHECK_EQ(ix3.propose(su, 8, 3, 8, 0.3f, out).n, 0);
+    /* it is incremental: the sequence grows and the proposal follows */
+    std::vector<int32_t> w = { 5, 6, 7, 8, 9, 40, 41, 42, 5, 6, 7 };
+    TokenSeq sw;
+    sw.a = w.data(); sw.na = (int64_t)w.size();
+    const SuffixIndex::Out ow = ix3.propose(sw, 8, 3, 8, 0.3f, out);
+    CHECK(ow.n >= 3);
+    CHECK_EQ(out[0], 8); CHECK_EQ(out[1], 9); CHECK_EQ(out[2], 40);
+    CHECK_NEAR(ow.score, 1.0, 1e-4);   /* a pattern seen once, followed once: D = 1 */
+}
+
+TEST(a_recurring_history_selects_a_suffix_step_in_place_of_the_heads_draft) {
+    Fixture f;
+    suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    /* the verify window is the suffix's: 1 + 8 rows, the head's 3 drafts replaced */
+    CHECK_EQ(b->n_spec, 8);
+    CHECK_EQ(b->n_tok, 9);
+    const StepEntry& e = f.sch.plan().e[0];
+    CHECK(e.suffix);
+    CHECK(e.ngram);
+    CHECK_EQ(e.n_spec, 8);
+    CHECK(e.draft_parent == nullptr);
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    /* no coupled row: the request marks zero model nodes, so the sampler's child list is empty */
+    CHECK_EQ(rq->draft_extra, 0);
+    const int32_t want[8] = { 101, 102, 103, 104, 105, 106, 107, 100 };
+    for (int j = 0; j < 8; ++j) CHECK_EQ(rq->draft[j], want[j]);
+    commit_one(f, 5, 900);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.suffix_steps, (int64_t)1);
+    CHECK_EQ(m.suffix_rows, (int64_t)8);
+    CHECK_EQ(m.suffix_accepted, (int64_t)5);
+    rq = f.sch.find(a);
+    REQUIRE(rq->output.size() >= 7);
+    for (int j = 0; j < 5; ++j) CHECK_EQ(rq->output[rq->output.size() - 6 + (size_t)j], want[j]);
+    CHECK_EQ(rq->output.back(), 900);
+    CHECK_EQ(rq->draft_extra, -1);   /* nothing carries over */
+}
+
+TEST(without_a_recurrence_or_with_the_flag_off_the_heads_draft_is_verified_as_before) {
+    {   /* no recurrence in a prompt of distinct tokens */
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(7);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(b->n_spec, 3);
+        CHECK(!f.sch.plan().e[0].suffix);
+        CHECK(!f.sch.plan().e[0].ngram);
+        CHECK_EQ(f.sch.find(a)->draft_extra, -1);
+        for (int j = 0; j < 3; ++j) CHECK_EQ(f.sch.find(a)->draft[j], kHeadDraft[j]);
+    }
+    {   /* the flag off: a recurring history changes nothing */
+        Fixture f;
+        suffix_setup(f, 3, 8, 4, /*on=*/false);
+        CHECK_OK(f.start());
+        const uint64_t a = ngram_cycle_request(f);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(100);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(b->n_spec, 3);
+        CHECK(!f.sch.plan().e[0].suffix);
+        CHECK_EQ(f.sch.find(a)->draft_extra, -1);
+        commit_one(f, 3, 900);
+        CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)0);
+        CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+    }
+}
+
+/* The head runs only its own 3 rounds after a suffix step, but its history pass covers every
+ * position the step verified (all 1 + 8), and the watermark moves to the commit, so the next
+ * step's pass owes only its own rows: the head's cache has no hole behind a suffix step. */
+TEST(the_head_catches_up_on_every_position_a_suffix_step_verified) {
+    Fixture f;
+    suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_spec, 8);
+    const int32_t ctx0 = f.sch.plan().e[0].ctx_len;
+
+    int rounds = 8;   /* the engine passes the declared depth; the scheduler clamps it to the head's */
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 3);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK(hb->draft_pass < 0);
+    CHECK_EQ(hb->n_tok, 9);                  /* the bonus row and all 8 proposals' positions */
+    CHECK_EQ(hb->n_draft_out, 1);
+    CHECK_EQ(hb->draft_out_ids[0], 8);
+    CHECK_EQ(hb->ctx_lens[0], ctx0);         /* from the step's first position */
+    CHECK(f.sch.serial_batch(1, 1) == nullptr);
+    for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
+
+    /* the verify took all 8: the watermark is the commit */
+    commit_one(f, 8, 900);
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    const RadBatch* b2 = f.sch.step();           /* 900 broke the cycle: the head's step */
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(b2->n_spec, 3);
+    CHECK(!f.sch.plan().e[0].suffix);
+    int rounds2 = 8;
+    CHECK_EQ(f.sch.serial_begin(&rounds2, rows, 4), 1);
+    CHECK_EQ(rounds2, 3);
+    const RadBatch* hb2 = f.sch.serial_batch(0, 1);
+    REQUIRE(hb2 != nullptr);
+    CHECK_EQ(hb2->n_tok, 4);                 /* its own 1 + 3 rows: nothing left owed */
+    CHECK_EQ(hb2->ctx_lens[0], ctx0 + 9);
+    f.sch.serial_end(rounds2);
+}
+
+/* A step issued ahead is made on the card from the head's drafts, before the previous commit: the
+ * lookup cannot run there. A sequence whose history ended in a recurring pattern at the last commit
+ * is not issued ahead (its next step is built after the commit, where the suffix selector reads the
+ * committed end); one whose history does not recur is, as before. */
+TEST(a_sequence_in_a_recurring_pattern_is_not_issued_ahead) {
+    for (int hot = 0; hot < 2; ++hot) {
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = hot ? ngram_cycle_request(f) : f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(hot ? 100 : 7);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.expect_draft(a, hot ? 8 : 3);
+        const RadBatch* nb = f.sch.step_next();
+        if (hot) {
+            CHECK(nb == nullptr);
+            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)1);
+        } else {
+            CHECK(nb != nullptr);
+            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+        }
+    }
+}
+
+/* Selection is a function of the committed text alone: the same history gives the same step whatever
+ * the head drafted, and a request that may not speculate (a constraining grammar) is never given a
+ * suffix chain. */
+TEST(the_suffix_choice_reads_the_history_only_and_respects_the_speculation_gate) {
+    for (int variant = 0; variant < 3; ++variant) {
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = ngram_cycle_request(f);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(100);
+        if (variant == 2) f.sch.find(a)->may_speculate = false;
+        const int32_t other[3] = { 77, 78, 79 };
+        CHECK_OK(f.sch.set_draft(a, variant == 1 ? other : kHeadDraft, 3));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        if (variant == 2) {
+            CHECK_EQ(b->n_spec, 0);
+            CHECK(!f.sch.plan().e[0].suffix);
+        } else {
+            CHECK_EQ(b->n_spec, 8);
+            CHECK(f.sch.plan().e[0].suffix);
+            CHECK_EQ(f.sch.find(a)->draft[0], 101);
+        }
+    }
+}

@@ -578,7 +578,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
     if (mtp_couple_) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
             const StepEntry& e = plan.e[i];
-            if (so.first_row[i] < 0 || e.n_spec <= 0 || e.card < 0 ||
+            if (so.first_row[i] < 0 || e.n_spec <= 0 || e.card < 0 || e.suffix ||
                 (size_t)e.card >= couple_by_card_.size())
                 continue;
             const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
@@ -724,7 +724,8 @@ void Engine::couple_calibrate(const StepOut& so) {
     int rows = 0, acc_sum = 0;
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const StepEntry& e = plan.e[i];
-        if (so.first_row[i] < 0 || e.n_spec <= 0 || e.card < 0 || (size_t)e.card >= couple_by_card_.size())
+        if (so.first_row[i] < 0 || e.n_spec <= 0 || e.card < 0 || e.suffix ||
+            (size_t)e.card >= couple_by_card_.size())
             continue;
         const RadMtpCoupleDraw& d = couple_by_card_[(size_t)e.card];
         if (d.seq != e.seq || d.mode != 1) continue;

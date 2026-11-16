@@ -162,6 +162,7 @@ private:
     Gauge   g_tree_active_[MAX_DRAFT_POS + 1];
     Gauge   g_tree_accdepth_[MAX_DRAFT_POS + 1];
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
+    Counter c_suffix_steps_, c_suffix_rows_, c_suffix_accepted_, c_suffix_held_ahead_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_queries_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;

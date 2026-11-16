@@ -173,6 +173,13 @@ struct SchedMetrics {
     int64_t ngram_graft_verifies = 0;
     int64_t ngram_graft_hits = 0;
     int64_t ngram_graft_hit_nodes = 0;
+    /* --draft-suffix (suffix.h): verifies that carried a suffix chain, the rows they carried and the
+     * drafts accepted; decode steps not issued ahead because the sequence was in a recurring
+     * pattern (where the lookup could run after the commit instead). */
+    int64_t suffix_steps = 0;
+    int64_t suffix_rows = 0;
+    int64_t suffix_accepted = 0;
+    int64_t suffix_held_ahead = 0;
     int64_t tree_active_cut = 0;
     int64_t tree_active_hist [RAD_METRICS_MAX_SPEC + 1] = {};
     int64_t tree_accdepth_hist[RAD_METRICS_MAX_SPEC + 1] = {};

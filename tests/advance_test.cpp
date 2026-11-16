@@ -1364,6 +1364,68 @@ TEST(an_inert_node_is_never_accepted_whatever_the_target_picks) {
     CHECK(deep > 200);
 }
 
+/* ================================================================== a suffix step (--draft-suffix) */
+
+/* A suffix step is a host-built verify of up to 8 proposals behind the bonus token while the head
+ * drafts 3 rounds. The card's side of it: the acceptance walks all 8 drafts (a prefix of them, up to
+ * the end-of-generation cut), the head's history pass covers all 9 positions with round 1 on the
+ * last committed one and the rejected rows repeating it, and the 3 rounds publish the next verify's
+ * 3 proposals into tok[1..3] without touching what lies past them. */
+TEST(a_host_built_nine_row_verify_is_accepted_caught_up_and_followed_by_three_rounds) {
+    for (int acc_want = 0; acc_want <= 8; ++acc_want) {
+        const int ctx = 200, n = 9;
+        /* the verify: the bonus token and 8 proposals, a host row (no device row) */
+        Slab a(ADV_ACCEPT);
+        a.row(0, false, 0, n, ctx, /*card=*/3, /*rtok=*/0, /*rout=*/0, /*aux=*/8);
+        for (int j = 0; j < n; ++j) a.w[Slab::TOK + j] = 500 + j;
+        for (int j = 0; j <= 8; ++j) a.src[j] = j < acc_want ? 500 + j + 1 : 9000 + j;
+        a.run();
+        const StepSlot& S = a.st[3];
+        CHECK_EQ(S.acc, acc_want);
+        CHECK_EQ(S.tok[0], 9000 + acc_want);
+        CHECK_EQ(S.head, ctx + acc_want);
+        CHECK_EQ(S.ctx, ctx + acc_want + 1);
+        CHECK_EQ(S.n_acc, acc_want + 1);
+        CHECK_EQ(S.npath, 0);
+
+        /* the head's history pass over all nine rows: positions up to the last committed one, the
+         * rest repeating it, so no rejected proposal's hidden state reaches the head's cache */
+        Slab h(ADV_HIST);
+        h.st[3] = S;
+        h.row(0, true, 0, n, ctx, 3, 0, 0, /*aux=*/0);
+        for (int j = 0; j < n; ++j) h.src[j] = a.src[j];
+        h.run();
+        for (int j = 0; j < n; ++j) {
+            const int up = std::min(j, acc_want);
+            CHECK_EQ(h.w[Slab::POS + j], ctx + up);
+            CHECK_EQ(h.slot(0, j), ctx + up);
+            CHECK_EQ(h.w[Slab::OUT + j], up);
+        }
+        CHECK_EQ(h.used(0, 0), ctx + acc_want + 1);
+
+        /* the head's own rounds: 3 of the 8 the verify window allows */
+        for (int round = 2; round <= 3; ++round) {
+            Slab r(ADV_ROUND);
+            r.a.round = round;
+            r.st[3] = h.st[3];
+            r.row(0, true, 0, 1, 0, 3, 0, 0, 0);
+            r.src[0] = 7100 + round;
+            r.run();
+            h.st[3] = r.st[3];
+        }
+        Slab t(ADV_TAKE);
+        t.a.round = 3;
+        t.st[3] = h.st[3];
+        t.row(0, true, 0, 1, 0, 3, 0, 0, 0);
+        t.src[0] = 7200;
+        t.run();
+        const StepSlot& N = t.st[3];
+        CHECK_EQ(N.tok[0], 9000 + acc_want);
+        CHECK_EQ(N.tok[3], 7200);
+        for (int j = 4; j <= RAD_SCHED_MAX_SPEC; ++j) CHECK_EQ(N.tok[j], (int32_t)0x7f7f7f7f);   /* untouched */
+    }
+}
+
 RAD_TEST_MAIN()
 
 /* ================================================================== dynamic rows (DESIGN-dynrows.md) */

@@ -1701,6 +1701,54 @@ budget, then up to N of the tree's last nodes. Lossless with and without `draft-
 successor the walk takes when the row's emitted token is its own, and the coupled draw never sees it
 (`Request::draft_extra`); `DESIGN-ngram.md` has the argument and the tests that check it. Steps issued ahead of
 the commit (the fast path) carry no graft: the lookup needs the committed end. Counters: `SchedMetrics::ngram_graft_*`.
+**SuffixDecoding as a step selector: `draft-suffix`.** `draft-suffix: on` (default off, which is the engine as
+it was, bit for bit) lets a serial head's chain (`draft-tree: off`) give a step to the sequence's own history.
+After each commit the engine looks, in the sequence's prompt and output, for an earlier occurrence of its last
+`draft-suffix-min-match` tokens (default 6; the longest of that length and three more wins, the latest occurrence
+of it). If there is one, the next step is a pure verify of what followed it (a chain of at most
+`draft-suffix-max` rows, default 7) in place of the head's draft, cut where the path score falls under
+`draft-suffix-min-score` (default 0.3): SuffixDecoding's frequency rule (Oliaro et al., arXiv 2411.04975), the
+product along the chain of how often that token followed that context in the history. Otherwise the step is the
+head's, as before. It pays where the reply copies its context (code edits, quoting, agent and tool loops,
+pasted text, structured output) and does nothing on free chat. A cross-request suffix tree adds nothing on such
+loads and is not built.
+
+How it is built: the verify window (`num-speculative-tokens` for every buffer, ring and kernel band) becomes
+`max(num-speculative-tokens, draft-suffix-max)` while the head keeps drafting its own `num-speculative-tokens`
+rounds, so the head's passes (and `--draft-coupling`'s draws) do not change. A suffix step is built after the
+commit, where the lookup can read the committed end, so a sequence whose history ended in a recurring pattern at
+the last commit is **not issued ahead** (the step ahead is made on the card from the head's drafts, before the
+commit; deciding on the last readback costs one step of lag when a copy starts and one built-after-commit step
+when it ends, where the card-side alternative would need a per-slot token history and a hash table in the advance
+kernels). The head still drafts behind every step, a suffix step included: its history pass covers all 1 + rows
+positions the step verified, so the head's cache has no hole behind it and its next draft is as good as after a
+head step; the draft pass behind a suffix step is the price of that (about 1.5 ms of a step).
+
+Exactness: the choice reads the committed text and nothing else, never a draw. The suffix step carries no
+coupled row: `Request::draft_extra` is 0 (no model node), which empties every row's child list in the sampler, so
+the head's staged coupled states for those positions are never bound (a proposal that equals the head's unused
+draw `x` would otherwise select the coupling by the value of that draw). Each row is the target's plain draw from
+`(seed, position)` and the walk follows the proposal iff the draw equals it: greedy text is the head-only run's
+(up to the last-bit differences a different row count makes to the logits, as between any two window sizes) and
+the sampled law is the target's. `tests/mtp_rrs_test.cpp` checks the law (chi-square over the first three
+tokens, with a negative control that exposes the coupled-visible variant), `tests/sched_test.cpp` the selection,
+the issue-ahead rule and the head's catch-up, `tests/arch_test.cpp` the issue pattern of a nine-row verify and
+the head's passes behind it. The window is bounded by the model's kernels: Flash-Next's fused conv + recurrent update serves at most 8 query
+rows (a register window), so `draft-suffix-max` is at most 7 there; a larger window makes the first step fail
+with `unsupported`. It needs a serial head's chain, `draft-window: fixed` and the rowwise verify;
+`/metrics` has `radiance:suffix_steps_total`, `suffix_rows_total`, `suffix_accepted_total` and
+`suffix_held_ahead_total`.
+
+```yaml
+    num-speculative-tokens: 3
+    draft-tree: off
+    draft-coupling: on
+    draft-suffix: on
+    draft-suffix-min-match: 6
+    draft-suffix-max: 7
+    draft-suffix-min-score: 0.3
+```
+
 Every draft is verified, so the thresholds change how many drafts land a step and what a step costs, not
 what the model says (up to the last-bit differences any change of the verify batch's rows can make to the
 target's logits, as between a chain and a tree).
@@ -2466,6 +2514,8 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `draft-tree-rows: M` | off | a serial head's tree: verify only the first (the larger active-node count of the sequence's last two trees) + M nodes, a prefix of the tree (0 to 64, or off: every verify issues the whole node budget); with `draft-tree-prune` the inert tail stops costing rows |
 | `draft-tree-chain: H` | 0 | a serial head's tree: issue a step as a plain chain verify (no tree operands, the fused delta-net op, the plain attention) when the last H (1 or 2) trees of every sequence of the step were pure chains; 0 off |
 | `draft-tree-exact: MODE` | auto | a serial head's stage-1 tree of two rounds or more: issue each verify with exactly the leaves the card kept, read back behind the head's first round, and as a plain chain verify when it kept none (no inert row, no prediction). `auto`: on where the tree is pruned; `on`; `off` (§4.6, "exact rows") |
+| `draft-suffix: on\|off` | off | SuffixDecoding as a step selector on a serial head's chain: a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless, also with `draft-coupling` |
+| `draft-suffix-min-match: L`, `draft-suffix-max: N`, `draft-suffix-min-score: D` | 6, 7, 0.3 | the shortest match (1..12), the most rows of a suffix step (1..32; widens the verify window to max(`num-speculative-tokens`, N)), and the path score under which the chain is cut |
 | `draft-coupling: MODE` | off | `on`: an MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. With a draft tree (`draft-tree on`, stage 1 or 2) the siblings of a node are sampled without replacement from the head's law and verified by recursive rejection sampling (`DESIGN-coupling.md`): the same lossless guarantee. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
 

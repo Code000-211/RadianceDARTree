@@ -284,6 +284,17 @@ static const Flag g_flags[] = {
                                         "also with --draft-coupling (default 0 = off)" },
     { "--draft-ngram-min-match", "L",   "shortest lookup match, in tokens, --draft-ngram-leaves grafts\n"
                                         "(default 8)" },
+    { "--draft-suffix",     "MODE",     "off (default) | on -- SuffixDecoding as a step selector on a serial head's chain: when the\n"
+                                        "sequence's last --draft-suffix-min-match tokens occurred earlier in\n"
+                                        "its own prompt ++ output, a host-built step verifies the earlier\n"
+                                        "continuation (a chain, up to --draft-suffix-max rows) instead of the\n"
+                                        "head's draft. Lossless, also with --draft-coupling (default off)" },
+    { "--draft-suffix-min-match", "L",  "shortest suffix match that selects a suffix step (default 6)" },
+    { "--draft-suffix-max", "N",        "most rows of a suffix step (default 7; the verify window becomes\n"
+                                        "max(--num-speculative-tokens, N), the head still drafts its own)" },
+    { "--draft-suffix-min-score", "D",  "cut the suffix chain where its path score (the product of the\n"
+                                        "follower frequencies along it, SuffixDecoding's D) falls under D\n"
+                                        "(default 0.3)" },
     { "--draft-coupling-temp", "T",     "the temperature of the coupled draft law Q (the head's top-8\n"
     "                                    scores / T, softmax): a number (default 1 = the legacy law), or\n"
     "                                    request / auto = each request's own temperature (times\n"
@@ -1042,6 +1053,27 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--draft-ngram-leaves"))    { if (!num(0, 16, &c->draft_ngram_leaves)) return RAD_E_INVAL; }
         else if (S("--draft-ngram-min-match")) { if (!num(1, 64, &c->draft_ngram_min_match)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_suffix = false;
+            else if (!std::strcmp(v, "on"))  c->draft_suffix = true;
+            else {
+                RAD_ERR("--draft-suffix takes off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-suffix-min-match")) { if (!num(1, 12, &c->draft_suffix_min_match)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-max"))       { if (!num(1, 32, &c->draft_suffix_max)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-min-score")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* end = nullptr;
+            const double d = std::strtod(v, &end);
+            if (end == v || *end || !(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-suffix-min-score takes a number in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_suffix_min_score = (float)d;
+        }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -1739,6 +1771,10 @@ const ShowRow kShow[] = {
     { "--draft-ngram-leaves", [](const Config& c) {
           return c.draft_ngram_leaves > 0 ? num(c.draft_ngram_leaves) : std::string("off"); } },
     { "--draft-ngram-min-match", [](const Config& c) { return num(c.draft_ngram_min_match); } },
+    { "--draft-suffix",       [](const Config& c) { return onoff(c.draft_suffix); } },
+    { "--draft-suffix-min-match", [](const Config& c) { return num(c.draft_suffix_min_match); } },
+    { "--draft-suffix-max",   [](const Config& c) { return num(c.draft_suffix_max); } },
+    { "--draft-suffix-min-score", [](const Config& c) { return fnum(c.draft_suffix_min_score); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-verify",       [](const Config& c) {
           return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },

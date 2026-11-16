@@ -65,6 +65,10 @@ struct StepEntry {
      * acceptance but not the adaptive window's estimate of the draft head (DraftController,
      * draft.h). */
     bool    ngram = false;
+    /* The drafts are a SuffixDecoding proposal (--draft-suffix, suffix.h): a chain of the
+     * sequence's own history, verified with no coupled row (Request::draft_extra = 0). Implies
+     * `ngram`. */
+    bool    suffix = false;
     /* The previous step's committed rows (SchedReq::last_path), npath of them, or null: the host
      * stages RadBatch::spec_path from them. Unused on a device row. */
     const int32_t* last_path = nullptr;

@@ -10033,6 +10033,57 @@ TEST(flashnext_steps_lint_clean_at_one_two_and_four_ranks) {
         }
 }
 
+/* --draft-suffix: the verify window is widened to 7 drafts (`max_spec` 7: the delta-net fold serves 8
+ * query rows) while the head still drafts 3 rounds. A suffix step is an eight-row verify, then the
+ * head's history pass over all eight rows (round 1 on the last) and rounds 2 and 3; the head's own
+ * step in the same deployment is four rows and the same passes. Both lint clean, and every pass issues
+ * the same ops by name, the same number of times, as the head's step at its own window does: only row
+ * counts differ, and round 3 of a deployment whose head declared more rounds than it runs carries one
+ * `cast` more (its hidden state on to a round 4 the core does not issue; a few microseconds). */
+TEST(flashnext_a_suffix_step_issues_the_heads_ops_over_eight_rows_and_lints_clean) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    std::vector<std::map<std::string, size_t>> pattern[3];
+    int idx = 0;
+    for (const auto& cfg : { std::pair<int, int>{ 3, 4 }, std::pair<int, int>{ 7, 8 }, std::pair<int, int>{ 7, 4 } }) {
+        RadBuilder b;
+        b.encs = { { "draft_head", u2_head() } };
+        RadBuildCtx ctx = q4_ctx(0, 1);
+        ctx.max_spec = cfg.first;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+        REQUIRE_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+        const auto ver = kit(b, std::vector<int>(1, cfg.second), {});
+        CHECK_EQ((int)ver->b.n_spec, cfg.second - 1);
+        const auto his = history_pass(b, *ver);
+        CHECK_EQ((int)his->b.n_tok, cfg.second);              /* every verified position */
+        CHECK_EQ(his->dout[0], cfg.second - 1);               /* round 1 on the last row */
+        const auto r2 = round_pass(b, 1, 2), r3 = round_pass(b, 1, 3);
+        const auto v = run_passes(b, qwen4exp_fp8::step, { ver.get(), his.get(), r2.get(), r3.get() });
+        CHECK_PASSES(b, v);
+        std::set<std::string> names;
+        for (const RecOp& o : b.ops) names.insert(o.op);
+        for (size_t pass = 0; pass < v.size(); ++pass) {
+            std::map<std::string, size_t> m;
+            for (const std::string& nm : names) m[nm] = issues_of(b, *v[pass], nm.c_str()).size();
+            pattern[idx].push_back(m);
+        }
+        ++idx;
+    }
+    for (size_t pass = 0; pass < 4; ++pass)
+        for (int o = 1; o < 3; ++o) {
+            std::map<std::string, std::pair<size_t, size_t>> d;
+            for (const auto& [nm, n] : pattern[0][pass])
+                if (pattern[o][pass].at(nm) != n) d[nm] = { n, pattern[o][pass].at(nm) };
+            if (pass == 3) {
+                CHECK_EQ(d.size(), (size_t)1);
+                CHECK_EQ(d.at("cast").first, (size_t)0);
+                CHECK_EQ(d.at("cast").second, (size_t)1);
+            } else {
+                CHECK_EQ(d.size(), (size_t)0);
+            }
+        }
+}
+
 /* Sparse attention issues one row per query, chunked by the split-KV scratch it declared, never
  * by `max_seqs`: with four sequences allowed, a 1024-token chunk after a long history is one
  * launch of the gated form, or four of 256 rows where only the plain form resolves. Rows of four

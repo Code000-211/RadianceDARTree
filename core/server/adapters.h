@@ -127,6 +127,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
+    o.suffix_steps = m.suffix_steps;             o.suffix_rows = m.suffix_rows;
+    o.suffix_accepted = m.suffix_accepted;       o.suffix_held_ahead = m.suffix_held_ahead;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
