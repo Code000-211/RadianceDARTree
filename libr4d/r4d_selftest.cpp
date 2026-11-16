@@ -72,6 +72,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <map>
 #include <vector>
 #include <set>
 
@@ -4947,7 +4948,8 @@ static int64_t i8_code_misses(const uint16_t* x, int64_t x_ld, const int8_t* q, 
  * stores it, and leaves the pair's in bf16: the values are bf16's, so the bytes must not change. */
 static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form,
                               bool i8 = false, bool f32w = false, bool had = false,
-                              bool wide = false, bool single = false, bool deep = false) {
+                              bool wide = false, bool single = false, bool deep = false,
+                              bool chain8 = false) {
     /* `deep`: the conv window of a draft tree of 15 nodes (conv_width - 1 + 15 = 18 entries, which the
      * fold must serve although its register preload holds 8 tokens: the plugin issues it on every
      * step of up to 8 rows) and previous steps that accepted 9 .. 16 rows, so the replay takes the
@@ -4964,15 +4966,17 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
                                   : nullptr;
     if (!rf || !rc || !rr || (had && !rh)) { ok(nm, false, "a row is absent"); return; }
 
-    const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 4, W = 4, MQ = deep ? 16 : 4, SL = W - 2 + MQ;
+    const int64_t K = 128, V = 128, H = 4, Hg = 2, N = 4, W = 4, MQ = deep ? 16 : chain8 ? 8 : 4, SL = W - 2 + MQ;
     const int64_t conv_dim = (2 * Hg * K + H * V), in_w = conv_dim + H * V;
     const int64_t COLS = 6, SSLOTS = N * COLS, CSLOTS = 5;
     /* `single`: one row a sequence (plain decode); the previous step's accepted counts still differ,
      * so the replay is exercised. */
-    static const int32_t lens_[3][N] = { { 4, 2, 3, 1 }, { 1, 1, 1, 1 }, { 8, 5, 2, 1 } },
-                         nacc_[3][N] = { { 2, 1, 3, 1 }, { 1, 3, 2, 1 }, { 9, 16, 12, 3 } };
-    const int32_t (&lens)[N] = lens_[single ? 1 : deep ? 2 : 0];
-    const int32_t (&nacc)[N] = nacc_[deep ? 2 : single ? 1 : 0];
+    /* `chain8`: a 7-draft chain's verify step (8 rows a sequence, the fold's upper band) over its
+     * 10-entry window (conv_width - 1 + 7), after steps that accepted 1 .. 8 rows. */
+    static const int32_t lens_[4][N] = { { 4, 2, 3, 1 }, { 1, 1, 1, 1 }, { 8, 5, 2, 1 }, { 8, 8, 8, 8 } },
+                         nacc_[4][N] = { { 2, 1, 3, 1 }, { 1, 3, 2, 1 }, { 9, 16, 12, 3 }, { 8, 5, 3, 1 } };
+    const int32_t (&lens)[N] = lens_[chain8 ? 3 : single ? 1 : deep ? 2 : 0];
+    const int32_t (&nacc)[N] = nacc_[chain8 ? 3 : deep ? 2 : single ? 1 : 0];
     const int32_t cidx[N] = { 3, 0, 1, -1 };
     int64_t Td = 0;
     std::vector<int32_t> cu(1, 0);
@@ -5116,6 +5120,18 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
             if (diff) {
                 why = "step " + std::to_string(step) + ": " + c.what + " differs in " +
                       std::to_string(diff) + " of " + std::to_string(c.n) + " bytes";
+                if (!std::strcmp(c.what, "conv_state")) {  /* where: (slot, entry) -> channels that differ */
+                    std::map<std::pair<int,int>, int> where;
+                    for (size_t i = 0; i < c.n; i += 2)
+                        if (A[i] != B[i] || A[i + 1] != B[i + 1]) {
+                            const size_t e = i / 2;
+                            where[{ (int)(e / (size_t)(conv_dim * SL)), (int)(e % (size_t)SL) }]++;
+                        }
+                    why += " [slot:entry=channels";
+                    for (auto& w : where) why += " " + std::to_string(w.first.first) + ":" +
+                                                 std::to_string(w.first.second) + "=" + std::to_string(w.second);
+                    why += "]";
+                }
                 break;
             }
         }
@@ -5138,7 +5154,7 @@ static void gdn_conv_fold_run(const Plugin& pl, const char* nm, const char* form
             moved = true;
     }
     if (why.empty() && !moved) why = "the key heads' conv state never moved";
-    char d[160];
+    char d[1024];
     std::snprintf(d, sizeof d, "%s", why.c_str());
     ok(nm, why.empty(), why.empty() ? "" : d);
 }
@@ -5185,7 +5201,17 @@ static void gdn_conv_fold(const Plugin& pl) {
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update serves an 18-entry conv window, one row a sequence, "
                               "byte-identical to the pair, anchor", "anchor", false, false, false, false, true, true);
     }
+    /* Regression: a chain of 7 drafts verifies 8 rows a sequence. */
+    if (sel(row) || sel("gdn_conv_recurrent_update_chain8")) {
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update at 8 rows a sequence (chain of 7 drafts, 10-entry window) "
+                              "is byte-identical to the pair, anchor", "anchor", false, false, false, false, false, false, true);
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update at 8 rows a sequence (chain of 7 drafts, 10-entry window) "
+                              "is byte-identical to the pair, per_candidate", "per_candidate", false, false, false, false, false, false, true);
+    }
     if (sel(row) || sel("gdn_conv_recurrent_update_had")) {
+        gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had at 8 rows a sequence (chain of 7 drafts) is "
+                              "byte-identical to the pair then had_quant_act_i8g, anchor", "anchor", true, false, true,
+                          false, false, false, true);
         gdn_conv_fold_run(pl, "gdn_conv_recurrent_update_had serves an 18-entry conv window after steps that "
                               "accepted 9 to 16 rows, byte-identical to the pair then had_quant_act_i8g, anchor",
                           "anchor", true, false, true, false, false, true);

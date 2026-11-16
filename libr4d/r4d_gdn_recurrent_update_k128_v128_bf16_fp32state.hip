@@ -622,7 +622,11 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
   constexpr int SU = 5;                     // RU_CVT rows * 160 float4 / RU_V * 2 threads
   ru_f4 stg[FUSE ? SU : 1];
   float stgb = 0.0f;
-  const bool viaLds = FUSE && nacc <= RU_CVT;
+  // The staged copies are (row, group) pairs, a row of RU_LP floats each: 4 * nacc rows in the k half
+  // of spqk, which holds 2 * RU_CVT of them. A step that accepted more than RU_CVT / 2 rows replays
+  // from the records directly (the !viaLds path); staging more ran past the array into the next LDS
+  // object (the key heads' conv history, a chain of 7 drafts after a step that accepted 5 to 8 rows).
+  const bool viaLds = FUSE && nacc <= RU_CVT / 2;
   if constexpr (FUSE) {
 #pragma unroll
     for (int i = 0; i < SU; ++i) {
