@@ -1224,17 +1224,57 @@ int Engine::prepare_release(const RadBatch* b) {
     return RAD_OK;
 }
 
+bool Engine::exact_jit() const {
+    return early_issued_ && serial_done_ >= 2 && slots_early_ && sched_.exact_rows() &&
+           exact_hold_ == 0;
+}
+
 int Engine::issue_ahead(const RadBatch** out) {
     *out = nullptr;
     if (!pipelining_) return RAD_OK;
     /* A flex release or a quiet window waits for a step boundary with nothing in flight. */
     if (flex_pending_.load(std::memory_order_acquire) || quiet_pending_.load(std::memory_order_acquire))
         return RAD_OK;
-    for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
-        sched_.expect_draft(serial_row_[(size_t)i].seq, serial_nodes(serial_done_));
+    /* Exact rows: the slots as the advance before round 2 left them say how many leaves the card
+     * kept, so the step issued here carries the chain and exactly those. The card is still in the
+     * head's later rounds when the copy lands; the wait costs it nothing unless the host is slower
+     * than they are (see exact_hold_). */
+    const bool exact = early_issued_ && serial_done_ >= 2 && slots_early_ && sched_.exact_rows();
+    const bool held = exact && exact_hold_ > 0;
+    if (exact && !held) {
+        rad_host_mark("ia_enter", -1);
+        /* Polled first: the event is at most a head pass away when the loop collected the ids
+         * before coming here, and a thread that sleeps on it pays its wake-up on the card's time.
+         * Bounded, so a stalled card is waited for asleep. */
+        const uint64_t t0 = rad_mono_ns();
+        while (rad_event_query(tree_early_) == 0 && rad_mono_ns() - t0 < 2000000ull)
+            __builtin_ia32_pause();
+        const int es = rad_event_sync(tree_early_);
+        if (es < 0) { RAD_ERR("exact tree rows: waiting for the card's slots: %s", rad_strerror(es)); return es; }
+        rad_host_mark("ia_synced", -1);
+    }
+    for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i) {
+        const int nodes = serial_nodes(serial_done_);
+        if (held) {
+            /* Not waited for: the chain alone, in the chain's form. */
+            sched_.expect_draft(serial_row_[(size_t)i].seq, nodes, serial_done_, true);
+        } else if (exact && serial_row_[(size_t)i].card >= 0 && serial_row_[(size_t)i].card < cfg_.max_seqs) {
+            /* ADV_TAKE's count: the chain, then the leaves the budget leaves room for, the first
+             * `nalt` of them real (the rest repeat node 1 and are never accepted). */
+            const StepSlot& S = slots_early_[serial_row_[(size_t)i].card];
+            int room = nodes - serial_done_;
+            if (room < 0) room = 0;
+            int real = S.nalt < 0 ? 0 : S.nalt;
+            if (real > room) real = room;
+            sched_.expect_draft(serial_row_[(size_t)i].seq, nodes, serial_done_ + real, real == 0);
+        } else {
+            sched_.expect_draft(serial_row_[(size_t)i].seq, nodes);
+        }
+    }
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
     const RadBatch* nb = sched_.step_next();
+    rad_host_mark("ia_next", -1);
     if (!nb) return RAD_OK;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     kv_test_prepare(sched_.plan(), nb->step, ranks_);
@@ -1242,11 +1282,36 @@ int Engine::issue_ahead(const RadBatch** out) {
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
+    rad_host_mark("ia_trunk", -1);
     RAD_TRY(prepare_release(nb));
+    rad_host_mark("ia_release", -1);
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
     barrier_->arrive_and_wait();
     barrier_->arrive_and_wait();
+    rad_host_mark("ia_done", -1);
+    if (held) {
+        ++exact_held_steps_;
+        --exact_hold_;
+    } else if (exact) {
+        /* Late: the step's end event had fired before its successor was on the queue, so the card
+         * stood idle. Three more late issues than timely ones stop the waiting for 64 steps, then
+         * twice as long each time it happens again at once (up to 1024); a run of timely issues
+         * forgets it. */
+        ++exact_jit_steps_;
+        const bool late = rad_event_query(step_end_) == 1;
+        if (late) { ++exact_late_steps_; ++exact_late_; }
+        else if (exact_late_ > 0) --exact_late_;
+        else exact_backoff_ = 0;
+        if (exact_late_ >= 3) {
+            exact_hold_ = 64 << (exact_backoff_ < 4 ? exact_backoff_ : 4);
+            if (exact_backoff_ < 4) ++exact_backoff_;
+            exact_late_ = 0;
+            RAD_DEBUG("exact tree rows: the host issued the next step after the card had finished "
+                      "this one three times; the next %d step(s) verify the chain alone",
+                      exact_hold_);
+        }
+    }
     const int st = step_status_.load(std::memory_order_acquire);
     if (st < 0) {
         RAD_ERR("step %d, issued ahead, failed: %s -- the engine cannot continue", nb->step,
@@ -1590,11 +1655,22 @@ int Engine::step_loop() {
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
-        st = issue_ahead(&ahead);
-        if (st < 0) return fail_loop(st);
+        /* Exact tree rows issue it behind the ids instead: the count it waits for lands a head
+         * pass after them, so collecting first costs the card nothing and leaves this thread awake
+         * for the count (Engine::exact_jit). The commit, and so the stream, follows that issue. */
+        const bool jit = so.early && !embedding_ && exact_jit();
+        if (!jit) {
+            st = issue_ahead(&ahead);
+            if (st < 0) return fail_loop(st);
+        }
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
+        rad_host_mark("lp_collect", -1);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        if (jit) {
+            st = issue_ahead(&ahead);
+            if (st < 0) return fail_loop(st);
+        }
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
@@ -1651,6 +1727,7 @@ int Engine::step_loop() {
         kv_test_before_commit(plan, so, b->step, ranks_);
 #endif
         st = sched_.commit(res);
+        rad_host_mark("lp_commit", -1);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
         /* The step has drained, so its counters are readable. A chunk that produced no row did not
@@ -1675,7 +1752,9 @@ int Engine::step_loop() {
          * acceptance against the host's and publish its proposals. Each driver returns
          * immediately for a kind that is not its own. */
         calib_step_ = b->step;
+        rad_host_mark("lp_stepend", -1);
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
+        rad_host_mark("lp_finish", -1);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */

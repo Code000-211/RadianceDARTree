@@ -554,6 +554,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-tree-nodes", { "8" } }, { "--draft-tree-width", { "2" } },
         { "--draft-tree-prune", { "0.1" } }, { "--draft-tree-prune-rel", { "0.3" } },
         { "--draft-tree-rows", { "1" } }, { "--draft-tree-chain", { "2" } },
+        { "--draft-tree-exact", { "on" } },
         { "--draft-ngram-leaves", { "2" } }, { "--draft-ngram-min-match", { "6" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
@@ -1026,6 +1027,33 @@ TEST(the_dynamic_row_flags_default_off_and_parse) {
     CHECK_EQ(c.draft_tree_chain, 0);
     for (const char* bad : { "-1", "65", "many", "" }) CHECK_EQ(parse_fresh({ "--draft-tree-rows", bad }), RAD_E_INVAL);
     for (const char* bad : { "-1", "3", "yes", "" }) CHECK_EQ(parse_fresh({ "--draft-tree-chain", bad }), RAD_E_INVAL);
+    /* --draft-tree-exact: auto unless said, and nothing but its three words. */
+    {
+        Config e;
+        CHECK_EQ(e.draft_tree_exact, -1);
+        CHECK_EQ(parse({ "--draft-tree-exact", "on" }, &e), RAD_OK);
+        CHECK_EQ(e.draft_tree_exact, 1);
+        CHECK_EQ(parse({ "--draft-tree-exact", "off" }, &e), RAD_OK);
+        CHECK_EQ(e.draft_tree_exact, 0);
+        CHECK_EQ(parse({ "--draft-tree-exact", "auto" }, &e), RAD_OK);
+        CHECK_EQ(e.draft_tree_exact, -1);
+        for (const char* bad : { "1", "yes", "" }) CHECK_EQ(parse_fresh({ "--draft-tree-exact", bad }), RAD_E_INVAL);
+        /* The rule both the scheduler and the engine resolve it by: stage 1, two rounds or more,
+         * leaves; auto follows the pruning. */
+        Config r;
+        CHECK(!draft_tree_exact_rows(r, true, 1, 3, 3));
+        r.draft_tree_prune_rel = 0.2;
+        CHECK(draft_tree_exact_rows(r, true, 1, 3, 3));
+        CHECK(!draft_tree_exact_rows(r, true, 2, 3, 3));     /* stage 2 grows to its last round */
+        CHECK(!draft_tree_exact_rows(r, true, 1, 1, 3));     /* no round after the leaves' */
+        CHECK(!draft_tree_exact_rows(r, true, 1, 3, 0));
+        CHECK(!draft_tree_exact_rows(r, false, 1, 3, 3));
+        r.draft_tree_exact = 0;
+        CHECK(!draft_tree_exact_rows(r, true, 1, 3, 3));
+        r = Config{};
+        r.draft_tree_exact = 1;
+        CHECK(draft_tree_exact_rows(r, true, 1, 3, 3));
+    }
 }
 
 /* --draft-adaptive: off unless asked for; its numbers and lists are validated at parse. */

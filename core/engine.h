@@ -656,6 +656,26 @@ private:
     int  step_state_init();
     void step_state_fini();
     StepSlot*            slots_host_ = nullptr;
+    /* Exact tree rows (Scheduler::exact_rows, --draft-tree-exact). A stage-1 tree past its chain
+     * is the first round's leaves, which the card takes in the advance before round 2. Rank 0's
+     * slots are copied to `slots_early_` behind that advance and `tree_early_` recorded; issue_ahead
+     * waits for it (the card still has the later rounds to run, so it does not idle) and tells the
+     * scheduler the real node count of the tree the next step verifies. */
+    StepSlot*            slots_early_ = nullptr;      /* pinned [max_seqs] */
+    RadEvent             tree_early_ = nullptr;
+    bool                 early_issued_ = false;       /* this step's copy was issued */
+    /* The wait is on the step's critical path: the card has the head's remaining rounds, about a
+     * millisecond, for the host to see the count and issue the next step. So the loop collects the
+     * step's ids first (exact_jit: the wait for them ends one head pass earlier, and this thread
+     * is then awake and polls the count's event instead of sleeping on it), and a host that still
+     * comes late too often (the card had already finished the step when its successor was issued)
+     * stops waiting for a while: `exact_hold_` steps are issued at the usual time as the chain
+     * alone, their leaves dropped, which is what a chain deployment would have verified. */
+    bool exact_jit() const;
+    int                  exact_late_ = 0;             /* late issues, decayed by timely ones */
+    int                  exact_hold_ = 0;             /* steps left to issue without the wait */
+    int                  exact_backoff_ = 0;          /* holds taken in a row: the next is longer */
+    uint64_t             exact_jit_steps_ = 0, exact_late_steps_ = 0, exact_held_steps_ = 0;
 
     /* --draft-coupling (engine_draft.cpp). The head declares `mtp_couple_draws` and
      * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and

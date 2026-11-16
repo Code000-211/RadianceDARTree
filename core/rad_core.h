@@ -1060,6 +1060,15 @@ struct Config {
      * only. */
     int         draft_tree_rows = -1;
     int         draft_tree_chain = 0;
+    /* --draft-tree-exact MODE: verify exactly the real nodes of a tree whose shape is final a head
+     * round before its verify is issued (stage 1, two rounds or more: the leaves are the first
+     * round's candidates). The engine reads the card's slot behind the advance that takes the
+     * leaves and issues the next step after it, with the leaves the card kept and nothing else, in
+     * the chain's form when there are none: no row is predicted, none is cut, and no inert
+     * duplicate is verified. -1 auto: on where the tree is pruned (--draft-tree-prune,
+     * --draft-tree-prune-rel, --draft-adaptive), else off; 0 off (the predictions above, or the
+     * whole budget); 1 on. Lossless: the nodes left out are the inert tail. */
+    int         draft_tree_exact = -1;
     /* --draft-adaptive: cost-aware, calibrated node selection of a serial head's tree
      * (abi/rad_mtp_adapt.h, docs/DESIGN-adaptive.md). A candidate becomes a node only while its
      * marginal expected accepted tokens per marginal verify-row cost beats the tree's current
@@ -1331,6 +1340,18 @@ struct Config {
      * the startup report (core/diag/diag.h) prints this beside every value. */
     std::map<std::string, std::string> given;
 };
+
+
+/* Config::draft_tree_exact resolved for a deployment whose serial tree has `width` frontier rows,
+ * `rounds` head rounds and `leaves` first-round leaves: exact rows need a stage-1 tree (its shape
+ * past the chain is the leaves, fixed in round 1) and a round after the first for the engine to
+ * learn them in. One rule for the scheduler, which plans by it, and the engine, which reads the
+ * card's slots for it. */
+inline bool draft_tree_exact_rows(const Config& c, bool serial_tree, int width, int rounds, int leaves) {
+    if (!serial_tree || width != 1 || rounds < 2 || leaves <= 0) return false;
+    if (c.draft_tree_exact >= 0) return c.draft_tree_exact > 0;
+    return c.draft_tree_prune > 0.0 || c.draft_tree_prune_rel > 0.0 || c.draft_adaptive;
+}
 
 }  /* namespace rad */
 

@@ -8363,6 +8363,217 @@ TEST(a_step_issued_ahead_is_a_chain_when_the_last_grown_trees_were_chains) {
     CHECK(nb->spec_path != nullptr);
 }
 
+/* Exact rows (--draft-tree-exact, Config::draft_tree_exact): the engine reads the card's slot behind
+ * the advance that takes the first round's leaves and tells expect_draft the real nodes of the tree
+ * the step will verify, and whether they are a chain. Nothing is predicted: the step carries
+ * exactly them, in the chain's form when they are one, no real node is cut and the inert tail is
+ * never issued. */
+TEST(exact_rows_resolve_from_the_tree_and_its_pruning) {
+    {
+        Fixture f;
+        serial_tree_setup(f);
+        CHECK_OK(f.start());
+        CHECK(!f.sch.exact_rows());            /* auto without pruning: every leaf is real */
+    }
+    {
+        Fixture f;
+        serial_tree_setup(f);
+        f.cfg.draft_tree_prune_rel = 0.2;
+        CHECK_OK(f.start());
+        CHECK(f.sch.exact_rows());             /* auto with pruning */
+    }
+    {
+        Fixture f;
+        serial_tree_setup(f);
+        f.cfg.draft_tree_prune_rel = 0.2;
+        f.cfg.draft_tree_exact = 0;
+        CHECK_OK(f.start());
+        CHECK(!f.sch.exact_rows());            /* off is off */
+    }
+    {
+        Fixture f;
+        serial_tree_setup(f, /*rounds=*/1, /*nodes=*/4, /*leaves=*/3);
+        f.cfg.draft_tree_exact = 1;
+        CHECK_OK(f.start());
+        CHECK(!f.sch.exact_rows());            /* one round: the leaves are known with the tree */
+    }
+}
+
+TEST(exact_rows_issue_the_real_nodes_and_the_chains_form_without_a_prediction) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_tree_exact = 1;
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.exact_rows());
+    auto r = f.request(160, 64);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kTreeDraft, 6, kTreePar));     /* a full tree: tree form */
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK_EQ(b->n_spec, 6);
+
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    auto grow = [&](const int32_t* tok) {
+        StepSlot& S = slots[(size_t)f.sch.plan().e[0].card];
+        S.ntree = 6;
+        for (int j = 0; j < 6; ++j) { S.tok[1 + j] = tok[j]; S.par[j] = kTreePar[j]; }
+    };
+    auto accept_none = [&]() {
+        std::vector<int32_t> y(16, -1);
+        const StepEntry& e0 = f.sch.plan().e[0];
+        for (int j = 0; j <= e0.n_spec; ++j) y[(size_t)(e0.dev_out + j)] = 900 + j;
+        AdvanceArgs acc = f.sch.advance_args(0);
+        acc.mode = ADV_ACCEPT;
+        acc.st = slots.data();
+        acc.src = y.data();
+        for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+    };
+    auto trunk = [&]() {
+        AdvanceArgs tr = f.sch.advance_args(0);
+        tr.mode = ADV_TRUNK; tr.st = slots.data();
+        for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+        return tr;
+    };
+
+    /* The card kept two leaves: the chain and exactly those, a tree of five; the sixth node (an
+     * inert repeat of node 1) is not a row. */
+    accept_none();
+    grow(kLeafDraft);
+    f.sch.expect_draft(a, 6, 5, false);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 5);
+    CHECK_EQ(nb->n_tok, 6);
+    CHECK(nb->spec_parent != nullptr);
+    trunk();
+    for (int j = 0; j < 6; ++j) CHECK_EQ(nb->token_ids[j], j == 0 ? 900 : kLeafDraft[j - 1]);
+    for (int j = 1; j <= 3; ++j) CHECK_EQ(nb->spec_parent[j], j - 1);
+    CHECK_EQ(nb->spec_parent[4], 0);
+    CHECK_EQ(nb->spec_parent[5], 0);
+    commit_one(f, 0, 900);
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    CHECK_EQ(f.sch.metrics().tree_rows_cut, (int64_t)1);       /* the inert slot */
+    CHECK_EQ(f.sch.metrics().tree_active_cut, (int64_t)0);     /* and nothing real */
+    f.sch.promote_next();
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 5);
+    CHECK(f.sch.plan().e[0].draft_parent != nullptr);
+
+    /* The card kept none: the chain's three nodes in the chain's form. The step in flight verified
+     * a tree, so its successor still carries the path plane. */
+    accept_none();
+    grow(kChainDraft);
+    f.sch.expect_draft(a, 6, 3, true);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 3);
+    CHECK_EQ(nb->n_tok, 4);
+    CHECK(nb->spec_parent == nullptr);
+    CHECK(nb->spec_path != nullptr);
+    AdvanceArgs tr = trunk();
+    CHECK_EQ(tr.parent_off, (int64_t)-1);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(nb->token_ids[j], j == 0 ? 900 : kChainDraft[j - 1]);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(nb->positions[j], nb->positions[0] + j);
+    commit_one(f, 0, 901);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    CHECK_EQ(f.sch.metrics().tree_rows_cut, (int64_t)4);
+    CHECK_EQ(f.sch.metrics().tree_active_cut, (int64_t)0);
+    f.sch.promote_next();
+    CHECK(!f.sch.plan().spec_is_tree);
+    CHECK(f.sch.plan().chain_fast);
+    CHECK(f.sch.plan().e[0].draft_parent == nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 3);
+    CHECK_EQ(f.sch.metrics().tree_chain_steps, (int64_t)1);
+    {
+        const Request* rq = f.sch.find(a);
+        REQUIRE(rq != nullptr);
+        CHECK_EQ(rq->draft_chain, 3);          /* every row of the chain is bound */
+    }
+
+    /* A chain behind a chain step owes no path: the operand lists are a chain deployment's. */
+    accept_none();
+    grow(kChainDraft);
+    f.sch.expect_draft(a, 6, 3, true);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 3);
+    CHECK(nb->spec_parent == nullptr);
+    CHECK(nb->spec_path == nullptr);
+    CHECK_EQ(f.sch.advance_args(0).path_off, (int64_t)-1);
+    commit_one(f, 0, 902);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    f.sch.promote_next();
+    CHECK_EQ(f.sch.metrics().tree_chain_steps, (int64_t)2);
+
+    /* One leaf again: a tree of four at once, with no run of chains to wait out. */
+    const int32_t one_leaf[6] = { 21, 22, 23, 31, 21, 21 };
+    accept_none();
+    grow(one_leaf);
+    f.sch.expect_draft(a, 6, 4, false);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 4);
+    CHECK(nb->spec_parent != nullptr);
+    CHECK(nb->spec_path == nullptr);          /* behind a chain step: a tree that owes no path */
+    commit_one(f, 0, 903);
+    CHECK_OK(f.sch.set_draft(a, one_leaf, 6, kTreePar));
+    CHECK_EQ(f.sch.metrics().tree_active_cut, (int64_t)0);
+    f.sch.promote_next();
+    CHECK(f.sch.plan().spec_is_tree);
+
+    /* Without the engine's count (a step whose rounds stopped before the second) the whole budget
+     * is issued, as a tree: nothing is guessed. */
+    accept_none();
+    grow(kChainDraft);
+    f.sch.expect_draft(a, 6);
+    nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_spec, 6);
+    CHECK(nb->spec_parent != nullptr);
+    CHECK(nb->spec_path != nullptr);          /* behind a tree verify: its path is owed */
+}
+
+/* A host-built step under exact rows knows the tree as well: the inert tail is not verified and a
+ * chain is issued as one, with no --draft-tree-rows or --draft-tree-chain set. */
+TEST(exact_rows_issue_a_host_built_chain_shaped_tree_as_a_chain) {
+    Fixture f;
+    serial_tree_setup(f);
+    f.cfg.draft_tree_exact = 1;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, kChainDraft, 6, kTreePar));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 3);
+    CHECK(!f.sch.plan().spec_is_tree);
+    CHECK(f.sch.plan().chain_fast);
+    CHECK(b->spec_parent == nullptr);
+    CHECK(b->spec_path == nullptr);
+    commit_one(f, 3, 77);
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 5);
+    CHECK(f.sch.plan().spec_is_tree);
+    CHECK(b->spec_parent != nullptr);
+    CHECK(b->spec_path == nullptr);           /* the chain step before it left no path to close */
+    /* and the step behind that tree verify closes its path, whatever its own shape */
+    const int32_t path4[1] = { 4 };
+    commit_one(f, 1, 905, path4, 1);
+    CHECK_OK(f.sch.set_draft(a, kLeafDraft, 6, kTreePar));
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK(f.sch.plan().spec_is_tree);
+    REQUIRE(b->spec_path != nullptr);
+    CHECK_EQ(b->spec_path[1], 4);
+}
+
 /* With the chain's form off, --draft-tree-rows alone: a prediction shorter than the budget cuts a
  * suffix of the tree. */
 TEST(the_predicted_row_count_is_the_recent_active_maximum_plus_the_margin) {

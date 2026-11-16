@@ -230,6 +230,11 @@ static const Flag g_flags[] = {
     { "--draft-tree-chain",   "H",      "a serial head's tree: issue a step as a plain chain verify\n"
                                         "(no tree operands, the fused delta-net op) when the last H\n"
                                         "trees of every sequence were pure chains (default 0 = off)" },
+    { "--draft-tree-exact",   "MODE",   "auto (default) | on | off -- a serial head's stage-1 tree of two\n"
+    "                                    rounds or more: issue each verify with exactly the leaves the\n"
+    "                                    card kept (read back behind the first round), as a plain chain\n"
+    "                                    verify when it kept none; no inert row is verified and none is\n"
+    "                                    predicted. auto: on where the tree is pruned" },
     { "--draft-adaptive",     "MODE",   "off (default) | on -- a serial head's tree (or chain, with\n"
     "                                    --draft-tree-width 1 and --draft-tree-nodes = rounds): keep adding\n"
     "                                    a node only while its marginal expected accepted tokens per\n"
@@ -964,6 +969,13 @@ int config_parse(int argc, char** argv, Config* c) {
             else c->draft_tree_rows = (int)n;
         }
         else if (S("--draft-tree-chain"))      { if (!num(0, 2, &c->draft_tree_chain)) return RAD_E_INVAL; }
+        else if (S("--draft-tree-exact")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "auto")) c->draft_tree_exact = -1;
+            else if (!std::strcmp(v, "off"))  c->draft_tree_exact = 0;
+            else if (!std::strcmp(v, "on"))   c->draft_tree_exact = 1;
+            else { RAD_ERR("--draft-tree-exact must be auto, on or off, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--draft-adaptive")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_adaptive = false;
@@ -1706,6 +1718,8 @@ const ShowRow kShow[] = {
           return c.draft_tree_rows >= 0 ? num(c.draft_tree_rows) : std::string("off"); } },
     { "--draft-tree-chain",   [](const Config& c) {
           return c.draft_tree_chain > 0 ? num(c.draft_tree_chain) : std::string("off"); } },
+    { "--draft-tree-exact",   [](const Config& c) {
+          return std::string(c.draft_tree_exact < 0 ? "auto" : c.draft_tree_exact ? "on" : "off"); } },
     { "--draft-adaptive",     [](const Config& c) { return onoff(c.draft_adaptive); } },
     { "--draft-adaptive-margin", [](const Config& c) { return fnum(c.draft_adaptive_margin); } },
     { "--draft-adaptive-floor", [](const Config& c) { return num(c.draft_adaptive_floor); } },

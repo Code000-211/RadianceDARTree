@@ -1676,6 +1676,23 @@ chain-form step after a tree verify still closes that verify's path. The step is
 (the tree it verifies is still being grown), so a surprise costs acceptance, never correctness: the nodes beyond
 the prediction are dropped and counted (`radiance:spec_tree_rows_cut_total`, `..._active_cut_total` for the real
 ones, `..._chain_steps_total`). Design and the cost model: `DESIGN-dynrows.md`.
+**Exact rows: `draft-tree-exact`.** A stage-1 tree (width 1) past its chain is the first round's leaves, and
+the card fixes them in the advance before round 2. With two rounds or more the engine reads the card's slot
+behind that advance and issues the next step once it knows the leaves the card kept, while the card runs the
+head's later rounds: the step carries the chain and exactly those leaves, and when the card kept none it is a
+plain chain verify (no tree operands, and no path plane once the step before it was a chain too), the step a
+chain deployment issues. Nothing is predicted, so no real node is cut (`radiance:spec_tree_active_cut_total`
+stays 0) and no inert duplicate is verified. `auto` (the default) turns it on where the tree is pruned
+(`draft-tree-prune`, `draft-tree-prune-rel`, `draft-adaptive`), since an unpruned tree has no inert slot; `on`
+and `off` say so. The cost is the host's lead: the step is issued behind the head's first round, with the
+later rounds (about a millisecond at three) left for the host to issue it in. The engine collects the step's
+ids first and polls for the count, so no wake-up is on that path; a host that still comes late (the card had
+finished the step before its successor was queued) three times more often than not stops waiting for 64 steps
+(then 128 ... 1024 while it keeps happening) and issues those steps at once as the chain alone, their leaves
+dropped: what a chain deployment verifies, and then `radiance:spec_tree_active_cut_total` counts the leaves
+left out. The line `exact tree rows: N step(s) issued behind the card's leaf count, M of them ... (late); K
+issued without the wait` at shutdown says how often.
+A stage-2 tree (`draft-tree-width` above 1) is grown up to its last round and keeps the predictions above.
 **Prompt-lookup nodes in the tree: `draft-ngram-leaves`, `draft-ngram-min-match`.** `draft-ngram-leaves: N`
 (default 0 = off) grafts up to N nodes of the sequence's own prompt-lookup proposal (the `--spec-ngram` matcher)
 onto a **host-built** tree verify -- a branch off the root, or the extension of a drafted chain -- when the
@@ -2448,6 +2465,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `draft-tree-prune-rel: R` | 0 | a serial head's tree: a candidate becomes a node only if its probability is at least R times its parent's best candidate's (0 to 1; 0 off); with both set it needs both |
 | `draft-tree-rows: M` | off | a serial head's tree: verify only the first (the larger active-node count of the sequence's last two trees) + M nodes, a prefix of the tree (0 to 64, or off: every verify issues the whole node budget); with `draft-tree-prune` the inert tail stops costing rows |
 | `draft-tree-chain: H` | 0 | a serial head's tree: issue a step as a plain chain verify (no tree operands, the fused delta-net op, the plain attention) when the last H (1 or 2) trees of every sequence of the step were pure chains; 0 off |
+| `draft-tree-exact: MODE` | auto | a serial head's stage-1 tree of two rounds or more: issue each verify with exactly the leaves the card kept, read back behind the head's first round, and as a plain chain verify when it kept none (no inert row, no prediction). `auto`: on where the tree is pruned; `on`; `off` (§4.6, "exact rows") |
 | `draft-coupling: MODE` | off | `on`: an MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. With a draft tree (`draft-tree on`, stage 1 or 2) the siblings of a node are sampled without replacement from the head's law and verified by recursive rejection sampling (`DESIGN-coupling.md`): the same lossless guarantee. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
 

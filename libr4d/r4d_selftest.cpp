@@ -158,6 +158,7 @@ struct Plugin {
     void (*mla_stats)(unsigned long long*) = nullptr;
     void (*pin_mla_rows)(int) = nullptr;
     void (*pin_late_push)(int) = nullptr;
+    int (*pin_gdn_path)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
     void (*ar8_settings)(const R4DAr8Settings*) = nullptr;
 };
@@ -230,6 +231,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
     okall &= sym(pl->h, "r4d_mla_rows_pin_form", &pl->pin_mla_rows);
     okall &= sym(pl->h, "r4d_ar_late_push_pin", &pl->pin_late_push);
+    okall &= sym(pl->h, "r4d_gdn_fold_pin_path", &pl->pin_gdn_path);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     okall &= sym(pl->h, "r4d_ar8_test_settings", &pl->ar8_settings);
     ScopedAr8::apply = pl->ar8_settings;
@@ -5509,9 +5511,11 @@ static void gdn_tree_check(const Plugin& pl, const char* nm, bool fold, bool had
         { -1, 0, 1, 2, 0, 0, 0, 0 },      /* stage one: a chain of three and four leaves off the anchor */
         { -1, 0, 1, 1, 0, 4, 4, 5 },      /* two non-leaf children of the anchor, a leaf beside a non-leaf */
         { -1, 0, 1, 2, 1, 4, 4, 0 },      /* the depth-one node's two children are both non-leaf */
+        { -1, 0, 0, 2, 3, 4, 5, 6 },      /* a leaf, then a chain of six beside it: its path commits
+                                           * seven rows that are no prefix, past the replay's staging */
     };
     std::string why;
-    int64_t row_checks = 0, commit_checks = 0;
+    int64_t row_checks = 0, commit_checks = 0, form_checks = 0;
     double worst_ref = 0.0, mag = 0.0;
     int tidx = 0;
     /* Negative controls: the same rows as a chain, and the same commit as a prefix, must give
@@ -5603,10 +5607,12 @@ static void gdn_tree_check(const Plugin& pl, const char* nm, bool fold, bool had
         }
 
         /* Commit a path, then a step on top of it. */
-        const std::vector<std::vector<int>> accepted = {
+        std::vector<std::vector<int>> accepted = {
             root_path(par0, n0 - 1),                       /* the last node's path */
-            std::vector<int>{ 0, par0[4] == 0 ? 4 : 7 },   /* a short, non-prefix path */
         };
+        /* a short, non-prefix path, where a node hangs off the anchor past row 1 */
+        if (par0[4] == 0) accepted.push_back(std::vector<int>{ 0, 4 });
+        else if (par0[7] == 0) accepted.push_back(std::vector<int>{ 0, 7 });
         for (const auto& P : accepted)
             for (int variant = 0; variant < 2 && why.empty(); ++variant) {
                 const int L = (int)P.size();
@@ -5625,6 +5631,35 @@ static void gdn_tree_check(const Plugin& pl, const char* nm, bool fold, bool had
                 e = rig.run(fold, s2, &o2t, &q2t, &d2t);
                 if (e != RAD_OK) { why = "commit step rc=" + std::to_string(e); break; }
                 const World w2t = rig.get();
+
+                /* A chain's rows behind a tree verify (spec_path alone) run the fold's path form:
+                 * the fused chain reading the committed rows through the path. The tree form took
+                 * such a step before and still serves it when pinned, so the two are held to the
+                 * same bytes: outputs, codes and scales, the conv window and the whole state cache
+                 * (the anchor and this step's records). They must be different kernels, or a pin
+                 * that is ignored would pass by comparing a form with itself. */
+                if (fold && !variant && pl.pin_gdn_path) {
+                    std::vector<uint16_t> o2x; std::vector<int8_t> q2x; std::vector<float> d2x;
+                    const int form_p = pl.pin_gdn_path(1);       /* the form the run above took */
+                    rig.put(wt);
+                    e = rig.run(fold, s2, &o2x, &q2x, &d2x);
+                    const int form_x = pl.pin_gdn_path(0);
+                    if (e != RAD_OK) { why = "the pinned tree form rc=" + std::to_string(e); break; }
+                    const World w2x = rig.get();
+                    ++form_checks;
+                    const bool distinct = form_p == 2 && form_x == 1;
+                    if (!distinct || o2x != o2t || w2x.cs != w2t.cs || w2x.st != w2t.st ||
+                        (had && (q2x != q2t || d2x != d2t))) {
+                        why = "tree " + std::to_string(tidx) + ": the path form of the step after a " +
+                              std::to_string(L) + "-row path " +
+                              (!distinct ? "did not run the two forms"
+                                         : o2x != o2t ? "differs from the tree form in o"
+                                         : w2x.cs != w2t.cs ? "differs from the tree form in the conv window"
+                                         : w2x.st != w2t.st ? "differs from the tree form in the state cache"
+                                                            : "differs from the tree form in its codes");
+                        break;
+                    }
+                }
 
                 /* The chain that decoded exactly the committed rows, then the same step with the
                  * plain prefix contract. */
@@ -5672,9 +5707,10 @@ static void gdn_tree_check(const Plugin& pl, const char* nm, bool fold, bool had
     if (why.empty() && !tree_sensitive) why = "a tree's rows equal the same rows as a chain: no tree to hold";
     if (why.empty() && !path_sensitive) why = "a committed path equals its prefix: no path to hold";
     char d[256];
-    std::snprintf(d, sizeof d, "%s%s%lld row checks, %lld commit checks, libref relative L2 %.3g (rms o %.3g)",
+    std::snprintf(d, sizeof d, "%s%s%lld row checks, %lld commit checks, %lld path-form checks, libref "
+                  "relative L2 %.3g (rms o %.3g)",
                   why.c_str(), why.empty() ? "" : "; ", (long long)row_checks,
-                  (long long)commit_checks, worst_ref, mag);
+                  (long long)commit_checks, (long long)form_checks, worst_ref, mag);
     if (why.empty()) std::printf("        %s\n", d);
     ok(nm, why.empty() && (had || worst_ref < 5e-3), d);
 }
@@ -5867,8 +5903,12 @@ static void gdn_tree_perf(const Plugin& pl, int64_t Q, int branch, int iters) {
         return r->launch(&a, (RadStream) nullptr);
     };
     const bool nospec = std::getenv("GDNT_NOSPEC") != nullptr;
+    /* GDNT_PATHONLY: spec_path alone, a chain's rows behind a tree verify (the fold's path form);
+     * with GDNT_PIN the tree form that served such a step before it. */
+    const bool pathonly = std::getenv("GDNT_PATHONLY") != nullptr;
+    if (pathonly && std::getenv("GDNT_PIN") && pl.pin_gdn_path) pl.pin_gdn_path(1);
     std::vector<RadTensor> tf = { tx, tw, none, tcs, tci, ta, tb, tal, tdt, tst, tsi, tna, tcu, tz, tnw,
-                                  to, none, none, nospec ? none : tsp, nospec ? none : tph };
+                                  to, none, none, nospec || pathonly ? none : tsp, nospec ? none : tph };
     std::vector<RadTensor> tcv = { tx, tw, none, tcs, tci, tna, tcu, tq, tk, tv, tsp, tph };
     std::vector<RadTensor> trc = { tq, tk, tv, ta, tb, tal, tdt, tst, tsi, tna, tcu, tz, tnw, to, none, none, tsp, tph };
     std::printf("gdn tree q_len %lld branch %d (H %lld Hg %lld)\n", (long long)Q, branch, (long long)H, (long long)Hg);

@@ -168,6 +168,15 @@ int Engine::step_state_init() {
 
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    /* Before the scheduler is initialised (serve does that): the rule itself, on what bring-up
+     * resolved. */
+    if (draft_tree_exact_rows(cfg_, serial_tree_, tree_width_, draft_rounds_, tree_leaves_)) {
+        slots_early_ = static_cast<StepSlot*>(
+            rad_dev_alloc((int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), RAD_MEM_HOST_PINNED));
+        if (!slots_early_) return RAD_E_NOMEM;
+        std::memset(slots_early_, 0, (size_t)cfg_.max_seqs * sizeof(StepSlot));
+        RAD_TRY(rad_event_create_as(&tree_early_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    }
     return RAD_OK;
 }
 
@@ -181,6 +190,15 @@ void Engine::step_state_fini() {
     }
     if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
     slots_host_ = nullptr;
+    if (exact_jit_steps_ + exact_held_steps_ > 0)
+        RAD_INFO("exact tree rows: %llu step(s) issued behind the card's leaf count, %llu of them "
+                 "after the card had finished the step before (late); %llu issued without the wait, "
+                 "as the chain alone", (unsigned long long)exact_jit_steps_,
+                 (unsigned long long)exact_late_steps_, (unsigned long long)exact_held_steps_);
+    if (slots_early_) rad_dev_free(slots_early_, RAD_MEM_HOST_PINNED);
+    slots_early_ = nullptr;
+    if (tree_early_) rad_event_destroy(tree_early_);
+    tree_early_ = nullptr;
     if (couple_draw_stage_) rad_dev_free(couple_draw_stage_, RAD_MEM_HOST_PINNED);
     if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
     couple_draw_stage_ = nullptr;
@@ -380,6 +398,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
+    early_issued_  = false;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -432,6 +451,18 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         RAD_TRY(advance_all(rd == 0 ? ADV_HIST
                                     : (serial_tree_ && tree_width_ > 1 ? ADV_ROUND_TREE : ADV_ROUND),
                             rd, rd > 0));
+        /* Exact rows: round 2's advance has just taken the first round's leaves into the slot
+         * (adv_capture), so from here the card knows the tree the next step verifies. Its slots,
+         * behind that advance and ahead of the round's own pass: issue_ahead waits for this copy
+         * while the card runs the rounds that are left. */
+        if (rd == 2 && slots_early_ && tree_early_ && serial_tree_ && tree_width_ == 1) {
+            Rank& r0 = *ranks_[0];
+            RAD_TRY(rad_memcpy_async(slots_early_, r0.step_slots,
+                                     (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot),
+                                     r0.ctx.stream()));
+            RAD_TRY(rad_event_record(tree_early_, r0.ctx.stream()));
+            early_issued_ = true;
+        }
         const auto tB = std::chrono::steady_clock::now();
         rad_host_mark("sc_adv_done", rd);
 

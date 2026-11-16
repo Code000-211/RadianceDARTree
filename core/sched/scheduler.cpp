@@ -168,6 +168,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     serial_tree_  = tree_ && prog.drafter.kind == RAD_DRAFT_SERIAL;
     tree_rounds_  = serial_tree_ ? prog.drafter.depth : 0;
     tree_width_   = serial_tree_ ? std::max(1, prog.drafter.tree_width) : 1;
+    /* Exact rows (Config::draft_tree_exact): stage 1 only, where the tree past the chain is the
+     * first round's leaves, and with a round after it for the engine to learn them in. */
+    exact_rows_   = draft_tree_exact_rows(cfg, serial_tree_, tree_width_, tree_rounds_,
+                                          prog.drafter.tree_leaves);
+    if (exact_rows_)
+        RAD_INFO("draft trees: exact rows -- each verify carries the leaves the card kept, read "
+                 "back behind the head's first round, and is a plain chain verify when it kept none");
     serial_shared_    = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_SERIAL &&
                         prog.drafter_shared_kv;
     serial_rot_shift_ = serial_shared_ ? prog.drafter_pos_offset : 0;
@@ -2519,7 +2526,7 @@ const RadBatch* Scheduler::step() {
      * the step is a chain (a head's tree whose nodes hang off their predecessors, prompt lookup's
      * proposal) and at least one verifies something. No spec_path either when no sequence still
      * owes the accepted path of an earlier tree verify. */
-    if (tree_ && serial_tree_ && cfg_.draft_tree_chain > 0) {
+    if (tree_ && serial_tree_ && (cfg_.draft_tree_chain > 0 || exact_rows_)) {
         bool chain = true, any = false, owes = false;
         for (const StepEntry& e : plan_.e) {
             if (e.n_last_path > 0) owes = true;
@@ -2539,6 +2546,12 @@ const RadBatch* Scheduler::step() {
                 if (sr.req) { sr.req->draft_parent = nullptr; sr.req->draft_chain = -1; }
             }
             ++m_.tree_chain_steps;
+        } else if (exact_rows_ && !owes) {
+            /* Exact rows: a tree step no sequence of which owes an accepted path (its last verify
+             * was a chain's, or it has none yet) carries no path plane either. The path it would
+             * carry is the identity, so the rows are the same; the plugin's path closing (the
+             * linear state's replay order, the windows' and the tail's compaction) is not issued. */
+            plan_.no_path = true;
         }
     }
     plan_.tree_verify = plan_.spec_is_tree && plan_.n_spec > 0;
@@ -2635,7 +2648,7 @@ void Scheduler::draft_cycle() {
 }
 
 /* ------------------------------------------------------------------ the next step */
-void Scheduler::expect_draft(uint64_t id, int n) {
+void Scheduler::expect_draft(uint64_t id, int n, int exact_nodes, bool exact_chain) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
     if (it == by_id_.end()) return;
@@ -2648,6 +2661,16 @@ void Scheduler::expect_draft(uint64_t id, int n) {
         if (n > cap) n = cap;
     }
     s.chain_next = false;
+    /* Exact rows: the engine has the card's own count of the tree's real nodes (the inert tail is
+     * a suffix, never verified) and whether they are a chain. Nothing is guessed, so nothing real
+     * is cut and no inert row is issued. */
+    if (exact_rows_ && exact_nodes >= 0 && n > 0) {
+        if (exact_nodes < 1) exact_nodes = 1;         /* node 1, the trunk's first, always exists */
+        if (exact_nodes < n) n = exact_nodes;
+        s.chain_next = exact_chain;
+        s.draft_next = n;
+        return;
+    }
     /* Dynamic rows: the shape of the tree this step will verify is not known yet (it is being grown
      * behind the step in flight), so it is predicted from the last two grown trees. Either guess is
      * lossless: a node beyond the count is dropped, a suffix of a tree being a tree, and the
@@ -2729,7 +2752,7 @@ const RadBatch* Scheduler::step_next_locked() {
     /* The chain's form (DESIGN-dynrows.md): every row of the step is predicted to verify a chain
      * (expect_draft), so the step carries no tree operands. The previous step's accepted path
      * still has to be applied unless that step verified no tree. */
-    bool fast = dyn_enabled() && cfg_.draft_tree_chain > 0;
+    bool fast = dyn_enabled() && (cfg_.draft_tree_chain > 0 || exact_rows_);
     bool any_draft = false;
     for (const StepEntry& e : plan_.e) {
         if (!fast) break;
@@ -2741,6 +2764,9 @@ const RadBatch* Scheduler::step_next_locked() {
     if (fast) {
         plan_next_.spec_is_tree = false;
         plan_next_.chain_fast = true;
+        plan_next_.no_path = !plan_.tree_verify;
+    } else if (exact_rows_) {
+        /* A tree step behind a step that verified no tree owes no path (step()). */
         plan_next_.no_path = !plan_.tree_verify;
     }
     for (const StepEntry& e : plan_.e) {

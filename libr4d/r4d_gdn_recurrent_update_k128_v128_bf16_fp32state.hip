@@ -390,16 +390,26 @@ __device__ __forceinline__ void ru_bar() {
   sidx_stride, const int* __restrict__ naccept, const unsigned short* __restrict__ zg,        \
   long zg_pitch, const float* __restrict__ nw, float neps, int nact, int H, int Hg, float     \
   scale, float sp_thr, const RuConv cv, const RuSpec spec
+// TP: 0 the chain; 1 a tree verify (spec_parent, with or without spec_path); 2 a chain's rows behind
+// a tree verify (spec_path alone: a chain-form step, or any decode step of a tree deployment whose
+// rows are no tree). The last is the chain's kernel in everything but where it finds the previous
+// block's committed rows: the replay's records and the convolution's history are read through the
+// path, as the tree form reads them, and every row then runs the chain's staged, fused loop. A row
+// of it is byte for byte the tree form's row of the same chain (which is the chain's).
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0, int TREE = 0>
+          int CV = 0, int TP = 0>
 __device__ __forceinline__ void ru_update_body(RU_PARAMS)
 {
   using ST = typename ru_state<SDT>::T;
+  constexpr int TREE = TP == 1 ? 1 : 0;
+  constexpr bool PATHF = TP == 2;
   constexpr int NR = RU_V / VS;         // v rows this workgroup owns
   constexpr int THR = NR * 2;
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
   static_assert(NORM != 4 || CV, "the pair's arrival counter is the folded convolution's block");
   static_assert(!TREE || (ANC && SDT == 0 && VS == 1), "a tree verify is the f32 anchor form");
+  static_assert(!PATHF || (ANC && SDT == 0 && VS == 1 && CV && STG),
+                "the path form is the fold's fused chain over an f32 anchor");
   // The tree's plan and the replay records of this step's rows (exact copies, see RuSpec).
   __shared__ int s_par[TREE ? RU_TMAX : 1];
   __shared__ int s_anc[TREE ? RU_TMAX * 4 : 1];
@@ -506,7 +516,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
       spa = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)ca * cv.cs_dim;
 #pragma unroll
       for (int i = 0; i < CS; ++i)
-        cha[i] = spa[(size_t)ru_hist_entry<TREE>(off + i, spec, n) * cv.cs_tok];
+        cha[i] = spa[(size_t)ru_hist_entry<(TP != 0 ? 1 : 0)>(off + i, spec, n) * cv.cs_tok];
       if (tid < RU_V) {
 #pragma unroll
         for (int t = 0; t < RU_CVT; ++t)
@@ -518,7 +528,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
         spb = cv.cs + (size_t)cslot * cv.cs_seq + (size_t)cb * cv.cs_dim;
 #pragma unroll
         for (int i = 0; i < CS; ++i)
-          chb[i] = spb[(size_t)ru_hist_entry<TREE>(off + i, spec, n) * cv.cs_tok];
+          chb[i] = spb[(size_t)ru_hist_entry<(TP != 0 ? 1 : 0)>(off + i, spec, n) * cv.cs_tok];
       }
       {
         const bool isa = tid < T;
@@ -627,15 +637,37 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
   // from the records directly (the !viaLds path); staging more ran past the array into the next LDS
   // object (the key heads' conv history, a chain of 7 drafts after a step that accepted 5 to 8 rows).
   const bool viaLds = FUSE && nacc <= RU_CVT / 2;
+  // PATHF: the t-th committed row's record is row spec_path[t]'s (clamped as the tree form clamps
+  // it). The path's first RU_CVT entries are one line, loaded here by every thread ahead of the
+  // factor loads that index by them, and packed a nibble an entry into one word (a record index is
+  // below RU_TMAX = 16): one register, where an array indexed by a thread's own row, or scalars a
+  // closure names, would live in scratch memory, and this kernel has no private segment. The
+  // launcher takes the path form only with a path, so the loads are unconditional.
+  static_assert(RU_TMAX <= 16 && RU_CVT <= 8, "the staged path entries are a nibble each of one word");
+  unsigned pw = 0x76543210u;
+  if constexpr (PATHF) {
+    const int* const pp = spec.path + (size_t)n * spec.pitch;
+    const int pl = spec.pitch - 1;
+    unsigned w = 0u;
+#pragma unroll
+    for (int t = 0; t < RU_CVT; ++t) {
+      const int v = pp[t < pl ? t : pl];
+      w |= (unsigned)(v < 0 ? 0 : (v >= RU_TMAX ? RU_TMAX - 1 : v)) << (4 * t);
+    }
+    pw = w;
+  }
+  auto path_rec = [pw](const int r) __attribute__((always_inline)) {
+    return PATHF ? (int)((pw >> (4 * (r & 7))) & 15u) : r;
+  };
   if constexpr (FUSE) {
 #pragma unroll
     for (int i = 0; i < SU; ++i) {
       const int u = tid + i * THR, r = u / 160, w = u - r * 160;
-      const int rr = r < nacc ? r : 0;
+      const int rr = r < nacc ? path_rec(r) : 0;
       stg[i] = *(const ru_f4*)(fr + (size_t)rr * RU_FSTR + (w < 128 ? 4 * w : 4 * RU_K + 4 * (w - 128)));
     }
     {
-      const int gr = (tid >> 3) < nacc ? (tid >> 3) : 0;
+      const int gr = (tid >> 3) < nacc ? path_rec(tid >> 3) : 0;
       stgb = fr[(size_t)gr * RU_FSTR + 4 * RU_K + RU_V + (tid & 7)];
     }
   }
@@ -802,7 +834,7 @@ __device__ __forceinline__ void ru_update_body(RU_PARAMS)
     for (int t = 0; t < nacc; ++t) {
       // The record of the t-th committed row: row t of a chain, spec_path[t] after a tree.
       int rec = t;
-      if constexpr (TREE) {
+      if constexpr (TP != 0) {
         if (spec.path) {
           const int pi = t < spec.pitch ? t : spec.pitch - 1;
           rec = spec.path[(size_t)n * spec.pitch + pi];
@@ -1437,12 +1469,12 @@ template <int ABF16, int NORM, int VS, int NT, int ANC, int STG, int SDT, int CV
 __global__ __launch_bounds__(RU_V / VS * 2)
 void r4d_gdn_recurrent_update_kernel(RU_PARAMS)
 {
-  if (CH::on) { if (TREE) ru_chain_wait(); else r4d_chain_wait(); }
+  if (CH::on) { if (TREE == 1) ru_chain_wait(); else r4d_chain_wait(); }
   ru_update_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV, TREE>(
       q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch,
       os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr,
       cv, spec);
-  if (CH::on) { if (TREE) ru_chain_done(); else r4d_chain_done(); }
+  if (CH::on) { if (TREE == 1) ru_chain_done(); else r4d_chain_done(); }
 }
 #undef RU_PARAMS
 
@@ -1627,6 +1659,19 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
                           (size_t)kMaxConvCtr * sizeof(unsigned int));
 }
 
+// r4d_gdn_fold_pin_path(1): a step that carries spec_path alone takes the tree form again (the
+// form it took before the path form existed), so r4d_selftest can hold the two to the same bytes
+// and --perfgdnt time both from one build. It returns the form the fold's last launch took (0 the
+// chain, 1 the tree form, 2 the path form), so a pin that is ignored cannot pass by comparing a
+// form with itself.
+static int g_ru_path_tree = 0;
+static int g_ru_last_form = 0;
+static inline bool ru_path_tree() { return g_ru_path_tree != 0; }
+extern "C" int r4d_gdn_fold_pin_path(int tree) {
+  g_ru_path_tree = tree;
+  return g_ru_last_form;
+}
+
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
 // factor-block bounds are as in ru_update_launch. `w_f32` is the conv weight's type. `oq_i8`:
@@ -1684,6 +1729,27 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else if (oq_i8 == 2) RC_TREE_NM(3, CVC);                                               \
        else if (oq_i8) RC_TREE_NM(2, CVC);                                                    \
        else            RC_TREE_NM(1, CVC); } while (0)
+// The path form (TP 2): the fused chain's instantiation, with the planes. Its non-temporal choice is
+// the chain's.
+#define RC_PATH_CH(NM, NTC, CVC, CH_)                                                         \
+  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, 1, 1, 0, CVC, 2,         \
+                                                      CH_>),                                  \
+                     grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
+                     ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
+                     (ru_state<0>::T*)state, st_slot, st_head, (unsigned short*)o,             \
+                     (unsigned char*)oq, (float*)os, oq_pitch, os_ld, (const int*)cu,          \
+                     (const int*)sidx, sidx_stride, (const int*)nacc,                          \
+                     (const unsigned short*)z, z_pitch, (const float*)nw, neps, nact, H, Hg,   \
+                     scale, thr, cv, spec)
+#define RC_PATH_NM(NM, NTC, CVC)                                                              \
+  do { if (chain) RC_PATH_CH(NM, NTC, CVC, r4dchain);                                         \
+       else       RC_PATH_CH(NM, NTC, CVC, R4dUnchained); } while (0)
+#define RC_PATH_NT(NTC, CVC)                                                                  \
+  do { if (oq_i8 == 3) RC_PATH_NM(4, NTC, CVC);                                               \
+       else if (oq_i8 == 2) RC_PATH_NM(3, NTC, CVC);                                          \
+       else if (oq_i8) RC_PATH_NM(2, NTC, CVC);                                               \
+       else            RC_PATH_NM(1, NTC, CVC); } while (0)
+#define RC_PATH(CVC) do { if (nt) RC_PATH_NT(1, CVC); else RC_PATH_NT(0, CVC); } while (0)
 // STGC 1 is the fused multi-row form (RU_FUSE): the anchor form over an f32 state only, picked by
 // `fuse`. The entry points always pick it, one row a sequence included: the unfused anchor form
 // spills 20 registers and is no faster at one row.
@@ -1697,8 +1763,24 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
        else RC_PICKNT(0, 0, CVC, 0); } while (0)
   if (spec.parent || spec.path) {
     if (!anc || sdt) return RAD_E_UNSUPPORTED;
-    if (w_f32) RC_TREE(2); else RC_TREE(1);
-  } else if (w_f32) RC_PICKSDT(2); else RC_PICKSDT(1);
+    // A path with no parents is a chain's rows behind a tree verify: the fused chain reads the
+    // previous block's rows through it (TP 2). A caller that did not ask for the fused form keeps
+    // the tree form, which serves a chain-shaped plane too.
+    if (!spec.parent && fuse && !ru_path_tree()) {
+      g_ru_last_form = 2;
+      if (w_f32) RC_PATH(2); else RC_PATH(1);
+    } else {
+      g_ru_last_form = 1;
+      if (w_f32) RC_TREE(2); else RC_TREE(1);
+    }
+  } else {
+    g_ru_last_form = 0;
+    if (w_f32) RC_PICKSDT(2); else RC_PICKSDT(1);
+  }
+#undef RC_PATH
+#undef RC_PATH_NT
+#undef RC_PATH_NM
+#undef RC_PATH_CH
 #undef RC_TREE
 #undef RC_TREE_CH
 #undef RC_TREE_NM

@@ -386,7 +386,11 @@ public:
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
      * finished request keeps them until that step has run. */
-    void            expect_draft(uint64_t id, int n);
+    /* `exact_nodes` >= 0 (exact_rows(): the engine read the card's slot behind the advance that
+     * fixed the next tree's shape): the real nodes of the tree the step will verify, a prefix of
+     * the `n` the card builds, and `exact_chain` whether those are a plain chain. Nothing is then
+     * predicted: the step carries exactly them, in the chain's form when they are one. */
+    void            expect_draft(uint64_t id, int n, int exact_nodes = -1, bool exact_chain = false);
     const RadBatch* step_next();
     const RadBatch* step_next_locked();
     /* Whether the step just issued likely ends every request it carries; step_next_locked then
@@ -443,7 +447,13 @@ public:
     void note_grown(uint64_t id, const int32_t* tokens, const int32_t* parents, int n);
     /* Whether the next step's form follows the prediction (the engine's tree_compact asks the
      * last build instead). */
-    bool dyn_enabled() const { return serial_tree_ && (cfg_.draft_tree_rows >= 0 || cfg_.draft_tree_chain > 0); }
+    bool dyn_enabled() const {
+        return serial_tree_ && (cfg_.draft_tree_rows >= 0 || cfg_.draft_tree_chain > 0 || exact_rows_);
+    }
+    /* --draft-tree-exact resolved for this deployment: a stage-1 serial tree of two rounds or more
+     * whose leaves the card fixes in round 1, so the engine can tell expect_draft the next tree's
+     * real nodes before it issues the step that verifies them (Config::draft_tree_exact). */
+    bool exact_rows() const { return exact_rows_; }
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
      * round 0 carries it. Call serial_end() once the step has committed. */
@@ -650,6 +660,7 @@ private:
      * runs `tree_rounds_` rounds (so no path is deeper), and `tree_width_` frontier rows a round
      * when it grows the tree itself (1: the chain and the core's leaves). */
     bool          serial_tree_ = false;
+    bool          exact_rows_ = false;     /* exact_rows() */
     int32_t       tree_rounds_ = 0;
     int32_t       tree_width_ = 1;
     BatchBuilder  builder_;
