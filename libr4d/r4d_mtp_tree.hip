@@ -132,13 +132,15 @@ extern "C" int r4d_rad_mtp_tree_grow(const RadArgs* a, RadStream s) {
   }
   const RadTensor *cdr = r4d_opt(a, 14), *csq = r4d_opt(a, 15), *cst = r4d_opt(a, 16);
   if (cdr && csq && cst) {
-    if (cdr->dtype != RAD_U32 || csq->dtype != RAD_I32 || cst->dtype != RAD_U32 || cdr->rank != 2 ||
-        cst->rank != 3 || cst->shape[2] != (long)RAD_MTP_COUPLE_STATE_WORDS || cst->shape[1] < M ||
-        cdr->shape[0] < M || cdr->shape[1] < (long)RAD_MTP_COUPLE_DRAW_WORDS ||
-        r4d_numel(csq) < M || cdr->stride[1] != 1 || cst->stride[2] != 1 || cdr->stride[0] % 2 ||
-        cst->stride[0] % 2 || cst->stride[1] % 2 || (uintptr_t)cdr->data % 8 ||
-        (uintptr_t)cst->data % 8)
-      return R4D_NO(RAD_E_SHAPE);
+    if (cdr->dtype != RAD_U32 || csq->dtype != RAD_I32 || cst->dtype != RAD_U32) return R4D_NO(RAD_E_DTYPE);
+    if (cdr->rank != 2 || cst->rank != 3) return R4D_NO(RAD_E_SHAPE);
+    if (cst->shape[2] != (long)RAD_MTP_COUPLE_STATE_WORDS || cst->shape[1] < M) return R4D_NO(RAD_E_SHAPE);
+    if (cdr->shape[0] < M || cdr->shape[1] < (long)RAD_MTP_COUPLE_DRAW_WORDS) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(csq) < M) return R4D_NO(RAD_E_SHAPE);
+    if (cdr->stride[1] != 1 || cst->stride[2] != 1) return R4D_NO(RAD_E_STRIDE);
+    if (cdr->stride[0] % 2) return R4D_NO(RAD_E_STRIDE);
+    if (cst->stride[0] % 2 || cst->stride[1] % 2) return R4D_NO(RAD_E_STRIDE);
+    if ((uintptr_t)cdr->data % 8 || (uintptr_t)cst->data % 8) return R4D_NO(RAD_E_ALIGN);
     k.cdraw = (const unsigned*)cdr->data;  k.cdraw_stride = (long)cdr->stride[0];
     k.cseq = (const int*)csq->data;        k.cseq_stride = csq->rank >= 1 ? (long)csq->stride[csq->rank - 1] : 1;
     k.cstate = (unsigned*)cst->data;       k.cst_node = (long)cst->stride[0];

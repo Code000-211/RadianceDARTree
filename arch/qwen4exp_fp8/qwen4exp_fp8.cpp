@@ -2447,8 +2447,9 @@ static void head_tree_grow(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brows(m.b_mtp_tsel, S * W), brows(m.b_mtp_tnsel, S * W),
                 brows(m.b_mtp_tvmask, S * W), brows(m.b_mtp_trb, S),
                 brows(m.b_mtp_tsrc, S * W), brows(m.b_mtp_tdst, S * W),
-                m.b_mtp_couple_draws ? praw(batch->seq_ids, RAD_I32, batch->n_seq) : RAD_NONE,
+                /* Operands 14..16 of mtp_tree_grow are cdraw, cseq, cstate, in that order. */
                 m.b_mtp_couple_draws ? brows(m.b_mtp_couple_draws, S) : RAD_NONE,
+                m.b_mtp_couple_draws ? praw(batch->seq_ids, RAD_I32, batch->n_seq) : RAD_NONE,
                 m.b_mtp_couple_draws ? RAD_B(m.b_mtp_couple_state) : RAD_NONE);
 }
 

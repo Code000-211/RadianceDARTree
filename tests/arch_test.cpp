@@ -13718,6 +13718,51 @@ TEST(flashnext_stage_two_head_rounds_carry_w_frontier_rows_and_grow_the_tree) {
     }
 }
 
+/* Stage 2 with --draft-coupling (the deployment mtp_tree_grow once refused at its first step): the
+ * grower's optional operands 14..16 are cdraw (the draw words, u32 [rows, 12]), cseq (the batch's
+ * sequence ids, an i32 raw pointer) and cstate (the node-row state plane, u32 [N, seqs, 46]), in
+ * the schema's slot order (libref/ref_registry.cpp oMtpTreeGrow), every round. The kernels check
+ * dtypes by slot, so a swap of the first two is a refusal at the first step, not a build error. */
+TEST(flashnext_stage_two_coupled_growers_issue_the_coupling_operands_in_slot_order) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    const int N = 7, R = 3, W = 2, S = 1;
+    RadBuilder b;
+    b.encs = { { "draft_head", u2_head() } };
+    RadBuildCtx ctx = q4_tree_ctx(0, 1, N, R, 0, W);
+    ctx.draft_coupling = 1;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &ctx), RAD_OK);
+    const RecBuf* draws = find_b(b, "mtp_couple_draws");
+    const RecBuf* state = find_b(b, "mtp_couple_state");
+    REQUIRE(draws != nullptr && state != nullptr);
+    CHECK(draws->d.dtype == RAD_U32 && state->d.dtype == RAD_U32);
+    CHECK_EQ(state->d.shape[0], (int64_t)N);
+    CHECK_EQ(state->d.shape[2], (int64_t)RAD_MTP_COUPLE_STATE_WORDS);
+    const uint32_t hd = (uint32_t)(draws - &b.bufs[0] + 1), hs = (uint32_t)(state - &b.bufs[0] + 1);
+
+    const TreeKit tk = tree_kit(b, S, N, R, true, false);
+    const auto his = history_pass(b, *tk.k);
+    auto round = [&](int r) {
+        auto k = kit(b, std::vector<int>(S, W), {});
+        k->b.draft_pass = r;
+        return k;
+    };
+    const auto r2 = round(2), r3 = round(3);
+    std::vector<int32_t> par((size_t)S * W, 0);
+    r2->b.spec_parent = par.data();
+    r3->b.spec_parent = par.data();
+    const auto v = run_passes(b, qwen4exp_fp8::step, { tk.k.get(), his.get(), r2.get(), r3.get() });
+    CHECK_PASSES(b, v);
+    for (size_t i = 1; i < 4; ++i) {
+        const auto g = issues_of(b, *v[i], "mtp_tree_grow");
+        REQUIRE_EQ(g.size(), (size_t)1);
+        REQUIRE(g[0]->opd.size() == 17);
+        CHECK(g[0]->opd[14].kind == RAD_OPK_BUF && g[0]->opd[14].handle == hd);
+        CHECK(g[0]->opd[15].kind == RAD_OPK_RAW && g[0]->opd[15].dtype == RAD_I32);
+        CHECK(g[0]->opd[16].kind == RAD_OPK_BUF && g[0]->opd[16].handle == hs);
+    }
+}
+
 TEST(flashnext_refuses_a_draft_tree_wider_than_its_node_budget) {
     MetaKV mk = q4_small();
     const RadModelMeta& meta = *mk.meta();

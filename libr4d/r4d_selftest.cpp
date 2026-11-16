@@ -10886,6 +10886,8 @@ static int mtp_tree_run(const RadKernelInfo* r, double pa, double pr, const char
     return inert;
 }
 
+static void mtp_tree_engine_run(const Plugin& pl);
+
 void mtp_tree_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
     if (!r) { ok("mtp_tree_grow", false, "row absent"); return; }
@@ -10953,6 +10955,7 @@ void mtp_tree_coupled_cases(const Plugin& pl) {
                          "mtp_tree_grow coupled, adaptive, with a per-depth tau and calibration word matches the host walk",
                          0.0f, 0.0f, 0, (6u | 3u << 4) | ((8u | 10u << 4) << 8) | ((1u | 14u << 4) << 16),
                          "on=1;floor=1;margin=0.8;draft=1.0;temp=1.2");
+    mtp_tree_engine_run(pl);
 }
 
 static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const char* label,
@@ -11079,6 +11082,143 @@ static void mtp_tree_coupled_run(const Plugin& pl, double pa, double pr, const c
             if (m == 4 || m == 5) bad += g.status != 0;   /* greedy / foreign draw: untouched */
         }
     ok(label, bad == 0 && nbound > 0, fmt("%d entries differ, %d coupled node state(s)", bad, nbound));
+}
+
+/* The stage-2 + coupling deployment's geometry, as arch/qwen4exp_fp8 issues it (--draft-tree-width 2
+ * --draft-tree-nodes 7 --draft-coupling, max_seqs 1): one sequence, the attention operands at
+ * sel_pitch 513 (the head's QSA top-k + 1), the head index of round 1, the hidden-store routing and
+ * the coupled operands in the schema's slot order cdraw, cseq, cstate (14..16), the node-row state
+ * plane [N, 1, 46]. Device against the host walk, every round; then the same launch with cdraw and
+ * cseq swapped (the order the plugin once issued) must be refused, not run. */
+static void mtp_tree_engine_run(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mtp_tree_grow_i32");
+    if (!r) { ok("mtp_tree_grow engine geometry", false, "row absent"); return; }
+    const int M = 1, W = 2, R = 3, N = 7, K = RAD_MTP_TREE_K, B = 4, SP = 513, PITCH = 8, VOC = 248320;
+    const int sw = rad_mtp_tree_state_words(N, W, R);
+    const int SWORDS = (int)RAD_MTP_COUPLE_STATE_WORDS, DWORDS = (int)RAD_MTP_COUPLE_DRAW_WORDS;
+    uint32_t seed = 4711;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xffffff; };
+    std::vector<int32_t> hstate((size_t)M * sw, 0);
+    void* dst = up_i32(hstate);
+    std::vector<int32_t> table(64);
+    for (int i = 0; i < 64; ++i) table[(size_t)i] = 1000 + i;
+    void* dtab = up_i32(table);
+    const int T1 = 3;
+    std::vector<int32_t> hpos = { 5, 6, 7 }, hrow = { 2 };
+    void* dhpos = up_i32(hpos);
+    void* dhrow = up_i32(hrow);
+    RadMtpCoupleDraw draw{ 0x1000ull, 40ull, 1ull, 0, 1u };
+    std::vector<int32_t> dwords(DWORDS);
+    std::memcpy(dwords.data(), &draw, dwords.size() * 4);
+    std::vector<int32_t> cards = { 0 };
+    std::vector<int32_t> pwords((size_t)N * M * SWORDS, 0);
+    void* ddraw = up_i32(dwords);
+    void* dcard = up_i32(cards);
+    void* dplane = up_i32(pwords);
+    void* dtok = dalloc((size_t)M * PITCH * 4);
+    void* dpar = dalloc((size_t)M * PITCH * 4);
+    void* dsel = dalloc((size_t)M * W * SP * 4);
+    void* dnsel = dalloc((size_t)M * W * 4);
+    void* dvm = dalloc((size_t)M * W * 8);
+    void* drb = dalloc((size_t)M * 4);
+    void* dsrc = dalloc((size_t)M * W * 4);
+    void* ddst = dalloc((size_t)M * W * 4);
+    if (!dst || !dtab || !dhpos || !dhrow || !ddraw || !dcard || !dplane || !dtok || !dpar || !dsel ||
+        !dnsel || !dvm || !drb || !dsrc || !ddst) {
+        ok("mtp_tree_grow engine geometry", false, "alloc");
+        return;
+    }
+    std::vector<RadMtpCoupleState> hplane((size_t)N * M);
+    std::vector<int32_t> wtok((size_t)M * PITCH), wpar((size_t)M * PITCH);
+    int bad = 0, swapped_rc = RAD_OK;
+    for (int round = 1; round <= R; ++round) {
+        const int rows = round == 1 ? M : M * W;
+        std::vector<int32_t> idx((size_t)rows * K);
+        std::vector<float> val((size_t)rows * K);
+        for (int i = 0; i < rows; ++i)
+            for (int c = 0; c < K; ++c) {
+                int id;
+                bool dup;
+                do {
+                    id = (int)(rnd() % VOC);
+                    dup = false;
+                    for (int q = 0; q < c; ++q) dup = dup || idx[(size_t)i * K + q] == id;
+                } while (dup);
+                idx[(size_t)i * K + c] = id;
+                val[(size_t)i * K + c] = 6.0f - 0.9f * c - (rnd() % 100) * 0.01f;
+            }
+        void* didx = up_i32(idx);
+        void* dval = up_f32(val);
+        std::vector<RadParam> ps = { PI("M", M), PI("round", round), PI("rounds", R), PI("nodes", N),
+                                     PI("width", W), PI("block_size", B), PI("sel_pitch", SP),
+                                     PI("n_vocab", VOC) };
+        const bool first = round == 1;
+        auto ops = [&](void* c14, void* c15) {
+            return std::vector<RadTensor>{
+                T(didx, RAD_I32, { rows, K }), T(dval, RAD_F32, { rows, K }), T(dst, RAD_I32, { M, sw }),
+                T(first ? dhpos : nullptr, RAD_I32, { T1 }), T(first ? dhrow : nullptr, RAD_I32, { M }),
+                T(dtab, RAD_I32, { M, 64 }), T(dtok, RAD_I32, { M, PITCH }), T(dpar, RAD_I32, { M, PITCH }),
+                T(dsel, RAD_I32, { M * W, SP }), T(dnsel, RAD_I32, { M * W }), T(dvm, RAD_I64, { M * W }),
+                T(drb, RAD_I32, { M }), T(dsrc, RAD_I32, { M * W }), T(ddst, RAD_I32, { M * W }),
+                c14 == ddraw ? T(c14, RAD_U32, { M, DWORDS }) : T(c14, RAD_I32, { M }),
+                c15 == ddraw ? T(c15, RAD_U32, { M, DWORDS }) : T(c15, RAD_I32, { M }),
+                T(dplane, RAD_U32, { N, M, SWORDS }) };
+        };
+        if (first) swapped_rc = launch(r, ops(dcard, ddraw), ps);
+        const int rc = launch(r, ops(ddraw, dcard), ps);
+        if (rc != RAD_OK) { ok("mtp_tree_grow engine geometry launch", false, "rc " + std::to_string(rc)); return; }
+        RadMtpTreeCfg cfg{};
+        cfg.round = round; cfg.rounds = R; cfg.nodes = N; cfg.width = W; cfg.block = B;
+        cfg.sel_pitch = SP; cfg.pitch = PITCH;
+        std::vector<int32_t> hsel((size_t)M * W * SP, 0), hnsel((size_t)M * W, 0), hrb((size_t)M, 0);
+        std::vector<long long> hvm((size_t)M * W, 0);
+        std::vector<int32_t> hsrc((size_t)M * W, 0), hdst((size_t)M * W, 0);
+        RadMtpTreeCpl cpl{};
+        cpl.draw = reinterpret_cast<const uint32_t*>(&draw);
+        cpl.card = 0;
+        cpl.state = reinterpret_cast<uint32_t*>(hplane.data());
+        cpl.st_node = (int64_t)M * SWORDS;
+        cpl.st_seq = SWORDS;
+        cpl.rows = N;
+        cpl.vocab = VOC;
+        const int head = round == 1 ? hpos[(size_t)hrow[0]] : -1;
+        rad_mtp_tree_grow_seq_cpl(&cfg, hstate.data(), idx.data(), val.data(), 0, K, 1, head,
+                                  table.data(), wtok.data(), wpar.data(), hsel.data(), hnsel.data(),
+                                  hvm.data(), hrb.data(), 0, hsrc.data(), hdst.data(), &cpl);
+        const std::vector<int32_t> gtok = down_i32(dtok, (size_t)M * PITCH);
+        const std::vector<int32_t> gpar = down_i32(dpar, (size_t)M * PITCH);
+        const std::vector<int32_t> gsel = down_i32(dsel, (size_t)M * W * SP);
+        const std::vector<int32_t> gnsel = down_i32(dnsel, (size_t)M * W);
+        const std::vector<int32_t> grb = down_i32(drb, (size_t)M);
+        std::vector<long long> gvm((size_t)M * W);
+        st_memcpy(gvm.data(), dvm, gvm.size() * 8, hipMemcpyDeviceToHost);
+        const int nt = round < R ? W : N;
+        for (int j = 0; j < nt; ++j) {
+            bad += gtok[(size_t)j] != wtok[(size_t)j];
+            bad += gpar[(size_t)j] != wpar[(size_t)j];
+        }
+        if (round < R) {
+            bad += grb[0] != hrb[0];
+            for (int w = 0; w < W; ++w) {
+                bad += gnsel[(size_t)w] != hnsel[(size_t)w] || gvm[(size_t)w] != hvm[(size_t)w];
+                for (int k = 0; k < SP; ++k) bad += gsel[(size_t)w * SP + k] != hsel[(size_t)w * SP + k];
+            }
+        }
+    }
+    const std::vector<int32_t> gplane = down_i32(dplane, (size_t)N * M * SWORDS);
+    int nbound = 0;
+    for (int f = 0; f < N; ++f) {
+        RadMtpCoupleState g;
+        std::memcpy(&g, gplane.data() + (size_t)f * SWORDS, sizeof g);
+        const RadMtpCoupleState& h = hplane[(size_t)f];
+        bad += g.status != h.status || g.round != h.round || g.count != h.count || g.x != h.x ||
+               g.nkids != h.nkids;
+        nbound += h.status == 1;
+    }
+    ok("mtp_tree_grow at the stage-2 coupling deployment's geometry (M=1, W=2, N=7, sel_pitch 513) matches the host walk",
+       bad == 0 && nbound > 0, fmt("%d entries differ, %d coupled node state(s)", bad, nbound));
+    ok("mtp_tree_grow refuses the coupled operands out of slot order (cseq in cdraw's slot)",
+       swapped_rc != RAD_OK, "the swapped launch ran");
 }
 
 /* iota with and without a period. Exact. */
