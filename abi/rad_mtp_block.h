@@ -54,15 +54,24 @@
 #define RAD_MTP_BLOCK_MAX      RAD_MTP_COUPLE_MAX_ROUNDS   /* g: the chain's longest block */
 #define RAD_MTP_BLOCK_KEY_STOP 0x424c4b53544f5000ull       /* the h_i uniforms, per block */
 
-/* One verify row's candidate list: the sampler's plane, either dense (lj == nullptr, n slots, holes
- * id < 0 and -inf scores skipped) or compacted to the live slots in ascending order (lj[j] indexes
- * ids/val, n of them), with `valid` and `top` the scan of the whole plane the device already made
- * (rad_mtp_block_scan makes the same on the host). Summation order is ascending slot order in both,
- * so the two give bit-identical FP64. */
+/* Summation structure. The device decides a block with one workgroup of RAD_MTP_BLOCK_LANES
+ * threads, so every FP64 sum over a row's candidate plane is DEFINED as this fixed tree, which the
+ * host reference mirrors operation for operation (FP64 addition is not associative: the tree is
+ * the definition, not an approximation):
+ *   - plane slot j belongs to lane j % LANES; a lane adds its live slots in ascending j;
+ *   - the lanes are reduced inside each group of RAD_MTP_BLOCK_WAVE by the butterfly
+ *     a[l] = a[l] + a[l ^ d], d = 16, 8, 4, 2, 1 (every lane of a group ends with the same bits),
+ *     and the LANES / WAVE group sums are added as ((g0 + g1) + (g2 + g3)).
+ * The exp() of a slot is the same libm / device function on both sides, as before. */
+#define RAD_MTP_BLOCK_LANES 128
+#define RAD_MTP_BLOCK_WAVE  32
+
+/* One verify row's candidate plane, dense (n slots, holes id < 0 and -inf scores skipped), with
+ * `valid` and `top` the scan of the whole plane (rad_mtp_block_scan makes it on the host; the
+ * device reduces the same two values across its workgroup: a max and an OR are order free). */
 struct RadBlockRow {
     const int32_t* ids;
     const float*   val;
-    const short*   lj;
     int64_t        n;
     int            valid;
     float          top;
@@ -81,10 +90,45 @@ static inline RAD_BLK_HD void rad_mtp_block_scan(RadBlockRow* r, int64_t vocab) 
     r->top = top;
 }
 
-/* Visit order helper: slot j's index into the plane, or -1 for a dead slot. */
-static inline RAD_BLK_HD int64_t rad_mtp_block_slot(const RadBlockRow& r, int64_t j) {
-    const int64_t i = r.lj ? (int64_t)r.lj[j] : j;
-    return (r.ids[i] < 0 || r.val[i] == -INFINITY) ? -1 : i;
+static inline RAD_BLK_HD bool rad_mtp_block_live(int32_t id, float v) { return id >= 0 && v != -INFINITY; }
+
+/* A lane's partial sums of one row: v[0..7] the mass on Q's ids (by their place in the state),
+ * v[8] the mass off Q's support, v[9] the total. */
+struct RadBlockAcc { double v[10]; };
+
+static inline RAD_BLK_HD int rad_mtp_block_find(const RadMtpCoupleState& s, int32_t id) {
+    int k = 0;
+    while (k < s.count && id != s.ids[k]) ++k;
+    return k;
+}
+
+/* Adds the live slot (id, v) to a lane's partial. */
+static inline RAD_BLK_HD void rad_mtp_block_acc_add(RadBlockAcc* a, const RadMtpCoupleState& s,
+                                                    int32_t id, float v, float top) {
+    const double w = ::exp((double)v - top);
+    const int k = rad_mtp_block_find(s, id);
+    for (int kk = 0; kk < 8; ++kk) a->v[kk] += kk == k ? w : 0.0;
+    a->v[8] += k >= s.count ? w : 0.0;
+    a->v[9] += w;
+}
+
+/* The lanes' partials reduced by the tree above (the host form; the device does the butterfly with
+ * shuffles and adds the four group sums the same way). */
+static inline RAD_BLK_HD RadBlockAcc rad_mtp_block_tree(const RadBlockAcc* lane) {
+    RadBlockAcc grp[RAD_MTP_BLOCK_LANES / RAD_MTP_BLOCK_WAVE];
+    for (int w = 0; w < RAD_MTP_BLOCK_LANES / RAD_MTP_BLOCK_WAVE; ++w) {
+        RadBlockAcc a[RAD_MTP_BLOCK_WAVE], t[RAD_MTP_BLOCK_WAVE];
+        for (int l = 0; l < RAD_MTP_BLOCK_WAVE; ++l) a[l] = lane[w * RAD_MTP_BLOCK_WAVE + l];
+        for (int d = RAD_MTP_BLOCK_WAVE / 2; d > 0; d >>= 1) {
+            for (int l = 0; l < RAD_MTP_BLOCK_WAVE; ++l) t[l] = a[l];
+            for (int l = 0; l < RAD_MTP_BLOCK_WAVE; ++l)
+                for (int c = 0; c < 10; ++c) a[l].v[c] = t[l].v[c] + t[l ^ d].v[c];
+        }
+        grp[w] = a[0];
+    }
+    RadBlockAcc o;
+    for (int c = 0; c < 10; ++c) o.v[c] = (grp[0].v[c] + grp[1].v[c]) + (grp[2].v[c] + grp[3].v[c]);
+    return o;
 }
 
 /* P_i over Q_{i+1}'s support (pq, normalised, duplicate candidates aggregated), the mass off that
@@ -95,29 +139,33 @@ struct RadBlockStat {
     int    ix;
 };
 
-static inline RAD_BLK_HD bool rad_mtp_block_stat(const RadBlockRow& r, const RadMtpCoupleState& s,
-                                                 RadBlockStat* o) {
-    if (!r.valid || r.top == -INFINITY) return false;
-    double sum = 0, wout = 0;
-    for (int k = 0; k < 8; ++k) o->pq[k] = 0;
-    for (int64_t j = 0; j < r.n; ++j) {
-        const int64_t i = rad_mtp_block_slot(r, j);
-        if (i < 0) continue;
-        const double w = ::exp((double)r.val[i] - r.top);
-        sum += w;
-        int k = 0;
-        while (k < s.count && r.ids[i] != s.ids[k]) ++k;
-        if (k < s.count) o->pq[k] += w; else wout += w;
-    }
+/* The stat from the reduced partials `t` (what the device builds from its workgroup's tree). */
+static inline RAD_BLK_HD bool rad_mtp_block_stat_from(const RadBlockAcc& t, int valid, float top,
+                                                      const RadMtpCoupleState& s, RadBlockStat* o) {
+    if (!valid || top == -INFINITY) return false;
+    const double sum = t.v[9];
     if (!(sum > 0) || !rad_spechub_finite(sum)) return false;
     o->ix = -1;
+    for (int k = 0; k < 8; ++k) o->pq[k] = k < s.count ? t.v[k] : 0.0;
     for (int k = 0; k < s.count; ++k) {
         o->pq[k] /= sum;
         if (s.ids[k] == s.x) o->ix = k;
     }
-    o->pout = wout / sum;
+    o->pout = t.v[8] / sum;
     o->sum = sum;
     return o->ix >= 0;
+}
+
+static inline RAD_BLK_HD bool rad_mtp_block_stat(const RadBlockRow& r, const RadMtpCoupleState& s,
+                                                 RadBlockStat* o) {
+    if (!r.valid || r.top == -INFINITY) return false;
+    RadBlockAcc lane[RAD_MTP_BLOCK_LANES];
+    for (int l = 0; l < RAD_MTP_BLOCK_LANES; ++l)
+        for (int c = 0; c < 10; ++c) lane[l].v[c] = 0;
+    for (int64_t j = 0; j < r.n; ++j)
+        if (rad_mtp_block_live(r.ids[j], r.val[j]))
+            rad_mtp_block_acc_add(&lane[j % RAD_MTP_BLOCK_LANES], s, r.ids[j], r.val[j], r.top);
+    return rad_mtp_block_stat_from(rad_mtp_block_tree(lane), r.valid, r.top, s, o);
 }
 
 /* The block's weights. p[i] (i = 0 .. g), h[i] (i = 0 .. g). */
@@ -166,48 +214,89 @@ static inline RAD_BLK_HD int rad_mtp_block_tau(const RadBlockPlan& pl, uint64_t 
     return 0;
 }
 
-/* Y ~ max(p P - Q, 0) normalised (state s, row r, stat t) with the uniform u in [0, 1). When the
- * residual's total underflows to zero (FP64 cancellation with p = 1: P == Q) Y is drawn from P
- * itself, a branch that depends on (P, Q) only. False: no live candidate. */
+/* One lane's partials of the residual draw: `off` the off-support masses p * (w / sum) (slots whose
+ * id is not among Q's), `all` the plain weights (the fallback draw from P itself), and the last
+ * positive id of each, in the lane's slot order. */
+struct RadBlockLane { double off, all; int32_t last_off, last_all; };
+
+static inline RAD_BLK_HD void rad_mtp_block_lane_add(RadBlockLane* a, const RadMtpCoupleState& s,
+                                                     const RadBlockStat& t, double p, int32_t id,
+                                                     float v, float top) {
+    const double w = ::exp((double)v - top);
+    a->all += w;
+    if (w > 0) a->last_all = id;
+    if (rad_mtp_block_find(s, id) >= s.count) {
+        const double m = p * (w / t.sum);
+        a->off += m;
+        if (m > 0) a->last_off = id;
+    }
+}
+
+/* Y ~ max(p P - Q, 0) normalised (state s, row r, stat t) with the uniform u in [0, 1). The mass
+ * is walked in a fixed order: the ids of Q (place k = 0 .. count-1, mass max(p pq[k] - q[k], 0)),
+ * then the other live slots lane by lane (the lanes of the tree above, each lane's slots in
+ * ascending order; the lane totals are added in lane order). The walk subtracts the masses from
+ * c = u * total and stops at the first negative; inside the lane it stops in, the walk restarts
+ * from the c at the lane's start, so the structure is exactly what the workgroup computes. When
+ * the total underflows to zero (FP64 cancellation with p = 1: P == Q) Y is drawn from P itself
+ * over all live slots in the same lane order, a branch that depends on (P, Q) only. False: no live
+ * candidate. */
+static inline RAD_BLK_HD bool rad_mtp_block_resid_walk(const RadBlockRow& r,
+                                                       const RadMtpCoupleState& s,
+                                                       const RadBlockStat& t, double p, double u,
+                                                       const RadBlockLane* lane, int32_t* out) {
+    double on[8];
+    double total = 0;
+    for (int k = 0; k < s.count; ++k) { on[k] = rad_spechub_positive(p * t.pq[k] - s.q[k]); total += on[k]; }
+    double offt = 0;
+    for (int l = 0; l < RAD_MTP_BLOCK_LANES; ++l) offt += lane[l].off;
+    total += offt;
+    const bool resid = total > 0 && rad_spechub_finite(total);
+    double c = resid ? u * total : u * t.sum;
+    int32_t last = -1;
+    if (resid) {
+        for (int k = 0; k < s.count; ++k)
+            if (on[k] > 0) { last = s.ids[k]; c -= on[k]; if (c < 0) { *out = last; return true; } }
+    }
+    for (int l = 0; l < RAD_MTP_BLOCK_LANES; ++l) {
+        const double T = resid ? lane[l].off : lane[l].all;
+        const int32_t ll = resid ? lane[l].last_off : lane[l].last_all;
+        if (!(T > 0)) continue;
+        if (ll >= 0) last = ll;
+        if (c - T < 0) {
+            double cl = c;
+            int32_t lastl = -1;
+            for (int64_t j = l; j < r.n; j += RAD_MTP_BLOCK_LANES) {
+                if (!rad_mtp_block_live(r.ids[j], r.val[j])) continue;
+                const double w = ::exp((double)r.val[j] - r.top);
+                double m;
+                if (resid) {
+                    if (rad_mtp_block_find(s, r.ids[j]) < s.count) continue;
+                    m = p * (w / t.sum);
+                } else {
+                    m = w;
+                }
+                if (m > 0) { lastl = r.ids[j]; cl -= m; if (cl < 0) { *out = lastl; return true; } }
+            }
+            *out = lastl >= 0 ? lastl : ll;
+            return *out >= 0;
+        }
+        c -= T;
+    }
+    *out = last;
+    return last >= 0;
+}
+
 static inline RAD_BLK_HD bool rad_mtp_block_resid_draw(const RadBlockRow& r,
                                                        const RadMtpCoupleState& s,
                                                        const RadBlockStat& t, double p, double u,
                                                        int32_t* out) {
-    double total = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-        unsigned seen = 0;
-        double c = u * total;
-        int32_t last = -1;
-        for (int64_t j = 0; j < r.n; ++j) {
-            const int64_t i = rad_mtp_block_slot(r, j);
-            if (i < 0) continue;
-            int k = 0;
-            while (k < s.count && r.ids[i] != s.ids[k]) ++k;
-            double m;
-            if (k < s.count) {
-                if (seen & (1u << k)) continue;
-                seen |= 1u << k;
-                m = rad_spechub_positive(p * t.pq[k] - s.q[k]);
-            } else {
-                m = p * (::exp((double)r.val[i] - r.top) / t.sum);
-            }
-            if (pass == 0) { total += m; continue; }
-            if (m > 0) { last = r.ids[i]; c -= m; if (c < 0) { *out = last; return true; } }
-        }
-        if (pass == 1) { *out = last; return last >= 0; }
-        if (!(total > 0 && rad_spechub_finite(total))) break;
-    }
-    /* direct draw from P */
-    double c = u * t.sum;
-    int32_t last = -1;
-    for (int64_t j = 0; j < r.n; ++j) {
-        const int64_t i = rad_mtp_block_slot(r, j);
-        if (i < 0) continue;
-        const double w = ::exp((double)r.val[i] - r.top);
-        if (w > 0) { last = r.ids[i]; c -= w; if (c < 0) { *out = last; return true; } }
-    }
-    *out = last;
-    return last >= 0;
+    RadBlockLane lane[RAD_MTP_BLOCK_LANES];
+    for (int l = 0; l < RAD_MTP_BLOCK_LANES; ++l) lane[l] = RadBlockLane{ 0, 0, -1, -1 };
+    for (int64_t j = 0; j < r.n; ++j)
+        if (rad_mtp_block_live(r.ids[j], r.val[j]))
+            rad_mtp_block_lane_add(&lane[j % RAD_MTP_BLOCK_LANES], s, t, p, r.ids[j], r.val[j], r.top);
+    return rad_mtp_block_resid_walk(r, s, t, p, u, lane, out);
 }
 
 /* The whole decision on the host: rows[0 .. g-1] / st[0 .. g-1] are the block's verify rows and

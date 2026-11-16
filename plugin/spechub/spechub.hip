@@ -98,18 +98,26 @@ struct LiveCands {
 };
 
 /* --draft-verify block (abi/rad_mtp_block.h). The workgroup of a block's round-1 row decides the
- * whole block and writes the tokens of rows 0 .. tau; the block's other rows return. Per row the
- * live candidates are compacted by the workgroup (couple_live) and thread 0 runs the shared helpers
- * over them in ascending slot order, so the result is the host reference's bit for bit. Called by
- * every thread of the workgroup (couple_live synchronises); `lj` is the kMaxCand scratch. */
-__device__ void block_verify(const RadMtpCoupleVerifyCall& c, int64_t row, short* lj) {
+ * whole block and writes the tokens of rows 0 .. tau; the block's other rows return. Every FP64 sum
+ * over a candidate plane is the header's fixed lane tree (slot j to lane j % 128, ascending within
+ * the lane, butterfly over each wave's 32 lanes, the four wave sums as ((0+1)+(2+3))): the
+ * workgroup computes all exps and lane partials in parallel and thread 0 only runs the 8-wide
+ * plan, so the result is the host reference's bit for bit (rad_mtp_block_decide). Called by every
+ * thread of the workgroup. */
+static_assert(kThreads == RAD_MTP_BLOCK_LANES && RAD_MTP_BLOCK_WAVE == 32, "the tree's shape");
+
+__device__ void block_verify(const RadMtpCoupleVerifyCall& c, int64_t row) {
+    constexpr int kW = kThreads / 32;
     __shared__ RadMtpCoupleState sst[RAD_MTP_BLOCK_MAX];
     __shared__ RadBlockStat      sstat[RAD_MTP_BLOCK_MAX];
     __shared__ RadBlockPlan      plan;
-    __shared__ int   g_s, ok_s, tau_s, nl_s, valid_s;
-    __shared__ float top_s;
+    __shared__ float             wmax[RAD_MTP_BLOCK_MAX][kW];
+    __shared__ int               wbad[RAD_MTP_BLOCK_MAX][kW];
+    __shared__ double            wacc[RAD_MTP_BLOCK_MAX][kW][10];
+    __shared__ RadBlockLane      lanes[kThreads];
+    __shared__ int   g_s, ok_s, tau_s;
     __shared__ int32_t y_s;
-    const int tid = threadIdx.x;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     if (tid == 0) {
         const auto& s0 = *reinterpret_cast<const RadMtpCoupleState*>(c.state + row * c.ld[3]);
         g_s = s0.blk;
@@ -126,34 +134,83 @@ __device__ void block_verify(const RadMtpCoupleVerifyCall& c, int64_t row, short
     __syncthreads();
     if (!ok_s) return;
     const int g = g_s;
+    const int64_t n = c.n_cand;
+    /* every row's validity and maximum */
     for (int i = 0; i < g; ++i) {
-        couple_live(c.idx + (row + i) * c.ld[0], c.val + (row + i) * c.ld[1], c.n_cand, c.vocab, lj,
-                    &nl_s, &valid_s, &top_s);
-        if (tid == 0) {
-            const RadBlockRow r{ c.idx + (row + i) * c.ld[0], c.val + (row + i) * c.ld[1], lj,
-                                 (int64_t)nl_s, valid_s, top_s };
-            if (!rad_mtp_block_stat(r, sst[i], &sstat[i])) ok_s = 0;
+        const int32_t* ids = c.idx + (row + i) * c.ld[0];
+        const float*   val = c.val + (row + i) * c.ld[1];
+        int bad = 0;
+        float mx = -INFINITY;
+        for (int64_t j = tid; j < n; j += kThreads) {
+            const int32_t id = ids[j];
+            const float v = val[j];
+            if (id >= 0) {
+                if (id >= c.vocab || v != v || v == INFINITY) bad = 1;
+                else if (v > mx) mx = v;
+            }
         }
-        __syncthreads();
+        for (int d = 16; d > 0; d >>= 1) {
+            bad |= __shfl_xor(bad, d);
+            mx = fmaxf(mx, __shfl_xor(mx, d));
+        }
+        if (lane == 0) { wbad[i][wave] = bad; wmax[i][wave] = mx; }
     }
-    if (!ok_s) return;
-    const auto& p0 = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
+    __syncthreads();
+    /* the lane partials and the butterfly of every row */
+    for (int i = 0; i < g; ++i) {
+        const int32_t* ids = c.idx + (row + i) * c.ld[0];
+        const float*   val = c.val + (row + i) * c.ld[1];
+        float top = wmax[i][0];
+        int bad = wbad[i][0];
+        for (int w = 1; w < kW; ++w) { top = fmaxf(top, wmax[i][w]); bad |= wbad[i][w]; }
+        if (bad || top == -INFINITY) return;   /* uniform: the same LDS everywhere */
+        RadBlockAcc a;
+        for (int k = 0; k < 10; ++k) a.v[k] = 0;
+        for (int64_t j = tid; j < n; j += kThreads)
+            if (rad_mtp_block_live(ids[j], val[j])) rad_mtp_block_acc_add(&a, sst[i], ids[j], val[j], top);
+        for (int d = 16; d > 0; d >>= 1)
+            for (int k = 0; k < 10; ++k) a.v[k] = a.v[k] + __shfl_xor(a.v[k], d);
+        if (lane == 0)
+            for (int k = 0; k < 10; ++k) wacc[i][wave][k] = a.v[k];
+    }
+    __syncthreads();
     if (tid == 0) {
-        rad_mtp_block_plan(sst, sstat, g, &plan);
-        tau_s = rad_mtp_block_tau(plan, p0.seed, p0.pos);
+        for (int i = 0; i < g && ok_s; ++i) {
+            RadBlockAcc t;
+            for (int k = 0; k < 10; ++k)
+                t.v[k] = (wacc[i][0][k] + wacc[i][1][k]) + (wacc[i][2][k] + wacc[i][3][k]);
+            float top = wmax[i][0];
+            for (int w = 1; w < kW; ++w) top = fmaxf(top, wmax[i][w]);
+            if (!rad_mtp_block_stat_from(t, 1, top, sst[i], &sstat[i])) ok_s = 0;
+        }
+        if (ok_s) {
+            const auto& p0 = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
+            rad_mtp_block_plan(sst, sstat, g, &plan);
+            tau_s = rad_mtp_block_tau(plan, p0.seed, p0.pos);
+        }
         y_s = -1;
     }
     __syncthreads();
+    if (!ok_s) return;
     const int tau = tau_s;
+    const auto& p0 = *reinterpret_cast<const RadSampleParams*>(c.params + row * c.ld[2]);
     if (tau < g) {
-        couple_live(c.idx + (row + tau) * c.ld[0], c.val + (row + tau) * c.ld[1], c.n_cand, c.vocab,
-                    lj, &nl_s, &valid_s, &top_s);
+        const int32_t* ids = c.idx + (row + tau) * c.ld[0];
+        const float*   val = c.val + (row + tau) * c.ld[1];
+        float top = wmax[tau][0];
+        for (int w = 1; w < kW; ++w) top = fmaxf(top, wmax[tau][w]);
+        RadBlockLane a{ 0, 0, -1, -1 };
+        for (int64_t j = tid; j < n; j += kThreads)
+            if (rad_mtp_block_live(ids[j], val[j]))
+                rad_mtp_block_lane_add(&a, sst[tau], sstat[tau], plan.p[tau], ids[j], val[j], top);
+        lanes[tid] = a;
+        __syncthreads();
         if (tid == 0) {
-            const RadBlockRow r{ c.idx + (row + tau) * c.ld[0], c.val + (row + tau) * c.ld[1], lj,
-                                 (int64_t)nl_s, valid_s, top_s };
-            if (!rad_mtp_block_resid_draw(r, sst[tau], sstat[tau], plan.p[tau],
+            const RadBlockRow r{ ids, val, n, 1, top };
+            if (!rad_mtp_block_resid_walk(r, sst[tau], sstat[tau], plan.p[tau],
                                           rad_spechub_uniform(p0.seed, p0.pos + (uint64_t)tau,
-                                                              RAD_SAMPLE_KEY_RESID), &y_s))
+                                                              RAD_SAMPLE_KEY_RESID),
+                                          lanes, &y_s))
                 ok_s = 0;
         }
         __syncthreads();
@@ -194,7 +251,12 @@ __global__ void couple_verify(const int32_t* idx, const float* values, const uin
     if (!eligible) return;
     /* A chain row of a block-verified draft (--draft-verify block). */
     if (s.blk >= 1) {
-        block_verify(c, row, lj);
+#ifdef RAD_BLOCK_REPEAT
+        /* microbenchmark build: the block is decided RAD_BLOCK_REPEAT times back to back (idempotent) */
+        for (int rep = 0; rep < RAD_BLOCK_REPEAT; ++rep) { block_verify(c, row); __syncthreads(); }
+#else
+        block_verify(c, row);
+#endif
         return;
     }
     /* A RheoSampling node (abi/rad_mtp_rrs.h): one thread runs the shared serial helper, which is

@@ -22,6 +22,8 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -299,7 +301,8 @@ TEST(the_device_block_verify_agrees_with_the_host_row) {
     const int SW = (int)RAD_MTP_COUPLE_STATE_WORDS;
     const int64_t VOC = 50000;
     int shortened = 0, whole = 0, writes = 0;
-    for (int NC : { 24, 1000, 1100 }) {
+    for (int NC : { 24, 1000, 1100, 1001 }) {   /* 1001: wide, 300..500 live slots a row */
+        const bool wide = NC == 1001;
         const int NSEQ = 40, MAXROWS = 9;
         const int M = NSEQ * MAXROWS;
         Buf cid(RAD_I32, { M, NC }, 4), cval(RAD_F32, { M, NC }, 4), prm(RAD_U32, { M, 24 }, 4);
@@ -316,19 +319,19 @@ TEST(the_device_block_verify_agrees_with_the_host_row) {
             const uint64_t seed = 0xb10c0000ull + (uint64_t)q, pos0 = 20 + 3 * (uint64_t)q;
             for (int i = 0; i <= g; ++i, ++row) {
                 /* live candidates at random slots */
-                const int nlive = 6 + (int)(rnd() % 19);
-                int ids[24];
+                const int nlive = wide ? 300 + (int)(rnd() % 200) : 6 + (int)(rnd() % 19);
+                int ids[512];
                 for (int c = 0; c < nlive; ++c) {
                     bool dup;
                     do {
-                        ids[c] = (int)(rnd() % 40);
+                        ids[c] = (int)(rnd() % (wide ? 20000u : 40u));
                         dup = false;
                         for (int k = 0; k < c; ++k) dup = dup || ids[k] == ids[c];
                     } while (dup);
                     int slot;
                     do { slot = (int)(rnd() % NC); } while (pi[row * NC + slot] >= 0);
                     pi[row * NC + slot] = ids[c];
-                    pv[row * NC + slot] = 3.0f - 0.35f * c - (rnd() % 100) * 0.01f;
+                    pv[row * NC + slot] = wide ? 3.0f - 0.02f * c - (rnd() % 100) * 0.01f : 3.0f - 0.35f * c - (rnd() % 100) * 0.01f;
                 }
                 pp[row].seed = seed;
                 pp[row].pos = pos0 + (uint64_t)i;
@@ -591,6 +594,100 @@ TEST(spechub_bench_tree_verify_and_traversal) {
         }
         std::printf("BENCH live=%4d: rrs-node verify (%d rows x 3 children) %.1f us, traversal (%d-row tree) %.1f us per call\n",
                     live, M, tv_us / iters, NR, tt_us / iters);
+    }
+    rad_stream_destroy(s);
+}
+
+
+/* Microbenchmark of the block verify op (set RAD_BLOCK_BENCH=1; RAD_BENCH_LIB=<spechub.so> to time
+ * another build of the plugin). Wall time per launch over back-to-back launches of one block (g
+ * drafts plus the bonus row, one sequence as at max-num-seqs 1), minus the same launch over rows the
+ * op ignores (the launch floor). Planes of 1024 slots with `live` live candidates: 20 (top_k 20)
+ * or 1024 (top_k 0). Eight different blocks are cycled. */
+TEST(block_verify_microbenchmark) {
+    if (!getenv("RAD_BLOCK_BENCH")) return;
+    RadDeviceProps dp{};
+    if (rad_dev_count() < 1 || rad_dev_props(0, &dp) != RAD_OK || dp.is_host_backend) return;
+    Plugin pl;
+    const char* lib = getenv("RAD_BENCH_LIB") ? getenv("RAD_BENCH_LIB") : RAD_SPECHUB_LIB;
+    REQUIRE(pl.open(lib));
+    const RadKernelInfo* dver = pl.row("spechub_mtp_couple_verify");
+    REQUIRE(dver);
+    RadStream s{};
+    REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
+    const int SW = (int)RAD_MTP_COUPLE_STATE_WORDS;
+    const int64_t VOC = 150000;
+    const int NC = 1024, NV = 8;
+    const int nrep = getenv("RAD_BENCH_REPS") ? atoi(getenv("RAD_BENCH_REPS")) : 400;
+    const int divide = getenv("RAD_BENCH_DIV") ? atoi(getenv("RAD_BENCH_DIV")) : 1;   /* the plugin's in-kernel repeat count */
+    for (int live : { 20, 1024 }) for (int g : { 3, 5, 7 }) {
+        const int M = g + 1;
+        struct Var { Buf cid, cval, prm, sts, tok; Var(int M, int NC, int SW) :
+            cid(RAD_I32, { M, NC }, 4), cval(RAD_F32, { M, NC }, 4), prm(RAD_U32, { M, 24 }, 4),
+            sts(RAD_U32, { M, SW }, 4), tok(RAD_I32, { M }, 4) {} };
+        std::vector<Var*> vars;
+        for (int v = 0; v < NV; ++v) {
+            Var* x = new Var(M, NC, SW);
+            vars.push_back(x);
+            int32_t* pi = (int32_t*)x->cid.host.data();
+            float* pv = (float*)x->cval.host.data();
+            RadSampleParams* pp = (RadSampleParams*)x->prm.host.data();
+            RadMtpCoupleState* ps_ = (RadMtpCoupleState*)x->sts.host.data();
+            for (int m = 0; m < M; ++m) for (int c = 0; c < NC; ++c) { pi[m * NC + c] = -1; pv[m * NC + c] = -INFINITY; }
+            const uint64_t seed = 0xbe00ull + (uint64_t)v, pos0 = 100;
+            for (int i = 0; i < M; ++i) {
+                int ids[1024];
+                for (int c = 0; c < live; ++c) {
+                    bool dup;
+                    do { ids[c] = (int)(rnd() % VOC); dup = false;
+                         for (int k = 0; k < c; ++k) dup = dup || ids[k] == ids[c]; } while (dup);
+                    pi[i * NC + c] = ids[c];
+                    pv[i * NC + c] = 12.0f - 0.9f * (float)c * (20.0f / (float)live) - (rnd() % 100) * 0.01f;
+                }
+                pp[i].seed = seed; pp[i].pos = pos0 + (uint64_t)i;
+                if (i == g) continue;
+                int32_t qid[8]; float qv[8];
+                for (int c = 0; c < 8; ++c) { qid[c] = ids[c]; qv[c] = 11.0f - 0.9f * c - (rnd() % 100) * 0.01f; }
+                RadMtpCoupleState st{};
+                REQUIRE(rad_mtp_couple_build_q(qid, qv, VOC, &st));
+                st.draw = make_draw(seed, pos0, 7 + (uint64_t)v, 0, 1u);
+                st.status = 1; st.round = i + 1; st.pos = pos0 + (uint64_t)i; st.blk = g;
+                st.x = st.ids[rnd() % 3u];
+                ps_[i] = st;
+            }
+        }
+        const std::vector<RadParam> pr = { P("M", M), P("n_cand", NC), P("n_vocab", (int)VOC) };
+        std::vector<RadTensor> ts[NV];
+        std::vector<RadTensor> tn[NV];
+        for (int v = 0; v < NV; ++v) {
+            Var* x = vars[(size_t)v];
+            ts[v] = { x->cid.on_dev(s), x->cval.on_dev(s), x->prm.on_dev(s), x->sts.on_dev(s), x->tok.on_dev(s) };
+        }
+        /* the floor: the same launch with every state inert (status 0) */
+        std::vector<Var*> inert;
+        for (int v = 0; v < NV; ++v) {
+            Var* x = new Var(M, NC, SW);
+            memcpy(x->cid.host.data(), vars[(size_t)v]->cid.host.data(), x->cid.host.size());
+            memcpy(x->cval.host.data(), vars[(size_t)v]->cval.host.data(), x->cval.host.size());
+            memcpy(x->prm.host.data(), vars[(size_t)v]->prm.host.data(), x->prm.host.size());
+            inert.push_back(x);
+            tn[v] = { x->cid.on_dev(s), x->cval.on_dev(s), x->prm.on_dev(s), x->sts.on_dev(s), x->tok.on_dev(s) };
+        }
+        auto run = [&](std::vector<RadTensor>* t, int reps) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r) {
+                RadArgs a{}; a.t = t[r % NV].data(); a.n_t = 5; a.p = pr.data(); a.n_p = (int)pr.size();
+                if (dver->launch(&a, s) != RAD_OK) return -1.0;
+            }
+            rad_stream_sync(s);
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+        };
+        run(ts, 50); run(tn, 50);
+        double best = 1e9, floor_ = 1e9;
+        for (int rep = 0; rep < 5; ++rep) { best = std::min(best, run(ts, nrep)); floor_ = std::min(floor_, run(tn, nrep)); }
+        fprintf(stderr, "  BENCH live=%4d g=%d  block %.1f us/call  floor %.1f us  net per block decision %.1f us\n", live, g, best, floor_, (best - floor_) / divide);
+        for (auto* x : vars) delete x;
+        for (auto* x : inert) delete x;
     }
     rad_stream_destroy(s);
 }

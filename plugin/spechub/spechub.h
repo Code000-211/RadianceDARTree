@@ -201,7 +201,7 @@ static inline RAD_SPECHUB_HD void rad_mtp_block_verify_row(const RadMtpCoupleVer
         st[i] = *reinterpret_cast<const RadMtpCoupleState*>(c.state + (row + i) * c.ld[3]);
         const auto& p = *reinterpret_cast<const RadSampleParams*>(c.params + (row + i) * c.ld[2]);
         if (!rad_mtp_block_row_ok(s0, st[i], p0, p, i, g, c.vocab)) return;
-        rows[i] = RadBlockRow{ c.idx + (row + i) * c.ld[0], c.val + (row + i) * c.ld[1], nullptr,
+        rows[i] = RadBlockRow{ c.idx + (row + i) * c.ld[0], c.val + (row + i) * c.ld[1],
                                c.n_cand, 0, 0.0f };
         rad_mtp_block_scan(&rows[i], c.vocab);
     }

@@ -179,7 +179,7 @@ int step(const Chain& t, uint64_t seed, uint64_t n_out, double noise, Mode mode,
         RadBlockRow rows[8];
         RadBlockStat stat[8];
         for (int i = 0; i < g; ++i) {
-            rows[i] = RadBlockRow{ pl.ids + i * V, pl.val + i * V, nullptr, V, 0, 0.0f };
+            rows[i] = RadBlockRow{ pl.ids + i * V, pl.val + i * V, V, 0, 0.0f };
             rad_mtp_block_scan(&rows[i], 1000);
             CHECK(rad_mtp_block_stat(rows[i], pl.st[i], &stat[i]));
         }
@@ -308,7 +308,7 @@ double exact_error(int gmax, double noise, double* h_err, int adaptive = 0) {
             for (int v = 0; v < V; ++v) { d[(size_t)j].P[v] = laws[(size_t)j].p[v]; d[(size_t)j].Q[v] = 0; }
             for (int k = 0; k < st[(size_t)j].count; ++k)
                 d[(size_t)j].Q[st[(size_t)j].ids[k]] = st[(size_t)j].q[k];
-            rows[(size_t)j] = RadBlockRow{ laws[(size_t)j].pid, laws[(size_t)j].pval, nullptr,
+            rows[(size_t)j] = RadBlockRow{ laws[(size_t)j].pid, laws[(size_t)j].pval,
                                            laws[(size_t)j].pn, 0, 0.0f };
             rad_mtp_block_scan(&rows[(size_t)j], 1000);
         }
@@ -506,6 +506,73 @@ TEST(block_rows_that_do_not_bind_keep_their_ordinary_picks) {
     pl.st[1].nkids = 2;
     verify(&pl, 0, g);
     CHECK(untouched(pl));                        /* a tree node is not a chain row */
+}
+
+
+/* The residual draw over a plane WIDER than the workgroup's 128 lanes (several slots per lane, ids
+ * on and off Q's support, holes): the lane-ordered walk of rad_mtp_block_resid_draw must still
+ * sample max(p P - Q, 0) normalised. Chi-square over the plane's ids against the dense closed
+ * form; the negative control draws from a residual with Q's mass halved (a wrong law) and the same
+ * statistic must see it. Also the tree sum: stat over the wide plane equals a plain ascending sum
+ * to rounding (the tree is a different order, not a different value). */
+TEST(the_lane_ordered_residual_draw_over_a_wide_plane_is_exact) {
+    const int N = 700;
+    std::vector<int32_t> ids((size_t)N);
+    std::vector<float> val((size_t)N);
+    for (int j = 0; j < N; ++j) {
+        ids[(size_t)j] = j % 11 == 5 ? -1 : 2 * j + 3;
+        val[(size_t)j] = j % 11 == 5 ? -INFINITY : (float)((H((uint64_t)j * 7919 + 5) >> 40) % 4000) / 1000.0f - 2.0f;
+    }
+    int32_t qid[8]; float qv[8];
+    for (int k = 0; k < 8; ++k) { qid[k] = 2 * (k * 83 + 1) + 3; qv[k] = 1.5f - 0.3f * (float)k; }
+    RadMtpCoupleState st{};
+    CHECK(rad_mtp_couple_build_q(qid, qv, 100000, &st));
+    st.x = st.ids[1];
+    RadBlockRow r{ ids.data(), val.data(), N, 0, 0.0f };
+    rad_mtp_block_scan(&r, 100000);
+    RadBlockStat t;
+    CHECK(rad_mtp_block_stat(r, st, &t));
+    double ref = 0, top = r.top;
+    for (int j = 0; j < N; ++j) if (ids[(size_t)j] >= 0) ref += std::exp((double)val[(size_t)j] - top);
+    CHECK(std::fabs(t.sum - ref) <= 1e-12 * ref);
+    const double p = 0.8;
+    std::map<int32_t, double> want;
+    double tot = 0;
+    for (int j = 0; j < N; ++j) {
+        if (ids[(size_t)j] < 0) continue;
+        const double P = std::exp((double)val[(size_t)j] - top) / ref;
+        double Q = 0;
+        for (int k = 0; k < st.count; ++k) if (st.ids[k] == ids[(size_t)j]) Q = st.q[k];
+        const double m = std::max(p * P - Q, 0.0);
+        want[ids[(size_t)j]] = m; tot += m;
+    }
+    const int D = 400000;
+    std::map<int32_t, double> got, bad;
+    for (int d = 0; d < D; ++d) {
+        const double u = (double)(H((uint64_t)d * 2654435761ull + 11) >> 11) / 9007199254740992.0;
+        int32_t y = -1;
+        CHECK(rad_mtp_block_resid_draw(r, st, t, p, u, &y));
+        got[y] += 1;
+        /* control: the walk with the uniform skewed (a wrong law) */
+        int32_t yb = -1;
+        CHECK(rad_mtp_block_resid_draw(r, st, t, p, u * u, &yb));
+        bad[yb] += 1;
+    }
+    auto chi = [&](std::map<int32_t, double>& c) {
+        double x = 0, pc = 0, pe = 0; int cells = 0;
+        for (auto& kv : want) {
+            const double e = D * kv.second / tot, o = c.count(kv.first) ? c[kv.first] : 0;
+            if (e < 5) { pc += o; pe += e; continue; }
+            x += (o - e) * (o - e) / e; ++cells;
+        }
+        if (pe >= 5) { x += (pc - pe) * (pc - pe) / pe; ++cells; }
+        return (x - (cells - 1)) / std::sqrt(2.0 * (cells - 1));   /* z of chi-square */
+    };
+    for (auto& kv : got) CHECK(want.count(kv.first) && want[kv.first] > 0);
+    const double z = chi(got), zb = chi(bad);
+    fprintf(stderr, "  wide plane residual draw: z=%.2f   negative control z=%.1f\n", z, zb);
+    CHECK(std::fabs(z) < 4.5);
+    CHECK(zb > 20);
 }
 
 RAD_TEST_MAIN()
