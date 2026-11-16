@@ -80,7 +80,9 @@ namespace rad {
 int aql_vmem_device_of(const void* addr, int* dev);
 
 namespace {
+inline int stamp_card() { static const int c = [] { const char* e = std::getenv("RADIANCE_AQL_STAMP_CARD"); return e ? std::atoi(e) : 0; }(); return c; }
 void stamp_hold(hsa_signal_t h, bool on);
+hsa_signal_t stamp_live(int ord, uint32_t qid, const hsa_kernel_dispatch_packet_t* p);
 }
 
 namespace aql {
@@ -370,6 +372,18 @@ bool interrupts(hsa_signal_t s) {
 }
 
 hsa_status_t on_system_event(const hsa_amd_event_t* e, void*);   /* the memory-fault report */
+
+/* A kernel with a private segment (spill or a local array: couple_verify, step_advance) makes the
+ * runtime hand the queue scratch memory when it is dispatched and take it back when it retires,
+ * with the queue paused each time: about 200 us of idle card per such dispatch, twice every decode
+ * step on the sampler/accept path. The runtime keeps a queue's scratch when told not to reclaim
+ * it. The setting is read when the runtime loads, which something in the process may do before
+ * init_devices runs, so this is a constructor of the first priority. A value the operator set
+ * stays; RADIANCE_SCRATCH_RECLAIM=1 restores the runtime's default. */
+__attribute__((constructor(101))) void keep_scratch() {
+    const char* keep = std::getenv("RADIANCE_SCRATCH_RECLAIM");
+    if (!(keep && *keep == '1')) setenv("HSA_NO_SCRATCH_RECLAIM", "1", 0);
+}
 
 /* HIP's ordinals and HSA's agents are matched by PCI address rather than by position: the CPU's
  * integrated graphics is an HSA agent too, and HIP's visible-device mask can hide any of them. */
@@ -1045,7 +1059,26 @@ inline int reserve(Stream* s, uint64_t* out) {
     return RAD_OK;
 }
 
+extern "C" void rad_host_mark(const char* tag, int rank);
+thread_local int t_pkt_line = 0;
 inline void publish(Stream* s, uint64_t idx, uint16_t header, uint16_t setup) {
+    static const bool pm = [] { const char* e = std::getenv("RADIANCE_HOST_MARK_PKT"); return e && *e == '1'; }();
+    if (pm && s->ord == stamp_card()) {
+        char b[200];
+        const unsigned ty = header & 0xff;
+        auto* pp = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
+        if (ty == 3) {
+            auto* bp = reinterpret_cast<hsa_barrier_and_packet_t*>(pp);
+            std::snprintf(b, sizeof b, "pkt type=3 q=%u L%d dep=%d done=%d acq=%u rel=%u bar=%u", (unsigned)s->id, t_pkt_line,
+                          bp->dep_signal[0].handle != 0, bp->completion_signal.handle != 0, (header >> 9) & 3, (header >> 11) & 3, (header >> 8) & 1);
+        } else {
+            std::string nm;
+            { std::lock_guard<std::mutex> nl(g_names_mu); auto k = g_names.find(pp->kernel_object); nm = k != g_names.end() ? k->second.substr(0, 60) : "?"; }
+            for (char& c : nm) if (c == ',' || c == ' ') c = '_';
+            std::snprintf(b, sizeof b, "pkt type=%u q=%u L0 acq=%u rel=%u bar=%u priv=%u wg=%u %s", ty, (unsigned)s->id, (header >> 9) & 3, (header >> 11) & 3, (header >> 8) & 1, (unsigned)pp->private_segment_size, (unsigned)pp->workgroup_size_x, nm.c_str());
+        }
+        rad_host_mark(b, 0);
+    }
     s->wr = idx + 1;
     hsa_queue_store_write_index_relaxed(s->q, idx + 1);
     _mm_sfence();                       /* the argument slot, written before the header */
@@ -1190,7 +1223,8 @@ static_assert(RAD_CHAIN_KARG_OFF >= kKargMax && RAD_CHAIN_KARG_OFF + RAD_CHAIN_R
               "the chain record sits in an argument slot's tail, past every kernel's arguments");
 
 int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
-            uint64_t* out_idx = nullptr) {
+            uint64_t* out_idx = nullptr, int line = __builtin_LINE()) {
+    t_pkt_line = line;
     s->lock();
     uint64_t idx = 0;
     const int rc = reserve(s, &idx);
@@ -1272,6 +1306,8 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     if (s->ride.handle) {
         p->completion_signal = s->ride;
         s->ride.handle = 0;
+    } else if (!capturing()) {
+        p->completion_signal = stamp_live(s->ord, s->id, p);   /* RADIANCE_AQL_STAMP_LIVE */
     }
     const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
@@ -2286,6 +2322,9 @@ struct StampRow {
     uint32_t records = 0;           /* the tape's length, which tells kinds of pass apart */
     uint64_t pass = 0;
     uint64_t kernel = 0;
+    uint64_t grid = 0;              /* workgroups x workgroup size, in work-items */
+    uint32_t wg = 0;                /* work-items a workgroup (occupancy figures) */
+    uint32_t lds = 0;               /* group segment bytes a workgroup */
 };
 
 struct Stamps {
@@ -2335,7 +2374,7 @@ bool stamps_file(Stamps& st) {
     }
     std::fseek(st.out, 0, SEEK_END);
     if (std::ftell(st.out) == 0)
-        std::fputs("pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records\n", st.out);
+        std::fputs("pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records,grid,wg,lds\n", st.out);
     return true;
 }
 
@@ -2385,10 +2424,47 @@ void stamps_read(Stamps& st, bool wait) {
                      stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
         if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
         else std::fputc(',', st.out);
-        std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+        std::fprintf(st.out, ",%u,%u,%" PRIu64 ",%u,%u\n", w.play, w.records, w.grid, w.wg, w.lds);
         wrote = true;
     }
     if (wrote) std::fflush(st.out);
+}
+
+/* RADIANCE_AQL_STAMP_LIVE=1: the dispatches issued live on card 0 (the sampler chain, the advance
+ * kernels, host-issued copies' blit kernels: everything that is not a played tape) get a stamp
+ * too, as pass 0 with a running record number. Needs RADIANCE_AQL_STAMP set. */
+hsa_signal_t stamp_live(int ord, uint32_t qid, const hsa_kernel_dispatch_packet_t* p) {
+    static const bool live = [] { const char* e = std::getenv("RADIANCE_AQL_STAMP_LIVE"); return e && *e == '1'; }();
+    static uint32_t n = 0;
+    hsa_signal_t none{};
+    if (!live || ord != stamp_card()) return none;
+    Stamps& st = stamps();
+    if (!st.every) return none;
+    std::lock_guard<std::mutex> lk(st.mu);
+    stamps_read(st, false);
+    hsa_signal_t h{};
+    if (!st.free.empty()) {
+        h = st.free.back();
+        st.free.pop_back();
+    } else if (st.made < kStampSignals &&
+               hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &h) == HSA_STATUS_SUCCESS) {
+        ++st.made;
+    } else {
+        return none;
+    }
+    hsa_signal_silent_store_relaxed(h, 1);
+    StampRow w;
+    w.h = h;
+    w.own = true;
+    w.queue = qid;
+    w.seq = (int)n++;
+    w.pass = 0;
+    w.kernel = p->kernel_object;
+    w.grid = (uint64_t)p->grid_size_x * p->grid_size_y * p->grid_size_z;
+    w.wg = (uint32_t)p->workgroup_size_x * p->workgroup_size_y * p->workgroup_size_z;
+    w.lds = p->group_segment_size;
+    st.rows.push_back(w);
+    return h;
 }
 
 void stamps_at_exit() {
@@ -2413,7 +2489,7 @@ struct StampRun {
 
     void begin(const Tape* t, int from, int to) {
         Stamps& st = stamps();
-        if (!st.every || from >= to || t->rec[(size_t)from].s->ord != 0) return;
+        if (!st.every || from >= to || t->rec[(size_t)from].s->ord != stamp_card()) return;
         std::lock_guard<std::mutex> lk(st.mu);
         stamps_read(st, false);
         if (from == 0) {
@@ -2471,6 +2547,9 @@ struct StampRun {
         w.records = records;
         w.pass = pass;
         w.kernel = r.pkt.kernel_object;
+        w.grid = (uint64_t)r.pkt.grid_size_x * r.pkt.grid_size_y * r.pkt.grid_size_z;
+        w.wg = (uint32_t)r.pkt.workgroup_size_x * r.pkt.workgroup_size_y * r.pkt.workgroup_size_z;
+        w.lds = r.pkt.group_segment_size;
         rows.push_back(w);
     }
     void end() {
@@ -4919,3 +4998,53 @@ bool ride_reusable(void*) { return false; }
 }  // namespace rad
 
 #endif /* RAD_HAVE_HIP */
+
+
+/* RADIANCE_HOST_MARK=<file>: host-side event marks (rad_host_mark) in the stamps' clock (HSA system
+ * timestamp in ns), written at exit as "ns,rank,tag". For finding what the card waits for between
+ * dispatches. */
+namespace {
+struct HostMarks {
+    std::mutex mu;
+    std::vector<std::pair<uint64_t, std::string>> v;
+    std::string path;
+    bool on = false;
+    double freq = 0;
+};
+HostMarks& host_marks();
+void host_marks_dump() {
+    HostMarks& h = host_marks();
+    FILE* f = std::fopen(h.path.c_str(), "w");
+    if (!f) return;
+    for (auto& e : h.v) std::fprintf(f, "%" PRIu64 ",%s\n", e.first, e.second.c_str());
+    std::fclose(f);
+}
+HostMarks& host_marks() {
+    static HostMarks* h = [] {
+        auto* x = new HostMarks();
+        const char* e = std::getenv("RADIANCE_HOST_MARK");
+        if (e && *e) {
+            x->on = true;
+            x->path = e;
+            x->v.reserve(1 << 20);
+            uint64_t f = 0;
+            hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &f);
+            x->freq = (double)f;
+            std::atexit(host_marks_dump);
+        }
+        return x;
+    }();
+    return *h;
+}
+}  // namespace
+extern "C" void rad_host_mark(const char* tag, int rank) {
+    HostMarks& h = host_marks();
+    if (!h.on) return;
+    uint64_t t = 0;
+    hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP, &t);
+    const uint64_t ns = (uint64_t)((unsigned __int128)t * 1000000000u / (uint64_t)h.freq);
+    char b[96];
+    std::snprintf(b, sizeof b, "%d,%s", rank, tag);
+    std::lock_guard<std::mutex> lk(h.mu);
+    h.v.emplace_back(ns, b);
+}

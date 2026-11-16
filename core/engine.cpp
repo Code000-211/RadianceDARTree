@@ -49,6 +49,7 @@
 #include <string>
 #endif
 
+extern "C" void rad_host_mark(const char* tag, int rank);
 namespace rad {
 
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -1146,6 +1147,7 @@ void Engine::rank_loop(int index) {
         if (stopping_.load(std::memory_order_acquire)) break;
 
         const RadBatch* b = step_batch_.load(std::memory_order_acquire);
+        rad_host_mark("rk_wake", index);
         if (b) {
             /* This rank's view of the step, pointing at this card's staging. Its upload was issued
              * on this rank's stream, so no cross-rank fence is needed. */
@@ -1163,6 +1165,7 @@ void Engine::rank_loop(int index) {
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            rad_host_mark("rk_runstep_done", index);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
@@ -1175,12 +1178,14 @@ void Engine::rank_loop(int index) {
                     build_cv_.wait(lk, [this] { return build_ready_; });
                     bst = build_status_;
                 }
+                rad_host_mark("rk_build_ready", index);
                 /* The sampler chain goes on the same stream behind the model with no host sync
                  * (spec §13). */
                 if (bst >= 0) {
                     /* The scored rows first: the sampler may rewrite a row in place. */
                     if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
                     if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
+                    rad_host_mark("rk_sampler_done", index);
                     if (s < 0) {
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
@@ -1189,6 +1194,7 @@ void Engine::rank_loop(int index) {
             }
             /* Behind the pass, once a step: see tiering_dispatch. */
             if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step);
+            rad_host_mark("rk_tier_done", index);
 
         }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */

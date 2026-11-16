@@ -705,8 +705,10 @@ private:
         int64_t  pool_slot = -1;
         int64_t  to_slot = -1;
         RadEvent ev = nullptr;
+        int      qslot = -1;        /* the shared quarantine event this record waits on, or -1: its own `ev` */
 
         void clear() {
+            qslot = -1;
             state = State::Free;
             unit = -1;
             slab_slot = pool_slot = to_slot = -1;
@@ -864,6 +866,10 @@ private:
     /* The lead gate's ring: one event a dispatch, and a host wait on the one from
      * max_lead_dispatches ago. */
     std::vector<RadEvent> lead_;
+    /* Quarantine events shared by the records one retire() publishes: one barrier packet on the
+     * compute queue per dispatch instead of one per record. A slot is free once no record in
+     * Quarantine names it. */
+    std::vector<RadEvent> qev_;
     int                   lead_next_ = 0;
     int32_t               prefetch_cursor_ = 0;
     int32_t               last_op_ = -1;

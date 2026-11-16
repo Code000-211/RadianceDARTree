@@ -81,6 +81,7 @@ Mover::~Mover() {
     }
     for (Move& m : moves_) if (m.ev) rad_event_destroy(m.ev);
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
+    for (RadEvent e : qev_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
     if (gate_) rad_event_destroy(gate_);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
@@ -356,6 +357,8 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
      * and tell the host when a slot is free, and the host never reads the ordered bytes through
      * them. A copy out to host memory carries system scope on its own packets. */
     RAD_TRY(rad_event_create_local(&gate_));
+    qev_.assign(8, nullptr);
+    for (RadEvent& e : qev_) RAD_TRY(rad_event_create_local(&e));
     /* A window's event is waited on by the HOST, before the window is read into again. */
     win_ev_.assign((size_t)n_windows_, nullptr);
     win_rec_.assign((size_t)n_windows_, 0);
@@ -1995,21 +1998,38 @@ int Mover::retire(HeatEngine* heat) {
      * slot. Re-recording the move's event on the compute stream is the barrier: when it signals,
      * every launch made before the publish has retired and the slot is safe to write. It must be
      * downstream of the publish in stream order, so it is not folded into the loop above. */
+    /* One record serves every move published together: it is downstream of all their publishes in
+     * stream order, which is all each record's own barrier would say. With no free shared event
+     * (all held by moves still in quarantine) each move records its own, as before. */
+    int shared = -1;
+    static const bool no_share = std::getenv("RADIANCE_MOVER_NOSHARE") != nullptr;   /* A/B switch */
+    if (!no_share) {
+        bool any = false;
+        for (const Move& m : moves_) any |= m.state == Move::State::Published;
+        if (any) {
+            if (!compute_) {
+                RAD_ERR("mover: no compute stream to quarantine the slots just freed");
+                return RAD_E_STATE;
+            }
+            std::vector<char> held(qev_.size(), 0);
+            for (const Move& m : moves_)
+                if (m.state == Move::State::Quarantine && m.qslot >= 0) held[(size_t)m.qslot] = 1;
+            for (size_t i = 0; i < qev_.size(); ++i)
+                if (!held[i]) { shared = (int)i; break; }
+            if (shared >= 0) RAD_TRY(rad_event_record(qev_[(size_t)shared], compute_));
+        }
+    }
     for (Move& m : moves_) {
         if (m.state != Move::State::Published) continue;
-        if (!compute_) {
-            RAD_ERR("mover: no compute stream to quarantine the slot just freed by unit %d",
-                    (int)m.unit);
-            return RAD_E_STATE;
-        }
-        RAD_TRY(rad_event_record(m.ev, compute_));
+        if (shared >= 0) m.qslot = shared;
+        else RAD_TRY(rad_event_record(m.ev, compute_));
         m.state = Move::State::Quarantine;
         ++stats_.quarantined;
     }
 
     for (Move& m : moves_) {
         if (m.state != Move::State::Quarantine) continue;
-        const int q = rad_event_query(m.ev);
+        const int q = rad_event_query(m.qslot >= 0 ? qev_[(size_t)m.qslot] : m.ev);
         if (q < 0) return RAD_E_DEVICE;
         if (q == 0) continue;
 

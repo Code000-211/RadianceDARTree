@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 
+extern "C" void rad_host_mark(const char* tag, int rank);
 namespace rad {
 
 /* ================================================================== grammar triggers
@@ -1244,6 +1245,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (!c || !logits || !out_tokens) return RAD_E_INVAL;
     if (n_seq_ == 0) return RAD_OK;
 
+    rad_host_mark("smp_run_begin", cfg_.rank);
     const RadStream s = rad_stream(c);
 
     bool any_mask = false, any_greedy = false, any_chain = false;
@@ -1420,6 +1422,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         RAD_TRY(issue(op_temp_late_, { o_cv, opd_rows(buf_params_late_, n_seq_) }));
 
     RAD_TRY(issue(op_pick_, { o_ci, o_cv, o_params, o_tok }));
+    rad_host_mark("smp_pick_issued", cfg_.rank);
     /* After the pick, over the same plane: a coupled row replaces the pick's token and an unbound
      * row keeps it. The issued step is recorded for the evidence line. */
     if (any_couple_) {
@@ -1428,6 +1431,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
                                       opd_rows(buf_trav_, n_seq_) }));
         else
             RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
+        rad_host_mark("smp_couple_issued", cfg_.rank);
         couple_issued_step_ = couple_build_.step;
         /* The verify wrote P over each decided row's q (status 2): a pinned copy of the rows,
          * ordered behind it on the stream, so the step's own wait covers it. */

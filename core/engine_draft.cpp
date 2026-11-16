@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+extern "C" void rad_host_mark(const char* tag, int rank);
 namespace rad {
 
 /* ------------------------------------------------------------------ the card's step state */
@@ -385,12 +386,15 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         return RAD_OK;
     }
 
+    rad_host_mark("sc_accept_begin", -1);
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+    rad_host_mark("sc_accept_done", -1);
     /* A serial tree's accepted path into place in the trunk's cache, against the build just
      * accepted and before the history pass or anything else reads it (a path that follows the
      * chain moves nothing: its nodes are already at their depth). */
     if (tree_) RAD_TRY(tree_compact(-1));
     RAD_TRY(collect_issue(so, /*fence=*/true));
+    rad_host_mark("sc_collect_done", -1);
 
     int rounds = drafter_.depth;
     serial_row_.resize((size_t)cfg_.max_seqs);
@@ -400,6 +404,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     if (rounds <= 0) return RAD_OK;
     serial_rounds_ = rounds;
     serial_rows_   = n;
+    rad_host_mark("sc_serial_begin_done", -1);
     /* Before any serial pass reads a draw; round 1 is the history pass below. */
     if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(serial_row_.data(), n));
 
@@ -415,6 +420,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         if (rd > 0 && n <= 0) break;
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
+        rad_host_mark("sc_batch_done", rd);
         if (!db) { if (rd == 0) continue; break; }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
@@ -427,6 +433,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
                                     : (serial_tree_ && tree_width_ > 1 ? ADV_ROUND_TREE : ADV_ROUND),
                             rd, rd > 0));
         const auto tB = std::chrono::steady_clock::now();
+        rad_host_mark("sc_adv_done", rd);
 
         /* Greedy, not the request's sampler: the target verifies against its own draw
          * (core/sample/accept.h), so sampling a draft would spend the request's RNG stream and
@@ -441,14 +448,17 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
 
         const auto tC = std::chrono::steady_clock::now();
+        rad_host_mark("sc_greedy_done", rd);
         issue_what_.store(kIssueAll, std::memory_order_release);
         step_batch_.store(db, std::memory_order_release);
         /* Timed separately: the first crossing releases the parked ranks (the wake), the second
          * waits for them to finish issuing (the issue). */
         barrier_->arrive_and_wait();
         const auto tC2 = std::chrono::steady_clock::now();
+        rad_host_mark("sc_bar1", rd);
         barrier_->arrive_and_wait();
         const auto tD = std::chrono::steady_clock::now();
+        rad_host_mark("sc_bar2", rd);
 
         int st = step_status_.load(std::memory_order_acquire);
         if (st < 0) {
