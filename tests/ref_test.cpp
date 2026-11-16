@@ -5116,6 +5116,49 @@ TEST(op_router_gemm_topk_scatter) {
     CHECK_NEAR(ew2.at(0) + ew2.at(1), 1.0f, 1e-6);   /* renormalised to sum to one */
 }
 
+/* The verify expert budget (opt-in, lossy): router_gemm_topk_scatter with `budget`. Six experts, top
+ * three, norm on; the router weight is the identity, so a row's logits are the row of x. Row 0 picks
+ * {0, 1, 2}, row 1 {0, 3, 4} and row 2 {1, 4, 5}. Budget 4 with row 0 exact: the forced three, plus the
+ * one restricted-row expert with the most mass, 4 (0.09 + 0.245). Rows 1 and 2 lose their slots on 3
+ * and 5, and their kept weights are scaled back up to the row's whole mass. */
+TEST(op_router_gemm_topk_scatter_budget) {
+    const int64_t M = 3, K = 6, ne = 6, k = 3;
+    T x(RAD_F32, {M, K});  x.f({5, 4, 3, 0, 0, 0,   5, 0, 0, 4, 3, 0,   0, 5, 0, 0, 4, 3});
+    T w(RAD_F32, {ne, K}); w.f({1,0,0,0,0,0, 0,1,0,0,0,0, 0,0,1,0,0,0, 0,0,0,1,0,0, 0,0,0,0,1,0, 0,0,0,0,0,1});
+    auto go = [&](int64_t budget, T& ids, T& ew, T& sorted, T& eoff, T& ecnt) {
+        T lg(RAD_F32, {M, ne});
+        A a; a.t(x).t(w).tnull().t(lg).t(ids).t(ew).t(sorted).t(eoff).t(ecnt).tnull()
+              .i("M", M).i("K", K).i("n_expert", ne).i("n_local", ne).i("top_k", k).i("norm", 1)
+              .s("dtype", "f32").i("expert_base", 0);
+        if (budget > 0) a.i("budget", budget).i("exact_rows", 1);
+        return run("router_gemm_topk_scatter", a);
+    };
+    T ids(RAD_I32, {M, k}), ew(RAD_F32, {M, k}), sorted(RAD_I32, {M * k}), eoff(RAD_I32, {ne + 1}), ecnt(RAD_I32, {ne});
+    CHECK_OK(go(4, ids, ew, sorted, eoff, ecnt));
+    CHECK_EQ(ids.iat(3), 0LL); CHECK_EQ(ids.iat(4), 3LL); CHECK_EQ(ids.iat(5), 4LL);   /* ids unchanged */
+    const float e5 = std::exp(5.f), e4 = std::exp(4.f), e3 = std::exp(3.f), tot = e5 + e4 + e3;
+    CHECK_NEAR(ew.at(0), e5 / tot, 1e-5);                         /* row 0 exact */
+    CHECK_NEAR(ew.at(3), e5 / (e5 + e3), 1e-5);                   /* row 1: experts 0 and 4 stay */
+    CHECK_NEAR(ew.at(5), e3 / (e5 + e3), 1e-5);
+    CHECK_NEAR(ew.at(7), e4 / (e5 + e4), 1e-5);                   /* row 2: experts 1 and 4 stay */
+    CHECK_EQ(ecnt.iat(3), 0LL); CHECK_EQ(ecnt.iat(5), 0LL);       /* 3 and 5 are not read */
+    CHECK_EQ(ecnt.iat(0), 2LL); CHECK_EQ(ecnt.iat(1), 2LL); CHECK_EQ(ecnt.iat(2), 1LL);
+    CHECK_EQ(ecnt.iat(4), 2LL);
+    CHECK_EQ(eoff.iat(6), 7LL);
+    /* budget 3 = row 0's experts only: row 1 keeps expert 0 alone, row 2 expert 1 alone, each with the
+     * row's whole mass (weight 1). */
+    T ids2(RAD_I32, {M, k}), ew2(RAD_F32, {M, k}), sorted2(RAD_I32, {M * k}), eoff2(RAD_I32, {ne + 1}), ecnt2(RAD_I32, {ne});
+    CHECK_OK(go(3, ids2, ew2, sorted2, eoff2, ecnt2));
+    CHECK_NEAR(ew2.at(3), 1.0f, 1e-5); CHECK_NEAR(ew2.at(6), 1.0f, 1e-5);
+    CHECK_EQ(eoff2.iat(6), 5LL);
+    /* budget off and a huge budget: the same bytes. */
+    T ids3(RAD_I32, {M, k}), ew3(RAD_F32, {M, k}), sorted3(RAD_I32, {M * k}), eoff3(RAD_I32, {ne + 1}), ecnt3(RAD_I32, {ne});
+    CHECK_OK(go(0, ids3, ew3, sorted3, eoff3, ecnt3));
+    T ids4(RAD_I32, {M, k}), ew4(RAD_F32, {M, k}), sorted4(RAD_I32, {M * k}), eoff4(RAD_I32, {ne + 1}), ecnt4(RAD_I32, {ne});
+    CHECK_OK(go(100, ids4, ew4, sorted4, eoff4, ecnt4));
+    for (int i = 0; i < M * k; ++i) { CHECK_NEAR(ew3.at(i), ew4.at(i), 0.0); CHECK_EQ(sorted3.iat(i), sorted4.iat(i)); }
+}
+
 /* The four-class grouped GEMM: expert e is entry e / 4 of class e % 4, each class at its own
  * width, and a narrower class's columns past its width are zero. Ten experts, so classes 0 and 1
  * hold three and 2 and 3 hold two (the shape of a layer with 510 quantised experts), and class 1

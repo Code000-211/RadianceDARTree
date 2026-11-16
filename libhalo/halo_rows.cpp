@@ -965,6 +965,7 @@ static const RadParamSpec pRouterGemmTopkScatter[] = {
     P_INT("top_k"), P_INT("norm"), P_STR("dtype"),
     P_INTO("expert_base"),
     P_STRO("protect"),
+    P_INTO("budget"), P_INTO("exact_rows"),
 };
 static const RadOperandSpec oRouterGemmTopkScatter[] = {
     { "a",             RAD_OPD_IN,     0 },

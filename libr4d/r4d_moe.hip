@@ -172,6 +172,11 @@ struct SlotSink {
     int32_t  base;
     uint32_t n_local;
     Protect  prot;
+    /* The verify expert budget (router_gemm_topk_scatter's `budget`): where set, a row also hands
+     * its slots' global expert ids and final weights to LDS and leaves the weight store to the
+     * budget pass (budget_apply), which may rescale them. Null everywhere else. */
+    int32_t* bid = nullptr;
+    float*   bw  = nullptr;
 };
 
 template <uint32_t MAXOWN>
@@ -263,8 +268,16 @@ __device__ __forceinline__ void router_topk_row(
                     __builtin_amdgcn_readlane(__builtin_bit_cast(int, p), (int)r));
     if (lane < nsel) {
         ids[(size_t)m * top_k + lane] = (int32_t)(~mykey & 0xFFFFu);
-        w[(size_t)m * top_k + lane]   = (norm && wsum > 0.0f)
-                                      ? f32_to_bf16(bf16_to_f32(pb) * (1.0f / wsum)) : pb;
+        if (!snk.bid)
+            w[(size_t)m * top_k + lane] = (norm && wsum > 0.0f)
+                                        ? f32_to_bf16(bf16_to_f32(pb) * (1.0f / wsum)) : pb;
+    }
+    if (snk.bid && lane < top_k) {
+        const bool lv = lane < nsel;
+        const uint16_t wb = (norm && wsum > 0.0f)
+                          ? f32_to_bf16(bf16_to_f32(pb) * (1.0f / wsum)) : pb;
+        snk.bid[m * top_k + lane] = lv ? (int32_t)(~mykey & 0xFFFFu) : -1;
+        snk.bw[m * top_k + lane]  = lv ? bf16_to_f32(wb) : 0.0f;
     }
     if (snk.e && lane < top_k) {
         const int32_t e  = (int32_t)(~mykey & 0xFFFFu) - snk.base;
@@ -3549,6 +3562,104 @@ __device__ __forceinline__ rg_v8f rg_item(const uint16_t* __restrict__ A,
     return acc;
 }
 
+/* ---- the verify expert budget (opt-in, LOSSY; MoE-Spec's per-layer expert capacity for a
+ * speculative verify, arXiv:2602.16052, adapted to a selection that is made per row).
+ *
+ * Rows [0, nexact) route exactly. Over the other rows' slots the budget keeps at most `budget`
+ * DISTINCT experts per layer in all: first every expert an exact row chose (they cost nothing
+ * extra: they are read anyway), then, for the `budget - n_forced` that remain, the experts with
+ * the largest router mass summed over the restricted rows (ties to the lower id). A restricted
+ * row's slot on a dropped expert is dropped (sorted -1, as another rank's experts are), and the
+ * row's kept weights are scaled by (all weights)/(kept weights), so the row's total router mass is
+ * unchanged. A row left with nothing keeps its top slot (carrying the whole mass), which can go
+ * past the budget on a tight one. Every decision reads global expert ids and the replicated
+ * router, so both ranks decide alike. All O(T) per slot on one workgroup, T <= kBudgetSlots. */
+constexpr uint32_t kBudgetSlots = 256;
+struct BudLds {
+    int32_t id[kBudgetSlots];       /* the slot's global expert, -1 where the row has no such rank */
+    float   w[kBudgetSlots];        /* its final weight (a bf16 value) */
+    int32_t keep[kBudgetSlots];
+};
+
+template <uint32_t NW>
+__device__ __forceinline__ void budget_apply(ScatterLds<NW>& sl, BudLds& bl,
+                                             uint16_t* __restrict__ w, uint32_t M, uint32_t top_k,
+                                             uint32_t budget, uint32_t nexact) {
+    const uint32_t T = M * top_k, tid = threadIdx.x, nx = nexact * top_k < T ? nexact * top_k : T;
+    /* sl.tk / sl.run are the sort's, free until it starts: slot mass and "first slot of its
+     * expert among the restricted rows". */
+    float* const mass = reinterpret_cast<float*>(sl.tk);
+    int32_t* const rep = sl.run;
+    lds_barrier();                                    /* every row's slots are in bl */
+    int32_t nforced = 0;                              /* distinct experts of the exact rows */
+    for (uint32_t j = 0; j < nx; ++j) {
+        const int32_t id = bl.id[j];
+        bool first = id >= 0;
+        for (uint32_t q = 0; q < j && first; ++q) first = bl.id[q] != id;
+        nforced += first;
+    }
+    for (uint32_t i = tid; i < T; i += blockDim.x) {
+        const int32_t id = bl.id[i];
+        float m = -1.0f;
+        int32_t r = 0;
+        if (i >= nx && id >= 0) {
+            bool forced = false;
+            for (uint32_t j = 0; j < nx; ++j) forced |= bl.id[j] == id;
+            if (!forced) {
+                m = 0.0f;
+                r = 1;
+                for (uint32_t j = nx; j < T; ++j) {
+                    if (bl.id[j] != id) continue;
+                    m += bl.w[j];
+                    if (j < i) r = 0;
+                }
+            }
+        }
+        mass[i] = m;
+        rep[i]  = r;
+    }
+    lds_barrier();
+    const int32_t extra = (int32_t)budget > nforced ? (int32_t)budget - nforced : 0;
+    for (uint32_t i = tid; i < T; i += blockDim.x) {
+        const int32_t id = bl.id[i];
+        int32_t k = 0;
+        if (id >= 0) {
+            if (mass[i] < 0.0f) k = 1;                /* an exact row, or a forced expert */
+            else {
+                int32_t rank = 0;
+                for (uint32_t j = nx; j < T; ++j)
+                    rank += rep[j] && (mass[j] > mass[i] || (mass[j] == mass[i] && bl.id[j] < id));
+                k = rank < extra;
+            }
+        }
+        bl.keep[i] = k;
+    }
+    lds_barrier();
+    for (uint32_t i = tid; i < T; i += blockDim.x) {
+        if (bl.id[i] < 0) continue;
+        const uint32_t r0 = (i / top_k) * top_k;
+        int32_t nkeep = 0, nlive = 0;
+        float s_all = 0.0f, s_kept = 0.0f;
+        for (uint32_t l = 0; l < top_k; ++l) {
+            if (bl.id[r0 + l] < 0) continue;
+            ++nlive;
+            s_all += bl.w[r0 + l];
+            if (bl.keep[r0 + l]) { ++nkeep; s_kept += bl.w[r0 + l]; }
+        }
+        bool kept = bl.keep[i] != 0;
+        float wv = bl.w[i];
+        if (nkeep == 0) {                             /* nothing allowed: the row's top slot */
+            kept = i == r0;
+            wv = s_all;
+        } else if (nkeep < nlive && s_kept > 0.0f) {
+            wv = bl.w[i] * (s_all / s_kept);
+        }
+        w[i] = f32_to_bf16(wv);
+        if (!kept) sl.e[i] = -1;
+    }
+    lds_barrier();                                    /* the sort reads sl.e, rewrites tk and run */
+}
+
 /* Launch geometry: `sk` the router's split, `tpb` its 16-column tiles per block, `nrb` the
  * router's blocks along x, `skg` the gate's split (0: no gate; its block is x = nrb). Rows are
  * tiled along y, one 16-row tile per block. */
@@ -3556,10 +3667,11 @@ struct RgGeom {
     uint32_t M, K, n_expert, n_local, top_k, lg_ld;
     int32_t  norm, base;
     uint32_t sk, tpb, nrb, skg;
+    uint32_t budget, nexact;     /* the verify expert budget (BUD instantiations only) */
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
-template <uint32_t MAXOWN, uint32_t NW, class CH>
+template <uint32_t MAXOWN, uint32_t NW, class CH, bool BUD = false>
 __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
@@ -3622,9 +3734,16 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
         /* router_topk_scatter_kernel, from here to the end. */
         ScatterLds<NW>& sl = *reinterpret_cast<ScatterLds<NW>*>(rg_smem);
         for (uint32_t e = tid; e < g.n_local; e += blockDim.x) sl.cnt[e] = 0;
-        const SlotSink snk{sl.e, g.base, g.n_local, prot};
+        SlotSink snk{sl.e, g.base, g.n_local, prot};
+        BudLds* bl = nullptr;
+        if constexpr (BUD) {
+            bl = reinterpret_cast<BudLds*>(rg_smem + sizeof(ScatterLds<NW>));
+            snk.bid = bl->id;
+            snk.bw  = bl->w;
+        }
         for (uint32_t m = wave; m < g.M; m += NW)
             router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, snk);
+        if constexpr (BUD) budget_apply<NW>(sl, *bl, w, g.M, g.top_k, g.budget, g.nexact);
         lds_barrier();
         scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
     }
@@ -3732,8 +3851,11 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     const long long top_k    = r4d_geti_or(a, "top_k", 0);
     const long long norm     = r4d_geti_or(a, "norm", 0);
     const long long base     = r4d_geti_or(a, "expert_base", 0);
+    const long long budget   = r4d_geti_or(a, "budget", 0);
+    const long long nexact   = r4d_geti_or(a, "exact_rows", 1);
     if (n_expert <= 0 || n_expert > (long long)kMaxExpert || top_k <= 0 || top_k > n_expert)
         return R4D_NO(RAD_E_SHAPE);
+    if (budget < 0 || nexact < 0) return R4D_NO(RAD_E_SHAPE);
     if (top_k > (long long)kWave) return R4D_NO(RAD_E_SHAPE);
     if (n_local <= 0 || n_local > n_expert) return R4D_NO(RAD_E_SHAPE);
     if (base < 0 || base + n_local > n_expert) return R4D_NO(RAD_E_SHAPE);
@@ -3761,6 +3883,7 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
 
     const long long T = M * top_k;
     if (T > (long long)kScatterSmall) return R4D_NO(RAD_E_SHAPE);
+    if (budget > 0 && T > (long long)kBudgetSlots) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(ids) || !r4d_contig(w) || !r4d_contig(sorted) || !r4d_contig(off) ||
         !r4d_contig(cnt)) return R4D_NO(RAD_E_STRIDE);
     if (r4d_numel(ids) < T || r4d_numel(w) < T) return R4D_NO(RAD_E_SHAPE);
@@ -3795,6 +3918,7 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     const size_t sort_lds = nw == 8 ? sizeof(ScatterLds<8>)
                           : nw == 16 ? sizeof(ScatterLds<16>) : sizeof(ScatterLds<32>);
     lds = std::max(lds, sort_lds);
+    if (budget > 0) lds = std::max(lds, sort_lds + sizeof(BudLds));
 
     RgGeom g{};
     g.M = (uint32_t)M;               g.K = (uint32_t)K;
@@ -3803,10 +3927,11 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     g.norm = (int32_t)norm;          g.base = (int32_t)base;
     g.sk = (uint32_t)cr.sk;          g.tpb = (uint32_t)tpb;
     g.nrb = (uint32_t)nrb;           g.skg = wg ? (uint32_t)cg.sk : 0u;
+    g.budget = (uint32_t)budget;     g.nexact = (uint32_t)nexact;
     const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
 
 #define R4D_RG_E(OWN, NWV, CH_)                                                                 \
-    emit_rc = R4D_EMIT(stream, (router_gemm_topk_scatter_kernel<OWN, NWV, CH_>), grid,          \
+    emit_rc = R4D_EMIT(stream, (router_gemm_topk_scatter_kernel<OWN, NWV, CH_, false>), grid,   \
                        dim3((NWV) * kWave), lds,                                                \
                        (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
                        wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \
@@ -3815,7 +3940,28 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
                        (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot)
 #define R4D_RG_L(OWN, NWV)                                                                      \
     do { if (chain) R4D_RG_E(OWN, NWV, r4dchain); else R4D_RG_E(OWN, NWV, R4dUnchained); } while (0)
+#define R4D_RGB_E(OWN, NWV, CH_)                                                                \
+    emit_rc = R4D_EMIT(stream, (router_gemm_topk_scatter_kernel<OWN, NWV, CH_, true>), grid,    \
+                       dim3((NWV) * kWave), lds,                                                \
+                       (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
+                       wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \
+                       (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,  \
+                       (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,         \
+                       (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot)
+#define R4D_RGB_L(OWN, NWV)                                                                     \
+    do { if (chain) R4D_RGB_E(OWN, NWV, r4dchain); else R4D_RGB_E(OWN, NWV, R4dUnchained); } while (0)
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    if (budget > 0) {
+        if (n_expert <= (long long)(8 * kWave)) {
+            if      (nw == 8)  R4D_RGB_L(8, 8);
+            else if (nw == 16) R4D_RGB_L(8, 16);
+            else               R4D_RGB_L(8, 32);
+        } else {
+            if      (nw == 8)  R4D_RGB_L(16, 8);
+            else if (nw == 16) R4D_RGB_L(16, 16);
+            else               R4D_RGB_L(16, 32);
+        }
+    } else
     if (n_expert <= (long long)(8 * kWave)) {
         if      (nw == 8)  R4D_RG_L(8, 8);
         else if (nw == 16) R4D_RG_L(8, 16);
@@ -3825,6 +3971,8 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
         else if (nw == 16) R4D_RG_L(16, 16);
         else               R4D_RG_L(16, 32);
     }
+#undef R4D_RGB_L
+#undef R4D_RGB_E
 #undef R4D_RG_L
 #undef R4D_RG_E
     if (emit_rc != RAD_OK) return emit_rc;

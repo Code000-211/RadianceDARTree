@@ -179,6 +179,91 @@ int ref_router_topk_scatter(const RadArgs* a, RadStream s) {
     return ref_moe_scatter(&sa, s);
 }
 
+/* ------------------------------------------------------------------ the verify expert budget */
+/* router_gemm_topk_scatter with `budget` > 0 (opt-in, LOSSY; see libr4d/r4d_moe.hip budget_apply
+ * for the rule). The selection is router_topk's; then, over the rows from `exact_rows` on, the
+ * slots whose expert is not among the budget's keepers are dropped from the sort (their id stays
+ * in `expert_ids`, as on the device) and the kept weights are scaled by all/kept. `a` is the six
+ * tensors logits, expert_ids, expert_w, sorted_tok, expert_offset, expert_count. */
+static int ref_router_budget_scatter(const RadArgs* a, int64_t budget, int64_t nexact, RadStream s) {
+    const int64_t ne = p_int(a, "n_expert", 0);
+    const int64_t nl = p_int(a, "n_local", ne);
+    const int64_t k  = p_int(a, "top_k", 1);
+    if (ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne) return RAD_E_SHAPE;
+    const RadTensor *lg = &a->t[0], *ids = &a->t[1], *w = &a->t[2];
+    const RadParam rp[] = { RAD_INT("n_expert", ne), RAD_INT("top_k", k),
+                            RAD_INT("norm", p_int(a, "norm", 0)),
+                            RAD_STR("dtype", p_str(a, "dtype", "bf16")) };
+    const RadArgs ra{ a->t, 3, rp, 4, nullptr, 0, nullptr, a->rank, a->world_size };
+    int rc = ref_router_topk(&ra, s);
+    if (rc != RAD_OK) return rc;
+    const int64_t M = numel(lg) / ne, T = M * k;
+    const int64_t nx = std::min<int64_t>(std::max<int64_t>(nexact, 0), M) * k;
+    std::vector<int64_t> id((size_t)T);
+    std::vector<float> wv((size_t)T);
+    for (int64_t i = 0; i < T; ++i) {
+        id[(size_t)i] = ld_int(ids->dtype, ids->data, i);
+        wv[(size_t)i] = ldt(w, i);
+    }
+    std::vector<char> keep((size_t)T, 1);
+    std::vector<int64_t> reps;
+    std::vector<float> mass((size_t)T, -1.0f);
+    int64_t nforced = 0;
+    for (int64_t j = 0; j < nx; ++j) {
+        bool first = true;
+        for (int64_t q = 0; q < j; ++q) first = first && id[(size_t)q] != id[(size_t)j];
+        nforced += first;
+    }
+    for (int64_t i = nx; i < T; ++i) {
+        bool forced = false;
+        for (int64_t j = 0; j < nx; ++j) forced = forced || id[(size_t)j] == id[(size_t)i];
+        if (forced) continue;
+        float m = 0.0f;
+        bool first = true;
+        for (int64_t j = nx; j < T; ++j)
+            if (id[(size_t)j] == id[(size_t)i]) { m += wv[(size_t)j]; if (j < i) first = false; }
+        mass[(size_t)i] = m;
+        if (first) reps.push_back(i);
+    }
+    const int64_t extra = budget > nforced ? budget - nforced : 0;
+    for (int64_t i = nx; i < T; ++i) {
+        if (mass[(size_t)i] < 0.0f) continue;
+        int64_t rank = 0;
+        for (int64_t j : reps)
+            rank += mass[(size_t)j] > mass[(size_t)i] ||
+                    (mass[(size_t)j] == mass[(size_t)i] && id[(size_t)j] < id[(size_t)i]);
+        keep[(size_t)i] = rank < extra;
+    }
+    std::vector<int32_t> sid((size_t)T);
+    for (int64_t m = 0; m < M; ++m) {
+        float s_all = 0.0f, s_kept = 0.0f;
+        int64_t nkeep = 0;
+        for (int64_t l = 0; l < k; ++l) {
+            s_all += wv[(size_t)(m * k + l)];
+            if (keep[(size_t)(m * k + l)]) { ++nkeep; s_kept += wv[(size_t)(m * k + l)]; }
+        }
+        for (int64_t l = 0; l < k; ++l) {
+            const size_t i = (size_t)(m * k + l);
+            bool kp = keep[i] != 0;
+            float v = wv[i];
+            if (nkeep == 0) { kp = l == 0; v = s_all; }
+            else if (nkeep < k && s_kept > 0.0f) v = wv[i] * (s_all / s_kept);
+            stt(w, (int64_t)i, v);
+            sid[i] = kp ? (int32_t)id[i] : -1;
+        }
+    }
+    const RadTensor idt{};
+    RadTensor sidt = *ids;
+    sidt.data = sid.data();
+    const RadTensor t4[] = { sidt, a->t[3], a->t[4], a->t[5] };
+    const RadParam sp[]   = { RAD_INT("n_expert", nl), RAD_INT("top_k", k),
+                              RAD_INT("expert_base", p_int(a, "expert_base", 0)),
+                              RAD_STR("protect", p_str(a, "protect", nullptr)) };
+    const RadArgs sa{ t4, 4, sp, 4, nullptr, 0, nullptr, a->rank, a->world_size };
+    (void)idt;
+    return ref_moe_scatter(&sa, s);
+}
+
 /* ------------------------------------------------------------------ router_gemm_topk_scatter */
 /* The router GEMM in front of the pair, and with `gate_b`/`gate` present the shared expert's
  * one-column gate over the same input. The reference is the launches it stands in for, and the
@@ -223,7 +308,9 @@ int ref_router_gemm_topk_scatter(const RadArgs* a, RadStream s) {
      * of this op, under the same name -- the fused lists are unions, so `a`'s list passes through. */
     const RadTensor t6[] = { a->t[3], a->t[4], a->t[5], a->t[6], a->t[7], a->t[8] };
     const RadArgs   fa{ t6, 6, a->p, a->n_p, nullptr, 0, nullptr, a->rank, a->world_size };
-    return ref_router_topk_scatter(&fa, s);
+    const int64_t budget = p_int(a, "budget", 0);
+    if (budget <= 0) return ref_router_topk_scatter(&fa, s);
+    return ref_router_budget_scatter(&fa, budget, p_int(a, "exact_rows", 1), s);
 }
 
 /* ------------------------------------------------------------------ moe_gemm, moe_gemm_q */

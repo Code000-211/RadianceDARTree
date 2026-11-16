@@ -51,6 +51,7 @@
 #include "rad_block_glm_router.h"
 #include "rad_device.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -402,6 +403,13 @@ struct MoeFP8 {
      * `router_fused_gate`. Otherwise, or for larger passes, the separate ops run. */
     rad_op  op_router_fused = 0;
     int64_t router_fused_rows = 0;
+    /* The verify expert budget (RADIANCE_MOE_VERIFY_BUDGET=N, opt-in and LOSSY; default off, and
+     * then nothing below is declared or issued). A second instance of the fused router whose
+     * selection caps the pass's distinct routed experts at N, rows from `bud_exact` on (see
+     * libr4d/r4d_moe.hip budget_apply), issued only for a speculative verify pass. */
+    rad_op  op_router_bud = 0;
+    int64_t router_bud_rows = 0;
+    int     bud_n = 0, bud_exact = 1;
     bool    router_fused_gate = false;
     /* `router_sigmoid_topk_scatter` (Config::router_fuse), up to `sigmoid_scatter_rows` tokens,
      * writing the shared gate's fill too when `sigmoid_scatter_gate`. */
@@ -525,10 +533,11 @@ struct MoeFP8 {
     void step(RadCtx* c, const RadBatch* batch) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
-    void step_rows(RadCtx* c, int64_t T) const;
+    void step_rows(RadCtx* c, int64_t T, bool spec = false) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
      * all-reduce itself (issue_ar), as GdnFP8::step describes. */
-    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
+              bool spec = false) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -1655,6 +1664,39 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             rad_op_writes(b, op_router_fused, wr, gate ? 7 : 6);
         }
         router_fused_gate = op_router_fused && gate;
+
+        /* The budget instance: the same operands, so the same buffers and lifetimes. */
+        const char* eb = std::getenv("RADIANCE_MOE_VERIFY_BUDGET");
+        const int   nb = eb ? std::atoi(eb) : 0;
+        if (op_router_fused && nb > 0) {
+            const char* ee = std::getenv("RADIANCE_MOE_VERIFY_EXACT_ROWS");
+            bud_n = nb;
+            bud_exact = ee ? std::max(std::atoi(ee), 0) : 1;
+            router_bud_rows = std::min<int64_t>(router_fused_rows, 256 / c.top_k);
+            const RadParam bp[] = {
+                RAD_RANGE("M", 2, router_bud_rows), RAD_INT("K", g.n_embd),
+                RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
+                RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),
+                RAD_STR("dtype", g.dtype), RAD_INT("expert_base", c.expert_base),
+                RAD_INT("budget", bud_n), RAD_INT("exact_rows", bud_exact),
+                RAD_STR("protect", prot_list),
+            };
+            const int n_bp = (int)(sizeof(bp) / sizeof(bp[0])) - (prot_list ? 0 : 1);
+            if (router_bud_rows >= 2)
+                op_router_bud = rad_decl_op(b, "router_gemm_topk_scatter", bp, n_bp, fw, gate ? 2 : 1);
+            if (op_router_bud) {
+                const rad_buf rd[1] = { w.h.x };
+                const rad_buf wr[7] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt, w.sgate };
+                rad_op_reads (b, op_router_bud, rd, 1);
+                rad_op_writes(b, op_router_bud, wr, gate ? 7 : 6);
+                if (l == 0)
+                    rad_note(b, "LOSSY: RADIANCE_MOE_VERIFY_BUDGET=%d, exact rows %d: speculative "
+                                "verify rows past them route within a per-layer expert budget",
+                             bud_n, bud_exact);
+            } else {
+                bud_n = 0;
+            }
+        }
     }
 
     /* GLM's selection and the sort as one op, plus the ungated shared arm's gate fill. Declared
@@ -1794,7 +1836,8 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
-inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
+                         bool spec) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -1840,7 +1883,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     } else if (c.sigmoid_router) {
         glm_router.step(c_, r0, rows, r0);
     } else if (rfused)
-        RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+        RAD_ISSUE_N(c_, (spec && r0 == 0 && op_router_bud && rows >= 2 && rows <= router_bud_rows)
+                            ? op_router_bud : op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
                     brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
@@ -2075,13 +2119,15 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
 }
 
 inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
-    step_rows(c_, batch->n_tok);
+    /* A speculative verify of one sequence, not a drafter's pass: the budget's rows are its own. */
+    step_rows(c_, batch->n_tok, op_router_bud && batch->n_spec > 0 && batch->draft_pass == 0 &&
+                                    batch->n_seq == 1);
 }
 
-inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {
+inline void MoeFP8::step_rows(RadCtx* c_, int64_t T, bool spec) const {
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
-        pass(c_, T, r0, n);
+        pass(c_, T, r0, n, true, spec);
     }
     route_report(c_);
 }

@@ -662,7 +662,8 @@ static const RadParamSpec pRouterGemmTopkScatter[] = { P_INT("M"), P_INT("K"),
                                                        P_INT("n_expert"), P_INTO("n_local"),
                                                        P_INT("top_k"), P_INT("norm"),
                                                        P_STR("dtype"), P_INTO("expert_base"),
-                                                       P_STRO("protect") };
+                                                       P_STRO("protect"), P_INTO("budget"),
+                                                       P_INTO("exact_rows") };
 static const RadOperandSpec oRouterGemmTopkScatter[] = {
     OPD("a"), WGT("b"), WGT_O("gate_b"), OUT("logits"), OUT("expert_ids"), OUT("expert_w"),
     OUT("sorted_tok"), OUT("expert_offset"), OUT("expert_count"), OUT_O("gate") };

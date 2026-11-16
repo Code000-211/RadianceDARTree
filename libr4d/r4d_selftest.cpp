@@ -3321,6 +3321,182 @@ static void router_gemm_fused_case(const Plugin& pl) {
     rg->fini(inst);
 }
 
+/* -------------------------------- router_gemm_topk_scatter with `budget` (opt-in, lossy)
+ *
+ * The budgeted op against a host mirror of the rule applied to the UNBUDGETED op's own output
+ * (ids, weights): expert_ids unchanged, expert_w the rescaled bf16 weights, and the sort the stable
+ * counting sort of the surviving slots (a dropped slot is -1, like another rank's expert). Also
+ * the invariants: a budget that keeps everything changes no byte, row 0 is untouched, and the
+ * distinct experts of the restricted rows outside row 0's stay within budget (a row left empty
+ * keeps its top slot, so a budget of fewer than top_k tolerates one extra expert per row). */
+static void router_budget_case(const Plugin& pl) {
+    if (!sel("router_gemm_topk_scatter_bf16")) return;
+    const RadKernelInfo* rg = find(pl, "router_gemm_topk_scatter_bf16");
+    if (!rg) { ok("router_gemm_topk_scatter budget", false, "row absent"); return; }
+    const int64_t ne = 512, K = 2560, k = 10, maxM = 16, maxNS = maxM * k;
+    uint64_t rs64 = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { rs64 ^= rs64 << 13; rs64 ^= rs64 >> 7; rs64 ^= rs64 << 17; return rs64; };
+    auto uni = [&](float lo, float hi) {
+        return lo + (hi - lo) * (float)((rnd() >> 40) & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    };
+    void* d_a = dalloc((size_t)maxM * K * 2);
+    void* d_w = dalloc((size_t)ne * K * 2);
+    void* d_lg = dalloc((size_t)maxM * ne * 2);
+    void* d_id[2] = { dalloc((size_t)maxNS * 4), dalloc((size_t)maxNS * 4) };
+    void* d_ew[2] = { dalloc((size_t)maxNS * 2), dalloc((size_t)maxNS * 2) };
+    void* d_so[2] = { dalloc((size_t)maxNS * 4), dalloc((size_t)maxNS * 4) };
+    void* d_of[2] = { dalloc((size_t)(ne + 1) * 4), dalloc((size_t)(ne + 1) * 4) };
+    void* d_cn[2] = { dalloc((size_t)ne * 4), dalloc((size_t)ne * 4) };
+    if (!d_a || !d_w || !d_lg) { ok("router_gemm_topk_scatter budget", false, "hipMalloc failed"); return; }
+    void* inst = nullptr;
+    {
+        std::vector<RadParam> ip = { PI("M", maxM), PI("K", K), PI("n_expert", ne),
+                                     PI("top_k", k), PI("norm", 1), PS("dtype", "bf16") };
+        if (rg->init(ip.data(), (int)ip.size(), 0, 1, &inst) != RAD_OK || !inst) {
+            ok("router_gemm_topk_scatter budget init", false, "init failed");
+            return;
+        }
+    }
+    std::vector<uint16_t> hw((size_t)ne * K);
+    for (auto& v : hw) v = h_to_bf16(uni(-0.06f, 0.06f));
+    st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    struct C { int64_t nl, base; };
+    int64_t n_bad = 0, n_chk = 0;
+    std::string first_bad;
+    for (const C c : { C{ 512, 0 }, C{ 254, 3 } }) {
+        for (const int64_t M : { 2, 4, 7, 16 }) {
+            std::vector<uint16_t> ha((size_t)M * K);
+            for (auto& v : ha) v = h_to_bf16(uni(-2.0f, 2.0f));
+            /* two near-identical rows, so the restricted rows share experts, as a draft does */
+            if (M >= 4) for (int64_t j = 0; j < K; ++j) ha[(size_t)(2 * K + j)] =
+                ha[(size_t)(1 * K + j)] = h_to_bf16(h_bf16(ha[(size_t)j]) * 0.9f + 0.1f);
+            st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+            const int64_t NS = M * k;
+            auto launch = [&](int slot, int64_t budget, int64_t nexact) {
+                st_memset(d_id[slot], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_ew[slot], 0, (size_t)maxNS * 2);
+                st_memset(d_so[slot], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_of[slot], 0xFF, (size_t)(ne + 1) * 4);
+                st_memset(d_cn[slot], 0xFF, (size_t)ne * 4);
+                std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { ne, K }),
+                                              T(nullptr, RAD_BF16, { 1, K }),
+                                              T(d_lg, RAD_BF16, { M, ne }),
+                                              T(d_id[slot], RAD_I32, { M, k }),
+                                              T(d_ew[slot], RAD_BF16, { M, k }),
+                                              T(d_so[slot], RAD_I32, { NS }),
+                                              T(d_of[slot], RAD_I32, { c.nl + 1 }),
+                                              T(d_cn[slot], RAD_I32, { c.nl }),
+                                              T(nullptr, RAD_BF16, { M, 1 }) };
+                absent(ts[2]); absent(ts[9]);
+                std::vector<RadParam> ps = { PI("M", M), PI("K", K), PI("n_expert", ne),
+                                             PI("n_local", c.nl), PI("top_k", k), PI("norm", 1),
+                                             PS("dtype", "bf16"), PI("expert_base", c.base) };
+                if (budget > 0) { ps.push_back(PI("budget", budget)); ps.push_back(PI("exact_rows", nexact)); }
+                run_case(rg, ts, ps, RAD_OK, inst);
+            };
+            launch(0, 0, 1);
+            std::vector<int32_t> id0((size_t)NS);
+            std::vector<uint16_t> ew0((size_t)NS);
+            st_memcpy(id0.data(), d_id[0], (size_t)NS * 4, hipMemcpyDeviceToHost);
+            st_memcpy(ew0.data(), d_ew[0], (size_t)NS * 2, hipMemcpyDeviceToHost);
+            for (const int64_t nexact : { 1, 2 }) {
+                for (const int64_t budget : { 3, 10, 12, 16, 24, 40, 1000 }) {
+                    launch(1, budget, nexact);
+                    std::vector<int32_t> id1((size_t)NS), so1((size_t)NS), of1((size_t)c.nl + 1), cn1((size_t)c.nl);
+                    std::vector<uint16_t> ew1((size_t)NS);
+                    st_memcpy(id1.data(), d_id[1], (size_t)NS * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(ew1.data(), d_ew[1], (size_t)NS * 2, hipMemcpyDeviceToHost);
+                    st_memcpy(so1.data(), d_so[1], (size_t)NS * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(of1.data(), d_of[1], (size_t)(c.nl + 1) * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(cn1.data(), d_cn[1], (size_t)c.nl * 4, hipMemcpyDeviceToHost);
+                    /* ---- the host mirror */
+                    const int64_t nx = std::min<int64_t>(nexact, M) * k;
+                    std::vector<float> mass((size_t)NS, -1.0f);
+                    std::vector<int> rep((size_t)NS, 0), keep((size_t)NS, 1);
+                    int64_t nforced = 0;
+                    for (int64_t j = 0; j < nx; ++j) {
+                        bool f = true;
+                        for (int64_t q = 0; q < j; ++q) f = f && id0[(size_t)q] != id0[(size_t)j];
+                        nforced += f;
+                    }
+                    for (int64_t i = nx; i < NS; ++i) {
+                        bool forced = false;
+                        for (int64_t j = 0; j < nx; ++j) forced = forced || id0[(size_t)j] == id0[(size_t)i];
+                        if (forced) continue;
+                        float m = 0; bool first = true;
+                        for (int64_t j = nx; j < NS; ++j)
+                            if (id0[(size_t)j] == id0[(size_t)i]) { m += h_bf16(ew0[(size_t)j]); if (j < i) first = false; }
+                        mass[(size_t)i] = m; rep[(size_t)i] = first;
+                    }
+                    const int64_t extra = budget > nforced ? budget - nforced : 0;
+                    for (int64_t i = nx; i < NS; ++i) {
+                        if (mass[(size_t)i] < 0) continue;
+                        int64_t rank = 0;
+                        for (int64_t j = nx; j < NS; ++j)
+                            rank += rep[(size_t)j] && (mass[(size_t)j] > mass[(size_t)i] ||
+                                    (mass[(size_t)j] == mass[(size_t)i] && id0[(size_t)j] < id0[(size_t)i]));
+                        keep[(size_t)i] = rank < extra;
+                    }
+                    std::vector<uint16_t> ewx((size_t)NS);
+                    std::vector<int> alive((size_t)NS, 1);
+                    for (int64_t m = 0; m < M; ++m) {
+                        float s_all = 0, s_kept = 0; int nkeep = 0;
+                        for (int64_t l = 0; l < k; ++l) {
+                            const float v = h_bf16(ew0[(size_t)(m * k + l)]);
+                            s_all += v;
+                            if (keep[(size_t)(m * k + l)]) { ++nkeep; s_kept += v; }
+                        }
+                        for (int64_t l = 0; l < k; ++l) {
+                            const size_t i = (size_t)(m * k + l);
+                            float v = h_bf16(ew0[i]);
+                            bool kp = keep[i] != 0;
+                            if (nkeep == 0) { kp = l == 0; v = s_all; }
+                            else if (nkeep < k && s_kept > 0.0f) v = v * (s_all / s_kept);
+                            ewx[i] = h_to_bf16(v);
+                            alive[i] = kp;
+                        }
+                    }
+                    std::vector<int32_t> sox((size_t)NS, -1), ofx((size_t)c.nl + 1, 0), cnx((size_t)c.nl, 0);
+                    for (int64_t i = 0; i < NS; ++i) {
+                        const int64_t e = id0[(size_t)i] - c.base;
+                        if (alive[(size_t)i] && e >= 0 && e < c.nl) ++cnx[(size_t)e];
+                    }
+                    for (int64_t e = 0; e < c.nl; ++e) ofx[(size_t)e + 1] = ofx[(size_t)e] + cnx[(size_t)e];
+                    std::vector<int32_t> fill(ofx.begin(), ofx.end() - 1);
+                    for (int64_t i = 0; i < NS; ++i) {
+                        const int64_t e = id0[(size_t)i] - c.base;
+                        if (alive[(size_t)i] && e >= 0 && e < c.nl) sox[(size_t)fill[(size_t)e]++] = (int32_t)i;
+                    }
+                    ++n_chk;
+                    bool good = id1 == id0 && ew1 == ewx && so1 == sox && of1 == ofx && cn1 == cnx;
+                    /* invariants */
+                    for (int64_t j = 0; j < nx && good; ++j)
+                        good = ew1[(size_t)j] == ew0[(size_t)j] && alive[(size_t)j];
+                    if (budget >= 1000) good = good && ew1 == ew0;
+                    if (!good) {
+                        ++n_bad;
+                        if (first_bad.empty())
+                            first_bad = fmt("nl %lld M %lld exact %lld budget %lld: ids %d w %d sorted %d off %d cnt %d",
+                                (long long)c.nl, (long long)M, (long long)nexact, (long long)budget,
+                                (int)(id1 == id0), (int)(ew1 == ewx), (int)(so1 == sox),
+                                (int)(of1 == ofx), (int)(cn1 == cnx));
+                    }
+                }
+            }
+            /* a budgeted launch followed by an unbudgeted one: the exact op is unchanged */
+            launch(1, 0, 1);
+            std::vector<uint8_t> x((size_t)NS * 2), y((size_t)NS * 2);
+            st_memcpy(x.data(), d_ew[0], x.size(), hipMemcpyDeviceToHost);
+            st_memcpy(y.data(), d_ew[1], y.size(), hipMemcpyDeviceToHost);
+            ++n_chk;
+            if (x != y) { ++n_bad; if (first_bad.empty()) first_bad = "budget 0 differs from the plain op"; }
+        }
+    }
+    ok(("router_gemm_topk_scatter budget matches the host mirror (" + std::to_string(n_chk) + " cases)").c_str(),
+       n_bad == 0, first_bad);
+    rg->fini(inst);
+}
+
 /* Protected experts are sorted last, checked against a host stable sort. Their rows must follow
  * every other expert's, in the listed order, with the rest closed up and every run stable. Both
  * standalone sort forms run (450 slots: one workgroup; 3000: three passes), with the first, a
@@ -34843,6 +35019,7 @@ static void device_phase(const Plugin& pl) {
         qsa_qprep_case(pl);
         topk_scatter_case(pl);
         router_gemm_fused_case(pl);
+        router_budget_case(pl);
         scatter_protect_case(pl);
         moe_gather_case(pl);
         if (sel("rowtopk_bf16")) {
