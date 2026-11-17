@@ -158,6 +158,7 @@ struct Plugin {
     void (*mla_stats)(unsigned long long*) = nullptr;
     void (*pin_mla_rows)(int) = nullptr;
     void (*pin_late_push)(int) = nullptr;
+    void (*pin_ar_form)(int) = nullptr;
     int (*pin_gdn_path)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
     void (*ar8_settings)(const R4DAr8Settings*) = nullptr;
@@ -231,6 +232,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
     okall &= sym(pl->h, "r4d_mla_rows_pin_form", &pl->pin_mla_rows);
     okall &= sym(pl->h, "r4d_ar_late_push_pin", &pl->pin_late_push);
+    okall &= sym(pl->h, "r4d_ar_form_pin", &pl->pin_ar_form);
     okall &= sym(pl->h, "r4d_gdn_fold_pin_path", &pl->pin_gdn_path);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     okall &= sym(pl->h, "r4d_ar8_test_settings", &pl->ar8_settings);
@@ -31494,6 +31496,7 @@ struct ArHc {
     const char* act = nullptr;                 /* gather's shared arm: null operand, "none", "sigmoid" */
     bool use_scratch = false;                  /* hand the inverse table's scratch to the gather */
     void* inst = nullptr;
+    int rounds = 1;                            /* launches on the one instance, y handed in again */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<uint16_t> y_in, inj, h0;       /* what we hand the kernel */
     std::vector<uint16_t> ye, ew, sh, sg;      /* the gather's inputs */
@@ -31569,8 +31572,11 @@ static void ar_hc_worker(ArHc* t) {
             }
         }
         if (t->rc_launch == RAD_OK) {
-            t->rc_launch = t->row->launch(&a, nullptr);
-            st_stream_sync(nullptr);
+            for (int round = 0; round < t->rounds && t->rc_launch == RAD_OK; ++round) {
+                if (round) st_memcpy(y, t->y_in.data(), yb, hipMemcpyHostToDevice);
+                t->rc_launch = t->row->launch(&a, nullptr);
+                st_stream_sync(nullptr);
+            }
             t->y_out.resize((size_t)(t->M * t->n));
             t->h_out.resize((size_t)(t->M * t->hc * t->n));
             st_memcpy(t->y_out.data(), y, yb, hipMemcpyDeviceToHost);
@@ -31773,6 +31779,115 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
                skew == 0, std::to_string(skew) + " elements differ between ranks");
         }
         if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst);
+    }
+}
+
+/* The register form of the two fused writes (r4d_ar_hc_write_reg_kernel and its gather twin: one
+ * word a thread, the write's operands read ahead, the handshake of r4d_ar_seq.h's
+ * r4d_ar_word_handshake) against the plain kernels, through r4d_ar_form_pin, at the decode and
+ * verify heights of Qwen3.8-Flash-Next's residual (n 2560, four streams): five launches back to
+ * back on one instance, so both slot parities and the counters' carry-over are walked, and every
+ * rank's y and h after the last compared byte for byte. The register form runs a second time with
+ * every push held ~20 us behind its flag (r4d_ar_late_push_pin), which is the path its push check
+ * re-reads on. The forms must agree bit for bit: the plain kernels are the ones ar_hc_write_case
+ * holds against the host oracle. */
+static void ar_hc_forms_case(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                             bool want_gather) {
+    const RadKernelInfo* row = find(pl, name);
+    const std::string nm = std::string(name) + " register form";
+    if (!row) { ok(nm.c_str(), false, "row absent"); return; }
+    if (devs.size() < 2) { skip(nm.c_str(), "needs 2 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(nm.c_str(), "no peer path between the cards (device.p2p)"); return; }
+    if (!pl.pin_ar_form || !pl.pin_late_push) { skip(nm.c_str(), "no r4d_ar_form_pin"); return; }
+    struct Arm { const char* act; };
+    const std::vector<Arm> arms = want_gather ? std::vector<Arm>{ { nullptr }, { "none" } }
+                                              : std::vector<Arm>{ { nullptr } };
+    for (const Arm& arm : arms)
+    for (int64_t M : { 1, 2, 3, 4, 5, 6, 8 }) {
+        const int64_t n = 2560, hc = 4, k = want_gather ? 8 : 0, T = M * k;
+        std::vector<int32_t> sorted((size_t)T, -1);
+        if (want_gather) {
+            std::vector<int32_t> ex((size_t)T);
+            uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull);
+            auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+            for (int64_t i = 0; i < T; ++i) {
+                const uint64_t v = rnd();
+                ex[(size_t)i] = (v % 31 == 0) ? -1 : (int32_t)((v >> 8) % 64);
+            }
+            int64_t pos = 0;
+            for (int32_t e = 0; e < 64; ++e)
+                for (int64_t i = 0; i < T; ++i)
+                    if (ex[(size_t)i] == e) sorted[(size_t)pos++] = (int32_t)i;
+        }
+        /* form 0: the plain kernels; 1: the register form; 2: the register form, late pushes. */
+        std::vector<std::vector<ArHc>> runs;
+        bool up = true, ran = true;
+        for (int form = 0; form < 3 && up && ran; ++form) {
+            pl.pin_ar_form(form == 0 ? 0 : 1);
+            pl.pin_late_push(form == 2 ? 1 : 0);
+            std::vector<ArHc> t(2);
+            std::vector<std::thread> th;
+            for (int r = 0; r < 2; ++r) {
+                ArHc& x = t[(size_t)r];
+                x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = 2;
+                x.M = M; x.n = n; x.hc = hc; x.top_k = k; x.act = arm.act; x.rounds = 5;
+                x.y_in.resize((size_t)(M * n));
+                x.inj.resize((size_t)(M * hc));
+                x.h0.resize((size_t)(M * hc * n));
+                uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)(r + 1) * 0x9E3779B97F4A7C15ull) ^
+                              ((uint64_t)M * 1315423911ull);
+                auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+                for (auto& v : x.y_in) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+                /* The gains and the streams are replicated across ranks, as the engine holds them. */
+                uint64_t rc = 0x2545F4914F6CDD1Dull ^ (uint64_t)M;
+                auto rndc = [&]() { rc ^= rc << 13; rc ^= rc >> 7; rc ^= rc << 17; return rc; };
+                for (auto& v : x.inj) v = h_to_bf16(((int64_t)(rndc() % 2001) - 1000) / 4000.0f);
+                for (auto& v : x.h0) v = h_to_bf16(((int64_t)(rndc() % 4001) - 2000) / 512.0f);
+                if (want_gather) {
+                    x.sorted = sorted;
+                    x.ye.resize((size_t)(T * n));
+                    x.ew.resize((size_t)T);
+                    for (auto& v : x.ye) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+                    for (auto& v : x.ew) v = h_to_bf16((float)(rndc() % 1000 + 1) / 1024.0f);
+                    if (arm.act) {
+                        x.sh.resize((size_t)(M * n));
+                        x.sg.resize((size_t)M);
+                        for (auto& v : x.sh) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 256.0f);
+                        for (auto& v : x.sg) v = h_to_bf16(((int64_t)(rndc() % 801) - 400) / 100.0f);
+                    }
+                }
+                th.emplace_back(ar_hc_worker, &x);
+            }
+            for (std::thread& x : th) x.join();
+            for (const ArHc& x : t) { up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == RAD_OK; }
+            if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst);
+            runs.push_back(std::move(t));
+        }
+        pl.pin_ar_form(-1);
+        pl.pin_late_push(0);
+        const std::string at = fmt(" M=%lld n=%lld hc=%lld%s", (long long)M, (long long)n,
+                                   (long long)hc, want_gather ? (arm.act ? ", top_k 8, shared arm"
+                                                                         : ", top_k 8") : "");
+        ok((nm + at + ": every form launches").c_str(), up && ran && runs.size() == 3);
+        if (!up || !ran || runs.size() != 3) continue;
+        static const char* const kWhat[] = { "", "byte-identical to the plain kernels after five launches",
+                                             "with every push ~20 us behind its flag: byte-identical too" };
+        for (size_t f = 1; f < 3; ++f) {
+            int64_t bad = 0, nz = 0;
+            for (int r = 0; r < 2; ++r) {
+                const ArHc& a = runs[0][(size_t)r];
+                const ArHc& b = runs[f][(size_t)r];
+                for (size_t i = 0; i < a.y_out.size(); ++i) bad += a.y_out[i] != b.y_out[i];
+                for (size_t i = 0; i < a.h_out.size(); ++i) { bad += a.h_out[i] != b.h_out[i]; nz += b.h_out[i] != 0; }
+            }
+            /* The two ranks' y agree as well (the fold is symmetric), and something was written. */
+            int64_t skew = 0;
+            for (size_t i = 0; i < runs[f][0].y_out.size(); ++i)
+                skew += runs[f][0].y_out[i] != runs[f][1].y_out[i];
+            ok((nm + at + ", " + kWhat[f]).c_str(), bad == 0 && skew == 0 && nz > M * hc * n,
+               fmt("%lld bytes differ from the plain kernels, %lld between the ranks", (long long)bad,
+                   (long long)skew));
+        }
     }
 }
 
@@ -36281,6 +36396,9 @@ static void device_phase(const Plugin& pl) {
             std::printf("  %s\n", n.c_str());
             ar_hc_write_case(pl, devs, n.c_str(), std::strstr(base, "4rank") ? 4 : 2,
                              std::strstr(base, "gather") != nullptr);
+            /* The host twins keep the plain kernels: their mailbox is read over the link. */
+            if (!std::strstr(base, "4rank") && n == base)
+                ar_hc_forms_case(pl, devs, n.c_str(), std::strstr(base, "gather") != nullptr);
         }
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
