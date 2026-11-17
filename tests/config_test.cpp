@@ -1903,6 +1903,21 @@ TEST(the_draft_suffix_flags_default_off_and_parse) {
     for (const char* bad : { "-0.1", "1.5", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-score", bad }), RAD_E_INVAL);
 }
 
+/* The suffix selector and the adaptive chain depth are served together, with traversal verification
+ * (bring-up refuses what the model cannot do; the parse and the shown rows say what was asked). */
+TEST(the_suffix_selector_parses_beside_adaptive_depth_and_traversal) {
+    Config c;
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-depth", "adaptive", "--draft-coupling", "on",
+                     "--draft-verify", "traversal", "--num-speculative-tokens", "5" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK(c.draft_depth_adaptive);
+    CHECK(c.draft_coupling);
+    CHECK(c.draft_verify_traversal);
+    CHECK(!c.draft_verify_block);
+    CHECK_EQ(c.n_spec, 5);
+    CHECK_EQ(c.draft_suffix_max, 7);
+}
+
 RAD_TEST_MAIN()
 
 /* The default tree budget of a serial head is rounds + leaves (never below the plugin's own), clamped

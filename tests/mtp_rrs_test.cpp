@@ -413,6 +413,7 @@ struct TravTree {
             int nk = 0;
             for (int q = j + 1; q <= t.n; ++q) {
                 if (t.par[q] != j) continue;
+                if (t.n_model >= 0 && q > t.n_model && !g_extras_visible) continue;   /* Request::draft_extra */
                 bool dup = false;
                 for (int z = 0; z < nk; ++z) dup = dup || kid[z] == t.tok[q];
                 if (!dup) kid[nk++] = t.tok[q];
@@ -3192,6 +3193,95 @@ TEST(a_depth_rule_that_reads_the_admitted_draft_or_the_target_is_not_exact) {
         CHECK(peek.z3 > 20.0 || peek.z1 > 20.0);
     }
     g_sharp = 1.0;
+}
+
+/* ==================================================================== --draft-suffix beside --draft-depth adaptive
+ *
+ * A step is either a suffix step (the committed text recurs: an uncoupled chain of 1..7 rows copied
+ * from the history, draft_extra = 0, no row binds a state) or an adaptive MTP chain (coupled, cut by
+ * the head's own laws), chosen by a function of the committed text alone -- the history hash here,
+ * the matcher over prompt ++ output in the engine. Both are verified by the traversal walk or row by
+ * row, and a generation runs over several such steps, so each step's kind and depth depend on what
+ * the steps before it committed. The negative control shows the suffix rows visible to the coupled
+ * rows' child lists (the head's stale states of the same positions), which is biased. */
+namespace {
+
+DepthRun run_mixed(const DraftDepthCfg& cfg, bool trav, int trials, double noise, int share_pct, int how) {
+    std::vector<double> cnt3((size_t)V * V * V, 0), cnt1((size_t)V, 0);
+    DepthRun R{};
+    double steps = 0, sfx = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x7a31c5ull + (uint64_t)s * 130363ull;
+        int out[16], len = 0;
+        uint64_t h = 1;
+        while (len < 3) {
+            Tree t;
+            /* the head drafts for this step either way (the history pass is paid behind a suffix step) */
+            const int D = draft_depth_chain(&t, seed, (uint64_t)len, cfg, noise, h, 0, 0);
+            const bool is_sfx = (int)(H(h * 31 + 7) % 100) < share_pct;
+            if (is_sfx) {
+                const int rows = 1 + (int)(H(h * 17 + 3) % 7);
+                suffix_chain(&t, (int)(h % 100003), how, rows, 1.0);
+                sfx += 1;
+            }
+            R.mean_depth += is_sfx ? t.n : D; ++steps;
+            int step_out[64], accepted = 0, n;
+            if (trav) n = walk_trav(t, seed, (uint64_t)len, noise, 0, step_out, &accepted, RadMtpTravOpt{});
+            else      n = walk(t, seed, (uint64_t)len, noise, 0, step_out, &accepted);
+            R.mean_acc += accepted;
+            for (int i = 0; i < n && len < 16; ++i) { out[len++] = step_out[i]; h = child_hash(h, step_out[i]); }
+        }
+        ++cnt1[(size_t)out[0]];
+        ++cnt3[(size_t)((out[0] * V + out[1]) * V + out[2])];
+    }
+    std::vector<double> e1((size_t)V, 0), e3((size_t)V * V * V, 0);
+    const Law l0 = law_at(1, noise);
+    for (int a = 0; a < V; ++a) {
+        e1[(size_t)a] = l0.p[a];
+        const uint64_t ha = child_hash(1, a);
+        const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(ha, b), noise);
+            for (int c = 0; c < V; ++c) e3[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+    R.z3 = zscore(cnt3, e3, trials);
+    R.z1 = zscore(cnt1, e1, trials);
+    R.mean_acc /= steps; R.mean_depth /= steps;
+    R.share[0] = sfx / steps;
+    return R;
+}
+
+}  /* namespace */
+
+TEST(suffix_steps_beside_adaptive_depth_chains_emit_the_target_law) {
+    g_sharp = 2.0;
+    g_extras_visible = false;
+    for (int how = 0; how < 2; ++how)
+        for (int pct : { 30, 70 }) {
+            const DraftDepthCfg cfg = depth_cfg(4, 1, DRAFT_DEPTH_TOP, 0.40);
+            const DepthRun tv = run_mixed(cfg, true, 250000, 0.6, pct, how);
+            const DepthRun rw = run_mixed(cfg, false, 250000, 0.6, pct, how);
+            std::printf("  suffix %d%% of steps (how %d): trav z3=%.2f z1=%.2f acc=%.3f | rowwise z3=%.2f z1=%.2f acc=%.3f | "
+                        "suffix share %.2f rows/draft %.2f\n", pct, how, tv.z3, tv.z1, tv.mean_acc, rw.z3, rw.z1,
+                        rw.mean_acc, tv.share[0], tv.mean_depth);
+            CHECK(tv.z3 < 4.5); CHECK(tv.z1 < 4.5);
+            CHECK(rw.z3 < 4.5); CHECK(rw.z1 < 4.5);
+        }
+    /* negative control: the suffix rows are children of the coupled rows (the head's own unused
+     * draw may equal the copied token, selecting the coupling by the VALUE of that draw) */
+    g_extras_visible = true;
+    double worst = 0;
+    for (int trav = 0; trav < 2; ++trav) {
+        /* every step a suffix step over a head that drafted its full chain (all its states are stale) */
+        const DepthRun r = run_mixed(depth_cfg(4, 1, DRAFT_DEPTH_TOP, 0.0), trav != 0, 250000, 0.6, 100, 0);
+        std::printf("  suffix rows visible to the coupled rows (known wrong, %s): z3=%.1f z1=%.1f\n",
+                    trav ? "traversal" : "rowwise", r.z3, r.z1);
+        worst = std::max(worst, std::max(r.z3, r.z1));
+    }
+    g_extras_visible = false;
+    g_sharp = 1.0;
+    CHECK(worst > 8.0);
 }
 
 RAD_TEST_MAIN()

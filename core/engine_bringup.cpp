@@ -1384,8 +1384,8 @@ int Engine::declare() {
         else if (pb.draft_depth_fixed)                bad = "this drafter is a block drafter, not a serial head";
         else if (cfg_.draft_window == DraftWindow::Adaptive)
                                                       bad = "it needs the fixed window (--draft-window fixed)";
-        else if (cfg_.draft_verify_block || cfg_.draft_verify_traversal)
-                                                      bad = "it needs the rowwise verify (--draft-verify rowwise)";
+        else if (cfg_.draft_verify_block)             bad = "it cannot be combined with --draft-verify block "
+                                                            "(a suffix chain is no block; --draft-verify token | traversal)";
         if (bad) {
             RAD_ERR("--draft-suffix on: %s", bad);
             return RAD_E_UNSUPPORTED;

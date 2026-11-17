@@ -1637,6 +1637,19 @@ at the same mean of 3.0 drafts and a step 0.7% longer: +3.0% tokens a second (95
 +5.0%) over temperatures 0.7 and 1.0; a cap of 7 gained no more, a deep verify row costing more than a
 shallow one. The stop is not sensitive between 0.80 and 0.90.
 
+**Adaptive depth and the suffix selector together.** `draft-depth: adaptive` and `draft-suffix: on` combine, with
+`draft-verify: traversal` or token by token. Per step and per sequence the selector goes first: if the sequence's own
+history recurs (`draft-suffix-min-match`, `draft-suffix-min-score`) the step verifies the suffix chain (up to
+`draft-suffix-max` rows, uncoupled ordinary draws), else it verifies the adaptive chain the head drafted. The verify
+window is `max(num-speculative-tokens, draft-suffix-max)`, the adaptive chain is capped by `num-speculative-tokens`
+(`draft-depth-max` lowers it), and one step may carry a suffix row and an adaptive row of other lengths. The
+suffix choice reads the committed text only, and a suffix step has no coupled row (`Request::draft_extra` 0), so
+the traversal walk sees every row of it as a leaf and leaves the plain draws alone; the adaptive rows are walked
+as before. The head's rounds run behind every step, a suffix step included, so a sequence in a recurring pattern
+pays them in vain; its next step is built after the commit (not issued ahead). `tests/mtp_rrs_test.cpp` checks
+the mixed generations' law (chi-square, both verifies, a negative control), `tests/sched_test.cpp` the shared
+step and the issue-ahead rule.
+
 **Chained launches.** Where the model's plugin measured its step faster with them, the AQL backend
 lets a kernel that depends on the one before it on its queue wait in its own prologue instead of
 behind the packet processor's barrier bit, which saves most of the launch gap between dependent
@@ -1782,8 +1795,9 @@ tokens, with a negative control that exposes the coupled-visible variant), `test
 the issue-ahead rule and the head's catch-up, `tests/arch_test.cpp` the issue pattern of a nine-row verify and
 the head's passes behind it. The window is bounded by the model's kernels: Flash-Next's fused conv + recurrent update serves at most 8 query
 rows (a register window), so `draft-suffix-max` is at most 7 there; a larger window makes the first step fail
-with `unsupported`. It needs a serial head's chain, `draft-window: fixed` and the rowwise verify;
-`/metrics` has `radiance:suffix_steps_total`, `suffix_rows_total`, `suffix_accepted_total` and
+with `unsupported`. It needs a serial head's chain and `draft-window: fixed`; the token-by-token and the
+traversal verify both serve it (not `draft-verify: block`), and it combines with `draft-depth: adaptive`
+(below). `/metrics` has `radiance:suffix_steps_total`, `suffix_rows_total`, `suffix_accepted_total` and
 `suffix_held_ahead_total`.
 
 ```yaml

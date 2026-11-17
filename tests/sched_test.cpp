@@ -9529,3 +9529,78 @@ TEST(the_suffix_choice_reads_the_history_only_and_respects_the_speculation_gate)
         }
     }
 }
+
+/* ================================================================== --draft-suffix beside --draft-depth adaptive */
+
+/* One step, two sequences: the one whose history recurs verifies its suffix chain (8 rows), the other
+ * the head's chain at the depth the adaptive rule gave it (set_draft's count, 2 of the head's 3
+ * rounds): the rows of the step differ per sequence, the window is the larger of the two. Only the
+ * suffix row carries the draft_extra = 0 mark; the adaptive row's coupled states stay bound. */
+TEST(a_suffix_row_and_an_adaptive_depth_row_share_a_step) {
+    Fixture f;
+    suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    const uint64_t b = f.submit(160, 2000);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    CHECK_OK(f.sch.set_draft(b, kHeadDraft, 2));     /* the adaptive chain stopped after two rounds */
+    const RadBatch* bt = f.sch.step();
+    REQUIRE(bt != nullptr);
+    const StepPlan& p = f.sch.plan();
+    REQUIRE_EQ(p.e.size(), (size_t)2);
+    size_t ia = 0, ib = 1;
+    if (p.e[0].seq != a) { ia = 1; ib = 0; }
+    CHECK(p.e[ia].suffix);
+    CHECK_EQ(p.e[ia].n_spec, 8);
+    CHECK_EQ(p.e[ia].draft_extra, 0);
+    CHECK(!p.e[ib].suffix);
+    CHECK_EQ(p.e[ib].n_spec, 2);
+    CHECK_EQ(p.e[ib].draft_extra, -1);
+    CHECK_EQ(bt->n_spec, 8);
+    CHECK_EQ(bt->n_tok, 9 + 3);
+    for (int j = 0; j < 2; ++j) CHECK_EQ(f.sch.find(b)->draft[j], kHeadDraft[j]);
+    /* A accepts 5 of its 8, B both: each is counted for what it carried */
+    CHECK_OK(f.commit(900, 0, [&](const StepEntry& e) { return e.seq == a ? 5 : 2; }));
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.suffix_steps, (int64_t)1);
+    CHECK_EQ(m.suffix_rows, (int64_t)8);
+    CHECK_EQ(m.suffix_accepted, (int64_t)5);
+    CHECK_EQ(m.draft_tokens, (int64_t)10);
+    CHECK_EQ(m.draft_accepted, (int64_t)7);
+}
+
+/* The host's order under the adaptive depth: sequences whose history is not in a pattern are issued
+ * ahead with their own row counts (expect_draft of the chain each drafted) in a suffix deployment's
+ * wider window; one in a pattern holds the whole step back and takes its suffix step after the commit. */
+TEST(adaptive_depth_rows_are_issued_ahead_in_a_suffix_deployment_unless_a_sequence_is_in_a_pattern) {
+    for (int hot = 0; hot < 2; ++hot) {
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = hot ? ngram_cycle_request(f) : f.submit(160, 2000);
+        const uint64_t b = f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(hot ? 100 : 7);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        CHECK_OK(f.sch.set_draft(b, kHeadDraft, 2));
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.find(b)->speculation_fixed = true;
+        f.sch.expect_draft(a, 3);
+        f.sch.expect_draft(b, 2);
+        const RadBatch* nb = f.sch.step_next();
+        if (hot) {
+            CHECK(nb == nullptr);
+        } else {
+            REQUIRE(nb != nullptr);
+            std::vector<int> q;
+            for (int64_t i = 0; i < nb->n_seq; ++i) q.push_back((int)nb->q_lens[i]);
+            std::sort(q.begin(), q.end());
+            REQUIRE_EQ(q.size(), (size_t)2);
+            CHECK_EQ(q[0], 3);   /* 1 + the 2 drafts of one chain */
+            CHECK_EQ(q[1], 4);   /* 1 + the 3 of the other */
+        }
+    }
+}

@@ -568,7 +568,7 @@ private:
                   int rec1);
     int  haz_mark(PassTape& t);
 
-    static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    static constexpr size_t  kTapes      = 48;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;

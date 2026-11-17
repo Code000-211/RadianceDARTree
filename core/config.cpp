@@ -302,7 +302,8 @@ static const Flag g_flags[] = {
                                         "sequence's last --draft-suffix-min-match tokens occurred earlier in\n"
                                         "its own prompt ++ output, a host-built step verifies the earlier\n"
                                         "continuation (a chain, up to --draft-suffix-max rows) instead of the\n"
-                                        "head's draft. Lossless, also with --draft-coupling (default off)" },
+                                        "head's draft. Lossless, also with --draft-coupling, --draft-verify\n"
+                                        "traversal and --draft-depth adaptive (default off)" },
     { "--draft-suffix-min-match", "L",  "shortest suffix match that selects a suffix step (default 6)" },
     { "--draft-suffix-max", "N",        "most rows of a suffix step (default 7; the verify window becomes\n"
                                         "max(--num-speculative-tokens, N), the head still drafts its own)" },

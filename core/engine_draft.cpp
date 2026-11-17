@@ -182,14 +182,11 @@ int Engine::step_state_init() {
                     "depth; serve one of them");
             return RAD_E_INVAL;
         }
-        if (cfg_.draft_suffix) {
-            RAD_ERR("--draft-depth adaptive and --draft-suffix on are not served together: a suffix "
-                    "step widens the verify window past the head's rounds, which the adaptive chain "
-                    "has not been run against");
-            return RAD_E_UNSUPPORTED;
-        }
         depth_cfg_.on   = true;
         depth_cfg_.max  = (int)std::min<int64_t>(drafter_.depth, couple_planes_);
+        /* --draft-suffix widens the verify window (and the depth the plugin declares) past the head's
+         * own rounds: the chain never goes deeper than the head's num-speculative-tokens. */
+        if (cfg_.n_spec_head > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.n_spec_head);
         if (cfg_.draft_depth_max > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.draft_depth_max);
         depth_cfg_.max  = std::min(depth_cfg_.max, (int)RAD_MTP_COUPLE_MAX_ROUNDS);
         depth_cfg_.min  = std::min(std::max(cfg_.draft_depth_min, 1), depth_cfg_.max);
