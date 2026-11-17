@@ -33,6 +33,7 @@
 #include "../plugin/spechub/spechub.h"
 #include "sched/ngram_tree.h"
 #include "rad_mtp_calib.h"
+#include "sched/draft_depth.h"
 
 #include <algorithm>
 #include <functional>
@@ -2995,6 +2996,202 @@ TEST(traversal_verification_of_rheo_siblings_is_exact) {
     g_scheme = 0;
     CHECK(pr.z < 4.5); CHECK(pr.first_z < 4.5);
     CHECK(far.z < 4.5); CHECK(far.first_z < 4.5);
+}
+
+/* ==================================================================== --draft-depth adaptive
+ *
+ * The chain of a step stops by the head's own laws (core/sched/draft_depth.h): round j is drafted
+ * only while the product of the earlier rounds' statistic holds. The rule under test is the
+ * engine's own function over the states the real propose row wrote; the verify is the real
+ * row-wise coupling and the real traversal walk. A generation runs over several steps, so the
+ * depth of every step depends on the tokens the steps before it committed and on its own drafts.
+ * Exact for every rule the engine offers (top / path statistic, decided 0 or 1 round behind);
+ * the two mistakes a rule can make are caught by the same statistic:
+ *   control 1  admits a draft by ITS OWN mass under the head's law (a draft-side quantity, but of
+ *              the token the decision admits: the chain keeps the drafts the head liked);
+ *   control 2  peeks at the target: admits a draft only where the target's mass on it is at least
+ *              the head's (the chain keeps the drafts the verify is going to like). */
+using namespace rad;
+namespace {
+
+struct DepthRun { double z3, z1, mean_acc, mean_depth; double share[8]; };
+
+/* A drafted chain of at most cfg.max rounds, cut by the rule (ctl 0) or by a control. */
+int draft_depth_chain(Tree* t, uint64_t seed, uint64_t base, const DraftDepthCfg& cfg, double noise,
+                      uint64_t h0, int ctl, double ctl_thr) {
+    draft_chain(t, seed, base, cfg.max, 0, noise, h0);
+    int D = cfg.max;
+    if (ctl == 0) {
+        double st[RAD_MTP_COUPLE_MAX_ROUNDS];
+        for (int r = 1; r <= cfg.max; ++r) st[r - 1] = draft_depth_stat(t->st[r - 1], r, cfg.stat);
+        D = draft_depth_of(cfg, st, cfg.max);
+    } else {
+        for (int r = 1; r <= cfg.max; ++r) {
+            const RadMtpCoupleState& c = t->st[r - 1];
+            double own = 0;
+            for (int i = 0; i < c.count; ++i) if (c.ids[i] == c.x) own = c.q[i];
+            bool keep;
+            if (ctl == 1) keep = own >= ctl_thr;
+            else {
+                const Law law = law_at(t->hash[r - 1], noise);
+                keep = law.p[c.x] >= own;
+            }
+            if (!keep) { D = r - 1; break; }
+        }
+    }
+    /* the rounds past the stop never ran: no node, no state */
+    for (int j = D; j < 64; ++j) t->st[j] = RadMtpCoupleState{};
+    t->n = D;
+    return D;
+}
+
+/* `trials` generations of three tokens, each step an adaptive chain verified by the traversal walk
+ * (trav) or row by row; the joint law of the three against the target's. */
+DepthRun run_depth(const DraftDepthCfg& cfg, bool trav, int trials, double noise, int ctl = 0,
+                   double ctl_thr = 0) {
+    std::vector<double> cnt3((size_t)V * V * V, 0), cnt1((size_t)V, 0);
+    DepthRun R{};
+    double steps = 0;
+    for (int s = 0; s < trials; ++s) {
+        const uint64_t seed = 0x51ed27ull + (uint64_t)s * 104729ull;
+        int out[16], len = 0;
+        uint64_t h = 1;
+        while (len < 3) {
+            Tree t;
+            const int D = draft_depth_chain(&t, seed, (uint64_t)len, cfg, noise, h, ctl, ctl_thr);
+            R.mean_depth += D; ++R.share[D < 8 ? D : 7]; ++steps;
+            int step_out[64], accepted = 0, n;
+            if (D == 0) {
+                /* no draft at all (a control cut the first one): the ordinary pick */
+                step_out[0] = sample_law(law_at(h, noise), seed, (uint64_t)len, 0);
+                n = 1;
+            } else if (trav) {
+                n = walk_trav(t, seed, (uint64_t)len, noise, 0, step_out, &accepted, RadMtpTravOpt{});
+            } else {
+                n = walk(t, seed, (uint64_t)len, noise, 0, step_out, &accepted);
+            }
+            R.mean_acc += accepted;
+            for (int i = 0; i < n && len < 16; ++i) { out[len++] = step_out[i]; h = child_hash(h, step_out[i]); }
+        }
+        ++cnt1[(size_t)out[0]];
+        ++cnt3[(size_t)((out[0] * V + out[1]) * V + out[2])];
+    }
+    std::vector<double> e1((size_t)V, 0), e3((size_t)V * V * V, 0);
+    const Law l0 = law_at(1, noise);
+    for (int a = 0; a < V; ++a) {
+        e1[(size_t)a] = l0.p[a];
+        const uint64_t ha = child_hash(1, a);
+        const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(ha, b), noise);
+            for (int c = 0; c < V; ++c) e3[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+    R.z3 = zscore(cnt3, e3, trials);
+    R.z1 = zscore(cnt1, e1, trials);
+    R.mean_acc /= steps; R.mean_depth /= steps;
+    for (double& x : R.share) x /= steps;
+    return R;
+}
+
+DraftDepthCfg depth_cfg(int max, int lag, int stat, double stop, int min = 1) {
+    DraftDepthCfg c;
+    c.on = true; c.max = max; c.min = min; c.lag = lag; c.stat = stat; c.stop = stop;
+    return c;
+}
+
+}  /* namespace */
+
+/* The rule itself: rounds are decided in order, `lag` rounds behind, and the first refusal ends the
+ * chain; min rounds always run, max bounds it, a row with no law takes the fixed fallback. */
+TEST(draft_depth_rule_decides_each_round_from_the_rounds_it_may_read) {
+    const double s[] = { 0.9, 0.8, 0.5, 0.9, 0.9 };   /* conf: .9 .72 .36 .324 .2916 */
+    CHECK_EQ(draft_depth_of(depth_cfg(5, 0, 0, 0.7), s, 5), 3);    /* round 4 needs conf(3) = .36 */
+    CHECK_EQ(draft_depth_of(depth_cfg(5, 1, 0, 0.7), s, 5), 4);    /* a round later: conf(2) admits round 4 */
+    CHECK_EQ(draft_depth_of(depth_cfg(5, 0, 0, 0.95), s, 5), 1);
+    CHECK_EQ(draft_depth_of(depth_cfg(5, 1, 0, 0.95), s, 5), 2);   /* round 2 reads nothing: it always runs */
+    CHECK_EQ(draft_depth_of(depth_cfg(5, 0, 0, 0.0), s, 5), 5);
+    CHECK_EQ(draft_depth_of(depth_cfg(3, 0, 0, 0.0), s, 5), 3);
+    CHECK_EQ(draft_depth_of(depth_cfg(5, 0, 0, 0.95, 3), s, 5), 3);  /* min */
+    CHECK_EQ(draft_depth_of(depth_cfg(1, 0, 0, 0.0), s, 5), 1);
+    /* the engine's incremental form: a decision never reads past draft_depth_need */
+    const DraftDepthCfg c = depth_cfg(5, 1, 0, 0.7);
+    CHECK_EQ(draft_depth_need(c, 2), 0);
+    CHECK_EQ(draft_depth_need(c, 5), 3);
+    DraftDepthRow r;
+    draft_depth_begin(c, &r, false);
+    CHECK(draft_depth_go(c, &r, 2));
+    draft_depth_observe(&r, 1, 0.9);
+    CHECK(draft_depth_go(c, &r, 3));
+    draft_depth_observe(&r, 2, 0.8);
+    CHECK(draft_depth_go(c, &r, 4));
+    draft_depth_observe(&r, 3, 0.5);
+    CHECK(!draft_depth_go(c, &r, 5));
+    CHECK(r.done); CHECK_EQ(r.depth, 4);
+    CHECK(!draft_depth_go(c, &r, 5));           /* the chain has ended */
+    /* no law: a greedy row, or a state the proposer could not make a law of */
+    DraftDepthRow g;
+    draft_depth_begin(c, &g, true);
+    CHECK(draft_depth_go(c, &g, 2)); CHECK(draft_depth_go(c, &g, 3)); CHECK(!draft_depth_go(c, &g, 4));
+    DraftDepthRow m;
+    draft_depth_begin(c, &m, false);
+    CHECK(draft_depth_go(c, &m, 2));
+    draft_depth_observe(&m, 1, -1.0);
+    CHECK(m.lawless);
+    CHECK(draft_depth_go(c, &m, 3)); CHECK(!draft_depth_go(c, &m, 4));
+    /* the statistic of a state: the largest mass, or the drawn token's; none without a law */
+    RadMtpCoupleState st{};
+    st.status = 1; st.round = 2; st.count = 3; st.x = 7;
+    st.ids[0] = 5; st.ids[1] = 7; st.ids[2] = 9;
+    st.q[0] = 0.6; st.q[1] = 0.3; st.q[2] = 0.1;
+    CHECK(draft_depth_stat(st, 2, DRAFT_DEPTH_TOP) == 0.6);
+    CHECK(draft_depth_stat(st, 2, DRAFT_DEPTH_PATH) == 0.3);
+    CHECK(draft_depth_stat(st, 1, DRAFT_DEPTH_TOP) < 0);   /* another round's state */
+    st.status = 0;
+    CHECK(draft_depth_stat(st, 2, DRAFT_DEPTH_TOP) < 0);
+}
+
+TEST(adaptive_chain_depth_keeps_the_target_law) {
+    const int trials = 300000;
+    g_sharp = 2.0;
+    struct C { int lag, stat; double stop; const char* name; };
+    const C cs[] = { { 0, DRAFT_DEPTH_TOP, 0.36, "top lag0" },  { 1, DRAFT_DEPTH_TOP, 0.40, "top lag1" },
+                     { 0, DRAFT_DEPTH_PATH, 0.12, "path lag0" }, { 1, DRAFT_DEPTH_PATH, 0.22, "path lag1" } };
+    for (const C& c : cs) {
+        const DraftDepthCfg cfg = depth_cfg(4, c.lag, c.stat, c.stop);
+        const DepthRun tv = run_depth(cfg, true, trials, 0.6);
+        const DepthRun rw = run_depth(cfg, false, trials, 0.6);
+        std::printf("  depth %-9s stop %.2f: trav z3=%.2f z1=%.2f acc=%.3f | rowwise z3=%.2f z1=%.2f acc=%.3f | "
+                    "depth %.2f shares %.2f %.2f %.2f %.2f\n", c.name, c.stop, tv.z3, tv.z1, tv.mean_acc,
+                    rw.z3, rw.z1, rw.mean_acc, tv.mean_depth, tv.share[1], tv.share[2], tv.share[3], tv.share[4]);
+        CHECK(tv.z3 < 4.5); CHECK(tv.z1 < 4.5);
+        CHECK(rw.z3 < 4.5); CHECK(rw.z1 < 4.5);
+        /* the rule really stops chains at different depths, and the walk gains from the longer ones */
+        int used = 0;
+        for (int d = 1; d <= 4; ++d) used += tv.share[d] > 0.10;
+        CHECK(used >= 2);
+        CHECK(tv.mean_acc >= rw.mean_acc);
+    }
+    /* a far head and a min of two rounds */
+    const DepthRun far = run_depth(depth_cfg(4, 1, DRAFT_DEPTH_TOP, 0.5, 2), true, 200000, 2.0);
+    CHECK(far.z3 < 4.5); CHECK(far.z1 < 4.5);
+    g_sharp = 1.0;
+}
+
+TEST(a_depth_rule_that_reads_the_admitted_draft_or_the_target_is_not_exact) {
+    const int trials = 100000;
+    g_sharp = 2.0;
+    const DraftDepthCfg cfg = depth_cfg(4, 0, DRAFT_DEPTH_TOP, 0.0);
+    for (int trav = 0; trav < 2; ++trav) {
+        const DepthRun own = run_depth(cfg, trav != 0, trials, 0.6, 1, 0.30);
+        const DepthRun peek = run_depth(cfg, trav != 0, trials, 0.6, 2, 0);
+        std::printf("  depth controls (%s): own-mass z3=%.1f z1=%.1f depth %.2f | target peek z3=%.1f z1=%.1f depth %.2f\n",
+                    trav ? "traversal" : "rowwise", own.z3, own.z1, own.mean_depth, peek.z3, peek.z1,
+                    peek.mean_depth);
+        CHECK(own.z3 > 20.0 || own.z1 > 20.0);
+        CHECK(peek.z3 > 20.0 || peek.z1 > 20.0);
+    }
+    g_sharp = 1.0;
 }
 
 RAD_TEST_MAIN()

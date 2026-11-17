@@ -1125,6 +1125,21 @@ struct Config {
      * Verification, arXiv 2505.12398, abi/rad_mtp_traversal.h): the same output law, more
      * accepted tokens. Needs --draft-coupling on. */
     bool        draft_verify_traversal = false;
+    /* --draft-depth fixed|adaptive (core/sched/draft_depth.h): adaptive stops a coupled serial
+     * chain within the step as soon as the head's own laws make the next draft unlikely, so a step
+     * drafts 1 .. draft_depth_max tokens (0: num-speculative-tokens) and its verify carries that
+     * many rows. The chain goes on while the product of the rounds' statistic (stat 0: the largest
+     * mass of each round's law, 1: the mass of the token it drew) stays >= draft_depth_stop; the
+     * decision trails the chain by draft_depth_lag rounds (0 or 1; 1 hides the host's readback
+     * behind a running round), draft_depth_min rounds always run. Needs --draft-coupling on, a
+     * serial head's chain (no draft tree) and --draft-window fixed. Lossless: the rule reads
+     * draft-side quantities only. Off by default, which is the fixed chain bit for bit. */
+    bool        draft_depth_adaptive = false;
+    int         draft_depth_max = 0;
+    int         draft_depth_min = 1;
+    int         draft_depth_lag = 1;
+    int         draft_depth_stat = 0;
+    double      draft_depth_stop = 0.85;
     /* --draft-ngram-leaves N / --draft-ngram-min-match L (core/sched/ngram_tree.h): on a host-built
      * tree verify, graft up to N prompt-lookup nodes (a branch or a chain extension) when the
      * lookup's match runs at least L tokens back. 0 (default) off. Lossless, also under

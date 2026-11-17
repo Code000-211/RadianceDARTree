@@ -1254,7 +1254,9 @@ int Engine::issue_ahead(const RadBatch** out) {
         rad_host_mark("ia_synced", -1);
     }
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i) {
-        const int nodes = serial_nodes(serial_done_);
+        /* --draft-depth adaptive: the row's own chain (Engine::depth_row_nodes); else the nodes
+         * every row verifies. */
+        const int nodes = depth_row_nodes(i);
         if (held) {
             /* Not waited for: the chain alone, in the chain's form. */
             sched_.expect_draft(serial_row_[(size_t)i].seq, nodes, serial_done_, true);

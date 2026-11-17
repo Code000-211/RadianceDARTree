@@ -558,6 +558,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-ngram-leaves", { "2" } }, { "--draft-ngram-min-match", { "6" } },
         { "--draft-suffix", { "on" } }, { "--draft-suffix-min-match", { "5" } },
         { "--draft-suffix-max", { "6" } }, { "--draft-suffix-min-score", { "0.4" } },
+        { "--draft-depth", { "adaptive" } }, { "--draft-depth-max", { "5" } },
+        { "--draft-depth-min", { "2" } }, { "--draft-depth-stop", { "0.7" } },
+        { "--draft-depth-lag", { "0" } }, { "--draft-depth-stat", { "path" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -1131,6 +1134,47 @@ TEST(the_draft_coupling_is_off_or_on) {
     for (const char* bad : { "On", "1", "yes", "true", "" })
         CHECK_EQ(parse({ "--draft-coupling", bad }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--draft-coupling" }, &c), RAD_E_INVAL);
+}
+
+/* --draft-depth is fixed unless asked for. adaptive switches the coupled drafting on (its rule reads
+ * the draft's laws), excludes a draft tree and the fixed block verify, and takes its knobs in range. */
+TEST(draft_depth_adaptive_parses_and_needs_a_coupled_chain) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK(!c.draft_depth_adaptive);
+    CHECK_EQ(c.draft_depth_max, 0);
+    CHECK_EQ(c.draft_depth_min, 1);
+    CHECK_EQ(c.draft_depth_lag, 1);
+    CHECK_EQ(c.draft_depth_stat, 0);
+    CHECK(c.draft_depth_stop == 0.85);
+    CHECK(!c.draft_coupling);
+    Config a;
+    CHECK_EQ(parse({ "--draft-depth", "adaptive", "--draft-depth-max", "6", "--draft-depth-stop", "0.6",
+                     "--draft-depth-lag", "0", "--draft-depth-stat", "path", "--draft-depth-min", "2" }, &a),
+             RAD_OK);
+    CHECK(a.draft_depth_adaptive);
+    CHECK(a.draft_coupling);
+    CHECK_EQ(a.draft_tree, 0);
+    CHECK_EQ(a.draft_depth_max, 6);
+    CHECK_EQ(a.draft_depth_min, 2);
+    CHECK_EQ(a.draft_depth_lag, 0);
+    CHECK_EQ(a.draft_depth_stat, 1);
+    CHECK(a.draft_depth_stop == 0.6);
+    CHECK_EQ(parse({ "--draft-depth", "fixed" }, &a), RAD_OK);
+    CHECK(!a.draft_depth_adaptive);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "traversal" }), RAD_OK);
+    for (const char* bad : { "on", "auto", "" }) CHECK_EQ(parse_fresh({ "--draft-depth", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth" }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-stop", bad }), RAD_E_INVAL);
+    for (const char* bad : { "2", "-1" }) CHECK_EQ(parse_fresh({ "--draft-depth-lag", bad }), RAD_E_INVAL);
+    for (const char* bad : { "17", "-1" }) CHECK_EQ(parse_fresh({ "--draft-depth-max", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-min", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-stat", "mean" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-coupling", "off" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-tree", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "block" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-min", "4", "--draft-depth-max", "3" }),
+             RAD_E_INVAL);
 }
 
 /* --draft-verify is token (alias rowwise) unless asked for; block and traversal parse, block

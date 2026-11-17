@@ -8611,6 +8611,152 @@ TEST(the_predicted_row_count_is_the_recent_active_maximum_plus_the_margin) {
     CHECK_EQ(nb->n_spec, 6);
 }
 
+/* ================================================================== --draft-depth adaptive
+ *
+ * The engine's adaptive chain (core/sched/draft_depth.h) gives every sequence its own number of
+ * drafts each step: the drafter ran for the deepest row, expect_draft names each row's depth, the
+ * step issued ahead verifies exactly that many (1 + d rows, the card's ADV_TRUNK taking the first d
+ * proposals of the slot) and set_draft publishes the same d. That step must be the step the
+ * scheduler builds after the commit from a d-token proposal, row for row, on every step of a run
+ * whose depths change from step to step and differ between the sequences of one step. */
+namespace {
+int depth_at(uint64_t seq, int t, int n_spec) {
+    return 1 + (int)(ahead_mix(seq * 31 + 7, (uint64_t)t) % (uint32_t)n_spec);
+}
+
+void depth_publish(Fixture& f, const std::vector<uint64_t>& ids, int n_spec, int t) {
+    for (uint64_t id : ids) {
+        int32_t d[8];
+        const int dn = depth_at(id, t, n_spec);
+        for (int j = 0; j < dn; ++j) d[j] = ahead_draft(id, t, j);
+        CHECK_OK(f.sch.set_draft(id, d, dn));
+    }
+}
+
+AheadRun depth_reference(int n_spec, int steps) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, n_spec, ids);
+    AheadRun run;
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    for (int t = 0; t < steps; ++t) {
+        CHECK_OK(ahead_commit(f, t));
+        depth_publish(f, ids, n_spec, t + 1);
+        b = f.sch.step();
+        if (!b) break;
+        run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    ahead_finish(f, ids, run);
+    return run;
+}
+
+AheadRun depth_pipelined(int n_spec, int steps, std::vector<int>* rows_seen) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, n_spec, ids);
+    AheadRun run;
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    for (int t = 0; t < steps; ++t) {
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> y((size_t)b->n_out + 1, -1);
+        for (const StepEntry& e : p.e) {
+            if (e.dev_out < 0) continue;
+            const int32_t a = ahead_acc(e.seq, t, e.n_spec);
+            for (int j = 0; j <= e.n_spec; ++j)
+                y[(size_t)(e.dev_out + j)] = j < a ? ahead_draft(e.seq, t, j) : ahead_tok(e.seq, t);
+        }
+        AdvanceArgs acc = f.sch.advance_args(0);
+        acc.mode = ADV_ACCEPT;
+        acc.st = slots.data();
+        acc.src = y.data();
+        for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+        for (const StepEntry& e : p.e) {
+            const StepSlot& S = slots[(size_t)e.card];
+            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+                ++run.card_host_disagree;
+            /* The head ran every round (the deepest row's); this row's chain is its first d. */
+            for (int j = 0; j < n_spec; ++j)
+                slots[(size_t)e.card].tok[1 + j] = ahead_draft(e.seq, t + 1, j);
+            f.sch.expect_draft(e.seq, depth_at(e.seq, t + 1, n_spec));
+        }
+        const RadBatch* nb = f.sch.step_next();
+        if (nb) {
+            AdvanceArgs tr = f.sch.advance_args(0);
+            tr.mode = ADV_TRUNK;
+            tr.st = slots.data();
+            for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+            for (int64_t i = 0; i < nb->n_seq; ++i) rows_seen->push_back(nb->q_lens[i]);
+        }
+        CHECK_OK(ahead_commit(f, t));
+        depth_publish(f, ids, n_spec, t + 1);
+        if (nb) {
+            f.sch.promote_next();
+            b = nb;
+            ++run.ahead;
+        } else {
+            b = f.sch.step();
+            if (!b) break;
+        }
+        run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    ahead_finish(f, ids, run);
+    return run;
+}
+}  /* namespace */
+
+TEST(a_step_issued_ahead_with_each_rows_own_draft_depth_equals_the_step_built_after_the_commit) {
+    const int n_spec = 5, T = 32;
+    std::vector<int> rows;
+    const AheadRun a = depth_reference(n_spec, T);
+    const AheadRun b = depth_pipelined(n_spec, T, &rows);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    adaptive depth: step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    /* every depth 1 .. n_spec was verified, as 1 + d rows */
+    for (int d = 1; d <= n_spec; ++d)
+        CHECK(std::count(rows.begin(), rows.end(), d + 1) > 0);
+    CHECK_EQ(std::count_if(rows.begin(), rows.end(), [&](int r) { return r < 2 || r > n_spec + 1; }),
+             (std::ptrdiff_t)0);
+    REQUIRE_EQ(a.held.size(), b.held.size());
+    for (size_t i = 0; i < a.held.size(); ++i) {
+        CHECK(b.held[i] >= a.held[i]);
+        CHECK(b.held[i] <= a.held[i] + 1);
+    }
+}
+
+/* The count a step issued ahead was planned with is binding: a proposal of another length for it is
+ * refused (the card verifies the planned rows), under a fixed window as under any other. */
+TEST(a_draft_of_another_depth_than_the_step_issued_ahead_was_planned_with_is_refused) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, 5, ids);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    for (uint64_t id : ids) f.sch.expect_draft(id, 2);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    for (int64_t i = 0; i < nb->n_seq; ++i) CHECK_EQ(nb->q_lens[i], 3);
+    CHECK_OK(ahead_commit(f, 0));
+    const int32_t d[5] = { 11, 12, 13, 14, 15 };
+    CHECK_EQ(f.sch.set_draft(ids[0], d, 3), RAD_E_STATE);
+    CHECK_EQ(f.sch.set_draft(ids[0], d, 1), RAD_E_STATE);
+    CHECK_OK(f.sch.set_draft(ids[0], d, 2));
+}
+
 RAD_TEST_MAIN()
 
 /* ================================================================== the plan without a span */

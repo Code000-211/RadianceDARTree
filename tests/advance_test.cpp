@@ -360,6 +360,49 @@ TEST(a_step_issued_ahead_takes_every_rows_tokens_positions_and_slots_from_its_st
     for (int t = 0; t < 9; ++t) CHECK_EQ(s.slot(1, t), 0);
 }
 
+/* --draft-depth adaptive (core/sched/draft_depth.h): the head ran for the deepest row of its step,
+ * so a slot holds every round's proposal, but the step issued ahead verifies only the chain each row
+ * really made -- its first d proposals, in 1 + d rows. The trunk advance takes exactly those (the
+ * rows' count is the batch's, never the slot's) and the acceptance behind that verify can accept no
+ * more than d, whatever the slot still holds past them. Two rows of one step differ in depth. */
+TEST(a_verify_of_a_chain_cut_short_takes_and_accepts_only_its_own_first_drafts) {
+    Slab s(ADV_TRUNK);
+    /* card 1 drafted five rounds and verifies two of them; card 3 verifies four */
+    s.row(0, true, 0, 3, /*ctx bound=*/40, /*card=*/1, 0, 0, 2);
+    s.row(1, true, 3, 5, 90, 3, 3, 3, 4);
+    for (int j = 0; j <= 5; ++j) { s.st[1].tok[j] = 700 + j; s.st[3].tok[j] = 800 + j; }
+    s.st[1].ctx = 20; s.st[1].n_acc = 3;
+    s.st[3].ctx = 60; s.st[3].n_acc = 1;
+    for (int t = 0; t < 8; ++t) s.w[Slab::TOK + t] = -5;
+    s.w[Slab::TOK + 8] = -5;
+    s.run();
+    const int32_t tok[8] = { 700, 701, 702, 800, 801, 802, 803, 804 };
+    const int32_t pos[8] = { 20, 21, 22, 60, 61, 62, 63, 64 };
+    for (int t = 0; t < 8; ++t) {
+        CHECK_EQ(s.w[Slab::TOK + t], tok[t]);
+        CHECK_EQ(s.w[Slab::POS + t], pos[t]);
+        CHECK_EQ(s.slot(0, t), pos[t]);
+    }
+    CHECK_EQ(s.w[Slab::TOK + 8], -5);            /* nothing past the rows the step has */
+    CHECK_EQ(s.used(0, 0), 23);
+    CHECK_EQ(s.used(0, 1), 65);
+    CHECK_EQ(s.w[Slab::ACC + 0], 3);
+    CHECK_EQ(s.w[Slab::ACC + 1], 1);
+
+    /* The acceptance behind that verify: the target agrees with every proposal the slot holds, and
+     * the row still accepts its own d only (the row descriptor's draft count), then emits the
+     * target's token at the row after them. */
+    Slab v(ADV_ACCEPT);
+    v.row(0, true, 0, 3, 20, 1, 0, 0, 2);
+    v.row(1, true, 3, 5, 60, 3, 3, 3, 4);
+    for (int t = 0; t < 8; ++t) v.w[Slab::TOK + t] = tok[t];
+    const int32_t y[8] = { 701, 702, 703, 801, 802, 803, 804, 805 };
+    for (int t = 0; t < 8; ++t) v.src[t] = y[t];
+    v.run();
+    CHECK_EQ(v.st[1].acc, 2);  CHECK_EQ(v.st[1].tok[0], 703);  CHECK_EQ(v.st[1].ctx, 23);
+    CHECK_EQ(v.st[3].acc, 4);  CHECK_EQ(v.st[3].tok[0], 805);  CHECK_EQ(v.st[3].ctx, 65);
+}
+
 /* A row the card moves keeps the host's offset between its position and its rotary position on
  * all three planes (a text row after an image rotates at its index plus a shift); a row whose
  * position does not move keeps the host's three components, which differ for a media token. A

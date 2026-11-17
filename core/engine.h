@@ -31,6 +31,7 @@
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
 #include "sched/mtp_couple_plan.h"   /* MtpCoupleLaw */
+#include "sched/draft_depth.h"       /* --draft-depth adaptive: the stop rule */
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -706,6 +707,39 @@ private:
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
+    /* --draft-depth adaptive (sched/draft_depth.h, engine_draft.cpp): the chain of a step stops by
+     * the head's own laws, so its rounds are issued one decision at a time. After the pass of
+     * round r the engine copies that round's state rows to depth_rb_ and records depth_ev_[r - 1];
+     * the driver waits for the event of the round a decision needs, reads the statistic and issues
+     * the next round or ends the chain. depth_of_[i] is drafting row i's final depth, which
+     * expect_draft, set_draft and the coupling's bind all take in place of the rounds that ran. */
+    DraftDepthCfg depth_cfg_;
+    RadEvent      depth_ev_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    bool          depth_issued_[RAD_MTP_COUPLE_MAX_ROUNDS] = {};
+    RadMtpCoupleState* depth_rb_ = nullptr;             /* pinned [rounds, couple_rows_] */
+    std::vector<DraftDepthRow> depth_row_;
+    std::vector<int32_t>       depth_of_;
+    int           depth_seen_ = 0;                      /* rounds observed this step */
+    int64_t       depth_spin_us_ = 3000;                /* RADIANCE_DEPTH_SPIN_US: poll this long, then block */
+    struct DepthStats {
+        uint64_t steps = 0, rows = 0, rounds = 0, drafts = 0, lawless = 0, waits = 0, blocked = 0;
+        uint64_t hist[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+        double   wait_us = 0;
+        uint64_t late = 0;
+        /* By the drafts a step made (d): the card's cycle from that step's first statistic to the
+         * next step's (its later rounds, the verify of d + 1 rows, the sampler, the next history
+         * pass), and what the verify of d drafts accepted. */
+        double   cyc_us[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+        uint64_t cyc_n[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+        uint64_t acc[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {}, acc_n[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
+    } depth_stats_;
+    std::chrono::steady_clock::time_point depth_e1_{};   /* the last step's first statistic */
+    int           depth_last_ = 0;                       /* and the deepest chain that step made */
+    /* Drafting row i's depth after issue_serial_drafter: its own under the adaptive rule, else the
+     * nodes every row verifies. */
+    int  depth_row_nodes(int i) const;
+    int  depth_readback_issue(int round, int n);
+    int  depth_observe_upto(int round, int n, const StepOut& so);
     /* `rows` are serial_row_ or block_row_ (Scheduler::SerialRow / BlockRow). */
     template <class Row> int stage_couple_draws(const Row* rows, int n);
     int  bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card);
