@@ -1032,6 +1032,9 @@ static const RadOperandSpec oKvLenTrim[] = {
 /* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
 static const RadParamSpec pPrefetch[] = {
     { "bytes", RAD_P_INT, RAD_REQUIRED },
+    /* The workgroups reading, where the architecture measured its own count; absent or 0, the
+     * kernel's (its `nb` axis). */
+    { "blocks", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oPrefetch[] = {
     { "w", RAD_OPD_WEIGHT, 0 },

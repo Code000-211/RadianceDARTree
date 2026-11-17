@@ -26,6 +26,7 @@
 #include "mem/vram_budget.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
+#include "mm/media.h"
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
@@ -1413,18 +1414,33 @@ int Engine::declare() {
         const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0 ||
                            rad_meta_geti(&meta_, "vision_config.image_size", 0) > 0;
         cfg_.mm_max_patches = (enc && *enc) || (!file_ && tower) ? 16384 : 0;
+        /* A build with no media decoder (RAD_WITH_FFMPEG) refuses every media part, so a tower it
+         * loaded could never run a pass: it would only hold card memory the routed experts are
+         * short of. Qwen3.8-Flash-Next at tp 2 on two R9700: 857 MiB a rank, about 800 expert
+         * units a rank that the routed GEMMs then read from the pinned pool over the link instead
+         * of from the card (the routed slots read off the card fall by half, the steps of a fresh
+         * server's first requests by 2.4%). An explicit --mm-max-patches still loads the tower. */
+        const bool undecodable = cfg_.mm_max_patches > 0 && !mm::decoder_available();
+        if (undecodable) cfg_.mm_max_patches = 0;
         /* Whole output rows a pass: the plugin's merge, when it states one. */
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         if (cfg_.mm_max_patches > 0 && pb.enc_merge > 1)
             cfg_.mm_max_patches -= cfg_.mm_max_patches % pb.enc_merge;
-        if (cfg_.mm_max_patches == 0 && tower)
+        if (undecodable)
+            RAD_INFO("media: off -- the model carries a vision tower, but this build has no media "
+                     "decoder (RAD_WITH_FFMPEG) and would refuse every media part, so the tower "
+                     "is not loaded and its card memory goes to the experts and the cache; "
+                     "--mm-max-patches N loads it all the same");
+        else if (cfg_.mm_max_patches == 0 && tower)
             RAD_INFO("media: off -- the checkpoint has a vision tower but this container was "
                      "converted without its weights; convert again to serve images and video");
         decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
                cfg_.mm_max_patches > 0
                    ? "the model carries a vision tower: 16384 patches is a 2048 x 2048 image, the "
                      "largest one encoder pass takes"
+               : undecodable ? "the model carries a vision tower, but this build has no media "
+                               "decoder to feed it"
                : tower ? "the checkpoint has a vision tower but this container was converted "
                          "without its weights"
                        : "the model carries no vision tower");
@@ -3887,6 +3903,9 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        /* The lent slots kept free for swaps follow the swaps asked for (mover.h): a rank that
+         * holds nearly all its experts gets the idle ones back as residents. */
+        mc.turnover_adaptive = true;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not

@@ -388,6 +388,10 @@ struct MoeFP8 {
      * which the shared arm's first stage then runs beside the router instead (pass()). */
     bool       gu_trellis = false;
     static constexpr int64_t kSharedFirstRows = 100;
+    /* The steps, by their rows [lo, hi], whose shared down projection is issued in front of the
+     * routed down GEMM instead of behind it (pass()); hi 0, the default, keeps it behind on
+     * every step. */
+    int64_t    sh_down_first_lo = 0, sh_down_first_hi = 0;
     LinearFP8    sh_gate_up{}, sh_down{};
     rad_op op_router = 0, op_topk = 0, op_scatter = 0;
     /* `op_scatter` is moe_scatter_inv and `op_gather` moe_gather_inv: the sort writes `w.inv` and
@@ -1964,6 +1968,19 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !(op_sh_gated && rows <= sh_gated_rows)) gq_sh.step(c_, w.sgu, T, r0, rows);
+    /* The shared arm's down projection in front of the routed down GEMM on a step of
+     * [sh_down_first_lo, sh_down_first_hi] rows. Behind it (below) the two still run together,
+     * but the card launches the arm only once every block of the routed GEMM is on it; at a
+     * verify step's forty routed rows that is a few microseconds before that GEMM ends, and the
+     * gather then waits for the arm. In front, the arm is the ordered launch behind the two
+     * quantisers and the routed GEMM starts beside it (it reads nothing the arm writes): the same
+     * start for the routed GEMM, and the arm is done long before it. At one row the routed GEMM
+     * is a quarter of the blocks, the arm behind it is launched in time, and in front it only
+     * delays that GEMM's launch (+0.38% a step), hence the lower bound. The arm's buffers are
+     * excluded from sharing (declare), so the order is free. Qwen3.8-Flash-Next at tp 2 with
+     * coupling, chain 1 / 2 / 3 (two / three / four rows): -0.28% / -0.21% / -0.25% a step. */
+    const bool sh_dn_first = shared && T >= sh_down_first_lo && T <= sh_down_first_hi;
+    if (sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
@@ -1998,7 +2015,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (shared && !sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {

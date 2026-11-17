@@ -2108,6 +2108,9 @@ struct LoanRig {
     /* None by default: on a slab this small the production count would leave most of the loan
      * empty. Tests of turnover set their own. */
     int         turnover = 0;
+    /* MoverConfig::turnover_adaptive and its floor, for the test of it. */
+    bool        adaptive = false;
+    int         floor = 0;
 
     explicit LoanRig(int n_expert = 8) : hf(n_expert) {}
 
@@ -2116,6 +2119,8 @@ struct LoanRig {
         RAD_TRY(h.init(hf.plan, hp));
         MoverConfig mc;
         mc.turnover_slots = turnover;
+        mc.turnover_adaptive = adaptive;
+        if (adaptive) mc.turnover_floor = floor;
         RAD_TRY(m.init(hf.f.prog, hf.plan, mc));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
@@ -2210,6 +2215,69 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
     std::sort(at.begin(), at.end());
     for (size_t k = 1; k < at.size(); ++k)
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
+}
+
+/* MoverConfig::turnover_adaptive: the slots kept free follow the swaps asked for. A quiet run keeps
+ * only the floor free and fills the rest; steps that propose swaps get three steps' worth of
+ * their mean back, up to the configured count, by drops (nothing crosses the link for them); and
+ * a quiet run gives them up again, each a copy in. */
+TEST(an_adaptive_turnover_follows_the_swaps_asked_for) {
+    LoanRig r(24);
+    r.turnover = 4;
+    r.adaptive = true;
+    r.floor = 1;
+    CHECK_OK(r.build());
+    CHECK_EQ(r.m.turnover_slots(), (int64_t)4);          /* the most it keeps */
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);            /* and what it starts from */
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    const int64_t slots = r.m.flex_capacity() / stride;
+    CHECK(r.pooled() > slots);
+    REQUIRE(slots > 4);
+
+    auto settle = [&](int64_t proposed, int steps) {
+        for (int k = 0; k < steps; ++k) {
+            r.m.swap_demand(proposed);
+            CHECK_OK(r.dispatch());
+        }
+        for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) CHECK_OK(r.dispatch());
+        for (int k = 0; k < 4; ++k) CHECK_OK(r.dispatch());
+    };
+
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();) {
+        r.m.swap_demand(0);
+        CHECK_OK(r.dispatch());
+    }
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 1) * stride);
+
+    /* One swap a step, step after step: the mean reaches one, and three steps of it are three. */
+    const uint64_t d2h = r.m.stats().d2h_bytes, h2d = r.m.stats().h2d_bytes;
+    settle(1, 600);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)3);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 3) * stride);
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)2);
+    /* Two a step would ask for six: the configured count bounds it. */
+    settle(2, 600);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)4);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 4) * stride);
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)3);
+    CHECK_EQ(r.m.stats().d2h_bytes, d2h);                /* the drops crossed no link */
+    CHECK_EQ(r.m.stats().h2d_bytes, h2d);
+
+    /* Quiet again: back to the floor, and the three slots are filled again. */
+    settle(0, 800);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 1) * stride);
+    CHECK(r.m.stats().h2d_bytes > h2d);
+
+    /* Off, the count is the configured one whatever is asked for. */
+    LoanRig s(24);
+    s.turnover = 4;
+    CHECK_OK(s.build());
+    s.m.swap_demand(0);
+    CHECK_OK(s.dispatch());
+    CHECK_EQ(s.m.turnover_now(), (int64_t)4);
 }
 
 /* The turnover slots stay free, and a shrinking loan does not take them for good. The fill stops

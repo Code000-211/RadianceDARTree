@@ -2678,6 +2678,123 @@ TEST(qsa_below_the_exact_bound_the_indexer_issues_no_query_score_or_select) {
     }
 }
 
+/* At decode heights the plugin issues a layer's small launches where a recorded pass lets them
+ * ride (qwen4exp_fp8.cpp: kVerifyRows, QsaSide): the k and v projections in front of the q|gate
+ * projection; the indexer's keys behind the attention's own launches where nothing of the layer
+ * reads them; the router's weight read beside the mixer's write; and from kVerifyRows rows the
+ * shared down projection in front of the routed one and the reads at the verify step's workgroup
+ * count. A prompt step keeps the declared order. */
+TEST(a_flash_next_decode_step_orders_its_small_launches) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 2);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    REQUIRE(m.qsa_defer);
+    auto run = [&](const Kit& k) {
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k.b;
+        qwen4exp_fp8::step(&ctx, &k.b);
+        return ctx.issues;
+    };
+    /* Where an op was issued, when it was issued exactly once; -1 never, -2 more than once. */
+    auto pos = [](const std::vector<RecIssue>& is, rad_op op) {
+        int64_t at = -1;
+        for (size_t i = 0; i < is.size(); ++i)
+            if (is[i].op == op) at = at == -1 ? (int64_t)i : -2;
+        return at;
+    };
+    const auto ver = kit(b, { 4 }, {});          /* a chain-3 verify */
+    const auto two = kit(b, { 2 }, {});          /* a chain-1 verify, the fewest rows of one */
+    const auto one = kit(b, { 1 }, {});          /* a plain decode step */
+    const auto pre = kit(b, {}, { 32 });         /* a prompt chunk */
+    const auto iv = run(*ver), i2 = run(*two), i1 = run(*one), ip = run(*pre);
+
+    size_t full = 0;
+    for (const auto& l : m.layers) {
+        const rad_op wr = l.hc_mix.op_ar_write ? l.hc_mix.op_ar_write : l.hc_mix.op_write;
+        const rad_op out = l.full ? l.attn.o.op : l.gdn.out.op;
+        /* The router's read: behind the mixer's out projection and in front of its write, at the
+         * step's workgroup count; a prompt step reads nothing ahead. */
+        REQUIRE(l.op_pf_router != 0);
+        REQUIRE(l.op_pf_router_v != 0);
+        for (const auto* is : { &iv, &i2 }) {
+            CHECK(pos(*is, l.op_pf_router_v) > pos(*is, out));
+            CHECK(pos(*is, l.op_pf_router_v) < pos(*is, wr));
+            CHECK_EQ(pos(*is, l.op_pf_router), (int64_t)-1);
+        }
+        CHECK(pos(i1, l.op_pf_router) > pos(i1, out));
+        CHECK(pos(i1, l.op_pf_router) < pos(i1, wr));
+        CHECK_EQ(pos(i1, l.op_pf_router_v), (int64_t)-1);
+        CHECK_EQ(pos(ip, l.op_pf_router), (int64_t)-1);
+        CHECK_EQ(pos(ip, l.op_pf_router_v), (int64_t)-1);
+        /* The shared down projection: in front of the routed down GEMM from kVerifyRows rows,
+         * behind it at one row and on a prompt step. */
+        REQUIRE(pos(iv, l.mlp.op_dn) >= 0);
+        REQUIRE(pos(iv, l.mlp.sh_down.op) >= 0);
+        CHECK(pos(iv, l.mlp.sh_down.op) < pos(iv, l.mlp.op_dn));
+        CHECK(pos(i2, l.mlp.sh_down.op) < pos(i2, l.mlp.op_dn));
+        CHECK(pos(i1, l.mlp.sh_down.op) > pos(i1, l.mlp.op_dn));
+        CHECK(pos(ip, l.mlp.sh_down.op) > pos(ip, l.mlp.op_dn));
+        if (!l.full) {
+            /* The out projection's read at the step's workgroup count. */
+            REQUIRE(l.gdn.op_pf_out != 0);
+            REQUIRE(l.gdn.op_pf_out_v != 0);
+            for (const auto* is : { &iv, &i2 }) {
+                CHECK(pos(*is, l.gdn.op_pf_out_v) >= 0);
+                CHECK_EQ(pos(*is, l.gdn.op_pf_out), (int64_t)-1);
+            }
+            CHECK(pos(i1, l.gdn.op_pf_out) >= 0);
+            CHECK_EQ(pos(i1, l.gdn.op_pf_out_v), (int64_t)-1);
+            continue;
+        }
+        ++full;
+        REQUIRE(l.attn.op_pf_o != 0);
+        REQUIRE(l.attn.op_pf_o_v != 0);
+        for (const auto* is : { &iv, &i2 }) {
+            CHECK(pos(*is, l.attn.op_pf_o_v) >= 0);
+            CHECK_EQ(pos(*is, l.attn.op_pf_o), (int64_t)-1);
+        }
+        CHECK(pos(i1, l.attn.op_pf_o) >= 0);
+        CHECK_EQ(pos(i1, l.attn.op_pf_o_v), (int64_t)-1);
+        for (const auto* is : { &iv, &i2, &i1 }) {
+            /* k and v in front of q|gate, the indexer's projection in front of all three. */
+            REQUIRE(pos(*is, l.attn.qg.op) >= 0);
+            CHECK(pos(*is, l.qsa.proj.op) >= 0);
+            CHECK(pos(*is, l.qsa.proj.op) < pos(*is, l.attn.kp.op));
+            CHECK(pos(*is, l.attn.kp.op) < pos(*is, l.attn.vp.op));
+            CHECK(pos(*is, l.attn.vp.op) < pos(*is, l.attn.qg.op));
+            /* The keys behind the attention's projections, in their own order, and all of them
+             * in front of the write that ends the block. */
+            CHECK(pos(*is, l.qsa.op_work) > pos(*is, l.attn.qg.op));
+            CHECK(pos(*is, l.qsa.op_bkey) > pos(*is, l.qsa.op_work));
+            CHECK(pos(*is, l.qsa.op_tail) > pos(*is, l.qsa.op_bkey));
+            CHECK(pos(*is, l.qsa.op_tail) < pos(*is, wr));
+        }
+        /* A prompt step: the indexer in front of the attention, q|gate in front of k and v. */
+        CHECK(pos(ip, l.qsa.op_tail) > pos(ip, l.qsa.op_work));
+        CHECK(pos(ip, l.qsa.op_tail) < pos(ip, l.attn.qg.op));
+        CHECK(pos(ip, l.attn.qg.op) < pos(ip, l.attn.kp.op));
+        CHECK(pos(ip, l.attn.kp.op) < pos(ip, l.attn.vp.op));
+    }
+    REQUIRE(full > 0);
+
+    /* Past the exactness bound the attention reads this layer's selection, so the indexer stays
+     * in front of it at every height. */
+    {
+        const auto k = kit(b, { 4 }, {});
+        k->b.max_ctx_len = 3072;
+        const auto is = run(*k);
+        for (const auto& l : m.layers) {
+            if (!l.full) continue;
+            CHECK(pos(is, l.qsa.op_work) >= 0);
+            CHECK(pos(is, l.qsa.op_tail) < pos(is, l.attn.kp.op));
+        }
+    }
+}
+
 /* Whether a step is within the indexer's budget is read from the attention group's exact host
  * ceiling where the batch carries it (RadBatch::kv_used_max_h), not from the context bound rounded
  * up to 1024 tokens: a 4-row verify at 1500 tokens of context is within it though
@@ -11783,10 +11900,10 @@ struct ArchCases {
             qwen35moe_fp8::step, 3, {}, 0x325d0299495a0dd8ull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x9c8d2b5a6052248aull);
+            qwen4exp_fp8::step, 3, {}, 0x0f402d93ca192adbull);
         add("qwen4exp_fp8, two ranks", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 2); return qwen4exp_fp8::declare(b, &q4, &c); },
-            nullptr, 3, { "ar_hc_write" }, 0x0a1227593eb26a3full);
+            nullptr, 3, { "ar_hc_write" }, 0x81339abe032a433bull);
         /* The cache dtype stated rather than left to the plugin's default. The streamed store and
          * the prologue that folds it are declared only where the vocabulary has them, and both are
          * written at the KV group's dtype -- bf16 being the copy-only one, and it is what
@@ -11798,7 +11915,7 @@ struct ArchCases {
                 auto c = q4_ctx(0, 1);
                 c.kv_dtype = RAD_BF16;
                 return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x9c8d2b5a6052248aull);
+            qwen4exp_fp8::step, 3, {}, 0x0f402d93ca192adbull);
         add("lfm2_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return lfm2_bf16::declare(b, &lfm, &c); },
             lfm2_bf16::step, 0, {}, 0x5bce917918dbd478ull);
@@ -12738,12 +12855,20 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
          * decode step, verify, history pass and round are below the indexer's exactness bound,
          * where the indexer now issues no query, score or select and a one-row sequence attends
          * over its block table (docs/QSA.md, "Below the bound"). Its prefill and mixed steps,
-         * past the bound, are issued as before. */
-        { "qwen4exp_fp8", 1, 0, 0x64fffe1f970fe9a3ull, 0x65d43fc170c2c598ull },
-        { "qwen4exp_fp8", 2, 0, 0xe616c803347c8d63ull, 0x521774d19f34781full },
-        { "qwen4exp_fp8", 2, 1, 0x5551ab9dbf8f611cull, 0x3afe8bf2df1eaa7bull },
-        { "qwen4exp_fp8", 4, 0, 0x015eb0ed4d0951a1ull, 0xe78350c7803a9437ull },
-        { "qwen4exp_fp8", 4, 3, 0x0e4fc56b33d75da3ull, 0xdb6d50824b015389ull },
+         * past the bound, are issued as before.
+         *
+         * Both moved again with the decode step's issue order (qwen4exp_fp8.cpp, kVerifyRows;
+         * a_flash_next_decode_step_orders_its_small_launches pins what moved): the graphs by the
+         * indexer's within-step buffers leaving the planner's sharing and, past one rank, by the
+         * router's weight read and each read's verify-height twin; the steps by k and v in front
+         * of q|gate, the indexer's keys behind the attention's launches and, at the verify, the
+         * shared down projection in front of the routed one. Prefill and mixed steps are issued
+         * as before. */
+        { "qwen4exp_fp8", 1, 0, 0xe733184739f30fd2ull, 0x816cd78a65a92598ull },
+        { "qwen4exp_fp8", 2, 0, 0x92921730d6df8e8full, 0x3b5931abdde2195dull },
+        { "qwen4exp_fp8", 2, 1, 0x9c9352c2e075cb44ull, 0x7cb5889253d852cdull },
+        { "qwen4exp_fp8", 4, 0, 0x74b4bf4e70c955e5ull, 0x4292bbe719b32ed1ull },
+        { "qwen4exp_fp8", 4, 3, 0xc36df9e24f272283ull, 0x9c08be223ae002dbull },
         { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
         { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },
@@ -14211,10 +14336,15 @@ TEST(flashnext_a_shorter_verify_under_a_deeper_coupled_chain_issues_that_chains_
         CHECK(ah == fh);
         if (av != fv || ah != fh) std::fprintf(stderr, "    depth %d under %d: issue pattern differs\n", d, D);
     }
-    /* depths that differ between the sequences of one step: the ops of the full-depth step */
+    /* depths that differ between the sequences of one step: the ops of the full-depth step. Their
+     * order may differ, since a step's launch order follows its total row count (the shared down
+     * arm goes first on steps of kVerifyRows..kPrefetchRows rows: 15 here against 24); the order
+     * is free (the arm's buffers are not shared), so the ops are compared as a multiset. */
     std::vector<std::string> mv, mh, dv, dh;
     run(D, { 2, D + 1, 4, 3 }, &mv, &mh);
     run(D, { D + 1, D + 1, D + 1, D + 1 }, &dv, &dh);
+    std::sort(mv.begin(), mv.end());
+    std::sort(dv.begin(), dv.end());
     CHECK(mv == dv);
     CHECK(mh == dh);
 }

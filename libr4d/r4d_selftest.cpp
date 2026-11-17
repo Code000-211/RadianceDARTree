@@ -33230,6 +33230,20 @@ static void device_phase(const Plugin& pl) {
             std::vector<RadTensor> ts = { T(d, RAD_U8, { (int64_t)1 << 20 }) };
             std::vector<RadParam> ps = { PI("bytes", (int64_t)1 << 20) };
             run_case(r, ts, ps);
+            /* With the architecture's own workgroup count (`blocks`): one block, the count
+             * Qwen3.8-Flash-Next asks for at a verify, the most the row takes, and absent, 0 and
+             * one past the most (the kernel's own count each) all launch, and the weight they read
+             * is the weight afterwards: the row writes nothing at any count. */
+            std::vector<uint8_t> h((size_t)1 << 20), back((size_t)1 << 20);
+            for (size_t i = 0; i < h.size(); ++i) h[i] = (uint8_t)(i * 131u + (i >> 9));
+            st_memcpy(d, h.data(), h.size(), hipMemcpyHostToDevice);
+            for (const long long nb : { 0ll, 1ll, 32ll, 1024ll, 1025ll }) {
+                std::vector<RadParam> pb = { PI("bytes", (int64_t)1 << 20), PI("blocks", nb) };
+                run_case(r, ts, pb);
+            }
+            st_memcpy(back.data(), d, back.size(), hipMemcpyDeviceToHost);
+            ok("prefetch at its caller's workgroup count leaves the weight as it was", back == h,
+               "the weight's bytes changed");
             RadLayout L{};
             const int st = r->layout ? r->layout(nullptr, 0, 0, nullptr, nullptr, nullptr, 0, &L) : 0;
             ok("prefetch's layout hook takes any stored form (RAD_LAYOUT_ANY)", st == RAD_LAYOUT_ANY,

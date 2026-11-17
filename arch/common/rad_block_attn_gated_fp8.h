@@ -134,6 +134,14 @@ struct AttnGatedFP8 {
      * (decl_prefetch, rad_arch.h), issued behind the q, k and v projections on decode steps
      * (prefetch_beside). 0 where none is declared. */
     rad_op     op_pf_o = 0;
+    /* The same read as a second op for steps of at least pf_o_v_rows rows, where the
+     * architecture measured another workgroup count for them (decl_prefetch's `blocks`); 0 where
+     * every step takes op_pf_o. */
+    rad_op     op_pf_o_v = 0;
+    int64_t    pf_o_v_rows = 0;
+    /* The most rows of a decode step whose k and v projections are issued in front of the q|gate
+     * projection (step()); 0, the default, keeps the declared order on every step. */
+    int64_t    kv_first_rows = 0;
     NormQuantFP8 nq_h{};
 
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
@@ -208,8 +216,12 @@ struct AttnGatedFP8 {
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
     /* `own_ar` false: the caller issues the all-reduce itself (GdnFP8::step says when). */
+    /* `side`: an independent chain's ops, issued behind this block's ordered launches (SideOps,
+     * rad_arch.h): one behind the prologue and the store, one behind the attention, one behind
+     * the gate where the gate is a launch of its own. Null, and on the paths that return early,
+     * nothing is asked of it. */
     void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
-              ArPieces* pieces = nullptr) const;
+              ArPieces* pieces = nullptr, const SideOps* side = nullptr) const;
     bool issues_ar(int64_t T) const { return op_ar && !ar_taken(g, T, ar_out, ar_out_take); }
     void issue_ar(RadCtx* c, int64_t r0, int64_t rows) const {
         RAD_ISSUE_N(c, op_ar_ov ? op_ar_ov : op_ar, rows * g.n_embd,
@@ -701,7 +713,7 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
 }
 
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
-                               ArPieces* pieces) const {
+                               ArPieces* pieces, const SideOps* side) const {
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
     const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table  : nullptr;
@@ -763,11 +775,23 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
         return;
     }
-    qg.step(c, w.h, w.qg, T);
-    kp.step(c, w.h, w.k,  T);
-    vp.step(c, w.h, w.v,  T);
+    /* The three projections read the same input and none reads another's output, so a recorded
+     * pass starts them together (Ctx::haz_mark) whatever their order; the order decides which
+     * the card launches first. On a decode step of up to `kv_first_rows` rows the two small ones
+     * go first: behind the wide q|gate projection their launches wait until its blocks are all
+     * on the card, and the prologue then waits for them. Qwen3.8-Flash-Next at tp 2, chain 3
+     * with coupling (twelve trunk layers and the head's): -0.66% a step. */
+    if (T <= kv_first_rows && batch->phase == RAD_PHASE_DECODE) {
+        kp.step(c, w.h, w.k,  T);
+        vp.step(c, w.h, w.v,  T);
+        qg.step(c, w.h, w.qg, T);
+    } else {
+        qg.step(c, w.h, w.qg, T);
+        kp.step(c, w.h, w.k,  T);
+        vp.step(c, w.h, w.v,  T);
+    }
     /* The out projection's weight, read beside the prologue and the attention (op_pf_o). */
-    prefetch_beside(c, op_pf_o, o.w, T);
+    prefetch_beside(c, op_pf_o_v && T >= pf_o_v_rows ? op_pf_o_v : op_pf_o, o.w, T);
 
     /* Fused or unfused prologue. The fused kernel takes the whole [q|gate] projection and splits it
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
@@ -812,6 +836,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     }
 
     if (!fused_kv && !folded_stream) store_cache(c, kvb, slot, T);
+    if (side) side->at(0);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
      * by row, and a row need not be a sequence, so T queries issued as T rows of q_len 1, each with
@@ -1057,6 +1082,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     /* Every attention launch of this layer is issued: start the next layer's stage copy, which
      * crosses the link under the out projection and the next layer's projections. */
     if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
+    if (side) side->at(1);
     if (gated) {
         /* the sparse attention gated and quantised in its merge */
     } else if (op_sig) {
@@ -1070,6 +1096,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                     bcol(w.qg, g.head_dim, g.head_dim, T), brows(w.attn.x, T),
                     brows(w.attn.cq(), T), brows(w.attn.cs(), T), brows(w.attn.x, T));
     }
+    if (side && !gated) side->at(2);
 
     o.step(c, w.attn, w.h.x, T);
     if (own_ar && op_ar && !ar_taken(g, T, ar_out, ar_out_take))

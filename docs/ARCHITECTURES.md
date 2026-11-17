@@ -730,7 +730,27 @@ a prefill below the bound runs the cheaper dense attention, and every change is 
 that equality. `docs/QSA.md` is the decomposition.
 
 The vision tower is declared when the container carries one and `mm-max-patches` is not 0
-(`arch/common/rad_block_vit.h`, `spec.md` §11).
+(`arch/common/rad_block_vit.h`, `spec.md` §11); `auto` is 0 in a build with no media decoder, which
+could not feed it, and its 857 MiB a rank at `tp: 2` then hold routed experts.
+
+**A decode step is its launches.** A verify pass at depth 3 is ~900 launches a rank in ~10 ms on two
+R9700, against 4.1 GB of weights read a rank (6.4 ms at the cards' 640 GB/s): the connections' reads,
+the delta net's update, the routers and the reductions are bound by their own chains of loads, not
+by bytes, and every launch behind another costs the step ~1.6 us where it waits for it and ~0.5 us
+where it does not (measured by adding launches; `scripts/stampseq.py`). So where a recorded pass
+lets a launch start beside the last ordered one (`Ctx::haz_mark`), the plugin issues the small
+launches of a decode step where they ride, the same kernels on the same operands in another order
+(`qwen4exp_fp8.cpp`, `kVerifyRows`): k and v in front of the q|gate projection; the indexer's
+keys behind the attention's own launches where nothing of the layer reads them (within the
+exactness bound); the router's weight read beside the mixer's reduction; and from two rows the
+shared expert's down projection in front of the routed one and the weight reads at 32 workgroups
+instead of 64. Chain 3 with coupling, one server, interleaved rounds: 12.11 -> 11.82 ms a step
+(-2.5%) with the chained kernels' wait polling by grid size (`libr4d/r4d_chain.h`); a plain decode
+step takes the order that helps at one row (router read, k and v, the indexer's keys). What did not
+help is in the comments beside each: a read of the mixer's first projection or of the connections'
+matrices in front of their reads, the shared arm beside the router, more workgroups for the reads
+(128: +2.0%, 256: +7.4%), and a connection read that asks for its own matrices before its wait
+(+2.3%).
 
 ---
 

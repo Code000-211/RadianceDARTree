@@ -676,8 +676,13 @@ inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
 }
 /* The `prefetch` of `w`'s first `bytes` where a library serves it; 0 otherwise. A plugin declares
  * none where the deployment turns the reads off (RadBuildCtx::weight_prefetch_off). */
-inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes) {
+inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes, int64_t blocks = 0) {
     if (!w || bytes <= 0 || !rad_op_declared(b, "prefetch")) return 0;
+    /* `blocks`: the workgroups reading, where the architecture measured its own count (docs/OPS.md);
+     * 0 leaves the kernel's. Stated only when asked, so a declaration without it is what it was. */
+    if (blocks > 0)
+        return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes), RAD_INT("blocks", blocks)),
+                      RAD_WEIGHTS(w));
     return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes)), RAD_WEIGHTS(w));
 }
 
@@ -1503,6 +1508,22 @@ inline bool tree_path_step(const RadBatch* b) {
  *               layer. The first full-attention layer of the pass issues it as always; no later
  *               layer issues a query, a score, a scratch block key or a select. */
 enum QsaUse : int { kQsaSelect = 0, kQsaUnread = 1, kQsaOnce = 2 };
+
+/* Ops of a chain that is independent of a block's own, for the block to issue behind its ordered
+ * launches. A recorded pass lets a launch start beside the last ordered one when it touches
+ * nothing in flight (Ctx::haz_mark). A dependent chain issued in one piece is therefore a row of
+ * ordered launches, each paid in turn; issued one op behind each of the block's own ordered
+ * launches, every op of it is unordered behind the block's launch in front of it, and still
+ * behind its own predecessor, which that launch already waited for. The block calls `at(k)` for
+ * k = 0, 1, 2, ... behind its ordered launches in turn, and the owner issues what is left once
+ * the block returns. The chain must read nothing the block writes and write nothing the block
+ * touches, and its buffers must be excluded from sharing (rad_buf_concurrent): they are in use at
+ * launches the linear order puts after their last declared use. */
+struct SideOps {
+    void (*fn)(void* u, int stage) = nullptr;
+    void* u = nullptr;
+    void at(int stage) const { if (fn) fn(u, stage); }
+};
 
 /* RADIANCE_DEBUG_QSA_EAGER: every step is kQsaSelect, the issue sequence before the forms above
  * existed. An instrument for comparing the two (the text must not move); read once. */

@@ -53,11 +53,28 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 // clocks for as long as the wait lasts, slowing whatever else that channel serves. The first
 // R4D_CHAIN_FAST polls are ~64 clocks apart, the rest R4D_CHAIN_SLOW x 64: a long wait ends at most
 // that much late and puts 1/R4D_CHAIN_SLOW of the load on the channel.
+//
+// A grid of a few blocks puts little on the channel however often it polls, and a decode step is
+// mostly such grids behind one another (a reduction's four blocks, a quantiser's, a router's
+// seventeen), each ending its wait up to a slow period late: so up to R4D_CHAIN_TINY blocks keep
+// the fast period for the whole wait and up to R4D_CHAIN_SMALL poll every R4D_CHAIN_MID x 64 clocks,
+// which is at most the load a 256-block grid puts there at the slow period. Qwen3.8-Flash-Next at
+// tp 2, chain 3 with coupling, ~670 dependent launches a verify pass: -0.32% a step; every grid at
+// 8 or 4 instead of 16 gave -0.16% and -0.25% for two and four times the polls of the wide ones.
 #ifndef R4D_CHAIN_FAST
 #define R4D_CHAIN_FAST 8
 #endif
 #ifndef R4D_CHAIN_SLOW
 #define R4D_CHAIN_SLOW 16
+#endif
+#ifndef R4D_CHAIN_TINY
+#define R4D_CHAIN_TINY 16
+#endif
+#ifndef R4D_CHAIN_SMALL
+#define R4D_CHAIN_SMALL 64
+#endif
+#ifndef R4D_CHAIN_MID
+#define R4D_CHAIN_MID 4
 #endif
 __device__ __forceinline__ void r4d_chain_wait() {
     const R4dChainRec* r = r4d_chain_rec();
@@ -65,11 +82,16 @@ __device__ __forceinline__ void r4d_chain_wait() {
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
         const unsigned long long target = r->target;
         unsigned long long* ctr = r->ctr;
+        const unsigned nblk = gridDim.x * gridDim.y * gridDim.z;
         int n = 0;
         while (__hip_atomic_load(ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < target) {
             if (n < R4D_CHAIN_FAST) {
                 __builtin_amdgcn_s_sleep(1);
                 ++n;
+            } else if (nblk <= R4D_CHAIN_TINY) {
+                __builtin_amdgcn_s_sleep(1);
+            } else if (nblk <= R4D_CHAIN_SMALL) {
+                __builtin_amdgcn_s_sleep(R4D_CHAIN_MID);
             } else {
                 __builtin_amdgcn_s_sleep(R4D_CHAIN_SLOW);
             }

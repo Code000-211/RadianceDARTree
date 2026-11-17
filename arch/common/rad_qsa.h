@@ -167,7 +167,32 @@ struct QsaIndexer {
      * selection (see AttnGatedFP8::store_kv). */
     void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
     /* `scratch`: a tree step's scratch block keys, which only its region score reads. */
-    bool store_keys(RadCtx* c, const RadBatch* batch, bool scratch = true) const;
+    /* `part` 0 issues all of it; 1, 2 and 3 its three stages apart and in that order (the work
+     * list with a heal's compaction, the block keys, the tail store), for a caller that issues
+     * them behind another block's launches (deferrable, below). */
+    bool store_keys(RadCtx* c, const RadBatch* batch, bool scratch = true, int part = 0) const;
+    /* Whether this step's keys and tail may be issued behind the attention block's launches
+     * instead of in front of them (SideOps, rad_arch.h): nothing reads a selection of this
+     * layer's (`use` as step() resolves it), so the attention reads nothing the three ops write,
+     * and the step neither verifies a tree nor heals one (their extra ops keep step()'s order).
+     * The caller answers for the buffers (Wire: qk, stage, page, bpos, nc excluded from
+     * sharing). */
+    bool deferrable(const RadBatch* batch, int use, bool first) const {
+        if (!on() || qsa_eager()) return false;
+        /* step() stores no keys for a batch without the attention's group; leave that to it. */
+        if (!kv_batch(batch, c.kv_attn)) return false;
+        if (c.tree && (tree_verify_step(batch) || tree_path_step(batch))) return false;
+        if (use == kQsaOnce) use = first ? kQsaSelect : kQsaUnread;
+        return use == kQsaUnread;
+    }
+    /* What step() issues on a deferrable step, a piece at a time: the projection, then
+     * store_keys's stages 1..3. */
+    void step_proj(RadCtx* c, const ActFP8& in, const RadBatch* batch) const {
+        proj.step(c, in, w.qk, batch->n_tok);
+    }
+    void step_part(RadCtx* c, const RadBatch* batch, int part) const {
+        (void)store_keys(c, batch, false, part);
+    }
 };
 
 inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -383,7 +408,8 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
 /* Stores the block keys of the blocks the pass completes and the tail of raw keys after them,
  * from the projection's raw-key head. False when the step has no batch for the indexer's
  * groups. */
-inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scratch) const {
+inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scratch,
+                                   int part) const {
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const int64_t nw = (c.heads + 1) * c.head_dim;
     const int64_t koff = c.heads * c.head_dim;   /* the raw-key head, after the query heads */
@@ -408,7 +434,7 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scrat
                           "serves");
         return false;
     }
-    if (heal) {
+    if (heal && part <= 1) {
         /* Exactly once per layer and step, before qsa_work. A sequence that followed a chain has
          * the identity path (num_accepted below 2 moves nothing). */
         RAD_ISSUE_N(c_, op_tail_compact, S,
@@ -440,7 +466,9 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scrat
         sbpos = g.rope_mc ? RAD_B_COL(w.sbpos, 0, mc ? 3 : 1) : brows(w.sbpos, T);
         if (g.rope_mc) sbpos.rows = T;
     }
-    if (tree || heal) {
+    if (part > 1) {
+        /* a later stage: the work list is issued */
+    } else if (tree || heal) {
         /* The trailing optionals, in order: spec_parent, num_accepted, then (a tree step only) the
          * scratch outputs. An absent one is a hole. */
         RAD_ISSUE_N(c_, op_work, T,
@@ -473,18 +501,21 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scrat
                     brows(w.stage, work * c.ratio), brows(w.page, work), bpos,
                     brows(w.nc, S));
     }
-    RAD_ISSUE_N(c_, op_bkey, work,
-                brows(w.stage, work * c.ratio), RAD_W(w_kn),
-                brows(w.page, work), bpos,
-                kv_cache(kv_bk, layer));
+    if (part == 1) return true;
+    if (part == 0 || part == 2)
+        RAD_ISSUE_N(c_, op_bkey, work,
+                    brows(w.stage, work * c.ratio), RAD_W(w_kn),
+                    brows(w.page, work), bpos,
+                    kv_cache(kv_bk, layer));
     /* The scratch block keys: one launch row per step row, and a row that completes no block is
      * skipped on its `spage` of -1. Only the region score reads them, so a step that scores no
      * region (`scratch` false) builds none; qsa_work still stages their rows, which costs no
      * launch. */
-    if (tree && scratch)
+    if (tree && scratch && (part == 0 || part == 2))
         RAD_ISSUE_N(c_, op_bkey2, T,
                     brows(w.sstage, T * c.ratio), RAD_W(w_kn),
                     brows(w.spage, T), sbpos, brows(w.skey, T));
+    if (part == 2) return true;
     if (tree)
         RAD_ISSUE_N(c_, op_tail, T,
                     bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
