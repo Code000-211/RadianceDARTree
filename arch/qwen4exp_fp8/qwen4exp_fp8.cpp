@@ -290,6 +290,16 @@ struct Model {
      * from the real declare, so it declares the same ops. */
     bool      span_on = false;
     bool      pipe_on = false;
+    /* The rows of a piece of a spanned step: one checkpoint interval's, what the routed block's
+     * pass is without --prefill-span-pass step (`moecfg.rows`). The connections' reads, the
+     * indexer's windows, the delta net's pieces and the pipelined step's pieces are a piece tall
+     * whatever the routed pass is. */
+    int64_t   piece_rows = 0;
+    /* --prefill-span-pass step (RadBuildCtx::span_pass_step) on a deployment that spans and does
+     * not pipeline: the routed block's pass is the whole step (`moecfg.rows` is max_tok), so a
+     * spanned step sorts its slots once and each expert's run is the step's. A sizing declare
+     * takes it from the real one, as span_on. */
+    bool      pass_step = false;
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -920,6 +930,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * prefill chunk to, so the shipped configuration is one pass. It also sizes four buffers at
          * `rows * top_k`, so a smaller max_tok lowers it. */
         mc.rows        = g.max_tok < 2048 ? g.max_tok : 2048;
+        /* A piece of a spanned step; `mc.rows` itself grows to the step under
+         * --prefill-span-pass step (below, once the span is known). */
+        m.piece_rows   = mc.rows;
         if (mc.n_expert <= 0 || mc.top_k <= 0 || mc.top_k > mc.n_expert) {
             fprintf(stderr, "radiance: qwen4exp: the container describes %lld expert(s) with "
                             "top_k %lld\n", (long long)mc.n_expert, (long long)mc.top_k);
@@ -1220,21 +1233,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const int64_t v_dim    = m.gcfg.v_dim();
     const int64_t conv_dim = m.gcfg.conv_dim();
     const int64_t T        = g.max_tok;
-    const int64_t ER       = m.moecfg.rows * m.moecfg.top_k;
 
     m.b_h   = decl_b(b, nm.f("h_wide"), g.act_dtype, {T, HN});
     m.a_x.x = decl_b(b, nm.f("x"),      g.act_dtype, {T, g.n_embd});
     if (ctx->shape_probe) {
-        m.span_on = g_model[rad_build_slot(ctx)].span_on;
-        m.pipe_on = g_model[rad_build_slot(ctx)].pipe_on;
+        m.span_on   = g_model[rad_build_slot(ctx)].span_on;
+        m.pipe_on   = g_model[rad_build_slot(ctx)].pipe_on;
+        m.pass_step = g_model[rad_build_slot(ctx)].pass_step;
     } else {
         m.span_on = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < g.max_tok &&
-                    g.max_tok > m.moecfg.rows;
+                    g.max_tok > m.piece_rows;
         /* Only where the blocks issue their own all-reduce at a step wider than a pass: at two
          * ranks the gated residual's fused write takes every step's (ar_exact_write_rows), so such
          * a step runs serially. */
         m.pipe_on = m.span_on && g.world > 1 && ar_exact_write_rows(g) < g.max_tok && !dmode_df;
+        /* --prefill-span-pass step, where a spanned step runs serially: nothing there needs the
+         * routed pass to be a piece (the pipelined step overlaps a piece's pass with the other
+         * piece's all-reduce, and keeps them), and a pass over the whole step reads each expert's
+         * weight once for two or four times the rows. A calibration run keeps its pieces: its
+         * statistics are taken a pass at a time. */
+        m.pass_step = ctx->span_pass_step != 0 && m.span_on && !m.pipe_on && !m.moecfg.calib;
+        if (ctx->span_pass_step != 0 && !m.pass_step && g.rank == 0)
+            rad_note(b, "--prefill-span-pass step: the routed pass stays one checkpoint interval "
+                        "(%s)", !m.span_on ? "this deployment has no step wider than an interval"
+                              : m.pipe_on  ? "a spanned step is pipelined here, a pass a piece "
+                                             "beside the other piece's all-reduce"
+                                           : "a calibration run takes its statistics a pass at a "
+                                             "time");
     }
+    /* Every op of a pass is per row, but the grouped trellis GEMM takes a run of one or two rows
+     * through its dot path and a longer one through its tiles, which agree only within f32
+     * rounding before the bf16 store: the step's longer runs move rows between the two, so the
+     * bytes are not those of piece-tall passes (the class of difference another chunk size makes,
+     * GUIDE 4.5). The planes below at `rows * top_k` grow with it. A sizing declare's max_tok is
+     * its level's, so a level holds one pass of its own rows. */
+    if (m.pass_step) m.moecfg.rows = g.max_tok;
+    const int64_t ER       = m.moecfg.rows * m.moecfg.top_k;
     /* The pipelined step's all-reduces run on the second lane, in place over `x`, so it is the one
      * buffer that lane touches; it is live over the whole program anyway. */
     if (m.pipe_on) RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_x.x));
@@ -1247,7 +1281,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Under a span every connection reads a step wider than a pass a pass at a time
      * (HyperConn::read_pieces, and the pipelined step's own reads), so the reads are declared no
      * wider than a pass and their scratch is sized for that band. */
-    if (m.span_on) m.hccfg.read_rows = m.moecfg.rows;
+    if (m.span_on) m.hccfg.read_rows = m.piece_rows;
     RAD_ARCH_TRY(m.a_x.declare_qs(b, nm, g, "x", g.n_embd, 0, m.trunk_i8));
     /* The connections write int8 codes themselves when every reader of their codes is an int8
      * linear: the trunk's are, and the routed experts then read the rotated copy or the bf16
@@ -1330,8 +1364,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * pass (QsaIndexer::step, with the bounds in b_pipe_cu). The plane is the largest buffer
          * the span would otherwise grow, max_ctx / ratio floats a query row (512 MiB more at 4096
          * rows and 256K of context). */
-        const int64_t qsa_rows = (m.span_on && ctx->max_mixed_tok <= m.moecfg.rows)
-                                     ? m.moecfg.rows : g.max_tok;
+        const int64_t qsa_rows = (m.span_on && ctx->max_mixed_tok <= m.piece_rows)
+                                     ? m.piece_rows : g.max_tok;
         m.qsacfg.plane_rows = qsa_rows < g.max_tok ? qsa_rows : 0;
         /* One row per query, not per sequence (arch/common/rad_qsa.h). The score plane is the
          * only buffer whose size is the product of two deployment bounds, so an oversized one is
@@ -2309,7 +2343,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * of the sharing pool (declare). The collectives there are declared at `overlap` 1, whose rows
  * leave the CUs to the work beside them. */
 static bool pipelined(const Model& m, int64_t T) {
-    const int64_t R = m.moecfg.rows;
+    const int64_t R = m.piece_rows;
     if (!m.pipe_on || R <= 0 || T <= R) return false;
     if (m.moecfg.calib || m.calib.on || dbg_resid_on() || !m.op_embed_ar) return false;
     for (const Layer& l : m.layers) {
@@ -2347,7 +2381,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
         m.pipe_cu_h = (int32_t*)rad_dev_alloc(2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
         if (m.pipe_cu_h) {
             m.pipe_cu_h[0] = 0;
-            m.pipe_cu_h[1] = (int32_t)m.moecfg.rows;
+            m.pipe_cu_h[1] = (int32_t)m.piece_rows;
         } else if (m.g.rank == 0) {
             fprintf(stderr, "radiance: qwen4exp: no pinned host memory for the window bounds; a "
                             "step wider than a pass cannot run\n");
@@ -2355,7 +2389,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     }
     if (!m.pipe_cu_h) return nullptr;
     int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
-    if (batch->n_tok > m.moecfg.rows && batch->n_seq == 1) {
+    if (batch->n_tok > m.piece_rows && batch->n_seq == 1) {
         const RadStream s = rad_stream(c);
         if (rad_memcpy_async(d, m.pipe_cu_h, 2 * sizeof(int32_t), s) != RAD_OK ||
             rad_memcpy_async(d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK)
@@ -2366,7 +2400,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
 
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
-    const int64_t T = batch->n_tok, R = m.moecfg.rows;
+    const int64_t T = batch->n_tok, R = m.piece_rows;
     const int64_t K = (T + R - 1) / R;
     auto r0 = [&](int64_t p) { return p * R; };
     auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };

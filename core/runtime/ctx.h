@@ -21,6 +21,7 @@
 #include "rank_barrier.h"
 #include "residency.h"
 #include "stager.h"
+#include "wtab.h"
 #include "device/device.h"
 
 #include <atomic>
@@ -355,6 +356,9 @@ public:
     void        dump_profile() const;      /* spec §16, opt-in, with its caveat printed */
     const char* step_error() const { return step_fail_.c_str(); }
     int64_t     stream_waits() const { return n_stream_waits_; }
+    /* Weight-table patch dispatches issued so far (runtime/wtab.h): one for an op's tables where
+     * their changed entries fit one block. Tests read it. */
+    int64_t     wtab_patches() const { return n_wtab_patches_; }
     /* Lane 1 has work lane 0 has not joined (lane1_pending_). */
     bool        lane1_pending() const { return lane1_pending_; }
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
@@ -485,6 +489,22 @@ private:
     /* Brings the table's device array up to date on the current stream: every entry on the first
      * issue, afterwards the queued ones. */
     int  table_refresh(rad_op h, int operand, WeightTable& t);
+    /* The patches of one op's tables, gathered (runtime/wtab.h). A routed GEMM names four to eight
+     * tables (a class of experts each, weights and scales), and in a pass the stager armed for
+     * each of them changes a few entries at every issue; a dispatch a table put four ordered
+     * launches in front of every routed GEMM of a prefill chunk (384 a chunk on Flash-Next at two
+     * ranks, each a packet the card's processor takes in turn). While `wtab_gather_` is set
+     * (issue_body, over its operands) table_refresh appends to `wtab_acc_` and dispatches only a
+     * full block; wtab_flush dispatches the rest on the current stream before the op is launched.
+     * The writes and their order against every reader are the same: they are behind the stream's
+     * earlier work and in front of the op that reads the tables, whichever dispatch carries them,
+     * and no two of them name one entry (an entry is patched once an issue).
+     *
+     * Not while recording: there a refresh is host work the tape names (kTapeTable) and replays
+     * per table, and a gathered dispatch would land on the tape as a packet. */
+    WtabPatch wtab_acc_;
+    bool      wtab_gather_ = false;
+    int  wtab_flush();
     /* ------------------------------------------------------------------ recorded passes
      *
      * A decode pass repeats step after step: same kernels, arguments and queues. The host work
@@ -849,6 +869,7 @@ private:
 
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
+    int64_t n_wtab_patches_ = 0;
     int64_t n_host_syncs_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};

@@ -684,6 +684,33 @@ TEST(qwen35_a_prefill_span_changes_no_logit) {
     CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
 }
 
+/* --prefill-span-min is the deployment's own bound on the prompts that span: at 0 every document
+ * alone in the engine spans from its second interval on and the scheduler says so; above every
+ * document's length none does, and every step stays one interval. --prefill-span-pass step rides
+ * along: this plugin has no routed pass to widen and ignores it, so no logit changes either way. */
+TEST(qwen35_the_span_minimum_decides_which_prompts_span) {
+    std::string log;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4",
+                              "--prefill-span-pass", "step", "--prefill-span-min", "0" },
+                            { "RADIANCE_LOG_STEPS=1" }, &log);
+    CHECK(log.find("--prefill-span-min 0: every prefill alone in its step spans from its second "
+                   "interval on") != std::string::npos);
+    CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
+
+    std::string none;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4",
+                              "--prefill-span-min", "100000" },
+                            { "RADIANCE_LOG_STEPS=1" }, &none);
+    CHECK(none.find("--prefill-span-min 100000: a prefill spans when it is 100000 tokens or "
+                    "longer") != std::string::npos);
+    CHECK(none.find("prefill n_seq=1 n_tok=256") == std::string::npos);
+    CHECK(none.find("prefill n_seq=1 n_tok=64") != std::string::npos);
+}
+
 /* Documents batched together share every step's GEMMs and occupy other state slots and KV
  * blocks; each one's logits stay exactly those it gets alone. */
 TEST(qwen35_batching_documents_together_changes_no_logit) {

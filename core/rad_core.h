@@ -969,6 +969,20 @@ struct Config {
      * inside a span are not written; those at its end and at a prompt's tail are, where a span of
      * 1 writes them. */
     int64_t prefill_span = 1;
+    /* --prefill-span-pass piece|step. `step`: where the architecture runs a spanned step serially
+     * (it pipelines none of it), its routed block takes the whole step in one pass instead of one
+     * pass an interval (RadBuildCtx::span_pass_step), so the step sorts its slots once and each
+     * expert's weight is read -- and a trellis expert decoded -- once for all its rows. The expert
+     * planes are then a step tall (on Qwen3.8-Flash-Next at a 4096 budget 165 MiB more arena a
+     * rank), and the output differs from piece passes at tie level, as a spanned step's at one or
+     * two ranks already does. Off (piece) is the span as it was, launch for launch. */
+    bool    prefill_span_step = false;
+    /* --prefill-span-min auto|N: the shortest prompt, in tokens, a lone prefill spans for
+     * (Scheduler::set_span_min). -1 is auto, which Engine::serve resolves: eight intervals where
+     * routed experts are staged from host memory (a spanned step runs at the full plan, which lends
+     * the expert slab nothing), 0 elsewhere. 0 spans every lone prefill from its second interval
+     * on. */
+    int64_t prefill_span_min = -1;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap

@@ -13106,6 +13106,95 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
         }
 }
 
+/* --prefill-span-pass step (RadBuildCtx::span_pass_step): where a spanned step runs serially, at
+ * one and two ranks, the routed block takes the whole step in one pass -- one router launch a
+ * routed block instead of one a piece, over planes a step tall -- while the connection reads and
+ * the indexer's windows stay a piece. At four ranks the step is pipelined and keeps its pieces, so
+ * the flag changes neither the graph nor the launches there. Off, the flag is the span as it was:
+ * the graph and the step's launches are those of a context that never heard of it. */
+TEST(flashnext_span_pass_step_takes_a_spanned_step_in_one_routed_pass) {
+    MetaKV mk = q4_small();
+    const RadModelMeta& meta = *mk.meta();
+    for (int world : { 1, 2, 4 })
+        for (int rank = 0; rank < world; ++rank) {
+            struct Run {
+                uint64_t graph = 0;
+                int routers = 0, wide_routers = 0, wide_reads = 0, wide_score = 0, issues = 0;
+                int64_t rows = 0, piece = 0, sorted = 0;
+                bool pass_step = false, pipe = false;
+            } run[2];
+            for (int on = 0; on < 2; ++on) {
+                RadBuilder b;
+                b.encs = { { "draft_head", u2_head() } };
+                RadBuildCtx ctx = q4_ctx(rank, world);
+                ctx.max_tok = 4096;
+                ctx.max_mixed_tok = 2048;
+                ctx.span_pass_step = on;
+                REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, &meta, &ctx); }),
+                           RAD_OK);
+                qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[rank];
+                Run& r = run[on];
+                r.graph = graph_hash(b);
+                r.pass_step = m.pass_step;
+                r.pipe = m.pipe_on;
+                r.rows = m.moecfg.rows;
+                r.piece = m.piece_rows;
+                for (const RecBuf& rb : b.bufs)
+                    if (rb.name == "moe_sorted") r.sorted = rb.d.shape[0];
+                CHECK(m.span_on);
+                CHECK_EQ(m.qsacfg.plane_rows, 2048);
+                const auto pf = kit(b, {}, { 4096 }, 4096);
+                const auto v = run_passes(b, qwen4exp_fp8::step, { pf.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                const RadCtx& c = *v[0];
+                CHECK(c.step_fail.empty());
+                r.issues = (int)c.issues.size();
+                for (const RecIssue& i : c.issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    if (o->op == "router_topk" || o->op == "router_topk_scatter") {
+                        ++r.routers;
+                        r.wide_routers += i.n > 2048;
+                    }
+                    if (o->op == "hc_read") r.wide_reads += i.n > 2048;
+                    if (o->op == "qsa_score") r.wide_score += i.n > 2048;
+                }
+                /* This fake runtime has no engine teardown between model redeclarations. */
+                rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+                m.pipe_cu_h = nullptr;
+                m.pipe_cu_tried = false;
+            }
+            /* Off: pieces, whatever the world. */
+            CHECK(!run[0].pass_step);
+            CHECK_EQ(run[0].rows, 2048);
+            CHECK_EQ(run[0].piece, 2048);
+            CHECK_EQ(run[0].wide_routers, 0);
+            CHECK(run[0].routers > 0);
+            CHECK_EQ(run[0].routers % 2, 0);
+            CHECK_EQ(run[1].piece, 2048);
+            CHECK_EQ(run[1].wide_reads, 0);
+            CHECK_EQ(run[1].wide_score, 0);
+            if (world > 2) {
+                /* Pipelined: the flag is declined, and nothing moves. */
+                CHECK(run[1].pipe);
+                CHECK(!run[1].pass_step);
+                CHECK_EQ(run[1].rows, 2048);
+                CHECK_EQ(run[1].graph, run[0].graph);
+                CHECK_EQ(run[1].issues, run[0].issues);
+                CHECK_EQ(run[1].routers, run[0].routers);
+                continue;
+            }
+            CHECK(run[1].pass_step);
+            CHECK_EQ(run[1].rows, 4096);
+            /* One pass a routed block where there were two, each over the whole step. */
+            CHECK_EQ(run[1].routers * 2, run[0].routers);
+            CHECK_EQ(run[1].wide_routers, run[1].routers);
+            /* The planes with a row per (token, slot) are a step tall. */
+            CHECK_EQ(run[1].sorted, 2 * run[0].sorted);
+            CHECK(run[1].issues < run[0].issues);
+        }
+}
+
 /* ============================ unlimitedocr: the DeepEncoder batch ============================= */
 
 namespace {

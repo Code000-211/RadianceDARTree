@@ -1406,8 +1406,10 @@ int Engine::step_loop() {
         /* Read before the step looks for work, so a request added after it found none still wakes
          * the idle wait below. */
         const uint64_t woke = issued ? 0 : sched_.wake_seq();
+        rad_host_mark("lp_top", issued ? 1 : 0);
         if (issued) sched_.promote_next();
         else        b = sched_.step();
+        if (b) rad_host_mark("lp_planned", (int)b->n_tok);
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
@@ -1590,6 +1592,7 @@ int Engine::step_loop() {
                 build_status_ = RAD_OK;
             }
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
+            rad_host_mark("lp_released", -1);
             /* An embedding program has no sampler to issue behind its pass. */
             issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
@@ -1621,6 +1624,7 @@ int Engine::step_loop() {
             barrier_->arrive_and_wait();
         }
         if (t_on) phase_mark(PH_RANKS);
+        rad_host_mark("lp_joined", -1);
 
         /* Deferred out of the staging, where the rank threads were reading the scheduler. */
         for (uint64_t id : cancel) sched_.cancel(id);
@@ -1646,6 +1650,7 @@ int Engine::step_loop() {
         }
 
         if (t_on) phase_mark(PH_SAVE);
+        rad_host_mark("lp_saved", -1);
         /* Queue the drafter's passes behind the step before waiting: the card computes acceptance
          * itself and every pass reads it there (sched/advance.h), so one wait covers the whole
          * step. */
@@ -2911,8 +2916,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * Qwen3.8-Flash-Next at TP2 (two R9700, 12 GiB host pool) the span loses to one-interval
          * steps up to 12K tokens and wins from 18K, hence eight intervals. With every expert on
          * the card there is no such cost and every lone prefill spans. */
-        sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
-                                ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+        const int64_t span_auto = stage_rows > 0 && arena_span_rows_ > 0
+                                      ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0;
+        /* --prefill-span-min N says it for the deployment: where the routed pass covers the whole
+         * spanned step (--prefill-span-pass step) the span pays from the second interval on. */
+        sched_.set_span_min(cfg_.prefill_span_min >= 0 ? cfg_.prefill_span_min : span_auto);
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());

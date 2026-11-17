@@ -309,6 +309,13 @@ typedef struct RadBuildCtx {
      * (--draft-rheo-m m) plus one sampled from the tail law. The plugin hands `rheo_m` = m to its
      * propose / grower ops only when this is non-zero. */
     int      draft_rheo;
+    /* ---- appended (--prefill-span-pass step). Nonzero: where the plugin runs a step wider than
+     * max_mixed_tok serially (it pipelines no part of it), its routed block may take the whole
+     * step in one pass rather than one pass a checkpoint interval, and size the planes that hold a
+     * row per (token, expert slot) for max_tok rows. 0, the zero-initialised default, keeps the
+     * interval-tall passes. A plugin without such a pass ignores it. It takes the tail padding
+     * behind draft_rheo, so the struct keeps its size. */
+    int      span_pass_step;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */

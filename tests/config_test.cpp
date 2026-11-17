@@ -434,6 +434,41 @@ TEST(a_prefill_span_below_one_interval_is_refused) {
     CHECK_EQ(c.prefill_span, 4);
 }
 
+/* --prefill-span-pass piece|step and --prefill-span-min auto|N shape a span: piece and auto are
+ * the defaults (the span as it was), and either is refused without a span to shape. */
+TEST(the_span_pass_and_the_span_minimum_need_a_span) {
+    LogGuard lg;
+    Config d;
+    CHECK(!d.prefill_span_step);
+    CHECK_EQ(d.prefill_span_min, -1);
+    CHECK_EQ(parse({ "--prefill-span", "2" }, &d), RAD_OK);
+    CHECK(!d.prefill_span_step);
+    CHECK_EQ(d.prefill_span_min, -1);
+
+    Config c;
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "step" }, &c), RAD_OK);
+    CHECK(c.prefill_span_step);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "piece" }, &c), RAD_OK);
+    CHECK(!c.prefill_span_step);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "whole" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-pass", "step" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span", "1", "--prefill-span-pass", "step" }), RAD_E_INVAL);
+    /* piece without a span is the default said aloud. */
+    CHECK_EQ(parse_fresh({ "--prefill-span-pass", "piece" }), RAD_OK);
+
+    Config m;
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "0" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, 0);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "16384" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, 16384);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "auto" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, -1);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "-1" }, &m), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "2k" }, &m), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-min", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-min", "auto" }), RAD_OK);
+}
+
 /* A budget flag takes a whole number; a typo is refused rather than read as 0 or its prefix. */
 TEST(a_numeric_flag_refuses_what_is_not_a_number) {
     Config c;
@@ -550,6 +585,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
+        { "--prefill-span-pass", { "step", "--prefill-span", "2" } },
+        { "--prefill-span-min", { "4096", "--prefill-span", "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--prefix-resume", { "nearest" } },
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },

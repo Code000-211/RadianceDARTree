@@ -249,6 +249,9 @@ TEST(the_tree_pruning_fields_are_appended_past_the_tree_shape) {
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_prune_rel), (size_t)216);
     CHECK_EQ(offsetof(RadBuildCtx, draft_adapt), (size_t)224);
     CHECK_EQ(offsetof(RadBuildCtx, draft_rheo), (size_t)232);
+    /* --prefill-span-pass: in the tail padding behind draft_rheo, so the size stays. */
+    CHECK_EQ(offsetof(RadBuildCtx, span_pass_step), (size_t)236);
+    CHECK_EQ(sizeof(RadBuildCtx), (size_t)240);
     CHECK_EQ(offsetof(RadDrafterDecl, proposal_score), (size_t)68);
     CHECK_EQ(sizeof(RadDrafterDecl), (size_t)72);
 }

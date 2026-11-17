@@ -1383,6 +1383,59 @@ pool), the same span took 2.61 s against 2.56 s to the first token of an 18K-tok
 10.72 s against 10.55 s at 75K, and `max-num-batched-tokens: 8192`, `prefill-span: 4` took 3.30 s
 and 10.82 s. Measure the prompts you serve before turning it on at two ranks.
 
+**The routed pass of a spanned step: `prefill-span-pass: step`.** Where a spanned step runs as one
+wider step (Flash-Next at one and two ranks), its routed block still takes it a 2048-row pass at a
+time: the step sorts its slots twice and reads every expert's weight -- and decodes a trellis-coded
+expert -- once a piece. That is why the span alone gains nothing at two ranks on a container whose
+routed GEMMs are bound by the bytes they read (the IQR-V4 container above). With
+
+```yaml
+    max-num-batched-tokens: 4096
+    prefill-span: 2
+    prefill-span-pass: step        # default: piece
+    prefill-span-min: 0            # default: auto
+```
+
+the routed block takes the whole spanned step in one pass, so each expert's run is the step's and
+its weight is read once for twice the rows. The connection reads, the indexer's windows and the
+delta net keep their pieces. Flash-Next serves it where it does not pipeline the step, at one and
+two ranks; above two ranks a piece's pass runs beside the other piece's all-reduce, the passes stay
+a piece tall, and startup notes that the key was declined. A step that carries a chunk and decode
+rows (2048 tokens and the decode headroom) is one pass too, where it was a pass and a remainder.
+
+`prefill-span-min: N` is the shortest prompt, in tokens, a prefill spans for. `auto` is the rule
+below (eight intervals where routed experts are staged from host memory, every prompt elsewhere);
+with step-tall passes the span pays from the second interval on, hence `0`.
+
+On Qwen3.8-Flash-Next IQR-V4 (2x R9700 at 210 W, TP2, `expert_tiered`, 12 GiB host pool, MTP 5 with
+adaptive depth), prefill of one cold prompt with the four keys above against
+`max-num-batched-tokens: 2048`, in tokens a second (prompt tokens over the time to the first token,
+the median of eight prompts of shuffled filler a depth):
+
+| prompt tokens | 2048 budget | span 2, step pass, min 0 | |
+|---|---|---|---|
+| 1.6K | 5780 | 5860 | +1.4 % |
+| 6K | 6220 | 6340 | +2.0 % |
+| 12K | 6190 | 6400 | +3.3 % |
+| 24K | 6150 | 6500 | +5.8 % |
+| 47K | 6060 | 6470 | +6.7 % |
+
+A prompt of one interval (under 2048 tokens) is not spanned; its figure is within the run-to-run
+spread. Single prompts of documentation text measured +4 % at 28K and +5 % at 42K.
+
+What `prefill-span-pass: step` costs beside the span's own costs below:
+
+- **Activation memory.** The planes that hold a row per (token, expert slot) are a step tall. On
+  Flash-Next at a 4096 budget that is 186 MiB more arena a rank than the span with piece
+  passes; with the span's own rows the KV pool goes from 4.58 GiB a card (4.18 with the span at
+  piece passes) to 4.02 on a 32 GiB R9700 at `host-pool-mib: 12288`: 3.4 sessions of 70000 tokens
+  where the 2048 budget holds 4.0.
+- **Bytes.** Every op of the pass is per row, but the grouped trellis GEMM takes a run of one or two
+  rows through its dot path and a longer one through its tiles, which agree only within f32
+  rounding before the bf16 store. The step's longer runs move rows between the two, so the output
+  differs from piece passes at tie level -- the difference a spanned step at one or two ranks
+  already has from 2048-token chunks, and any other chunk size has. It is deterministic.
+
 What it costs:
 
 - **The checkpoints inside a span are not written.** A later request that shares only part of a
@@ -1397,7 +1450,8 @@ What it costs:
   span's extra rows are VRAM the expert slab does not get (320 MiB a card on Flash-Next at TP2).
   Every step but a spanned one runs at an arena level of the shared size, which lends those rows to
   the slab and keeps the prefill stager's ring right above its own buffers. A prefill there spans
-  only from eight intervals (16K tokens on), where the span starts to win. Startup says so:
+  only from eight intervals (16K tokens on), where the span starts to win with piece-tall passes
+  (`prefill-span-min: auto`; `prefill-span-min: N` sets the bound). Startup says so:
 
   ```
   scheduler: --prefill-span: a prefill spans when it is 16384 tokens or longer -- routed experts
@@ -2639,6 +2693,8 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens |
 | `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
+| `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
+| `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
 | `checkpoint-slots: N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `tp: 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB, and with its DFlash2 drafter that drafter's 2048-token window too, 487 MiB). `auto` gives each of `max-num-seqs` what `checkpoint-policy` keeps for a `max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; a floor of 8 (or what the policy wants, if fewer) outranks `memory.host-headroom-mib`, which gives back exactly the shortfall down to 1 GiB rather than take the store to none, and the startup line says so. The startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `checkpoint-policy: NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `prefix-resume: MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |

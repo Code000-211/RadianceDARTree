@@ -423,8 +423,10 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         t.checked = true;
     } else {
         /* Entries that may have moved: resolve each (which also orders the stream behind an
-         * in-flight transfer) and patch only those whose pointer differs. */
-        WtabPatch pt;
+         * in-flight transfer) and patch only those whose pointer differs. Into the op's gather
+         * when there is one (wtab_flush), else a dispatch of this table's own. */
+        WtabPatch own;
+        WtabPatch& pt = wtab_gather_ ? wtab_acc_ : own;
         auto one = [&](int64_t e) -> int {
             void* p = nullptr;
             RAD_TRY(resolve(e, &p));
@@ -435,6 +437,7 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
             pt.val[pt.n] = p;
             if (++pt.n == (uint32_t)kWtabPatch) {
                 RAD_TRY(wtab_patch(pt, cur_stream()));
+                ++n_wtab_patches_;
                 pt.n = 0;
             }
             return RAD_OK;
@@ -444,10 +447,14 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         } else {
             for (int32_t e : t.pend) RAD_TRY(one(e));
         }
-        const int rc = wtab_patch(pt, cur_stream());
-        if (rc < 0)
-            return abort_step_msg(h, rc,
-                                  fmt("operand %d: the weight table could not be patched", operand));
+        if (!wtab_gather_) {
+            if (pt.n > 0) ++n_wtab_patches_;
+            const int rc = wtab_patch(pt, cur_stream());
+            if (rc < 0)
+                return abort_step_msg(h, rc,
+                                      fmt("operand %d: the weight table could not be patched",
+                                          operand));
+        }
     }
     t.full = false;
     t.pend.clear();
@@ -457,6 +464,15 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
         g_wtab_e  += walked;
     }
     return RAD_OK;
+}
+
+/* Dispatches what the op's tables gathered (ctx.h, wtab_acc_) on the current stream. */
+int Ctx::wtab_flush() {
+    if (wtab_acc_.n == 0) return RAD_OK;
+    ++n_wtab_patches_;
+    const int rc = wtab_patch(wtab_acc_, cur_stream());
+    wtab_acc_.n = 0;
+    return rc;
 }
 
 /* Queues the residency table's changes against every table holding each weight. A weight also
@@ -784,6 +800,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * never after it. Loop-invariant, so computed once here rather than per buffer operand. */
     const int32_t at_op = p.info && p.info->anchor >= 0 ? p.info->anchor : (int32_t)h;
 
+    /* The op's tables patch into one gather (ctx.h, wtab_acc_), dispatched below once every
+     * operand is resolved; a refusal on the way dispatches what was gathered (abort_step_msg), so
+     * the device arrays hold what `cur` says they do. */
+    wtab_gather_ = rec_ == nullptr;
     for (int i = 0; i < n_opd; ++i) {
         const RadOperand& o = opd[i];
         RadTensor&        tt = t[i];
@@ -989,6 +1009,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             break;
         }
     }
+
+    wtab_gather_ = false;
+    if (const int ws = wtab_flush(); ws < 0)
+        return abort_step_msg(h, ws, "the op's weight tables could not be patched");
 
     /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. There is one
      * entry per schema operand, the trailing optional ones the issue left out null. */
@@ -1338,6 +1362,9 @@ int Ctx::host_join_wait(bool drain) {
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
+    /* What the op's tables gathered before the refusal still goes out (ctx.h, wtab_acc_). */
+    wtab_gather_ = false;
+    (void)wtab_flush();
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     const char*     pname = ip.row ? ip.row->plugin.c_str() : "<unknown plugin>";
@@ -1370,6 +1397,9 @@ int Ctx::step_fail(const char* what) {
 }
 
 int Ctx::abort_step_msg(rad_op h, int status, std::string what) {
+    /* What the op's tables gathered before the refusal still goes out (ctx.h, wtab_acc_). */
+    wtab_gather_ = false;
+    (void)wtab_flush();
     const OpInfo* o = (h != RAD_NULL_HANDLE && (size_t)h < plans_.size()) ? plans_[h].info : nullptr;
     step_fail_ = o ? fmt("op '%s' {%s}: %s", o->op.c_str(), o->base.str().c_str(), what.c_str())
                    : fmt("op handle %u: %s", h, what.c_str());

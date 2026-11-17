@@ -178,6 +178,16 @@ static const Flag g_flags[] = {
     "                                    other step is planned at the budget less the extra\n"
     "                                    intervals, and the checkpoints inside a span are not\n"
     "                                    written" },
+    { "--prefill-span-pass",  "MODE",   "piece (default) | step -- the routed (MoE) block's pass of a\n"
+    "                                    spanned step: a pass an interval, or one pass over the\n"
+    "                                    whole step where the model runs such a step serially\n"
+    "                                    (Flash-Next at one or two ranks). Each expert's weight is\n"
+    "                                    then read once for all the step's rows; the arena grows by\n"
+    "                                    the expert planes' extra rows and the output differs from\n"
+    "                                    piece passes at tie level. Needs --prefill-span above 1" },
+    { "--prefill-span-min",   "N",      "the shortest prompt, in tokens, a prefill spans for: auto\n"
+    "                                    (default) is 8 intervals where routed experts are read from\n"
+    "                                    host memory and 0 elsewhere; 0 spans every lone prefill" },
     /* A total, not per sequence: the snapshot store is one pool of N slots
      * (KVManager::set_checkpoint_store). */
     { "--checkpoint-slots",   "N",      "linear-state or sliding-window snapshots the server holds in\n"
@@ -937,6 +947,20 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
         else if (S("--prefill-span"))          { if (!num(1, INT32_MAX, &c->prefill_span)) return RAD_E_INVAL; }
+        else if (S("--prefill-span-pass")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "piece")) c->prefill_span_step = false;
+            else if (!std::strcmp(v, "step"))  c->prefill_span_step = true;
+            else {
+                RAD_ERR("--prefill-span-pass takes piece or step, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-span-min")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->prefill_span_min = -1;
+            else if (!parse_int(a.c_str(), v, 0, INT64_MAX, &c->prefill_span_min)) return RAD_E_INVAL;
+        }
         else if (S("--checkpoint-slots")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "auto")) {
@@ -1715,6 +1739,17 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --prefill-span-pass step and --prefill-span-min shape a span, so they need one. */
+    if (c->prefill_span_step && c->prefill_span <= 1) {
+        RAD_ERR("--prefill-span-pass step is the routed pass of a spanned step and needs "
+                "--prefill-span above 1");
+        return RAD_E_INVAL;
+    }
+    if (c->prefill_span_min >= 0 && c->prefill_span <= 1) {
+        RAD_ERR("--prefill-span-min is the shortest prompt a span is taken for and needs "
+                "--prefill-span above 1");
+        return RAD_E_INVAL;
+    }
     /* --draft-depth adaptive reads the coupled chain's laws; a tree has its own pruning. */
     if (c->draft_depth_adaptive) {
         if (c->given.count("--draft-coupling") && !c->draft_coupling) {
@@ -1875,6 +1910,9 @@ const ShowRow kShow[] = {
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },
+    { "--prefill-span-pass",  [](const Config& c) { return std::string(c.prefill_span_step ? "step" : "piece"); } },
+    { "--prefill-span-min",   [](const Config& c) {
+          return c.prefill_span_min < 0 ? std::string("auto") : num(c.prefill_span_min); } },
     { "--checkpoint-slots",   [](const Config& c) {
           return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {

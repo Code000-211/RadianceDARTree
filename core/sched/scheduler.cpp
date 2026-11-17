@@ -1417,10 +1417,20 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
 /* ------------------------------------------------------------------ a prefill sharing a step */
 void Scheduler::set_span_min(int64_t tokens) {
     span_min_ = tokens > 0 ? tokens : 0;
-    if (span_min_ > 0 && geo_.span > 1)
+    if (geo_.span <= 1) return;
+    if (cfg_.prefill_span_min >= 0) {
+        /* The deployment's own bound (--prefill-span-min), whatever the experts' placement. */
+        if (span_min_ > 0)
+            RAD_INFO("scheduler: --prefill-span-min %lld: a prefill spans when it is %lld tokens "
+                     "or longer", (long long)cfg_.prefill_span_min, (long long)span_min_);
+        else
+            RAD_INFO("scheduler: --prefill-span-min 0: every prefill alone in its step spans from "
+                     "its second interval on");
+    } else if (span_min_ > 0) {
         RAD_INFO("scheduler: --prefill-span: a prefill spans when it is %lld tokens or longer -- "
                  "routed experts are read from host memory, and the arena a spanned step takes is "
                  "room they lose for it", (long long)span_min_);
+    }
 }
 
 void Scheduler::set_stage_rows(int64_t rows) {
