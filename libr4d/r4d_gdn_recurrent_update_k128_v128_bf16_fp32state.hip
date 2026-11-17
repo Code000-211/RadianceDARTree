@@ -1451,7 +1451,7 @@ __device__ __forceinline__ void ru_chain_wait() {
     }
   }
   __syncthreads();
-  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  r4d_chain_acquire();
 }
 __device__ __forceinline__ void ru_chain_done() {
   const R4dChainRec* r = r4d_chain_rec();

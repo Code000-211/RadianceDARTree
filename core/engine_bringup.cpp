@@ -1277,7 +1277,14 @@ int Engine::declare() {
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         const bool always = pb.chain_pays == RAD_CHAIN_ALWAYS;
         const bool pays = always || (cfg_.n_spec > 0 && pb.chain_pays != RAD_CHAIN_NONE);
-        rad_dev_chain_infer(pays);
+        /* Their packets go without the packet processor's acquire where every row that can chain
+         * acquires in the kernel for all it reads (RadKernelChainFn saying 2): one row that does
+         * not, from any library this engine loaded, keeps the acquire on all of them, since a
+         * queue's packets are not told apart by library. */
+        bool fenced = pays;
+        for (const KernelRow& row : reg_->rows())
+            if (row.chain && !row.chain_fenced) fenced = false;
+        rad_dev_chain_infer(pays ? (fenced ? 2 : 1) : 0);
         const bool on = rad_dev_chain_enabled() != 0;
         const char* why = on     ? (always ? "the model's plugin measured a gain with them"
                                            : "the model's plugin measured a gain with its "
@@ -1285,7 +1292,12 @@ int Engine::declare() {
                           : pays ? "the device backend does not chain"
                                  : "no drafter whose plugin measured a gain with them decodes "
                                    "speculatively";
-        RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);
+        RAD_INFO("chained launches: %s -- %s%s", on ? "on" : "off", why,
+                 !on ? ""
+                 : rad_dev_chain_unfenced() ? "; their packets take no acquire from the packet processor"
+                                            : "; their packets keep the packet processor's acquire "
+                                              "(a row that chains does not acquire for its scalar "
+                                              "loads itself)");
         decide("chained launches", on ? "on" : "off", why);
     }
     /* Trees: a block drafter's proposals verified as a tree, where the model's plugin measured a

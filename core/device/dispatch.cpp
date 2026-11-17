@@ -937,21 +937,24 @@ void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
  * serves several models, each with its own plugin's answer; a single answer for the process was
  * the answer of whichever model started last. Owner 0 is a thread outside every engine (a tool, a
  * test). Only where the backend chains: the AQL backend writes the record a chained form reads,
- * while a HIP launch carries only the kernel's own arguments. */
+ * while a HIP launch carries only the kernel's own arguments. The answer is 2 where every chained
+ * form the engine can launch fences itself (RadKernelChainFn saying 2), which
+ * rad_dev_chain_unfenced reads. */
 static std::mutex              g_chain_mu;
-static std::map<int, int>      g_chain_pays;    /* by owner */
+static std::map<int, int>      g_chain_pays;    /* by owner: 0, 1, or 2 (their packets unacquired) */
 static std::atomic<uint64_t>   g_chain_gen{1};
 void rad_dev_chain_infer(int pays) {
     {
         std::lock_guard<std::mutex> lk(g_chain_mu);
-        g_chain_pays[rad::engine_owner()] = pays ? 1 : 0;
+        g_chain_pays[rad::engine_owner()] = pays == 2 ? 2 : pays ? 1 : 0;
     }
     g_chain_gen.fetch_add(1, std::memory_order_release);
 }
-int rad_dev_chain_enabled(void) {
-    /* Asked on every launch: a thread keeps its engine's answer until some answer changes. */
+/* The calling thread's engine's answer where the backend chains, else 0: asked on every launch,
+ * so a thread keeps it until some answer changes. */
+static int chain_mode() {
     thread_local uint64_t seen = 0;
-    thread_local int      owner = -1, on = 0;
+    thread_local int      owner = -1, mode = 0;
     const uint64_t gen = g_chain_gen.load(std::memory_order_acquire);
     const int      o = rad::engine_owner();
     if (seen != gen || owner != o) {
@@ -961,12 +964,14 @@ int rad_dev_chain_enabled(void) {
             const auto it = g_chain_pays.find(o);
             if (it != g_chain_pays.end()) pays = it->second;
         }
-        on = pays && std::strcmp(rad::device_backend_name(), "aql") == 0 ? 1 : 0;
+        mode = pays && std::strcmp(rad::device_backend_name(), "aql") == 0 ? pays : 0;
         seen = gen;
         owner = o;
     }
-    return on;
+    return mode;
 }
+int rad_dev_chain_enabled(void)  { return chain_mode() != 0; }
+int rad_dev_chain_unfenced(void) { return chain_mode() == 2; }
 
 int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
     return dev()->event_elapsed_ms(a, b, out);

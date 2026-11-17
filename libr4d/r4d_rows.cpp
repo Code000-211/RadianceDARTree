@@ -11248,7 +11248,12 @@ extern "C" int rad_kernel_concurrent(int i) {
 
 /* Which rows can chain (RadKernelChainFn, rad_abi.h): every kernel their launch emits has a
  * chained form (r4d_chain.h) the launch selects from the `chain` parameter. A row joins this list
- * only once all of its kernels have one. */
+ * only once all of its kernels have one.
+ *
+ * They answer 2: every chained form here ends its wait in r4d_chain_acquire, which empties the
+ * scalar data cache behind the fence, so the engine may issue their packets without the packet
+ * processor's acquire. A form that waited without it would have to keep this at 1 for the whole
+ * library: one row's 1 keeps the fences on every chained packet of the engine. */
 extern "C" int rad_kernel_chain(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
@@ -11371,13 +11376,13 @@ extern "C" int rad_kernel_chain(int i) {
         "kv_store_i8",
     };
     for (const char* p : kChained)
-        if (std::strcmp(k->name, p) == 0) return 1;
+        if (std::strcmp(k->name, p) == 0) return 2;
     /* The host-mailbox twins (host_twins, --p2p off) of the two-rank fused writes: the same
      * launcher and kernels as the rows they are generated from, so the same chained forms. Only
      * these two: the other collectives' twins have not been run chained through the mailbox. */
     static const char* const kChainedHostTwins[] = { "ar_hc_write_host", "ar_gather_hc_write_host" };
     for (const char* p : kChainedHostTwins)
-        if (std::strcmp(k->name, p) == 0) return 1;
+        if (std::strcmp(k->name, p) == 0) return 2;
     return 0;
 }
 

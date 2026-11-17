@@ -10,6 +10,18 @@
 //
 // Every block must reach r4d_chain_done exactly once, so a kernel whose blocks return early keeps
 // its body in a __device__ function called from the chained wrapper.
+//
+// The wait's acquire is the only one a chained kernel gets at the right time: its packet's acquire
+// runs when the packet processor launches it, before the kernels in front have written, and the
+// engine issues the packet without one (core/device/aql.cpp, "the acquire of a chained launch"; this
+// library's rows say so, rad_kernel_chain returning 2). So the acquire here has to cover every
+// read behind it, and an agent-scope fence does not: it invalidates the vector caches, while a
+// load whose address every lane shares is a scalar load, served from the scalar data cache. A
+// GEMM reads its rows' scales that way, the routed kernels their counts and offsets, the head its
+// activation (r4dchain_lm_wmma, 16 words a load). What that cache holds is what a launch read
+// from the same arena address a layer earlier. r4d_chain_wait therefore empties it behind the
+// fence (r4d_chain_acquire). A kernel that waits its own way (the delta net's tree form) ends its
+// wait with the same call.
 #pragma once
 #include <hip/hip_runtime.h>
 #include "rad_abi.h"
@@ -76,6 +88,16 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 #ifndef R4D_CHAIN_MID
 #define R4D_CHAIN_MID 4
 #endif
+// The acquire behind a chained wait: the vector caches by the fence, the scalar data cache by
+// hand, which the fence leaves (see the head of this file). Every wave, for the compute unit it
+// runs on. Qwen3.8-Flash-Next at tp 2, chain 3 with coupling: with the packets fenced the
+// instruction moves nothing (12.00 against 11.97 ms a step, within the sessions' spread); with
+// them unfenced the text changes without it, in every request of a 5-request set.
+__device__ __forceinline__ void r4d_chain_acquire() {
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    asm volatile("s_dcache_inv" ::: "memory");
+}
+
 __device__ __forceinline__ void r4d_chain_wait() {
     const R4dChainRec* r = r4d_chain_rec();
     if (!r) return;
@@ -98,7 +120,7 @@ __device__ __forceinline__ void r4d_chain_wait() {
         }
     }
     __syncthreads();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    r4d_chain_acquire();
 }
 
 // After the block's last write: release, then one add a block.

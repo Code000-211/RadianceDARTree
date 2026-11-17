@@ -1654,6 +1654,17 @@ other model; the startup report's `chained launches` row says which and why. Whe
 than one card share their cards, a launch behind a collective keeps its barrier bit (about 1% of
 a step; MULTIMODEL §9.1).
 
+A chained kernel acquires in its own prologue, behind its wait, so its packet goes out without
+the packet processor's acquire where every kernel library the engine loaded says its chained forms
+cover all they read there (`rad_kernel_chain` answering 2: libr4d's do, by emptying the scalar
+data cache behind the fence). That acquire holds the packet processor about 0.9 us a launch on an
+R9700 and comes before the kernel in front has written, so it guards nothing the launch reads. It
+did give the arguments the host had just written into VRAM the time to get there; the backend now
+sees to that itself and flushes the card's host data path in front of every doorbell, for every
+launch (a card that offers no flush register keeps the acquire). The log line `chained launches:
+on` says whether the packets take the acquire. `RADIANCE_AQL_CHAIN_FENCE=1` puts it back, to rule
+the change out.
+
 **Draft trees.** Where the model's plugin measured a gain (the Gemma 4 31B with DFlash2: +7%
 single-stream decode and +6-9% aggregate at 1-16 users on 4x R9700, +4% and +6-12% on two,
 BetterBench with thinking off), a block drafter's proposals are verified as a tree: grown best-first
@@ -4634,6 +4645,7 @@ TranslateGemma 18.3 ms a step, against 19.8-20.5.
 | `RADIANCE_PROFILE_EVERY` | with `profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_MOE_VERIFY_BUDGET`, `RADIANCE_MOE_VERIFY_EXACT_ROWS` | opt-in and **lossy** (MoE-Spec style): on a single-sequence speculative verify pass, cap the distinct routed experts a layer reads at `N`. The experts of the first `EXACT_ROWS` rows (default 1, the committed token's row) stay allowed and exact; the other rows keep only the allowed experts with the most router mass, their kept weights rescaled to the row's original mass. Prefill, plain decode and the draft head stay exact. On Qwen3.8-Flash-Next IQR-V4 TP2, MTP chain3 + coupling: `18` gave +3-4% tok/s at T0.7/T1.0 with a small rise of the generated text's NLL under the exact model (0.222 -> 0.251 at T0.7); `14` +5-6% but NLL +60%; `12` and below unusable. Unset: off (bit-identical) |
 | `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: time every dispatch of one recorded pass in N on card 0, each with a completion signal of its own, without changing its barriers or chains (`profile-ops` plays no recorded pass). One CSV line a dispatch (pass, record, queue, kernel, ordered, chained, start and end in ns) goes to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`); `scripts/stampgaps.py` summarises it per kind of pass. AQL backend only |
+| `RADIANCE_AQL_CHAIN_FENCE` | `1`: a chained launch's packet keeps the packet processor's acquire even where the kernel libraries acquire in the kernel (§ "Chained launches"). For ruling the unfenced packets out of a fault, not for deployment: about 1% of a Qwen3.8-Flash-Next step. AQL backend only |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
