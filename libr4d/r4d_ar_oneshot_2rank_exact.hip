@@ -22,6 +22,7 @@
 #include "r4d_chain.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
+#include "r4d_ar_arc.h"     // the lossless chunk codec of the coded pushes
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
@@ -481,6 +482,228 @@ __global__ void r4d_ar_gather_hc_write_reg_kernel(
   if (CH::on) r4d_chain_done();
 }
 
+// ---- The coded form of the two fused writes: the push carries ~12.1 bits a bf16 value instead of
+// 16, losslessly (the four-rank coded two-shot's chunk codec, r4d_ar_arc.h), for the messages whose
+// time is the link's: a prefill chunk (2048 rows of 2560 are 10.5 MB each way a reduction) and a
+// many-stream decode or verify step. The peer decodes the same bf16 words it would have been sent
+// raw and folds them in the same arithmetic, so y and h are the plain kernels' byte for byte.
+//
+// A slot holds one coded message of n16 chunks (16-byte words), n16 a multiple of 32:
+//
+//   packed  u32[3 * n16]   at 0            three dwords a chunk
+//   bases   u32[n16 / 32]  at 12 * n16     a base-exponent byte for each group of 8 chunks
+//   spill   u32[n16]       behind, 16-byte aligned: the fourth dword of a raw group's chunks
+//
+// A wave codes 32 consecutive chunks and redistributes the packed dwords among its lanes, so that
+// each of its three stores is 128 contiguous bytes and the P2P writes stay coalesced, as in the
+// four-rank form. A group that does not code (a subnormal, an inf or NaN, an exponent range past
+// 14: base byte 0xFF) travels raw in the same place: the first three dwords of each of its chunks
+// in the chunk's packed cell and the fourth in the spill, so a slot is 16.125 bytes a chunk
+// whatever the data (r4d_ar_entry.hip sizes a two-rank bf16 slot for it) and a message of raw
+// groups only costs a spill store a chunk.
+//
+// The push check (r4d_ar_seq.h) runs over the dwords as they cross the link: the writer sums
+// mix(dword, position) over what it stores, the reader over what it is about to decode, each
+// region in its own index space. A stale base byte makes the reader sum a spill dword the writer
+// did not store, or miss one it did, and the sums disagree as for any other stale dword.
+//
+// P2P instances only, like the register form: a host mailbox keeps the plain kernels and their
+// mirror.
+struct R4dArc2 { unsigned* packed; unsigned* bases; unsigned* spill; };
+__host__ __device__ constexpr size_t r4d_arc2_spill_off(long n16) {
+  return ((size_t)12 * n16 + (size_t)n16 / 8 + 15) & ~(size_t)15;
+}
+// Bytes of a coded message of n16 chunks, n16 a multiple of 32.
+__host__ __device__ constexpr size_t r4d_arc2_bytes(long n16) {
+  return r4d_arc2_spill_off(n16) + (size_t)4 * n16;
+}
+__device__ __forceinline__ R4dArc2 r4d_arc2_at(const void* p, int n16) {
+  char* b = (char*)p;
+  return R4dArc2{(unsigned*)b, (unsigned*)(b + (size_t)12 * n16),
+                 (unsigned*)(b + r4d_arc2_spill_off(n16))};
+}
+#define R4D_ARC2_BASES 0x40000000u   // the push check's index spaces of the bases and the spill,
+#define R4D_ARC2_SPILL 0x80000000u   // apart from the packed dwords' (under 2^30)
+
+// Code this lane's chunk `v` of the wave's chunks [k0, k0 + 32) into the peer's slot; every lane of
+// the wave calls. Returns the lane's share of the push check.
+__device__ __forceinline__ unsigned r4d_arc2_put(const R4dArc2& d, int k0, int4 v) {
+  const int lane = (int)(threadIdx.x & 31u);
+  R4dArcEnc e = r4d_arc_enc(v, true);
+  const bool raw = e.base == 0xFFu;      /* uniform over the lane's group of 8 */
+  if (raw) { e.w[0] = (unsigned)v.x; e.w[1] = (unsigned)v.y; e.w[2] = (unsigned)v.z; }
+  unsigned h = 0u;
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const int p = 32 * j + lane, sl = p / 3, wi = p - sl * 3;
+    const unsigned a0 = r4d_arc_shfl(e.w[0], sl), a1 = r4d_arc_shfl(e.w[1], sl);
+    const unsigned a2 = r4d_arc_shfl(e.w[2], sl);
+    const unsigned val = wi == 0 ? a0 : wi == 1 ? a1 : a2;
+    const unsigned at = 3u * (unsigned)k0 + (unsigned)p;
+    d.packed[at] = val;
+    h += r4d_archk_mix(val, at);
+  }
+  const unsigned b0 = r4d_arc_shfl(e.base, 0), b1 = r4d_arc_shfl(e.base, 8);
+  const unsigned b2 = r4d_arc_shfl(e.base, 16), b3 = r4d_arc_shfl(e.base, 24);
+  if (lane == 0) {
+    const unsigned bw = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    d.bases[k0 >> 5] = bw;
+    h += r4d_archk_mix(bw, R4D_ARC2_BASES + (unsigned)(k0 >> 5));
+  }
+  if (raw) {
+    d.spill[k0 + lane] = (unsigned)v.w;
+    h += r4d_archk_mix((unsigned)v.w, R4D_ARC2_SPILL + (unsigned)(k0 + lane));
+  }
+  return h;
+}
+// The reader's share of the push check over the wave's chunks [k0, k0 + 32): the dwords
+// r4d_arc2_get is about to load, in the writer's index spaces.
+__device__ __forceinline__ unsigned r4d_arc2_sum(const R4dArc2& s, int k0) {
+  const int lane = (int)(threadIdx.x & 31u);
+  const unsigned bw = s.bases[k0 >> 5];
+  unsigned h = lane == 0 ? r4d_archk_mix(bw, R4D_ARC2_BASES + (unsigned)(k0 >> 5)) : 0u;
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const unsigned at = 3u * (unsigned)k0 + (unsigned)(32 * j + lane);
+    h += r4d_archk_mix(s.packed[at], at);
+  }
+  if (((bw >> ((lane >> 3) * 8)) & 0xffu) == 0xFFu)
+    h += r4d_archk_mix(s.spill[k0 + lane], R4D_ARC2_SPILL + (unsigned)(k0 + lane));
+  return h;
+}
+// This lane's chunk of the wave's chunks [k0, k0 + 32) back from a slot; every lane calls.
+__device__ __forceinline__ int4 r4d_arc2_get(const R4dArc2& s, int k0) {
+  const int lane = (int)(threadIdx.x & 31u);
+  unsigned ld[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) ld[j] = s.packed[3u * (unsigned)k0 + (unsigned)(32 * j + lane)];
+  const unsigned base = (s.bases[k0 >> 5] >> ((lane >> 3) * 8)) & 0xffu;
+  unsigned w[3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int q = 3 * lane + i, sl = q & 31, j = q >> 5;
+    const unsigned a0 = r4d_arc_shfl(ld[0], sl), a1 = r4d_arc_shfl(ld[1], sl);
+    const unsigned a2 = r4d_arc_shfl(ld[2], sl);
+    w[i] = j == 0 ? a0 : j == 1 ? a1 : a2;
+  }
+  if (base == 0xFFu)
+    return make_int4((int)w[0], (int)w[1], (int)w[2], (int)s.spill[k0 + lane]);
+  return r4d_arc_dec(w, base);
+}
+
+// r4d_ar_hc_write_kernel and r4d_ar_gather_hc_write_kernel with the coded push. MODE 0: `y` is the
+// message (the plain write); 1: the gather in front, its slot table in LDS; 2: the gather in front
+// by the inverse table. Blocks own whole waves' chunks (the launcher: n16 and the block size are
+// multiples of 32, and so is the thread count), so every lane of a wave is in each pass together.
+// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early.
+template <int MODE, class CH>
+__global__ void r4d_ar_hc_write_coded_kernel(
+    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
+    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
+    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
+    int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
+    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr) {
+  if (CH::on) r4d_chain_wait();
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq, s_slot;
+  __shared__ int   s_i[R4D_ARG_ROWS * R4D_ARG_SLOTS];
+  __shared__ float s_w[R4D_ARG_ROWS * R4D_ARG_SLOTS];
+  __shared__ float s_g[R4D_ARG_ROWS];
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
+  const unsigned int s = s_seq;
+  const int slot = (int)s_slot;
+  const R4dArc2 ps = r4d_arc2_at(peer_base + (size_t)slot * slot_stride16, n16);
+  const R4dArc2 ms = r4d_arc2_at(my_base + (size_t)slot * slot_stride16, n16);
+
+  const int w = ((n16 + nb - 1) / nb + 31) & ~31;   // 16B words per block, whole waves
+  int start = b * w; if (start > n16) start = n16;
+  int end = start + w; if (end > n16) end = n16;
+  const int lane = tid & 31;
+  unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
+  const int wpr = n >> 3;                 // 16B words a row
+  const int row_lo = start / wpr;
+  const int nrow = end > start ? (end - 1) / wpr - row_lo + 1 : 0;
+
+  if (MODE == 1) {
+    /* Slot table, as r4d_ar_gather_hc_write_kernel's. */
+    const int K = G.top_k;
+    for (int x = tid; x < nrow * K; x += nt) s_i[x] = -1;
+    __syncthreads();
+    {
+      const int lo = row_lo * K, hi = (row_lo + nrow) * K;
+      for (int i = tid; i < G.T; i += nt) {
+        const int f = G.sorted[i];
+        if (f >= lo && f < hi) s_i[f - lo] = i;
+      }
+    }
+    for (int x = tid; x < nrow * K; x += nt)
+      s_w[x] = bf2f(G.ew[(long)(row_lo + x / K) * G.ew_ld + x % K]);
+    if (G.sh)
+      for (int r = tid; r < nrow; r += nt) {
+        const float v0 = bf2f(G.sg[(long)(row_lo + r) * G.sg_ld]);
+        s_g[r] = G.sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
+      }
+    __syncthreads();
+  }
+
+  /* drain 4, tests only (r4d_ar_late_push_pin): the flag ahead of the push and the push ~20 us
+   * behind it, as in r4d_ar_oneshot_2rank_exact_kernel, so the push check re-reads coded bytes. */
+  if (drain == 4) {
+    if (tid == 0) store_sys_rel(&peer_flags[b], s);
+    const unsigned long long t0 = wall_clock64();
+    while (wall_clock64() - t0 < 2000ull) __builtin_amdgcn_s_sleep(8);   // 100 MHz: 20 us
+  }
+  /* Code and push; the gather forms produce the word first and keep it as this rank's message. */
+  for (int k = start + tid; k < end; k += nt) {
+    int4 v;
+    if (MODE == 0) {
+      v = y4[k];
+    } else {
+      const int row = k / wpr, i0 = (k - row * wpr) * 8;
+      v = r4d_ar_gather_word<MODE == 2>(G, inv, s_i, s_w, s_g, row, row - row_lo, i0);
+      y4[k] = v;
+    }
+    hck += r4d_arc2_put(ps, k - lane, v);
+  }
+  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s, drain == 4);
+  if (drain == 1) __threadfence_system();
+  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __syncthreads();
+  if (tid == 0) {
+    if (drain == 2) __threadfence_system();
+    if (drain != 4) store_sys_rel(&peer_flags[b], s);
+    unsigned long long z = 0;
+    while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
+      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+    }
+  }
+  __syncthreads();
+  if (acq) __threadfence_system();
+  r4d_archk_wait(my_flags, nbw, (unsigned)slot, (unsigned)b, s, [&](unsigned int& hh) {
+    for (int k = start + tid; k < end; k += nt) hh += r4d_arc2_sum(ms, k - lane);
+  });
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+
+  for (int k = start + tid; k < end; k += nt) {
+    const int4 r = vadd<__hip_bfloat16, 8>(y4[k], r4d_arc2_get(ms, k - lane));
+    y4[k] = r;
+    const int row = k / wpr, i0 = (k - row * wpr) * 8;
+    r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
+                         reinterpret_cast<const unsigned short*>(&r));
+  }
+  if (CH::on) r4d_chain_done();
+}
+
+/* Whether a message of n16 chunks fits the coded form in a slot of `slot_stride16` words on a P2P
+ * instance (`stage` 0): whole waves' chunks, and the coded image within the slot. */
+int r4d_ar_coded2_ok(long n16, long slot_stride16, long stage) {
+  return n16 > 0 && n16 % 32 == 0 && !stage &&
+         r4d_arc2_bytes(n16) <= (size_t)slot_stride16 * 16;
+}
+/* Bytes a slot needs to hold the coded form of any message of up to n16 chunks. */
+long r4d_ar_coded2_bytes(long n16) { return (long)r4d_arc2_bytes((n16 + 31) / 32 * 32); }
+
 /* r4d_ar_form_pin: the form of the fused writes at a message of one word a thread. -1 is the
  * launchers' rule (the register form on a P2P instance), 0 the plain kernels, 1 the rule again.
  * A test hook (r4d_selftest compares the two forms byte for byte); nothing else sets it. */
@@ -594,7 +817,8 @@ int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, lon
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream_i, long nblocks, long nthreads,
-                     long drain, long acq, long gate, long gate_ctr, long stage, long chain) {
+                     long drain, long acq, long gate, long gate_ctr, long stage, long chain,
+                     long coded) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8) throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
   if (hc < 1 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
@@ -610,6 +834,21 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
   nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
+  if (coded && r4d_ar_coded2_ok(n16, slot_stride16, stage)) {
+    if (nb > n16 / 32) nb = n16 / 32;   /* a block owns whole waves' chunks */
+    if (g_ar_late_push) drain = 4;      /* tests only: every push lands after its flag */
+    R4dArGather G;
+    std::memset(&G, 0, sizeof G);
+#define R4D_ARHWC(CH_)                                                                          \
+  r4d_ar_hc_write_coded_kernel<0, CH_><<<nb, nt, 0, st>>>(                                      \
+      (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,           \
+      (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
+      n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,      \
+      nullptr, (long long*)gate, (unsigned int*)gate_ctr)
+    if (chain) R4D_ARHWC(r4dchain); else R4D_ARHWC(R4dUnchained);
+#undef R4D_ARHWC
+    return;
+  }
   if (ar_reg_form(n16, nb, nt, hc, stage)) {
     /* Tests only: every push lands after its flag (drain 4). */
     const int dr = g_ar_late_push ? 4 : (int)drain;
@@ -639,7 +878,7 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
                            long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                            long top_k, long sig, long stream_i, long nblocks, long nthreads,
                            long drain, long acq, long inv, long gate, long gate_ctr, long stage,
-                           long chain) {
+                           long chain, long coded) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
@@ -653,7 +892,16 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   /* Enough blocks that none spans more than R4D_ARG_ROWS rows: a block of w words touches at most
    * (w - 1) / wpr + 2 rows. Both ranks compute the same count from the same M and n, as the
    * per-block handshake requires. */
-  const int wmax = (R4D_ARG_ROWS - 2) * wpr + 1;
+  int wmax = (R4D_ARG_ROWS - 2) * wpr + 1;
+  /* The coded form (r4d_ar_hc_write_coded_kernel) gives a block whole waves' chunks, so its LDS
+   * table bounds a block at the waves within R4D_ARG_ROWS - 2 rows. Rows too short for that to
+   * be one wave leave the inverse table (a bound of one word asks for it below), or the plain
+   * kernels. */
+  const int wmax_c = ((R4D_ARG_ROWS - 2) * wpr) & ~31;
+  bool cod = coded && r4d_ar_coded2_ok(n16, slot_stride16, stage);
+  if (cod && wmax_c >= 32) wmax = wmax_c;
+  else if (cod && inv != 0 && n16 > nb) wmax = 1;
+  else cod = false;
   const int nb_min = (n16 + wmax - 1) / wmax;
   /* Use the inverse table when the LDS table would need more blocks than requested (a prefill
    * chunk, never a decode step); both ranks decide from the same M and n. The block count stays
@@ -661,6 +909,7 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   const bool by_inv = inv != 0 && nb_min > nb;
   if (!by_inv && nb < nb_min) nb = nb_min;
   if (nb > n16) nb = n16;
+  if (cod && nb > n16 / 32) nb = n16 / 32;
   if (nb > R4D_AR_MAX_BLOCKS || (unsigned)nb > nbw) return -4;
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
@@ -684,7 +933,24 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,    \
         inv_, (long long*)gate, (unsigned int*)gate_ctr, stage)
-  if (!by_inv && ar_reg_form(n16, nb, nt, hc, stage)) {
+  if (cod) {
+    if (g_ar_late_push) drain = 4;      /* tests only: every push lands after its flag */
+#define R4D_ARGHWC(MODE_, CH_, inv_)                                                            \
+    r4d_ar_hc_write_coded_kernel<MODE_, CH_><<<nb, nt, 0, st>>>(                                \
+        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,         \
+        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
+        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,    \
+        inv_, (long long*)gate, (unsigned int*)gate_ctr)
+    if (by_inv) {
+      r4d_ar_gather_inv_kernel<<<1, 1024, 0, st>>>((int*)inv, (const int*)sorted, G.T);
+      R4D_ARGHWC(2, R4dUnchained, (const int*)inv);
+    } else if (chain) {
+      R4D_ARGHWC(1, r4dchain, nullptr);
+    } else {
+      R4D_ARGHWC(1, R4dUnchained, nullptr);
+    }
+#undef R4D_ARGHWC
+  } else if (!by_inv && ar_reg_form(n16, nb, nt, hc, stage)) {
     /* Tests only: every push lands after its flag (drain 4). */
     const int dr = g_ar_late_push ? 4 : (int)drain;
 #define R4D_ARGHWR(CH_)                                                                         \

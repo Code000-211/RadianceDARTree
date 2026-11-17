@@ -2762,7 +2762,11 @@ output feeds a gated residual rather than a norm; `y` is inout as `x` is above. 
 wires, one op per wire: a caller declares the rotated form beside the exact one and issues whichever
 the step's message goes out on, and `wire` 6 is 6 at every size. A caller states `wire` 0 on the
 exact form rather than omitting it: a row that serves one wire says so with a constraint on `wire`,
-and a constraint on an absent key does not hold.
+and a constraint on an absent key does not hold. The two-rank exact row (and `ar_gather_hc_write`'s)
+over P2P carries a message of 512 KiB or more with its push coded at about 12.1 bits a value,
+losslessly: the peer decodes the bf16 words the plain push would have carried, so `y` and `h` are
+the same bytes (docs/GUIDE.md §4.7; `R4D_AR_CODED_MIN_KB` moves the floor). The form needs a message
+of whole 256-value waves and leaves the others, and the host-mailbox twins, plain.
 
 `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output is the message,
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`

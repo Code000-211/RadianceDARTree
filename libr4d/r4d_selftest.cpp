@@ -31497,6 +31497,7 @@ struct ArHc {
     bool use_scratch = false;                  /* hand the inverse table's scratch to the gather */
     void* inst = nullptr;
     int rounds = 1;                            /* launches on the one instance, y handed in again */
+    std::vector<int> coded_seq;                /* launch r's `coded` is [r % size]; empty: none */
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<uint16_t> y_in, inj, h0;       /* what we hand the kernel */
     std::vector<uint16_t> ye, ew, sh, sg;      /* the gather's inputs */
@@ -31574,6 +31575,10 @@ static void ar_hc_worker(ArHc* t) {
         if (t->rc_launch == RAD_OK) {
             for (int round = 0; round < t->rounds && t->rc_launch == RAD_OK; ++round) {
                 if (round) st_memcpy(y, t->y_in.data(), yb, hipMemcpyHostToDevice);
+                std::vector<RadParam> lp = ps;
+                if (!t->coded_seq.empty())
+                    lp.push_back(PI("coded", t->coded_seq[(size_t)round % t->coded_seq.size()]));
+                a.p = lp.data(); a.n_p = (int)lp.size();
                 t->rc_launch = t->row->launch(&a, nullptr);
                 st_stream_sync(nullptr);
             }
@@ -31606,13 +31611,16 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
     struct Shape { int64_t M, n, hc, top_k; const char* act; bool scratch; };
     std::vector<Shape> shapes;
     if (!want_gather) {
-        /* A decode step's rows and a chunk's, both under the one-shot bands. */
-        shapes = { { 8, 1024, 4, 0, nullptr, false }, { 64, 2560, 2, 0, nullptr, false } };
+        /* A decode step's rows and a chunk's, both under the one-shot bands; and a message past
+         * the coded form's floor (r4d_ar_entry.hip), which the row then sends coded. */
+        shapes = { { 8, 1024, 4, 0, nullptr, false }, { 64, 2560, 2, 0, nullptr, false },
+                   { 256, 2560, 4, 0, nullptr, false } };
     } else {
         /* The first two stay under the launcher's by_inv line (its own widening keeps the LDS
          * table at or below eight rows a block); the third is a prefill-sized message where only
-         * the inverse table fits. The shared arm: absent, then "none" (the gate multiplies as it
-         * is -- exact against the host), then "sigmoid" (the ulp-tolerant arm). */
+         * the inverse table fits, and past the coded form's floor. The shared arm: absent, then
+         * "none" (the gate multiplies as it is -- exact against the host), then "sigmoid" (the
+         * ulp-tolerant arm). */
         shapes = { { 8, 256, 2, 10, nullptr, false }, { 40, 512, 4, 6, "none", false },
                    { 200, 2048, 2, 10, "sigmoid", true } };
     }
@@ -31881,6 +31889,171 @@ static void ar_hc_forms_case(const Plugin& pl, const std::vector<int>& devs, con
                 for (size_t i = 0; i < a.h_out.size(); ++i) { bad += a.h_out[i] != b.h_out[i]; nz += b.h_out[i] != 0; }
             }
             /* The two ranks' y agree as well (the fold is symmetric), and something was written. */
+            int64_t skew = 0;
+            for (size_t i = 0; i < runs[f][0].y_out.size(); ++i)
+                skew += runs[f][0].y_out[i] != runs[f][1].y_out[i];
+            ok((nm + at + ", " + kWhat[f]).c_str(), bad == 0 && skew == 0 && nz > M * hc * n,
+               fmt("%lld bytes differ from the plain kernels, %lld between the ranks", (long long)bad,
+                   (long long)skew));
+        }
+    }
+}
+
+/* The coded form of the two fused writes (r4d_ar_hc_write_coded_kernel: the push at ~12.1 bits a
+ * bf16 value, the chunk codec of the four-rank coded two-shot) against the plain kernels, through
+ * the `coded` launch parameter, from one row to a prefill chunk twice the usual size. Six launches
+ * back to back on one instance, y and h of every rank compared byte for byte after the last, in
+ * four arms: plain; coded; coded with every push held ~20 us behind its flag
+ * (r4d_ar_late_push_pin), the path the push check re-reads coded bytes on; and the two forms mixed
+ * (plain, plain, coded, coded, plain, coded), so each form's push lands on a slot the other left.
+ * The patterns send groups down every path of the codec: `rough` exponents over 2^-12..2^12 (most
+ * groups raw, some coded), and `paths` an exponent range of exactly 14 (coded) and 15 (raw), a
+ * subnormal, an infinity, zeros and exponents near the top beside ordinary groups. A message that
+ * is not whole 256-value waves keeps the plain kernels under `coded` 1, and so must agree too. */
+static uint16_t ar_hc_coded_bits(int pat, int rank, int64_t i, uint64_t r) {
+    switch (pat) {
+    case 1:  return h_to_bf16(ar_rough_value(rank, i));
+    case 2: {
+        const int64_t g = i / 64, j = i % 64;
+        const float base = ((int64_t)(r % 4001) - 2000) / 512.0f;
+        const float sg = (j & 1) ? -1.0f : 1.0f;
+        switch (g % 16) {
+        case 3:  return h_to_bf16(std::ldexp(base, 3 * (int)(j % 8)));
+        case 5:  return j == 17 ? (uint16_t)(rank == 1 ? 0x0005 : 0x3f80) : h_to_bf16(base);
+        case 7:  return (j == 40 && rank == 0) ? (uint16_t)0x7f80 : h_to_bf16(base);
+        case 9:  return 0;
+        case 11: return h_to_bf16(sg * (j == 5 ? 16384.0f : 1.0f));
+        case 13: return h_to_bf16(sg * (j == 5 ? 32768.0f : 1.0f));
+        case 14: return h_to_bf16(std::ldexp(base, 100));
+        default: return h_to_bf16(base);
+        }
+    }
+    default: return h_to_bf16(((int64_t)(r % 4001) - 2000) / 512.0f);
+    }
+}
+
+static void ar_hc_coded_case(const Plugin& pl, const std::vector<int>& devs, const char* name,
+                             bool want_gather) {
+    const RadKernelInfo* row = find(pl, name);
+    const std::string nm = std::string(name) + " coded form";
+    if (!row) { ok(nm.c_str(), false, "row absent"); return; }
+    if (devs.size() < 2) { skip(nm.c_str(), "needs 2 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 2)) { skip(nm.c_str(), "no peer path between the cards (device.p2p)"); return; }
+    if (!pl.pin_late_push) { skip(nm.c_str(), "no r4d_ar_late_push_pin"); return; }
+    struct Shape { int64_t M, n, hc; int pat; bool scratch; const char* act; };
+    std::vector<Shape> shapes;
+    /* Flash-Next's residual (n 2560, four streams) from a decode row to 4096 rows; then widths
+     * whose rows are one wave, a quarter wave and one word, and messages of no whole waves. */
+    for (int64_t M : { 1, 2, 3, 5, 8, 12, 13, 16, 31, 48, 64, 100, 127, 256, 513, 1024, 2048, 4096 })
+        shapes.push_back({ M, 2560, 4, (int)(M % 3), M > 64, nullptr });
+    shapes.push_back({ 48, 2560, 4, 2, true, "none" });
+    shapes.push_back({ 300, 2560, 2, 1, true, "none" });
+    shapes.push_back({ 77, 256, 2, 2, false, nullptr });
+    shapes.push_back({ 1000, 1024, 8, 1, true, nullptr });
+    shapes.push_back({ 64, 64, 2, 2, false, nullptr });
+    shapes.push_back({ 640, 8, 1, 2, true, nullptr });
+    shapes.push_back({ 6, 64, 2, 0, false, nullptr });     /* 48 words: not whole waves, plain */
+    shapes.push_back({ 33, 1000, 4, 1, true, nullptr });   /* 4125 words: plain */
+    static const char* const kPat[] = { "uniform", "rough", "paths" };
+    for (const Shape& sh : shapes) {
+        const int64_t M = sh.M, n = sh.n, hc = sh.hc, k = want_gather ? 8 : 0, T = M * k;
+        std::vector<int32_t> sorted((size_t)T, -1);
+        if (want_gather) {
+            std::vector<int32_t> ex((size_t)T);
+            uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^ (uint64_t)n;
+            auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+            for (int64_t i = 0; i < T; ++i) {
+                const uint64_t v = rnd();
+                ex[(size_t)i] = (v % 31 == 0) ? -1 : (int32_t)((v >> 8) % 64);
+            }
+            std::vector<int64_t> cnt(65, 0);
+            for (int64_t i = 0; i < T; ++i) if (ex[(size_t)i] >= 0) ++cnt[(size_t)ex[(size_t)i] + 1];
+            for (int e = 0; e < 64; ++e) cnt[(size_t)e + 1] += cnt[(size_t)e];
+            for (int64_t i = 0; i < T; ++i)
+                if (ex[(size_t)i] >= 0) sorted[(size_t)cnt[(size_t)ex[(size_t)i]]++] = (int32_t)i;
+        }
+        /* arm 0: plain; 1: coded; 2: coded, late pushes; 3: the forms mixed. */
+        static const std::vector<int> kSeq[] = { { 0 }, { 1 }, { 1 }, { 0, 0, 1, 1, 0, 1 } };
+        /* Every arm is handed the same inputs, built once. */
+        std::vector<ArHc> proto(2);
+        {
+            for (int r = 0; r < 2; ++r) {
+                ArHc& x = proto[(size_t)r];
+                x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = 2;
+                x.M = M; x.n = n; x.hc = hc; x.top_k = k; x.act = want_gather ? sh.act : nullptr;
+                x.use_scratch = sh.scratch; x.rounds = 6;
+                x.y_in.resize((size_t)(M * n));
+                x.inj.resize((size_t)(M * hc));
+                x.h0.resize((size_t)(M * hc * n));
+                uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)(r + 1) * 0x9E3779B97F4A7C15ull) ^
+                              ((uint64_t)M * 1315423911ull) ^ ((uint64_t)n * 2654435761ull);
+                auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+                for (int64_t i = 0; i < M * n; ++i)
+                    x.y_in[(size_t)i] = want_gather ? (uint16_t)0x7f7fu
+                                                    : ar_hc_coded_bits(sh.pat, r, i, rnd());
+                /* The gains and the streams are replicated across ranks, as the engine holds them. */
+                uint64_t rc = 0x2545F4914F6CDD1Dull ^ (uint64_t)M ^ ((uint64_t)n << 20);
+                auto rndc = [&]() { rc ^= rc << 13; rc ^= rc >> 7; rc ^= rc << 17; return rc; };
+                for (auto& v : x.inj) v = h_to_bf16(((int64_t)(rndc() % 2001) - 1000) / 4000.0f);
+                for (auto& v : x.h0) v = h_to_bf16(((int64_t)(rndc() % 4001) - 2000) / 512.0f);
+                if (want_gather) {
+                    x.sorted = sorted;
+                    x.ye.resize((size_t)(T * n));
+                    x.ew.resize((size_t)T);
+                    /* A routed row carries the pattern at its token's elements, so the gathered
+                     * word keeps the pattern's exponents (a weight scales a row by about one). */
+                    for (int64_t i = 0; i < T; ++i) {
+                        const int64_t tok = sorted[(size_t)i] >= 0 ? sorted[(size_t)i] / k : 0;
+                        for (int64_t e = 0; e < n; ++e)
+                            x.ye[(size_t)(i * n + e)] = ar_hc_coded_bits(sh.pat, r, tok * n + e, rnd());
+                    }
+                    for (auto& v : x.ew) v = h_to_bf16((float)(rndc() % 1000 + 1) / 1024.0f);
+                    if (x.act) {
+                        x.sh.resize((size_t)(M * n));
+                        x.sg.resize((size_t)M);
+                        for (auto& v : x.sh) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 256.0f);
+                        for (auto& v : x.sg) v = h_to_bf16(((int64_t)(rndc() % 801) - 400) / 100.0f);
+                    }
+                }
+            }
+        }
+        std::vector<std::vector<ArHc>> runs;
+        bool up = true, ran = true;
+        for (int arm = 0; arm < 4 && up && ran; ++arm) {
+            pl.pin_late_push(arm == 2 ? 1 : 0);
+            std::vector<ArHc> t = proto;
+            std::vector<std::thread> th;
+            for (ArHc& x : t) { x.coded_seq = kSeq[arm]; th.emplace_back(ar_hc_worker, &x); }
+            for (std::thread& x : th) x.join();
+            for (const ArHc& x : t) { up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == RAD_OK; }
+            if (row->fini) for (ArHc& x : t) if (x.inst) row->fini(x.inst);
+            /* The inputs are compared no further; the outputs are. */
+            for (ArHc& x : t) {
+                std::vector<uint16_t>().swap(x.ye); std::vector<uint16_t>().swap(x.h0);
+                std::vector<uint16_t>().swap(x.y_in);
+            }
+            runs.push_back(std::move(t));
+        }
+        pl.pin_late_push(0);
+        const bool waves = (M * n) % 256 == 0;
+        const std::string at = fmt(" M=%lld n=%lld hc=%lld %s%s%s%s", (long long)M, (long long)n,
+                                   (long long)hc, kPat[sh.pat],
+                                   want_gather ? (sh.scratch ? ", top_k 8, inverse table" : ", top_k 8") : "",
+                                   want_gather && sh.act ? ", shared arm" : "",
+                                   waves ? "" : " (not whole waves: plain)");
+        ok((nm + at + ": every arm launches").c_str(), up && ran && runs.size() == 4);
+        if (!up || !ran || runs.size() != 4) continue;
+        static const char* const kWhat[] = { "", "byte-identical to the plain kernels after six launches",
+                                             "with every push ~20 us behind its flag: byte-identical too",
+                                             "mixed with the plain kernels on one instance: byte-identical too" };
+        for (size_t f = 1; f < 4; ++f) {
+            int64_t bad = 0, nz = 0;
+            for (int r = 0; r < 2; ++r) {
+                const ArHc& a = runs[0][(size_t)r];
+                const ArHc& b = runs[f][(size_t)r];
+                for (size_t i = 0; i < a.y_out.size(); ++i) bad += a.y_out[i] != b.y_out[i];
+                for (size_t i = 0; i < a.h_out.size(); ++i) { bad += a.h_out[i] != b.h_out[i]; nz += b.h_out[i] != 0; }
+            }
             int64_t skew = 0;
             for (size_t i = 0; i < runs[f][0].y_out.size(); ++i)
                 skew += runs[f][0].y_out[i] != runs[f][1].y_out[i];
@@ -36397,8 +36570,10 @@ static void device_phase(const Plugin& pl) {
             ar_hc_write_case(pl, devs, n.c_str(), std::strstr(base, "4rank") ? 4 : 2,
                              std::strstr(base, "gather") != nullptr);
             /* The host twins keep the plain kernels: their mailbox is read over the link. */
-            if (!std::strstr(base, "4rank") && n == base)
+            if (!std::strstr(base, "4rank") && n == base) {
                 ar_hc_forms_case(pl, devs, n.c_str(), std::strstr(base, "gather") != nullptr);
+                ar_hc_coded_case(pl, devs, n.c_str(), std::strstr(base, "gather") != nullptr);
+            }
         }
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width

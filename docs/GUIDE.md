@@ -1930,6 +1930,19 @@ four ranks only the exact wire has a fused form, used for decode and verify step
 `max-num-seqs` x (1 + `num-speculative-tokens`) rows; prefill chunks and tiered-int8 messages run
 the unfused chain.
 
+At two ranks the exact wire's fused writes send a message of 512 KiB or more coded, at about 12.1
+bits a bf16 value instead of 16, and losslessly: a value keeps its sign and its mantissa and takes a
+4-bit offset from a base exponent its 64 neighbours share, and a group whose exponents span more
+than 14 (or that holds a subnormal, an inf or a NaN) travels raw. The peer decodes the bf16 words it
+would have been sent and folds them in the same order, so every byte of the result is the plain
+kernels' and nothing is configured. A prefill chunk's reductions are bound by the link (2048 rows of
+2560 are 10.5 MB each way, 96 times a chunk on Qwen3.8-Flash-Next, where the code is 12.13 to 12.16
+bits a value): coded, a long prompt's prefill gains 2.6 to 2.9% on 2x R9700 (24K tokens 6297 to 6479
+tok/s, 47K 6251 to 6414). A message under the floor stays plain: the two forms cost the same near
+280 KiB, an eight-stream decode or verify step is 240 KiB, and a one-stream step, bound by its
+handshake and not its bytes, is slower coded (a 20 KiB reduction 3.7 us plain and 5.5 coded, 3.8% of
+decode throughput). `R4D_AR_CODED_MIN_KB` (§8) moves the floor.
+
 **Cards without peer access.** The all-reduce kernels normally write into the other card's memory
 directly (P2P). At launch radiance asks the driver whether each pair of cards can, and logs the
 answer; the IOMMU setting, the PCIe topology and any switch between the cards decide. Where a pair
@@ -4635,6 +4648,7 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `model: <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `model: <owner/name>` fetches to without `server.download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
+| `R4D_AR_CODED_MIN_KB` | the smallest message, in KiB, the two-rank fused all-reduce writes send coded (§4.7; lossless, the same bytes out): `0` codes every message that fits the form, `off` none. Unset, 512 |
 | `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
 
 **Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the

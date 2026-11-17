@@ -332,11 +332,19 @@ void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_fla
 // form (r4d_ar_hc_write_reg_kernel), which also stores into the peer's wake word: `peer_flags` is
 // then 3 * r4d_ar_max_blocks() words (the flags and two slots' check words) and one more line of
 // 64 bytes behind them, as r4d_ar_entry.hip allocates it.
+// A non-zero `coded` (the gather form takes it too) carries the push at ~12.1 bits a bf16 value,
+// losslessly (r4d_ar_hc_write_coded_kernel: the same y and h, byte for byte), wherever
+// r4d_ar_coded2_ok says the message fits the form: whole 256-value waves, a P2P instance, and a
+// slot of r4d_ar_coded2_bytes. Both ranks must pass the same value. It then takes precedence over
+// the register form, which the caller keeps by coding large messages only.
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream, long nblocks, long nthreads,
                      long drain, long acq, long gate, long gate_ctr, long stage = 0,
-                     long chain = 0);
+                     long chain = 0, long coded = 0);
+int  r4d_ar_coded2_ok(long n16, long slot_stride16, long stage);
+// Bytes a slot must have for the coded form of any message of up to n16 16-byte words.
+long r4d_ar_coded2_bytes(long n16);
 // The same with the MoE gather as its prologue: y is produced, not read, from the routed experts'
 // rows `ye` [M*top_k][ye_ld] summed to token order by weights `ew` [M][ew_ld] and `sorted`
 // [M*top_k], with the shared arm `sh` [M][sh_ld] and its gate `sg` folded when both are non-zero.
@@ -349,7 +357,7 @@ int  r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags,
                             long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                             long top_k, long sig, long stream, long nblocks, long nthreads,
                             long drain, long acq, long inv, long gate, long gate_ctr,
-                            long stage = 0, long chain = 0);
+                            long stage = 0, long chain = 0, long coded = 0);
 // r4d_ar_hc_write and r4d_ar_gather_hc_write on the rotated 6-bit wire (r4d_ar_oneshot_2rank_wht6's
 // format, loc_pack and scratch split): byte-identical to all_reduce on that wire then hc_write,
 // with `ye` non-zero preceded by moe_gather. Gather operands as r4d_ar_gather_hc_write; its slot
