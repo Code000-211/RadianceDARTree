@@ -1303,6 +1303,34 @@ from 6.5 to 31 tokens/s each and delayed the last first token by 6 %. Because th
 device's timing, which steps carry a chunk differs from run to run; a number schedules the same
 steps every time.
 
+**Room for the decode rows: `--decode-headroom auto|N|0`.** A step carrying a chunk is planned at
+the prefill budget (`--max-num-batched-tokens`), which the chunk keeps whole, and the decode rows
+riding along take up to `N` rows on top of it; only rows past that come out of the budget. Without
+it, every interval beside decoding sequences is two steps: a chunk short by the decode rows
+(rounded down to the quantum) and a remainder of one quantum up to the checkpoint boundary. On
+Qwen3.8-Flash-Next at TP2 with 8 sessions decoding (MTP 3) beside a 64K prompt that remainder ran
+31 times at ~86 ms beside ~477 ms chunks. `auto` (the default) is a row per verified position of
+every other sequence, `(max-num-seqs - 1) x (1 + drafts)`, rounded up to 64 and at most 256 (the
+activation arena's smallest level, an eighth of the default budget); `0` plans as before, step for
+step, and is what `auto` resolves to under `--deterministic`, for a generator and in KL mode.
+Everything that holds a whole step (the activation arena, the batch staging, the KV manager's
+per-step blocks) is sized for budget + headroom; startup prints the headroom and what it adds to
+the arena:
+
+```
+decode headroom: 256 rows on a 2048-token budget, steps of up to 2304 tokens; the activation arena
+is ... a rank, ... more than at the budget alone (--decode-headroom 0)
+```
+
+The chunks stay where they were (on the checkpoint interval and, under `--prefix-resume exact`,
+on the grid an idle server cuts), so a prompt's checkpoints do not move; which decode tokens share a
+step does, as any change in load moves them. Measured on Qwen3.8-Flash-Next fp8 (TP2, MTP 3, 8
+sessions decoding beside 64K prompts, `--max-num-seqs 16`, so 64 rows of headroom), auto against
+`0`: aggregate prefill 3,664 -> 4,455 tokens/s (+22 %), time to first token 17.3 -> 14.2 s; the
+decoders go from 12.3 to 9.5 tokens/s each, losing the cheap remainder steps they used to get a
+token from, which `--prefill-interleave N` gives back. The arena grew by 12.4 MiB a rank (of
+570 MiB).
+
 **A prefill alone in its step can carry several intervals** (`prefill-span: N`, default 1). A
 chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
 With
@@ -2493,6 +2521,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | key | default | |
 |---|---|---|
 | `max-num-batched-tokens: N` | 2048 | largest token count one step may carry |
+| `decode-headroom: MODE` | auto | rows a step carries for decode rows on top of the budget, so a chunk beside decoders fills its interval in one step (§4.5): `auto` is (max-num-seqs - 1) x (1 + drafts), at most 256; `0` is the budget alone |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
