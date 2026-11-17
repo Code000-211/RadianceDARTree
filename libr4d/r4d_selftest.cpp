@@ -153,6 +153,9 @@ struct Plugin {
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_hc_dec)(int) = nullptr;
+    long long (*hc_rcp_check)(unsigned, unsigned, long long*) = nullptr;
+    void (*pin_usel)(int, int) = nullptr;
+    int (*usel_geom)(int, int*) = nullptr;
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -227,6 +230,9 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
+    okall &= sym(pl->h, "r4d_hc_rcp_check", &pl->hc_rcp_check);
+    okall &= sym(pl->h, "r4d_attn_usel_gqa12_pin", &pl->pin_usel);
+    okall &= sym(pl->h, "r4d_attn_usel_gqa12_geom", &pl->usel_geom);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -4071,6 +4077,853 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
                   "differ; %lld nonzero codes", (long long)n_o, ob, (long long)n_q, q8b,
                   (long long)n_s, sb, (long long)live);
     ok(name.c_str(), n_o == 0 && n_q == 0 && n_s == 0 && live > 0, msg);
+}
+
+/* ------------------------------------------------- the sparse launch's prefill form
+ *
+ * r4d_attn_usel.h: a launch of many q_len-1 rows (QSA's sparse attention at a prefill chunk) run as
+ * tiles of rows over the union of their page lists, against the decode kernel a row that every
+ * launch took before. Both through r4d_attn_usel_gqa12_pin (1 the decode kernel, 2 the tiled form,
+ * with the union size past which a tile is handed back), at Qwen3.8-Flash-Next's TP2 rank (12
+ * query heads over one KV head of 256, 4-token pages, lists of 512 pages and the partial one).
+ *
+ * A workload is NR launch rows and a cache; three kinds:
+ *   0  NR consecutive queries ending a context of `ctx` tokens, each selecting its 512 best of the
+ *      blocks wholly behind it by a score that drifts slowly from query to query (neighbours share
+ *      most of their lists, as a chunk's queries do), in block order, then its partial page; two
+ *      padded rows; below 2052 tokens every block.
+ *   1  the same, but the `grp` rows of a tile share the first one's list and key count; every
+ *      other tile's rows end with their whole pages.
+ *   2  rows of unrelated sequences: 40 pages each (`grp` of them when it names more than a
+ *      tile's rows), no page shared; the rows of every other sixteen end inside their last page.
+ * `scramble` permutes the page ids (block b's keys move with its page), so two workloads that differ
+ * in it alone hold the same keys under other ids. */
+static const RadKernelInfo* tsel_libref_row(const char* op);   /* libref's row for an op, below */
+struct UselWork {
+    int64_t NR = 0, W = 513, pages = 0;
+    std::vector<int32_t> table, used;       /* [NR, W] page ids, -1 padded; [NR] keys */
+    std::vector<int32_t> page;              /* block -> page id */
+};
+static UselWork usel_work(int64_t NR, int64_t ctx, int kind, uint32_t scramble, int64_t grp = 16) {
+    const int64_t W = 513, topk = 512, bs = 4;
+    UselWork w;
+    w.NR = NR; w.W = W;
+    const int64_t own2 = grp > 16 ? std::min<int64_t>(grp, topk) : 40;   /* kind 2: pages a row */
+    const int64_t nblk = kind == 2 ? NR * own2 : (ctx + bs - 1) / bs;
+    w.pages = nblk + 5;
+    w.page.resize((size_t)w.pages);
+    for (int64_t b = 0; b < w.pages; ++b) w.page[(size_t)b] = (int32_t)b;
+    uint32_t st = 0x51f15e5du ^ scramble;
+    for (int64_t b = w.pages - 1; b > 0; --b) {
+        st = st * 1664525u + 1013904223u;
+        std::swap(w.page[(size_t)b], w.page[(size_t)((st >> 8) % (uint32_t)(b + 1))]);
+    }
+    w.table.assign((size_t)(NR * W), -1);
+    w.used.assign((size_t)NR, 0);
+    auto h01 = [](uint32_t a, uint32_t b) {
+        return (float)(st_mix32(a * 0x9e3779b1u + st_mix32(b + 0x7f4a7c15u)) >> 8) / 16777216.0f;
+    };
+    std::vector<std::pair<float, int32_t>> sc;
+    for (int64_t i = 0; i < NR; ++i) {
+        int32_t* row = &w.table[(size_t)(i * W)];
+        if (kind == 2) {
+            for (int64_t j = 0; j < own2; ++j) row[j] = w.page[(size_t)(i * own2 + j)];
+            w.used[(size_t)i] = (int32_t)(own2 * bs - ((i / 16) % 2 ? i % 4 : 0));
+            continue;
+        }
+        const int64_t is = kind == 1 ? i - i % grp : i;      /* the row whose list this one takes */
+        if (kind == 0 && (i == 5 || i == NR - 3)) continue;   /* padded */
+        const int64_t p = ctx - NR + is, own = (p + 1) / bs;
+        int64_t n = 0;
+        if (own <= topk) {
+            for (int64_t b = 0; b < own; ++b) row[n++] = w.page[(size_t)b];
+        } else {
+            sc.clear();
+            const uint32_t ep = (uint32_t)(is / 24);
+            const float fr = (float)(is % 24) / 24.0f;
+            for (int64_t b = 0; b < own; ++b) {
+                const float drift = (1.0f - fr) * h01((uint32_t)b, 2 + ep) + fr * h01((uint32_t)b, 3 + ep);
+                const float near = own - b <= 48 ? 4.0f : 0.0f;
+                sc.push_back({ h01((uint32_t)b, 1) + 0.9f * drift + 0.12f * h01((uint32_t)b, 1000 + (uint32_t)is) + near,
+                               (int32_t)b });
+            }
+            std::nth_element(sc.begin(), sc.begin() + topk, sc.end(),
+                             [](const auto& x, const auto& y) { return x.first > y.first; });
+            std::vector<int32_t> blk;
+            for (int64_t k = 0; k < topk; ++k) blk.push_back(sc[(size_t)k].second);
+            std::sort(blk.begin(), blk.end());
+            for (int32_t b : blk) row[n++] = w.page[(size_t)b];
+        }
+        int32_t used = (int32_t)(n * bs);
+        const bool whole = kind == 1 && (is / grp) % 2 == 0;
+        if ((p + 1) % bs != 0 && !whole) { row[n] = w.page[(size_t)own]; used += (int32_t)(p % bs) + 1; }
+        w.used[(size_t)i] = used;
+    }
+    return w;
+}
+
+/* The cache of a workload: block b's four keys (K then V, 256 each) at its page, bounded random
+ * bf16 that depends on the block, not the page. `end` >= 0: the keys from token `end` on were
+ * never written and hold what a cache's memory may: inf and NaN. */
+static std::vector<uint16_t> usel_cache(const UselWork& w, int64_t end = -1) {
+    const int64_t hd = 256, bs = 4;
+    std::vector<uint16_t> kv((size_t)(w.pages * bs * 2 * hd));
+    for (int64_t b = 0; b < w.pages; ++b) {
+        uint16_t* dst = &kv[(size_t)((int64_t)w.page[(size_t)b] * bs * 2 * hd)];
+        for (int64_t e = 0; e < bs * 2 * hd; ++e) {
+            const uint32_t x = st_mix32((uint32_t)(b * bs * 2 * hd + e) ^ 0x3c6ef372u);
+            dst[e] = h_to_bf16((((float)(x & 0x00ffffffu) / 16777215.0f) * 2.0f - 1.0f) * 1.5f);
+            if (end >= 0 && b * bs + e / (2 * hd) >= end)
+                dst[e] = (x & 1u) ? (uint16_t)0x7fc0u : (x & 2u) ? (uint16_t)0x7f80u : (uint16_t)0xff80u;
+        }
+    }
+    return kv;
+}
+
+/* Distinct pages of each tile of G rows: mean and largest. */
+static void usel_union_stats(const UselWork& w, int64_t G, double* mean, int64_t* most) {
+    int64_t tiles = 0, sum = 0;
+    *most = 0;
+    for (int64_t r0 = 0; r0 < w.NR; r0 += G) {
+        std::vector<int32_t> s;
+        for (int64_t r = r0; r < std::min(w.NR, r0 + G); ++r) {
+            const int64_t n = (w.used[(size_t)r] + 3) / 4;
+            for (int64_t j = 0; j < n; ++j) s.push_back(w.table[(size_t)(r * w.W + j)]);
+        }
+        std::sort(s.begin(), s.end());
+        const int64_t u = std::unique(s.begin(), s.end()) - s.begin();
+        sum += u; ++tiles;
+        *most = std::max(*most, u);
+    }
+    *mean = tiles ? (double)sum / (double)tiles : 0.0;
+}
+
+/* Queries that single out one key each, for a workload and its cache: head h of row r is 3.3 times
+ * one key's K, so that key scores some 37 nats above the others and a softmax that sees it is
+ * that key's V. Bounded random queries cannot tell a row that reads one key too many or too few
+ * (one key in 2051 moves the output by less than a bf16 step); these can.
+ *   inside   the key is one of the row's own: by head, its last (the query's own token, in the
+ *            partial page where there is one), its first, the last key of its first page, or any.
+ *   outside  the key is one the row must not read: the next key of its partial page (a later
+ *            token of the same block), or a key of a page that a neighbouring row of its tile
+ *            lists and it does not. A form that masks right gives the broad softmax over the row's
+ *            own keys; one that lets the key through gives that key's V. */
+static std::vector<uint16_t> usel_sharp_q(const UselWork& w, const std::vector<uint16_t>& kv,
+                                          bool outside) {
+    const int64_t nq = 12, hd = 256;
+    std::vector<uint16_t> hq((size_t)(w.NR * nq * hd), 0);
+    for (int64_t r = 0; r < w.NR; ++r) {
+        const int32_t used = w.used[(size_t)r];
+        if (used <= 0) continue;
+        const int64_t n = (used + 3) / 4, last = used - 4 * (n - 1);
+        const int32_t* row = &w.table[(size_t)(r * w.W)];
+        for (int64_t h = 0; h < nq; ++h) {
+            const uint32_t rnd = st_mix32((uint32_t)(r * nq + h) ^ 0x5eed1234u);
+            int64_t page = -1, slot = 0;
+            if (!outside) {
+                int64_t k;
+                switch (h % 4) {
+                    case 0:  k = used - 1; break;
+                    case 1:  k = 0; break;
+                    case 2:  k = std::min<int64_t>(3, used - 1); break;
+                    default: k = rnd % (uint32_t)used; break;
+                }
+                page = row[k / 4]; slot = k % 4;
+            } else {
+                if (h % 2 == 0 && last < 4) { page = row[n - 1]; slot = last; }
+                else {
+                    /* A page the tile-mate lists and this row does not. */
+                    const int64_t mate = (r ^ 1) < w.NR ? (r ^ 1) : r;
+                    const int64_t nm = (w.used[(size_t)mate] + 3) / 4;
+                    for (int64_t j = (int64_t)(rnd % 97u); j < nm && page < 0; ++j) {
+                        const int32_t cand = w.table[(size_t)(mate * w.W + j)];
+                        if (std::find(row, row + n, cand) == row + n) page = cand;
+                    }
+                    slot = (int64_t)(rnd >> 8) % 4;
+                }
+            }
+            if (page < 0) {     /* nothing to single out: a bounded random query */
+                for (int64_t e = 0; e < hd; ++e)
+                    hq[(size_t)((r * nq + h) * hd + e)] = st_rand_bf16((uint32_t)((r * nq + h) * hd + e));
+                continue;
+            }
+            const uint16_t* kp = &kv[(size_t)((page * 4 + slot) * 2 * hd)];
+            for (int64_t e = 0; e < hd; ++e)
+                hq[(size_t)((r * nq + h) * hd + e)] = h_to_bf16(h_bf16(kp[e]) * 3.3f);
+        }
+    }
+    return hq;
+}
+
+struct UselOut { std::vector<uint8_t> o, q, s; int rc = 0; };
+
+/* One launch of the plain row (`gated` false: out) or of the rotated-int8 merge (out, codes,
+ * scales) over a workload, under a pin. */
+static UselOut usel_run(const Plugin& pl, const UselWork& w, const std::vector<uint16_t>& kv,
+                        const std::vector<uint16_t>& hq, const std::vector<uint16_t>& hqg,
+                        bool gated, int form, int lim) {
+    const int64_t nq = 12, nkv = 1, hd = 256, bs = 4, NR = w.NR;
+    UselOut out;
+    const RadKernelInfo* r = find(pl, gated ? "attn_decode_ghq_h256_gqa12_bf16kv"
+                                            : "attn_decode_h256_gqa12_bf16kv");
+    if (!r) { out.rc = -999; return out; }
+    const size_t ob = (size_t)(NR * nq * hd) * 2, q8b = (size_t)(NR * nq * hd);
+    const size_t sb = (size_t)(NR * nq * (hd / 128)) * 4;
+    void* d_q  = dalloc(hq.size() * 2);
+    void* d_qg = dalloc(hqg.size() * 2);
+    void* d_c  = dalloc(kv.size() * 2);
+    void* d_o  = dalloc(ob);
+    void* d_q8 = dalloc(q8b);
+    void* d_s  = dalloc(sb);
+    if (!d_q || !d_qg || !d_c || !d_o || !d_q8 || !d_s) { out.rc = -998; return out; }
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_c, kv.data(), kv.size() * 2, hipMemcpyHostToDevice);
+    RadTensor gate = T((uint8_t*)d_qg + hd * 2, RAD_BF16, { NR, nq, hd });
+    gate.stride[0] = nq * 2 * hd;
+    gate.stride[1] = 2 * hd;
+    std::vector<RadTensor> ts = {
+        T(d_q, RAD_BF16, { NR, nq, hd }),
+        T(d_c, RAD_BF16, { w.pages, nkv, bs, 2 * hd }),
+        TI32({ NR, w.W }, w.table),
+        TI32({ NR }, w.used),
+        RadTensor{}, RadTensor{}, RadTensor{},
+        T(d_o, RAD_BF16, { NR, nq * hd }) };
+    std::vector<RadParam> ps = {
+        PI("q_len", 1), PI("head_dim", hd), PI("gqa", nq / nkv), PI("block_size", bs),
+        PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+        PI("n_head", nq), PI("max_seqs", NR), PI("max_ctx", 513 * bs),
+    };
+    if (gated) {
+        ts.push_back(gate);
+        ts.push_back(T(d_q8, RAD_I8, { NR, nq * hd }));
+        ts.push_back(T(d_s, RAD_F32, { NR, nq * hd / 128 }));
+        ps.push_back(PI("group", 128));
+        ps.push_back(PS("act", "sigmoid"));
+    }
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    if (pl.pin_usel) pl.pin_usel(form, lim);
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) {
+            /* The scratch as an engine hands it over: full of another launch's bytes. All ones
+             * here, so a partial or a table entry read where this launch did not write it is a
+             * NaN, a flagged tile or a page that does not exist. */
+            a.scratch = dalloc((size_t)need);
+            a.scratch_bytes = need;
+            if (!a.scratch) { out.rc = -998; return out; }
+            const std::vector<uint8_t> ones((size_t)need, 0xff);
+            st_memcpy(a.scratch, ones.data(), (size_t)need, hipMemcpyHostToDevice);
+        }
+    }
+    out.rc = r->launch(&a, nullptr);
+    if (st_stream_sync(nullptr) != hipSuccess) out.rc = -997;
+    if (pl.pin_usel) pl.pin_usel(0, 0);
+    out.o.resize(ob); out.q.resize(q8b); out.s.resize(sb);
+    st_memcpy(out.o.data(), d_o, ob, hipMemcpyDeviceToHost);
+    st_memcpy(out.q.data(), d_q8, q8b, hipMemcpyDeviceToHost);
+    st_memcpy(out.s.data(), d_s, sb, hipMemcpyDeviceToHost);
+    return out;
+}
+
+/* The two forms on usel_sharp_q's queries, the plain row: any (row, head) whose outputs differ by
+ * more than rounding has read a key it should not, or missed one. */
+static void usel_sharp_check(const Plugin& pl, const UselWork& w, const std::vector<uint16_t>& kv,
+                             const std::string& at) {
+    const int64_t nq = 12, hd = 256;
+    const std::vector<uint16_t> hqg((size_t)(w.NR * nq * 2 * hd), 0);
+    for (int outside = 0; outside < 2; ++outside) {
+        const std::vector<uint16_t> sq = usel_sharp_q(w, kv, outside != 0);
+        const UselOut d = usel_run(pl, w, kv, sq, hqg, false, 1, 0);
+        const UselOut t = usel_run(pl, w, kv, sq, hqg, false, 2, 1 << 30);
+        const std::string what = fmt("the sparse launch's prefill form, queries that single out a "
+                                     "key %s%s", outside ? "the row must not read" : "of the row's own",
+                                     at.c_str());
+        if (d.rc != RAD_OK || t.rc != RAD_OK) {
+            ok(what.c_str(), false, fmt("rc=%d, %d", d.rc, t.rc));
+            dfree_all();
+            return;
+        }
+        int64_t differ = 0, off = 0, first_off = -1;
+        double worst = 0.0;
+        for (int64_t rh = 0; rh < w.NR * nq; ++rh) {
+            float top = 0.0f, dm = 0.0f;
+            for (int64_t e = 0; e < hd; ++e) {
+                uint16_t ua, ub;
+                std::memcpy(&ua, &d.o[(size_t)(rh * hd + e) * 2], 2);
+                std::memcpy(&ub, &t.o[(size_t)(rh * hd + e) * 2], 2);
+                const float fa = h_bf16(ua), fb = h_bf16(ub);
+                top = std::max(top, std::max(std::fabs(fa), std::fabs(fb)));
+                dm = std::max(dm, std::fabs(fa - fb));
+                differ += ua != ub;
+            }
+            const double rel = top > 0.0f ? (double)dm / (double)top : 0.0;
+            worst = std::max(worst, rel);
+            if (rel > 1.0 / 32.0) { ++off; if (first_off < 0) first_off = rh; }
+        }
+        ok(fmt("%s: tiled against the decode kernel, %lld of %lld bf16 values differ, by at most "
+               "%.2e of the row's largest", what.c_str(), (long long)differ,
+               (long long)(w.NR * nq * hd), worst).c_str(),
+           off == 0,
+           fmt("%lld (row, head) pairs differ past rounding, the first row %lld head %lld",
+               (long long)off, (long long)(first_off / nq), (long long)(first_off % nq)));
+        dfree_all();
+    }
+}
+
+/* The claims, at NR rows:
+ *
+ *   1. Handed back whole (a union limit of one page), the form's launch is the decode launch byte
+ *      for byte: the hand-back runs the decode kernel on the rows it is given.
+ *   2. Where the rows of a tile share one list, the tiled kernel is byte-identical to the decode
+ *      kernel: a row's keys then meet the same sixteen-key m-tiles in the same order, so a score,
+ *      a p, a partial and a merge are the same arithmetic. Likewise below the exactness bound,
+ *      where a row's list is a prefix of its successor's.
+ *   3. On a chunk's lists the two agree to the rounding of an f16 p against another reference max
+ *      and of the softmax sums in another order: the outputs differ in a share of bf16 values
+ *      (printed; an eighth on these lists), each by one unit in the last place of a value near the
+ *      row's largest, and both sit as close to an f64 evaluation of each row's own key set as each
+ *      other (a key too many or too few in a mask would show there as an error far above
+ *      rounding), and to libref's attn_paged.
+ *   4. Deterministic, and independent of the page ids: twice the same bytes, and the same bytes
+ *      again when the pages are renumbered.
+ *   5. Rows of unrelated sequences: tiled (when forced) within the same rounding, and under the
+ *      launcher's limit handed back for sharing nothing, byte-identical to the decode launch.
+ *   6. The gated merge (rotated int8 codes): the same statements about out, codes and scales.
+ *   7. A context that ends inside a page: the slots behind its last token were never written, and
+ *      hold inf and NaN here. The decode kernel loads no key past a row's count; the tiled form
+ *      stages a union's pages for all its rows, and stages zeros for the slots no row of the tile
+ *      sees. No output moves with what those slots hold, none is not finite, and the forms agree
+ *      as in 3; both for a launch that starts on a page and for one that starts inside one, where
+ *      every tile ends in a page whose other keys belong to the next tile's rows.
+ *   8. Queries that single out one key (usel_sharp_q): of the row's own, both forms give that
+ *      key's V; one the row must not read (a later token of its own block, a page only its
+ *      neighbour lists), both give the softmax over the row's keys.
+ *   9. The form's other geometries (r4d_attn_usel_gqa12_geom; the launcher takes the first): 3,
+ *      7 and 8 in short, on a launch that starts inside a page and ends inside one.
+ * Every launch finds its scratch full of ones (usel_run). */
+static void attn_usel_case(const Plugin& pl, int64_t NR, int64_t ctx) {
+    const char* row = "attn_decode_ghq_h256_gqa12_bf16kv";
+    const bool a = sel(row), b = sel("attn_decode_h256_gqa12_bf16kv");
+    if (!a && !b) return;
+    if (!pl.pin_usel || !pl.usel_geom) {
+        skip("the sparse launch's prefill form", "no r4d_attn_usel_gqa12_pin");
+        return;
+    }
+    const int64_t nq = 12, hd = 256;
+    const int64_t G = pl.usel_geom(-1, nullptr);     /* rows a tile */
+    const std::string at = fmt(" at %lld rows over %lld tokens", (long long)NR, (long long)ctx);
+    std::vector<uint16_t> hq((size_t)(NR * nq * hd)), hqg((size_t)(NR * nq * 2 * hd));
+    for (size_t i = 0; i < hq.size(); ++i)
+        hq[i] = h_to_bf16(h_bf16(st_rand_bf16((uint32_t)i ^ 0x1234567u)) * 2.0f);
+    for (size_t i = 0; i < hqg.size(); ++i)
+        hqg[i] = h_to_bf16(h_bf16(st_rand_bf16((uint32_t)i ^ 0x7654321u)) * 6.0f);
+
+    auto nd = [](const std::vector<uint8_t>& x, const std::vector<uint8_t>& y) {
+        int64_t n = 0;
+        for (size_t i = 0; i < x.size(); ++i) n += x[i] != y[i];
+        return n;
+    };
+    auto same = [&](const UselOut& x, const UselOut& y) {
+        return nd(x.o, y.o) == 0 && nd(x.q, y.q) == 0 && nd(x.s, y.s) == 0;
+    };
+    auto served = [&](const UselOut& x, const char* what) {
+        if (x.rc == RAD_OK) return true;
+        ok((std::string("the sparse launch's prefill form: ") + what + at).c_str(), false,
+           fmt("rc=%d", x.rc));
+        return false;
+    };
+    /* bf16 values of two outputs: how many differ, and the largest difference against the larger
+     * magnitude of the pair's (row, head). */
+    struct Diff { int64_t n = 0, differ = 0; double rel = 0.0; };
+    auto diff16 = [&](const std::vector<uint8_t>& x, const std::vector<uint8_t>& y) {
+        Diff d;
+        d.n = (int64_t)(x.size() / 2);
+        for (int64_t rh = 0; rh < d.n / hd; ++rh) {
+            float top = 0.0f, dm = 0.0f;
+            for (int64_t e = 0; e < hd; ++e) {
+                uint16_t ua, ub;
+                std::memcpy(&ua, &x[(size_t)(rh * hd + e) * 2], 2);
+                std::memcpy(&ub, &y[(size_t)(rh * hd + e) * 2], 2);
+                const float fa = h_bf16(ua), fb = h_bf16(ub);
+                top = std::max(top, std::max(std::fabs(fa), std::fabs(fb)));
+                dm = std::max(dm, std::fabs(fa - fb));
+                d.differ += ua != ub;
+            }
+            if (top > 0.0f) d.rel = std::max(d.rel, (double)dm / (double)top);
+        }
+        return d;
+    };
+
+    for (int gated = 0; gated < 2; ++gated) {
+        const char* gn = gated ? "gated merge, " : "";
+        /* ---- a chunk's lists */
+        const UselWork w0 = usel_work(NR, ctx, 0, 0);
+        const std::vector<uint16_t> kv0 = usel_cache(w0);
+        double umean = 0.0; int64_t umost = 0;
+        usel_union_stats(w0, G, &umean, &umost);
+        const UselOut dec  = usel_run(pl, w0, kv0, hq, hqg, gated, 1, 0);
+        const UselOut til  = usel_run(pl, w0, kv0, hq, hqg, gated, 2, 1 << 30);
+        const UselOut til2 = usel_run(pl, w0, kv0, hq, hqg, gated, 2, 1 << 30);
+        const UselOut back = usel_run(pl, w0, kv0, hq, hqg, gated, 2, 1);
+        if (!served(dec, "decode") || !served(til, "tiled") || !served(til2, "tiled") ||
+            !served(back, "handed back")) { dfree_all(); return; }
+        int64_t live = 0;
+        for (uint8_t x : dec.o) live += x != 0;
+        ok(fmt("the sparse launch's prefill form, %shanded back whole: byte-identical to the decode "
+               "launch%s", gn, at.c_str()).c_str(),
+           same(dec, back) && live > 0,
+           fmt("out %lld, codes %lld, scales %lld bytes differ; %lld non-zero",
+               (long long)nd(dec.o, back.o), (long long)nd(dec.q, back.q),
+               (long long)nd(dec.s, back.s), (long long)live));
+        ok(fmt("the sparse launch's prefill form, %stiled twice: the same bytes%s", gn,
+               at.c_str()).c_str(), same(til, til2));
+        {
+            const Diff d = diff16(dec.o, til.o);
+            ok(fmt("the sparse launch's prefill form, %stiled against the decode kernel%s: %lld of "
+                   "%lld bf16 values differ (%.3f %%), by at most %.2e of the row's largest; union "
+                   "%.0f pages a tile (most %lld)", gn, at.c_str(), (long long)d.differ,
+                   (long long)d.n, 100.0 * (double)d.differ / (double)d.n, d.rel, umean,
+                   (long long)umost).c_str(),
+               d.differ * 4 < d.n && d.rel < 1.0 / 64.0);
+            if (gated) {
+                int64_t cd = 0, cmax = 0;
+                for (size_t i = 0; i < dec.q.size(); ++i) {
+                    const int dl = std::abs((int)(int8_t)dec.q[i] - (int)(int8_t)til.q[i]);
+                    cd += dl != 0; cmax = std::max<int64_t>(cmax, dl);
+                }
+                double srel = 0.0;
+                for (size_t i = 0; i + 3 < dec.s.size(); i += 4) {
+                    float x, y;
+                    std::memcpy(&x, &dec.s[i], 4); std::memcpy(&y, &til.s[i], 4);
+                    if (x != 0.0f) srel = std::max(srel, (double)std::fabs(x - y) / (double)std::fabs(x));
+                }
+                ok(fmt("the sparse launch's prefill form, gated merge%s: %lld of %zu int8 codes "
+                       "differ (%.3f %%), by at most %lld; scales within %.2e", at.c_str(),
+                       (long long)cd, dec.q.size(), 100.0 * (double)cd / (double)dec.q.size(),
+                       (long long)cmax, srel).c_str(),
+                   cd * 10 < (int64_t)dec.q.size() && cmax <= 3 && srel < 1.0 / 32.0);
+            }
+        }
+        /* ---- each form against f64 over the row's own keys, a sample of rows (plain only) */
+        if (!gated) {
+            std::vector<int64_t> rows;
+            for (int64_t r = 0; r < NR; r += std::max<int64_t>(1, NR / 24)) rows.push_back(r);
+            for (int64_t r : { (int64_t)1, (int64_t)2, (int64_t)3, (int64_t)15, (int64_t)17, NR - 1, NR - 2, NR - 4 })
+                if (r >= 0 && r < NR) rows.push_back(r);
+            std::vector<double> ed(rows.size(), 0.0), et(rows.size(), 0.0);
+            st_par_for((int64_t)rows.size(), [&](int64_t ri) {
+                const int64_t r = rows[(size_t)ri];
+                const int32_t used = w0.used[(size_t)r];
+                if (used <= 0) return;
+                std::vector<double> s((size_t)used), o((size_t)hd);
+                for (int64_t h = 0; h < nq; ++h) {
+                    const uint16_t* q = &hq[(size_t)((r * nq + h) * hd)];
+                    double top = -1e300;
+                    for (int32_t k = 0; k < used; ++k) {
+                        const uint16_t* kp = &kv0[(size_t)(((int64_t)w0.table[(size_t)(r * w0.W + k / 4)] * 4 + k % 4) * 2 * hd)];
+                        double acc = 0.0;
+                        for (int64_t e = 0; e < hd; ++e) acc += (double)h_bf16(q[e]) * (double)h_bf16(kp[e]);
+                        s[(size_t)k] = acc / 16.0;
+                        top = std::max(top, s[(size_t)k]);
+                    }
+                    double l = 0.0;
+                    std::fill(o.begin(), o.end(), 0.0);
+                    for (int32_t k = 0; k < used; ++k) {
+                        const double p = std::exp(s[(size_t)k] - top);
+                        const uint16_t* vp = &kv0[(size_t)(((int64_t)w0.table[(size_t)(r * w0.W + k / 4)] * 4 + k % 4) * 2 * hd + hd)];
+                        l += p;
+                        for (int64_t e = 0; e < hd; ++e) o[(size_t)e] += p * (double)h_bf16(vp[e]);
+                    }
+                    double mx = 0.0, e1 = 0.0, e2 = 0.0;
+                    for (int64_t e = 0; e < hd; ++e) {
+                        const double ref = o[(size_t)e] / l;
+                        uint16_t ua, ub;
+                        std::memcpy(&ua, &dec.o[(size_t)((r * nq + h) * hd + e) * 2], 2);
+                        std::memcpy(&ub, &til.o[(size_t)((r * nq + h) * hd + e) * 2], 2);
+                        mx = std::max(mx, std::fabs(ref));
+                        e1 = std::max(e1, std::fabs((double)h_bf16(ua) - ref));
+                        e2 = std::max(e2, std::fabs((double)h_bf16(ub) - ref));
+                    }
+                    if (mx > 0.0) {
+                        ed[(size_t)ri] = std::max(ed[(size_t)ri], e1 / mx);
+                        et[(size_t)ri] = std::max(et[(size_t)ri], e2 / mx);
+                    }
+                }
+            });
+            double md = 0.0, mt = 0.0;
+            for (size_t i = 0; i < rows.size(); ++i) { md = std::max(md, ed[i]); mt = std::max(mt, et[i]); }
+            ok(fmt("the sparse launch's prefill form against f64 over each row's own keys%s, %zu "
+                   "rows: tiled within %.2e of the row's largest, the decode kernel %.2e",
+                   at.c_str(), rows.size(), mt, md).c_str(),
+               mt < 1.0 / 100.0 && md < 1.0 / 100.0 && mt > 0.0);
+            /* libref's attn_paged on the same bytes, every row: the op's oracle, the bound the
+             * tree-sel row's check uses. */
+            const RadKernelInfo* rr = tsel_libref_row("attn_paged");
+            if (!rr) {
+                skip("the sparse launch's prefill form against libref", "libref's attn_paged unavailable");
+            } else {
+                std::vector<uint8_t> hout((size_t)(NR * nq * hd) * 2, 0);
+                std::vector<uint16_t> hq2 = hq, kv2 = kv0;
+                std::vector<int32_t> tb = w0.table, us = w0.used;
+                std::vector<RadTensor> ts = {
+                    T(hq2.data(), RAD_BF16, { NR, nq, hd }),
+                    T(kv2.data(), RAD_BF16, { w0.pages, 1, 4, 2 * hd }),
+                    T(tb.data(), RAD_I32, { NR, w0.W }), T(us.data(), RAD_I32, { NR }),
+                    RadTensor{}, RadTensor{}, RadTensor{},
+                    T(hout.data(), RAD_BF16, { NR, nq * hd }),
+                };
+                std::vector<RadParam> ps = {
+                    PI("q_len", 1), PI("head_dim", hd), PI("gqa", nq), PI("block_size", 4),
+                    PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+                    PI("n_head", nq), PI("max_seqs", NR), PI("max_ctx", 513 * 4),
+                };
+                RadArgs ra;
+                std::memset(&ra, 0, sizeof ra);
+                ra.t = ts.data(); ra.n_t = (int)ts.size(); ra.p = ps.data(); ra.n_p = (int)ps.size();
+                ra.world_size = 1;
+                const int rc = rr->launch(&ra, nullptr);
+                auto rel_l2 = [&](const std::vector<uint8_t>& dev) {
+                    double num = 0, den = 0;
+                    for (size_t i = 0; i < (size_t)(NR * nq * hd); ++i) {
+                        uint16_t x, y;
+                        std::memcpy(&x, &dev[i * 2], 2);
+                        std::memcpy(&y, &hout[i * 2], 2);
+                        const double dx = h_bf16(x), dy = h_bf16(y);
+                        num += (dx - dy) * (dx - dy);
+                        den += dy * dy;
+                    }
+                    return den > 0 ? std::sqrt(num / den) : 1.0;
+                };
+                const double rt = rel_l2(til.o), rd = rel_l2(dec.o);
+                ok(fmt("the sparse launch's prefill form agrees with libref's attn_paged%s: rel_l2 "
+                       "%.3g tiled, %.3g the decode kernel", at.c_str(), rt, rd).c_str(),
+                   rc == RAD_OK && rt < 1.2e-2 && rd < 1.2e-2, fmt("rc=%d", rc));
+            }
+        }
+        /* ---- queries that single out one key */
+        if (!gated) usel_sharp_check(pl, w0, kv0, at);
+        dfree_all();
+        /* ---- a context that ends inside a page */
+        {
+            auto unfinite = [&](const std::vector<uint8_t>& o) {
+                int64_t n = 0;
+                for (size_t i = 0; i + 1 < o.size(); i += 2) {
+                    uint16_t u;
+                    std::memcpy(&u, &o[i], 2);
+                    n += (u & 0x7f80u) == 0x7f80u;
+                }
+                return n;
+            };
+            /* Two launches that end two tokens into a page: one that starts on a page, as a cold
+             * chunk does (its last tile alone holds a page nobody reads whole), and one that
+             * starts inside a page, as the prefill of a turn appended to a session does (every
+             * tile ends in such a page: the block its last rows begin, whose other keys are the
+             * next tile's). */
+            for (int inside = 0; inside < 2; ++inside) {
+                const int64_t NR4 = inside ? NR : NR - 2, ctx2 = ctx + 2;
+                const UselWork w4 = usel_work(NR4, ctx2, 0, 0);
+                const std::vector<uint16_t> kv4 = usel_cache(w4), kv4n = usel_cache(w4, ctx2);
+                const UselOut d4  = usel_run(pl, w4, kv4n, hq, hqg, gated, 1, 0);
+                const UselOut t4  = usel_run(pl, w4, kv4n, hq, hqg, gated, 2, 1 << 30);
+                const UselOut t4f = usel_run(pl, w4, kv4, hq, hqg, gated, 2, 1 << 30);
+                const UselOut l4  = usel_run(pl, w4, kv4n, hq, hqg, gated, 2, 0);
+                if (!served(d4, "decode, an open page") || !served(t4, "tiled, an open page") ||
+                    !served(t4f, "tiled, an open page") ||
+                    !served(l4, "the launcher's rule, an open page")) {
+                    dfree_all(); return;
+                }
+                const Diff d = diff16(d4.o, t4.o);
+                const int64_t bad = unfinite(d4.o) + unfinite(t4.o) + unfinite(l4.o);
+                ok(fmt("the sparse launch's prefill form, %sa context that ends inside a page, inf "
+                       "and NaN behind its end, %lld rows over %lld tokens (the launch starts %s a "
+                       "page): no output moves with them, none is not finite; tiled against the "
+                       "decode kernel %lld of %lld bf16 values differ, by at most %.2e of the row's "
+                       "largest", gn, (long long)NR4, (long long)ctx2, inside ? "inside" : "on",
+                       (long long)d.differ, (long long)d.n, d.rel).c_str(),
+                   same(t4, t4f) && same(t4, l4) && bad == 0 && d.differ * 4 < d.n &&
+                       d.rel < 1.0 / 64.0,
+                   fmt("%lld values not finite; the tiled form %s with the slots' content; the "
+                       "launcher's rule %s the tiled form's bytes", (long long)bad,
+                       same(t4, t4f) ? "does not move" : "moves",
+                       same(t4, l4) ? "gives" : "does not give"));
+                /* Its masks, where a row's partial page is whole in the next tile. */
+                if (!gated && inside)
+                    usel_sharp_check(pl, w4, kv4, fmt(" at %lld rows over %lld tokens, the launch "
+                                                      "starting inside a page", (long long)NR4,
+                                                      (long long)ctx2));
+                dfree_all();
+            }
+        }
+        /* ---- the form's other geometries (the launcher takes the first): a launch that starts
+         * inside a page and ends inside one, inf and NaN behind its end */
+        for (int gi = 1; pl.usel_geom(gi, nullptr) > 0; ++gi) {
+            int gd[2] = { 0, 0 };
+            const int g2 = pl.usel_geom(gi, gd);
+            const int64_t ctx2 = ctx + 2;
+            const UselWork w5 = usel_work(NR, ctx2, 0, 0);
+            const std::vector<uint16_t> kv5 = usel_cache(w5), kv5n = usel_cache(w5, ctx2);
+            const UselOut d5  = usel_run(pl, w5, kv5n, hq, hqg, gated, 1, 0);
+            const UselOut t5  = usel_run(pl, w5, kv5n, hq, hqg, gated, 2, 1 << 30);
+            const UselOut t5f = usel_run(pl, w5, kv5, hq, hqg, gated, 2, 1 << 30);
+            const std::string geo = fmt("%d waves, %d rows a tile, %d stagers", gd[0], g2, gd[1]);
+            if (!served(d5, "decode") || !served(t5, geo.c_str()) || !served(t5f, geo.c_str())) {
+                pl.usel_geom(0, nullptr);
+                dfree_all();
+                return;
+            }
+            int64_t bad = 0;
+            for (size_t i = 0; i + 1 < t5.o.size(); i += 2) {
+                uint16_t u;
+                std::memcpy(&u, &t5.o[i], 2);
+                bad += (u & 0x7f80u) == 0x7f80u;
+            }
+            const Diff d = diff16(d5.o, t5.o);
+            ok(fmt("the sparse launch's prefill form, %s%s, %lld rows over %lld tokens: tiled "
+                   "against the decode kernel %lld of %lld bf16 values differ, by at most %.2e of "
+                   "the row's largest; no output moves with the slots behind the context's end, "
+                   "none is not finite", gn, geo.c_str(), (long long)NR, (long long)ctx2,
+                   (long long)d.differ, (long long)d.n, d.rel).c_str(),
+               same(t5, t5f) && bad == 0 && d.differ * 4 < d.n && d.rel < 1.0 / 64.0,
+               fmt("%lld values not finite; the form %s with the slots' content", (long long)bad,
+                   same(t5, t5f) ? "does not move" : "moves"));
+            if (!gated)
+                usel_sharp_check(pl, w5, kv5, fmt(" at %lld rows over %lld tokens, %s",
+                                                  (long long)NR, (long long)ctx2, geo.c_str()));
+            dfree_all();
+        }
+        pl.usel_geom(0, nullptr);
+        /* ---- the same keys under other page ids */
+        {
+            const UselWork w1 = usel_work(NR, ctx, 0, 0x5bd1e995u);
+            const std::vector<uint16_t> kv1 = usel_cache(w1);
+            const UselOut t1 = usel_run(pl, w1, kv1, hq, hqg, gated, 2, 1 << 30);
+            if (!served(t1, "tiled, renumbered")) { dfree_all(); return; }
+            ok(fmt("the sparse launch's prefill form, %sthe pages renumbered: the same bytes%s", gn,
+                   at.c_str()).c_str(), same(til, t1));
+        }
+        dfree_all();
+        /* ---- one list a tile */
+        {
+            const UselWork w2 = usel_work(NR, ctx, 1, 0, G);
+            const std::vector<uint16_t> kv2 = usel_cache(w2);
+            const UselOut d2 = usel_run(pl, w2, kv2, hq, hqg, gated, 1, 0);
+            const UselOut t2 = usel_run(pl, w2, kv2, hq, hqg, gated, 2, 1 << 30);
+            if (!served(d2, "decode, one list a tile") || !served(t2, "tiled, one list a tile")) {
+                dfree_all(); return;
+            }
+            ok(fmt("the sparse launch's prefill form, %sone list a tile: byte-identical to the "
+                   "decode kernel%s", gn, at.c_str()).c_str(), same(d2, t2),
+               fmt("out %lld, codes %lld, scales %lld bytes differ", (long long)nd(d2.o, t2.o),
+                   (long long)nd(d2.q, t2.q), (long long)nd(d2.s, t2.s)));
+        }
+        dfree_all();
+        /* ---- rows of unrelated sequences */
+        {
+            const UselWork w3 = usel_work(NR, ctx, 2, 0);
+            const std::vector<uint16_t> kv3 = usel_cache(w3);
+            const UselOut d3 = usel_run(pl, w3, kv3, hq, hqg, gated, 1, 0);
+            const UselOut t3 = usel_run(pl, w3, kv3, hq, hqg, gated, 2, 1 << 30);
+            const UselOut b3 = usel_run(pl, w3, kv3, hq, hqg, gated, 2, 0);
+            if (!served(d3, "decode, unrelated rows") || !served(t3, "tiled, unrelated rows") ||
+                !served(b3, "handed back, unrelated rows")) { dfree_all(); return; }
+            const Diff d = diff16(d3.o, t3.o);
+            ok(fmt("the sparse launch's prefill form, %srows of unrelated sequences, tiled: %lld of "
+                   "%lld bf16 values differ, by at most %.2e of the row's largest%s", gn,
+                   (long long)d.differ, (long long)d.n, d.rel, at.c_str()).c_str(),
+               d.differ * 20 < d.n && d.rel < 1.0 / 64.0);
+            ok(fmt("the sparse launch's prefill form, %srows of unrelated sequences under the "
+                   "launcher's limit: handed back, byte-identical to the decode launch%s", gn,
+                   at.c_str()).c_str(),
+               same(d3, b3));
+        }
+        dfree_all();
+    }
+}
+
+/* --perfusel NR CTX [iters]: the sparse launch at a prefill chunk, NR rows ending a context of CTX
+ * tokens, through the gated merge as the engine issues it: the decode kernel a row, the tiled form,
+ * and the launcher's rule. With R4D_USEL_SEL and R4D_USEL_SEQU (RADIANCE_DUMP_BUF's files of
+ * qsa_sel and qsa_sequ, a chunk's [2048, 513] page lists and [2048] key counts) the lists are a
+ * real chunk's and CTX sizes nothing; with R4D_USEL_KIND=2 they are 512 pages a row with no page
+ * shared (rows of unrelated sequences, what the hand-back is for); else usel_work's chunk. Rate:
+ * 4 head_dim heads FLOPs per (row, key) pair the rows read. */
+static void usel_perf(const Plugin& pl, int64_t NR, int64_t ctx, int iters) {
+    if (iters <= 0) iters = 10;
+    if (!pl.pin_usel) { std::printf("--perfusel: no r4d_attn_usel_gqa12_pin\n"); return; }
+    const int64_t nq = 12, nkv = 1, hd = 256, bs = 4;
+    UselWork w;
+    const char* fsel = std::getenv("R4D_USEL_SEL");
+    const char* fsu  = std::getenv("R4D_USEL_SEQU");
+    if (fsel && fsu) {
+        w.NR = NR; w.W = 513;
+        w.table.assign((size_t)(NR * w.W), -1);
+        w.used.assign((size_t)NR, 0);
+        FILE* f1 = std::fopen(fsel, "rb");
+        FILE* f2 = std::fopen(fsu, "rb");
+        const size_t n1 = f1 ? std::fread(w.table.data(), 4, w.table.size(), f1) : 0;
+        const size_t n2 = f2 ? std::fread(w.used.data(), 4, w.used.size(), f2) : 0;
+        if (f1) std::fclose(f1);
+        if (f2) std::fclose(f2);
+        if (n1 != w.table.size() || n2 != w.used.size()) {
+            std::printf("--perfusel: %s / %s hold fewer than %lld rows\n", fsel, fsu, (long long)NR);
+            return;
+        }
+        int32_t top = 0;
+        for (int64_t r = 0; r < NR; ++r) {
+            const int64_t n = (w.used[(size_t)r] + 3) / 4;
+            for (int64_t j = 0; j < n; ++j) top = std::max(top, w.table[(size_t)(r * w.W + j)]);
+        }
+        w.pages = (int64_t)top + 1;
+        w.page.resize((size_t)w.pages);
+        for (int64_t b = 0; b < w.pages; ++b) w.page[(size_t)b] = (int32_t)b;
+    } else if (const char* kd = std::getenv("R4D_USEL_KIND"); kd && kd[0] == '2') {
+        w = usel_work(NR, ctx, 2, 0, 512);      /* rows of unrelated sequences, 512 pages each */
+    } else {
+        w = usel_work(NR, ctx, 0, 0);
+    }
+    const std::vector<uint16_t> kv = usel_cache(w);
+    double umean = 0.0; int64_t umost = 0, keys = 0;
+    for (int64_t r = 0; r < NR; ++r) keys += std::max(0, w.used[(size_t)r]);
+    const double flop = 4.0 * (double)hd * (double)nq * (double)keys;
+    std::printf("sparse attention at a prefill chunk: %lld rows, %.0f keys a row, %lld pages of cache; "
+                "%d launches each\n", (long long)NR, (double)keys / (double)NR, (long long)w.pages,
+                iters);
+    for (int64_t g : { 8, 12, 16, 24, 32 }) {
+        usel_union_stats(w, g, &umean, &umost);
+        std::printf("  union of %2lld rows: %.0f pages (most %lld)\n", (long long)g, umean,
+                    (long long)umost);
+    }
+    std::vector<uint16_t> hq((size_t)(NR * nq * hd)), hqg((size_t)(NR * nq * 2 * hd));
+    for (size_t i = 0; i < hq.size(); ++i)
+        hq[i] = h_to_bf16(h_bf16(st_rand_bf16((uint32_t)i ^ 0x1234567u)) * 2.0f);
+    for (size_t i = 0; i < hqg.size(); ++i)
+        hqg[i] = h_to_bf16(h_bf16(st_rand_bf16((uint32_t)i ^ 0x7654321u)) * 6.0f);
+    const RadKernelInfo* r = find(pl, "attn_decode_ghq_h256_gqa12_bf16kv");
+    if (!r) { std::printf("  attn_decode_ghq_h256_gqa12_bf16kv absent\n"); return; }
+    void* d_q  = dalloc(hq.size() * 2);
+    void* d_qg = dalloc(hqg.size() * 2);
+    void* d_c  = dalloc(kv.size() * 2);
+    void* d_o  = dalloc((size_t)(NR * nq * hd) * 2);
+    void* d_q8 = dalloc((size_t)(NR * nq * hd));
+    void* d_s  = dalloc((size_t)(NR * nq * (hd / 128)) * 4);
+    if (!d_q || !d_qg || !d_c || !d_o || !d_q8 || !d_s) { std::printf("--perfusel: hipMalloc failed\n"); dfree_all(); return; }
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_c, kv.data(), kv.size() * 2, hipMemcpyHostToDevice);
+    RadTensor gate = T((uint8_t*)d_qg + hd * 2, RAD_BF16, { NR, nq, hd });
+    gate.stride[0] = nq * 2 * hd;
+    gate.stride[1] = 2 * hd;
+    std::vector<RadTensor> ts = {
+        T(d_q, RAD_BF16, { NR, nq, hd }),
+        T(d_c, RAD_BF16, { w.pages, nkv, bs, 2 * hd }),
+        TI32({ NR, w.W }, w.table),
+        TI32({ NR }, w.used),
+        RadTensor{}, RadTensor{}, RadTensor{},
+        T(d_o, RAD_BF16, { NR, nq * hd }),
+        gate,
+        T(d_q8, RAD_I8, { NR, nq * hd }),
+        T(d_s, RAD_F32, { NR, nq * hd / 128 }) };
+    std::vector<RadParam> ps = {
+        PI("q_len", 1), PI("head_dim", hd), PI("gqa", nq / nkv), PI("block_size", bs),
+        PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+        PI("n_head", nq), PI("max_seqs", NR), PI("max_ctx", 513 * bs),
+        PI("group", 128), PS("act", "sigmoid"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    pl.pin_usel(2, 1 << 30);
+    /* Scratch for the widest geometry (the most rows a tile), found by asking each. */
+    int64_t need = 0;
+    int ngeom = 0;
+    for (int gi = 0; pl.usel_geom(gi, nullptr) > 0; ++gi) {
+        ngeom = gi + 1;
+        if (r->scratch) need = std::max<int64_t>(need, r->scratch(&a));
+    }
+    if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    auto time_arm = [&](const char* name, int form, int lim) {
+        pl.pin_usel(form, lim);
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            std::printf("  %-44s rc %d\n", name, rc);
+            return;
+        }
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("  %-44s %9.3f ms  %7.1f TFLOP/s of the rows' own keys\n", name, us / 1000.0,
+                    flop / (us * 1e6));
+    };
+    pl.usel_geom(0, nullptr);
+    time_arm("the decode kernel a row", 1, 0);
+    for (int gi = 0; gi < ngeom; ++gi) {
+        int gd[2] = { 0, 0 };
+        const int G = pl.usel_geom(gi, gd);
+        time_arm(fmt("tiled: %2d waves, %2d rows a tile, %d stagers", gd[0], G, gd[1]).c_str(), 2,
+                 1 << 30);
+    }
+    pl.usel_geom(0, nullptr);
+    time_arm("the launcher's rule", 0, 0);
+    /* Every tile handed back: what the hand-back itself costs beside the decode launch. */
+    time_arm("tiled, every tile handed back", 2, 1);
+    /* The tiled form's launches apart (the launcher's geometry): each left out in turn, the tables
+     * of the launch before standing in for the builder's. */
+    time_arm("tiled, without the builder", 2 | (1 << 8), 1 << 30);
+    time_arm("tiled, without the attention", 2 | (2 << 8), 1 << 30);
+    time_arm("tiled, without the hand-back", 2 | (4 << 8), 1 << 30);
+    time_arm("tiled, without the merge", 2 | (8 << 8), 1 << 30);
+    time_arm("tiled, the builder alone", 2 | (14 << 8), 1 << 30);
+    /* The two forms' outputs on these lists: how many bf16 values differ and by how much of the
+     * row's largest (one unit in the last place of a value near it is 0.8 %), and the rows whose
+     * difference is past rounding. */
+    {
+        const size_t ob = (size_t)(NR * nq * hd) * 2;
+        std::vector<uint8_t> od(ob), ot(ob);
+        auto run_form = [&](int form, std::vector<uint8_t>& o) {
+            pl.pin_usel(form, form == 2 ? 1 << 30 : 0);
+            st_memset(d_o, 0, ob);
+            const int rc = r->launch(&a, nullptr);
+            const bool okl = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            st_memcpy(o.data(), d_o, ob, hipMemcpyDeviceToHost);
+            return okl;
+        };
+        if (run_form(1, od) && run_form(2, ot)) {
+            int64_t differ = 0, rows_off = 0;
+            double worst = 0.0;
+            for (int64_t rh = 0; rh < NR * nq; ++rh) {
+                float top = 0.0f, dm = 0.0f;
+                for (int64_t e = 0; e < hd; ++e) {
+                    uint16_t ua, ub;
+                    std::memcpy(&ua, &od[(size_t)(rh * hd + e) * 2], 2);
+                    std::memcpy(&ub, &ot[(size_t)(rh * hd + e) * 2], 2);
+                    const float fa = h_bf16(ua), fb = h_bf16(ub);
+                    top = std::max(top, std::max(std::fabs(fa), std::fabs(fb)));
+                    dm = std::max(dm, std::fabs(fa - fb));
+                    differ += ua != ub;
+                }
+                const double rel = top > 0.0f ? (double)dm / (double)top : 0.0;
+                worst = std::max(worst, rel);
+                rows_off += rel > 1.0 / 64.0;
+            }
+            std::printf("  tiled against the decode kernel: %lld of %lld bf16 values differ (%.2f %%), "
+                        "by at most %.2e of the row's largest; %lld of %lld (row, head) pairs past "
+                        "1/64\n", (long long)differ, (long long)(NR * nq * hd),
+                        100.0 * (double)differ / (double)(NR * nq * hd), worst, (long long)rows_off,
+                        (long long)(NR * nq));
+        } else {
+            std::printf("  tiled against the decode kernel: a launch failed\n");
+        }
+    }
+    pl.pin_usel(0, 0);
+    dfree_all();
+    usel_sharp_check(pl, w, kv, fmt(" at %lld rows of these lists", (long long)NR));
+    pl.pin_usel(0, 0);
+    dfree_all();
 }
 
 /* ------------------------------------------------- attn_paged_tree_sel, on an explicit tree
@@ -21818,9 +22671,10 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     const RadStream rst = (RadStream)hs;
 
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; };
-    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= kHcPf2MinRows ? 3 : 2) : 0;
+    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= kHcPf2MinRows ? 4 : 2) : 0;
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
-                                         "the wide kernels", "the PF2 kernels" };
+                                         "the wide kernels", "the PF2 kernels, the wide up product",
+                                         "the PF2 kernels" };
     std::vector<Out> outs;
     std::vector<int> ran;   /* the form each of `outs` came from */
     for (int form = f_lo; form <= f_hi; ++form) {
@@ -33790,6 +34644,11 @@ static void device_phase(const Plugin& pl) {
     attn_gq_fold_case(pl, 24, true, true);
     attn_gq_fold_case(pl, 3, false, true, 3, true);
     attn_gq_fold_case(pl, 24, false, true, 3, true);
+    /* The sparse launch's prefill form: a chunk past the exactness bound, and one below it, where
+     * the rows' lists are prefixes of one another and a row's partial page is its successors'
+     * complete one. */
+    attn_usel_case(pl, 300, 9000);
+    attn_usel_case(pl, 300, 1500);
     attn_gq_fold_case(pl, 3, true, true, 0, true);
     attn_gq_fold_case(pl, 24, true, true, 0, true);
     /* attn_paged_tree_sel on an explicit tree, both ratios and cache dtypes, and its gated merges. */
@@ -36237,6 +37096,17 @@ static void device_phase(const Plugin& pl) {
         /* 700 and 1000 put PF2's K chunks across a stream boundary and row tiles past the last
          * row; 4096 is the one-chunk epilogue. */
         for (int64_t m : { 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
+        /* The PF2 up product's reciprocal rule (hc_up_mix_pf3_kernel) over every float it can
+         * meet: 1 + e^-v lies in [1, inf], and a NaN stays the division's. */
+        if (pl.hc_rcp_check) {
+            long long far = 0, far2 = 0;
+            const long long bad  = pl.hc_rcp_check(0x3f800000u, 0x7f800000u, &far);
+            const long long bad2 = pl.hc_rcp_check(0x7f800001u, 0x7fffffffu, &far2);
+            ok(fmt("hc_read's rounded reciprocal: the quotient's bf16 for every float in [1, inf] "
+                   "(%lld of 1082130433 differ; %lld kept reciprocals more than one unit in the "
+                   "last place from the quotient) and every positive NaN (%lld differ)", bad, far,
+                   bad2).c_str(), bad == 0 && bad2 == 0 && far == 0);
+        }
         /* 1 to 7 rows each hit a different up-product instantiation below eight. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 33, 65, 300, 2048 }) {
             hc_read_i8(pl, m, false, 0);
@@ -36909,6 +37779,10 @@ static void usage(void) {
                 "  --perfpaged Q CTX [iters]:  the paged prefill attention rows (head 256, gqa 6) at\n"
                 "                       Qwen3.8's TP2 rank, Q query rows ending a CTX-token context,\n"
                 "                       every KV layout.\n"
+                "  --perfusel T CTX [iters]:  QSA's sparse attention at a prefill chunk (T rows of\n"
+                "                       q_len 1 ending a CTX-token context, the gated merge): the\n"
+                "                       decode kernel a row against the tiled form. R4D_USEL_SEL and\n"
+                "                       R4D_USEL_SEQU name dumps of a real chunk's qsa_sel / qsa_sequ.\n"
                 "  --perfattn M HEADS [iters]:  the head-128 dense attention over one M-row\n"
                 "                       sequence: attn_dense and attn_prefix_self without a prefix at\n"
                 "                       bf16 and int8 scores, bf16 and fp8 P.V, and quant_cols_fp8\n"
@@ -37012,6 +37886,8 @@ int main(int argc, char** argv) {
     long long attn_m = 0, attn_h = 0;
     int attn_it = 5;
     long long pg_q = 0, pg_ctx = 0;
+    long long us_t = 0, us_ctx = 0;
+    int us_it = 0;
     int pg_it = 10;
     int vsa_it = 0;
     bool vsa_local = false;
@@ -37268,6 +38144,11 @@ int main(int argc, char** argv) {
             pg_q = std::strtoll(argv[++i], nullptr, 0);
             pg_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') pg_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfusel")) {
+            if (i + 2 >= argc) { usage(); return 2; }
+            us_t = std::strtoll(argv[++i], nullptr, 0);
+            us_ctx = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') us_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfattn")) {
             if (i + 2 >= argc) { usage(); return 2; }
             attn_m = std::strtoll(argv[++i], nullptr, 0);
@@ -37313,6 +38194,15 @@ int main(int argc, char** argv) {
     Plugin pl;
 
     /* Timing modes run alone, without the catalogue. */
+    if (us_t > 0 && us_ctx > 0) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        usel_perf(pl, us_t, us_ctx, us_it);
+#else
+        skip("sparse attention timing", "built without HIP");
+#endif
+        return 0;
+    }
     if (pg_q > 0 && pg_ctx > 0) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP

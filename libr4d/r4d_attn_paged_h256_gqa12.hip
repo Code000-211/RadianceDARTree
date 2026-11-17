@@ -19,5 +19,9 @@
 #define G8_BLOCK_SIZE 4
 // attn_paged_tree_sel entry points (r4d_attn_paged_gqa8.hip): QSA attention at a tree verify.
 #define G8_TSEL 1
+/* The sparse launch's prefill form (r4d_attn_usel.h): the launcher's geometry (eight waves, a
+ * launch row each, staging for themselves), then the one r4d_selftest --perfusel times against it
+ * (sixteen rows a tile behind eight stager waves). */
+#define G8_USEL_GEOMS(X) X(0, 8, 0) X(1, 24, 8)
 
 #include "r4d_attn_paged_gqa8.hip"

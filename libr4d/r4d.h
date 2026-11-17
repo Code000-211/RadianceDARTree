@@ -735,10 +735,26 @@ void r4d_moe_gather_pin_form(int form);
 void r4d_moe_gemm_pin_down_dec(int pin);
 // Test hook: pins the gated residual read's prefill tile. 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
-// kernels (refusing shapes they are not built for), 3 the PF2 kernels the rule takes from 512 rows
-// (refused likewise, and below 512 rows, whose scratch is not sized for their weight planes).
-// All bit-identical; r4d_selftest compares their bytes.
+// kernels (refusing shapes they are not built for), 3 the PF2 kernels with the wide kernel as their
+// up product (refused likewise, and below 512 rows, whose scratch is not sized for their weight
+// planes), 4 the PF2 kernels as the rule takes them from 512 rows, the up product
+// hc_up_mix_pf3_kernel. All bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_pin_prefill(int form);
+// Test hook: the PF2 up product's reciprocal rule against the division, over every float whose bit
+// pattern lies in [lo, hi] (r4d_hc_bf16.hip). Returns how many take another bf16 (the claim: none
+// from 1.0 to infinity and over the NaNs), -1 when the launch fails; `far` (optional) receives how
+// many reciprocals the rule keeps lie more than one unit in the last place from the quotient.
+long long r4d_hc_rcp_check(unsigned lo, unsigned hi, long long* far);
+// Test hooks: the sparse attention launch's prefill form at twelve queries a KV head
+// (r4d_attn_usel.h). `form` 0 is the rule of a process started with R4D_ATTN_USEL=1 (tiles of rows
+// from 256 launch rows of q_len 1), 1 the decode kernel a row at every row count (what a process
+// starts with), 2 the tiled form at every row count; `lim` the
+// union past which a tile is handed back to the decode kernel (0: the launcher's; 2^20 or more:
+// never, nor for sharing too little). Bits 8 and up of `form` leave launches out, for timing.
+// r4d_attn_usel_gqa12_geom picks one of the tiled kernel's built geometries and returns its rows a
+// tile (-1 past the last; a negative index asks for the one in force).
+void r4d_attn_usel_gqa12_pin(int form, int lim);
+int  r4d_attn_usel_gqa12_geom(int idx, int* desc);
 // Test hook: pins the gated residual read's decode kernels. 0 is the launcher's rule (kernels A and
 // B as one grid at one to seven rows where the per-stream counters exist, the tiled up-mix's K
 // passes pipelined from eight rows), 1 the two-grid form (A, then the up-mix in a second launch;

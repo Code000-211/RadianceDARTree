@@ -2584,9 +2584,17 @@ constexpr int kWideRT = 128, kWideNT = 112, kWideCH = 16;
 
 /* The prefill form, pinnable for tests: 0 the launcher's rule, 1 the decode tiles' kernels at
  * RT 128 (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide kernels (refusing
- * shapes they are not built for), 3 the PF2 form (hc_pf2_launch; refused likewise, and below
- * kPf2MinRows, where `u` is not sized for its weight planes). */
+ * shapes they are not built for), 3 the PF2 form with the wide kernel as its up product
+ * (hc_pf2_launch; refused likewise, and below kPf2MinRows, where `u` is not sized for its weight
+ * planes), 4 the PF2 form as the rule runs it, its up product hc_up_mix_pf3_kernel. */
 static int g_hc_prefill_form = 0;
+/* R4D_HC_PF3=0 in the environment keeps the wide kernel as the PF2 form's up product wherever the
+ * rule runs PF2: the read as it was before hc_up_mix_pf3_kernel, for a comparison in a running
+ * engine. A pin of 3 or 4 names the up product itself. */
+static const bool g_hc_pf3 = [] {
+    const char* e = std::getenv("R4D_HC_PF3");
+    return !(e && e[0] == '0' && !e[1]);
+}();
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -3934,6 +3942,212 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
     }
 }
 
+/* ==================================================== hc_read, the PF2 form's up product, two a CU
+ *
+ * hc_up_mix_wide_kernel at 256 rows holds 39 KiB of LDS (the 64-wide K slice of 256 rows of `d`,
+ * the weight tile, and behind the product the tile's N, 32 KiB): one workgroup a CU, so eight
+ * waves on two SIMDs, and a quarter of the launch's time is waves waiting with nothing else
+ * resident to run. Its epilogue is a third of its arithmetic, half of that the IEEE division of
+ * the sigmoid (ten instructions an element where the rest of the sigmoid is three).
+ *
+ * This kernel is the same product and mix in 27 KiB, so two workgroups a CU:
+ *
+ *   K is staged 32 wide (ten slices at lowrank 320, two k-steps each), the row pitch 36 shorts.
+ *   N never goes through LDS. A lane's share of it is one channel of eight rows a (m-tile,
+ *   stream): eight lanes each load eight channels of one row and global_load_tr_b128 transposes,
+ *   so every lane holds its channel of the eight rows in one register pair. Only the rows' norm
+ *   scales are staged (4 KiB).
+ *   The sigmoid's quotient is v_rcp_f32 where that is enough: for d below 2^120 the reciprocal is
+ *   within one unit in the last place of 1 / d, so its bf16 can differ from the quotient's only
+ *   when its low sixteen bits are 0x7fff or 0x8000, one step from the rounding tie. A wave any of
+ *   whose lanes is there divides instead (a few in a thousand times), and so does one that holds a
+ *   d of 2^120 or more or a NaN: v_rcp_f32 flushes a subnormal reciprocal to zero where the
+ *   division keeps it. r4d_hc_rcp_check tries every float from 1 to infinity against the
+ *   division.
+ *
+ * Same bytes as hc_up_mix_wide_kernel: every accumulator sees the same fragments in the same
+ * order (frag() reads the same elements at either pitch, and a slice boundary is between two
+ * k-steps), N is (h * scale) * (w + wadd) rounded once as the staging rounds it, the sigmoid's
+ * bf16 is the quotient's, and the sum over the streams ascends. r4d_selftest compares the forms. */
+constexpr int kPf3KT = 32;                       // K staged a pass
+constexpr int kPf3AP = kPf3KT + 4;               // LDS row pitch in shorts: sixteen lanes, sixteen bank pairs
+
+/* v_rcp_f32 is within one unit in the last place of the quotient below this d. */
+constexpr float kRcpTop = 0x1p120f;
+/* Whether the bf16 of `r`, a reciprocal within one unit in the last place of the quotient, may
+ * differ from the quotient's: as a distance, (low16 - 0x7fff) mod 2^16 < 2. */
+__device__ __forceinline__ unsigned rcp_tie_dist(float r) {
+    return (__float_as_uint(r) - 0x7fffu) & 0xffffu;
+}
+
+template <int HC>
+__global__ __launch_bounds__(kThreads)
+void hc_up_mix_pf3_kernel(const unsigned short* __restrict__ up,
+                          const unsigned short* __restrict__ dbuf,
+                          const unsigned short* __restrict__ h, const float* __restrict__ w,
+                          const float* __restrict__ scalein,
+                          unsigned short* __restrict__ x,
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+    constexpr int RT = kPf2UpRT, CH = kWideCH, NT = HC * CH;
+    constexpr int MW = RT / 16 / kWaves;                        /* m-tiles a wave */
+    constexpr int KT = kPf3KT, AP = kPf3AP;
+    constexpr int kKV = KT / 8;                                 /* 16-byte vectors a staged row */
+    constexpr int kRS = kThreads / kKV;                         /* rows between a thread's rows */
+    constexpr int kAV = RT / kRS, kBV = NT / kRS;
+    static_assert(MW >= 1 && MW * 16 * kWaves == RT && RT % kRS == 0 && NT % kRS == 0 &&
+                  HC == 4 && RT == kThreads && CH == 16,
+                  "the waves cover the rows, every thread stages whole vectors and one row's scales");
+    __shared__ unsigned short sA[RT * AP];
+    __shared__ unsigned short sB[NT * AP];
+    __shared__ float          sS[RT * HC];
+
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = (long)blockIdx.y * RT;
+    const long i0 = (long)blockIdx.x * CH;
+    if (r0 >= rows) return;
+    const int k8a = (tid % kKV) * 8, tr = tid / kKV;
+    const int half = lane >> 4, cg = (lane >> 3) & 1, vj = lane & 7, nn = lane & 15;
+
+    /* The rows' scales, a row a thread. */
+    {
+        const long r = r0 + tid < rows ? r0 + tid : rows - 1;
+        *(uint4*)(sS + tid * HC) = *(const uint4*)(scalein + r * kHcMax);
+    }
+    /* This lane's channel of the mix's `h`, eight rows a (m-tile, stream), issued before the K
+     * loop like the wide kernel's so the latency hides under the product; and the channel's norm
+     * weights. */
+    r4d_u32x4 pn[MW * HC];
+    float wv[HC];
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi) {
+        long r = r0 + (wave * MW + mi) * 16 + 8 * half + vj;
+        if (r >= rows) r = rows - 1;
+#pragma unroll
+        for (int c = 0; c < HC; ++c)
+            pn[mi * HC + c] = __builtin_bit_cast(
+                r4d_u32x4, load_tr_b128(h + r * hrow + (long)c * n + i0 + 8 * cg));
+    }
+#pragma unroll
+    for (int c = 0; c < HC; ++c) wv[c] = w[(long)c * n + i0 + nn] + wadd;
+
+    uint4 pa[kAV], pb[kBV];
+    auto fetch = [&](long k0) {
+        const long k = k0 + k8a;
+        const bool in = k + 8 <= lr;
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) {
+            long r = r0 + tr + i * kRS; if (r >= rows) r = rows - 1;
+            pa[i] = in ? *(const uint4*)(dbuf + r * lr + k) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        /* Tile row tt is sub-stream tt / CH of channel i0 + tt % CH. */
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) {
+            const int  tt = tr + i * kRS;
+            const long j  = (long)(tt / CH) * n + i0 + tt % CH;
+            pb[i] = in ? *(const uint4*)(up + j * lr + k) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+
+    v8f acc[MW * HC];
+#pragma unroll
+    for (int c = 0; c < MW * HC; ++c) acc[c] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    fetch(0);
+    for (long k0 = 0; k0 < lr; k0 += KT) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kAV; ++i) *(uint4*)(sA + (tr + i * kRS) * AP + k8a) = pa[i];
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) *(uint4*)(sB + (tr + i * kRS) * AP + k8a) = pb[i];
+        __syncthreads();
+        if (k0 + KT < lr) fetch(k0 + KT);
+#pragma unroll
+        for (int ks = 0; ks < KT / 16; ++ks) {
+            v8bf af[MW];
+#pragma unroll
+            for (int mi = 0; mi < MW; ++mi)
+                af[mi] = frag(sA, AP, (wave * MW + mi) * 16, ks * 16, lane);
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const v8bf bf = frag(sB, AP, c * 16, ks * 16, lane);
+#pragma unroll
+                for (int mi = 0; mi < MW; ++mi)
+                    acc[mi * HC + c] = mma(af[mi], bf, acc[mi * HC + c]);
+            }
+        }
+    }
+
+    const float inv_hc = 1.0f / (float)HC;
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi) {
+        const int rl0 = (wave * MW + mi) * 16 + 8 * half;
+        unsigned short ns[HC][8];
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const r4d_u32x4 v = pn[mi * HC + c];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                ns[c][2 * q]     = (unsigned short)(v[q] & 0xffffu);
+                ns[c][2 * q + 1] = (unsigned short)(v[q] >> 16);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int  rl = rl0 + e;
+            const long r  = r0 + rl;
+            float d[HC], q[HC];
+            unsigned tie = 0xffffu;
+            float dsum = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                d[c] = 1.0f + __expf(-acc[mi * HC + c][e]);
+                q[c] = __builtin_amdgcn_rcpf(d[c]);
+                const unsigned t = rcp_tie_dist(q[c]);
+                tie = t < tie ? t : tie;
+                dsum += d[c];
+            }
+            /* One step from a rounding tie, or a d whose reciprocal is not within a unit of the
+             * quotient (2^120 and up, a NaN; every d is at least 1, so the sum of the four catches
+             * each): the quotient itself. */
+            if (__builtin_amdgcn_ballot_w32(tie < 2u || !(dsum < kRcpTop))) {
+#pragma unroll
+                for (int c = 0; c < HC; ++c) q[c] = 1.0f / d[c];
+            }
+            float a = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const float nv = bf2f(f2bf(bf2f(ns[c][e]) * sS[rl * HC + c] * wv[c]));
+                a += bf2f(f2bf(q[c])) * nv;
+            }
+            if (r < rows) x[r * xrow + i0 + nn] = f2bf(a * inv_hc);
+        }
+    }
+}
+
+/* Every float d in [lo, hi] (bit patterns, so 0x3f800000 to 0x7f800000 is 1 to infinity, and
+ * past that the NaNs): whether the bf16 the PF3 epilogue takes for 1 / d -- v_rcp_f32's, or the
+ * quotient's where rcp_tie_dist says a unit in the last place could move it -- is the quotient's.
+ * Counts the ones that are not in bad[0], and in bad[1] the reciprocals the rule keeps that lie
+ * more than one unit from the quotient (none, if the rule's premise holds). */
+__global__ __launch_bounds__(kThreads)
+void hc_rcp_check_kernel(unsigned lo, unsigned hi, unsigned* bad) {
+    const unsigned long long span = (unsigned long long)hi - lo + 1ull;
+    const unsigned long long step = (unsigned long long)gridDim.x * kThreads;
+    unsigned miss = 0, far = 0;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * kThreads + threadIdx.x; i < span;
+         i += step) {
+        const float d = __uint_as_float(lo + (unsigned)i);
+        const float r = __builtin_amdgcn_rcpf(d), qe = 1.0f / d;
+        const bool div = rcp_tie_dist(r) < 2u || !(d < kRcpTop);
+        const float t = div ? qe : r;
+        miss += f2bf(t) != f2bf(qe);
+        const unsigned rb = __float_as_uint(r), qb = __float_as_uint(qe);
+        far += !div && (rb > qb ? rb - qb : qb - rb) > 1u;
+    }
+    if (miss) atomicAdd(bad, miss);
+    if (far)  atomicAdd(bad + 1, far);
+}
+
 /* K per down-product workgroup: enough z-blocks that lr/kTNT * z covers the part, rounded to whole
  * kTKT slices so a slice never straddles a sub-stream. Returns HN when one block covers K (the
  * prefill form, un-split epilogue). */
@@ -4659,7 +4873,7 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                          unsigned short* inj, unsigned char* q, float* qs, unsigned char* rq,
                          float* rqs, long rows, long n, int hc, long lr, long ncol, long hrow,
                          long irow, long xrow, long qrow, long srow, long rqrow, long rsrow,
-                         long kc, int ks, float eps, float wadd, RadStream s) {
+                         long kc, int ks, float eps, float wadd, RadStream s, bool pf3) {
     const long HN  = (long)hc * n;
     const long ntt = (ncol + 15) / 16;                        /* plane n-tiles */
     uint4* const          plane = (uint4*)wsp;
@@ -4692,13 +4906,18 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
         if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
     }
 
-    /* The up product and mix: the wide kernel at 256 rows over a bf16 mix_up with row pitch lr
-     * (the decoded plane, or the stored matrix at bf16). */
-    hipLaunchKernelGGL((hc_up_mix_wide_kernel<4, false, kPf2UpRT>),
-                       dim3((unsigned)(n / kWideCH), (unsigned)((rows + kPf2UpRT - 1) / kPf2UpRT)),
-                       dim3(kThreads), 0, (hipStream_t)s, (const void*)ubf, lr,
+    /* The up product and mix over a bf16 mix_up with row pitch lr (the decoded plane, or the stored
+     * matrix at bf16), 256 rows a workgroup: hc_up_mix_pf3_kernel, or under the PF2 pin the wide
+     * kernel it replaces. Through r4d_emit, so r4d_record_dispatches sees which ran. */
+    const dim3 gu((unsigned)(n / kWideCH), (unsigned)((rows + kPf2UpRT - 1) / kPf2UpRT));
+    if (pf3)
+        (void)R4D_EMIT(s, (hc_up_mix_pf3_kernel<4>), gu, dim3(kThreads), 0, ubf,
                        (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr, hrow,
                        xrow, wadd);
+    else
+        (void)R4D_EMIT(s, (hc_up_mix_wide_kernel<4, false, kPf2UpRT>), gu, dim3(kThreads), 0,
+                       (const void*)ubf, lr, (const unsigned short*)dbuf, h, w,
+                       (const float*)scale, x, rows, n, lr, hrow, xrow, wadd);
     if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
     hc_quant_rows_launch(i8, x, q, qs, rq, rqs, rows, n, xrow, qrow, srow, rqrow, rsrow, s);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
@@ -5137,7 +5356,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         const long ntt       = (ncol + 15) / 16;
         const bool pf2_shape = rt == kWideRT && hc == 4 && (n % kThreads) == 0
                                && ntt <= (long)kPf2MaxNT;
-        const bool pf2       = g_hc_prefill_form == 3
+        const bool pf2       = g_hc_prefill_form == 3 || g_hc_prefill_form == 4
                                || (g_hc_prefill_form == 0 && rows >= kPf2MinRows && pf2_shape);
         if (pf2) {
             if (!pf2_shape) return R4D_NO(RAD_E_SHAPE);
@@ -5150,7 +5369,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,
                 rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
                 (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow, (long)irow, (long)xrow,
-                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, s);
+                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, s,
+                g_hc_prefill_form == 4 || (g_hc_prefill_form != 3 && g_hc_pf3));
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
@@ -5377,6 +5597,29 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 }
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
+
+/* Test hook: hc_rcp_check_kernel over the floats with bit patterns [lo, hi], on the null stream,
+ * waited for. Returns how many take another bf16 from the PF3 epilogue's reciprocal rule than from
+ * the division (the claim: none), -1 when the launch fails; `far` (optional) receives how many
+ * reciprocals lie more than one unit in the last place from the quotient. */
+extern "C" long long r4d_hc_rcp_check(unsigned lo, unsigned hi, long long* far) {
+    unsigned* bad = nullptr;
+    if (hipMalloc((void**)&bad, 2 * sizeof(unsigned)) != hipSuccess) return -1;
+    long long out = -1;
+    unsigned got[2] = { 0u, 0u };
+    if (hipMemset(bad, 0, 2 * sizeof(unsigned)) == hipSuccess &&
+        hipDeviceSynchronize() == hipSuccess) {
+        hipLaunchKernelGGL(hc_rcp_check_kernel, dim3(16384), dim3(kThreads), 0, (hipStream_t)nullptr,
+                           lo, hi, bad);
+        if (hipGetLastError() == hipSuccess && hipDeviceSynchronize() == hipSuccess &&
+            hipMemcpy(got, bad, sizeof(got), hipMemcpyDeviceToHost) == hipSuccess) {
+            out = (long long)got[0];
+            if (far) *far = (long long)got[1];
+        }
+    }
+    (void)hipFree(bad);
+    return out;
+}
 /* 0 the launcher's rule; 1 the two-grid form (and the 64-row tile from 33 rows); 2 the rule with the
  * 64-row tile from 33 rows, as it was before the 48-row tile; 3 the rule with the 48-row tile at
  * kTNT columns a workgroup. */
