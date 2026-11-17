@@ -1935,6 +1935,7 @@ int Engine::plan() {
                 for (RadStream s : q) if (s) rad_stream_destroy(s);
             }
             f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
+            f.queue_scratch = 0;   /* set below, once props are read */
             /* The weights' cost, split into the fixed floor and the elastic plane
              * (weight_footprint in core/place/planner.h). Per rank, so already this card's share
              * under TP. */
@@ -1955,6 +1956,7 @@ int Engine::plan() {
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
+            f.queue_scratch = rad_dev_resident_scratch_bytes(&props);
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
             /* Unified memory: the pinned host pool is the same RAM as the card, so the

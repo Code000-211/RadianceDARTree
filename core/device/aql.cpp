@@ -373,15 +373,21 @@ bool interrupts(hsa_signal_t s) {
 
 hsa_status_t on_system_event(const hsa_amd_event_t* e, void*);   /* the memory-fault report */
 
-/* A kernel with a private segment (spill or a local array: couple_verify, step_advance) makes the
- * runtime hand the queue scratch memory when it is dispatched and take it back when it retires,
+/* A kernel with a private segment (spill or a local array: step_advance, the draft propose) makes
+ * the runtime hand the queue scratch memory when it is dispatched and take it back when it retires,
  * with the queue paused each time: about 200 us of idle card per such dispatch, twice every decode
- * step on the sampler/accept path. The runtime keeps a queue's scratch when told not to reclaim
- * it. The setting is read when the runtime loads, which something in the process may do before
- * init_devices runs, so this is a constructor of the first priority. A value the operator set
- * stays. OPT-IN for now (RADIANCE_SCRATCH_RECLAIM=0): resident scratch is not charged to the VRAM
- * budget, and couple_verify's large private segment (1024 threads x ~17.8 KB) can then exhaust the
- * last free MiBs and fault the queue (OUT_OF_RESOURCES) on coupled trees and occasionally chains. */
+ * step on the sampler/accept path (0.39 ms a step measured while couple_verify had a 17.8 KB
+ * private segment). The runtime keeps a queue's scratch when told not to reclaim it. Since
+ * couple_verify needs no scratch, keep and reclaim measure the same (within 0.5%), so this stays
+ * opt-in: RADIANCE_SCRATCH_RECLAIM=0 keeps the scratch. The setting is read when the runtime loads, which something in the
+ * process may do before init_devices runs, so this is a constructor of the first priority. A value
+ * the operator set stays.
+ *
+ * Kept scratch is resident VRAM the runtime takes on the first dispatch with a private segment, so
+ * the VRAM budget charges it (rad_dev_resident_scratch_bytes); a kernel with a large private segment
+ * (couple_verify once had 17.8 KB a lane) would otherwise take the last free MiBs and fault the
+ * queue (OUT_OF_RESOURCES). Measured on R9700 : +114 MiB a card with step_advance's 816
+ * bytes a lane, +150 MiB on a stage-2 tree. */
 __attribute__((constructor(101))) void keep_scratch() {
     const char* keep = std::getenv("RADIANCE_SCRATCH_RECLAIM");
     if (keep && *keep == '0') setenv("HSA_NO_SCRATCH_RECLAIM", "1", 0);
@@ -5049,4 +5055,12 @@ extern "C" void rad_host_mark(const char* tag, int rank) {
     std::snprintf(b, sizeof b, "%d,%s", rank, tag);
     std::lock_guard<std::mutex> lk(h.mu);
     h.v.emplace_back(ns, b);
+}
+
+/* The VRAM the runtime keeps as queue scratch on `device` once the draft and accept kernels have
+ * run (the same with RADIANCE_SCRATCH_RECLAIM=1: the card showed +114 MiB after the first draft step either way and
+ * kept it): 5 MiB a CU (the R9700 reports 32), 160 MiB, over the measured 114-150. */
+extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
+    if (!p || p->is_host_backend || p->unified) return 0;
+    return (int64_t)p->n_cu * (5LL * 1024 * 1024);
 }
