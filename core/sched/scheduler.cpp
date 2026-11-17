@@ -3457,6 +3457,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.lead       = (int32_t)lead;
         m.base_pos   = head_max;
         m.draft_idx  = can_draft ? n_draft_rows : -1;
+        m.order      = e.n_spec;
         serial_.push_back(m);
 
         if (can_draft) {
@@ -3466,10 +3467,30 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
             ++n_draft_rows;
         }
     }
+    /* serial_order_by_depth: the drafting sequences by the drafts their last chain made, deepest
+     * first. A sequence's chain depth is close to its last one's, so the rows whose chains end
+     * early sit behind the others and a round's pass over the rows still going leaves them out.
+     * Only the order of the drafting rows moves (their place in every pass, their draft index);
+     * nothing a row computes depends on it. */
+    if (serial_by_depth_ && n_draft_rows > 1) {
+        std::vector<size_t>    at;
+        std::vector<SerialSeq> d;
+        for (size_t i = 0; i < serial_.size(); ++i)
+            if (serial_[i].draft_idx >= 0) { at.push_back(i); d.push_back(serial_[i]); }
+        std::stable_sort(d.begin(), d.end(),
+                         [](const SerialSeq& a, const SerialSeq& b) { return a.order > b.order; });
+        for (size_t k = 0; k < at.size(); ++k) {
+            d[k].draft_idx = (int32_t)k;
+            serial_[at[k]] = d[k];
+            out[k].seq  = d[k].seq;
+            out[k].slot = d[k].slot;
+            out[k].card = d[k].card;
+        }
+    }
     return n_draft_rows;
 }
 
-const RadBatch* Scheduler::serial_batch(int round, int step) {
+const RadBatch* Scheduler::serial_batch(int round, int step, int rows) {
     /* RADIANCE_DEBUG_STAGE, below. Read before the lock so the timer covers the wait for it. */
     static const bool stg = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr;
     const auto t_stage0 = stg ? std::chrono::steady_clock::now()
@@ -3503,6 +3524,9 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         if ((m.draft_idx >= 0) != (part == 0)) continue;
         if (round == 0 && m.hist_n <= 0) continue;      /* nothing owed for this sequence */
         if (round > 0 && m.draft_idx < 0) continue;     /* history only: no token to propose */
+        /* A round over the first `rows` drafting sequences: the adaptive chain's rows behind the
+         * last one still going (Engine::issue_serial_drafter). */
+        if (round > 0 && rows >= 0 && m.draft_idx >= rows) continue;
         const Request* rq = serial_req(m);
         /* Unreachable while reap() defers on block_holds(); if it happens the round is skipped,
          * costing one step's draft. */

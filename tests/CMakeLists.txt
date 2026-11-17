@@ -89,7 +89,7 @@ set_target_properties(harness_fixture PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 # Binaries registered as several entries, <bin>_shard<k> running `<bin> --shard k/n`, so their
 # cases run in parallel and no entry is the fast tier's long pole.
 set(RAD_TEST_SHARDS_gbnf_test 4)
-set(RAD_TEST_SHARDS_mtp_rrs_test 8)  # chi-square statistics: ~3 CPU minutes in all, so eight ctest entries of under a minute each
+set(RAD_TEST_SHARDS_mtp_rrs_test 14)  # chi-square statistics: ~5 CPU minutes in all (the adaptive depth's rules and their controls are ~2 of them); fourteen ctest entries keep the long cases apart, each entry under a minute and a half
 
 # ------------------------------------------------------------------ the environment of every test
 #

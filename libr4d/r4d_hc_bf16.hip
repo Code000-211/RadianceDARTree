@@ -3114,11 +3114,16 @@ __device__ __forceinline__ void hc_up_mix_tiled_body(HC_UMT_PARAMS) {
         }
     }
 
-    constexpr int kTPR = kThreads / RT;             /* threads a row; RT divides kThreads */
+    /* Threads a row: a power of two, so a row's threads are one aligned run of a wave's lanes
+     * (r4d_xor_max). RT divides kThreads at the 32- and 64-row tiles; the 48-row tile takes the
+     * 64-row tile's four and its last quarter of the block has no row. */
+    constexpr int kTPR = RT == 48 ? kThreads / 64 : kThreads / RT;
     constexpr int kRuns = (kUpTB / 4) / kTPR;       /* a thread's four-channel runs */
+    static_assert((kTPR & (kTPR - 1)) == 0 && kTPR * RT <= kThreads && kRuns * kTPR * 4 == kUpTB,
+                  "a row's threads cover its scale group");
     const int  rl = tid / kTPR, lr_ = tid % kTPR;
     const long r  = r0 + rl;
-    if (r >= rows) return;
+    if (rl >= RT || r >= rows) return;
     const long base = (i0 / kUpTB) * kUpTB;
     const unsigned short* const xr = x + r * xrow + base;
     float xv[kRuns][4];
@@ -3534,6 +3539,9 @@ void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* _
  * self-resetting counter is sound only while two launches of its kernel cannot overlap, which one
  * stream guarantees. Allocation failure is not an error; the caller runs the unfused pair. */
 constexpr unsigned kMaxMixCtr = 2048;
+/* The 48-row tile's columns a workgroup, in both products: 32, so its 3 x 2 WMMA tiles are one a
+ * wave, as the 32-row tile's 2 x 4 are (hc_down_rt has the measurements). */
+constexpr int kMidNT = 32;
 
 unsigned int* hc_mix_ctr(RadStream s) {
     /* A lock a device: zeroing a block waits for the card, and under tensor parallelism the card
@@ -3578,8 +3586,8 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
                                           float* rqs, unsigned int* ctr,
                                           long rows, long n, int hc, long lr, long hrow,
                                           long xrow, long qrow, long srow, long rqrow, long rsrow,
-                                          float wadd, RadStream s, bool chain) {
-    const dim3 gm((unsigned)(n / (kTNT / hc)), (unsigned)((rows + rt - 1) / rt));
+                                          float wadd, RadStream s, bool chain, int nt = kTNT) {
+    const dim3 gm((unsigned)(n / (nt / hc)), (unsigned)((rows + rt - 1) / rt));
     /* Through r4d_emit, so r4d_record_dispatches sees which form ran. */
 #define HC_UM_K(K_)                                                                               \
     (void)R4D_EMIT(s, K_, gm, dim3(kThreads), 0, up, uld, dbuf, h, w, scale, x, q, qs, rq, rqs, ctr, \
@@ -3592,8 +3600,22 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
     } while (0)
 #define HC_UM_CASE(RT_, F8_)                                                                     \
     do { if (i8) HC_UM_CASE3(RT_, F8_, true); else HC_UM_CASE3(RT_, F8_, false); } while (0)
-    if (f8) { if (rt == 32) HC_UM_CASE(32, true);  else HC_UM_CASE(64, true); }
-    else    { if (rt == 32) HC_UM_CASE(32, false); else HC_UM_CASE(64, false); }
+    /* The 48-row tile has no two-grid twin: the pin keeps the 64-row tile (hc_down_rt). */
+#define HC_UM_MID(NT_, F8_, I8_)                                                                 \
+    do {                                                                                         \
+        if (chain) HC_UM_K((hc_up_mix_tiled_kernel<48, NT_, F8_, I8_, r4dchain>));               \
+        else       HC_UM_K((hc_up_mix_tiled_kernel<48, NT_, F8_, I8_, R4dUnchained>));           \
+    } while (0)
+#define HC_UM_MID2(F8_, I8_)                                                                     \
+    do { if (nt == kMidNT) HC_UM_MID(kMidNT, F8_, I8_); else HC_UM_MID(kTNT, F8_, I8_); } while (0)
+    if (rt == 48) {
+        if (f8) { if (i8) HC_UM_MID2(true, true);  else HC_UM_MID2(true, false); }
+        else    { if (i8) HC_UM_MID2(false, true); else HC_UM_MID2(false, false); }
+    }
+    else if (f8) { if (rt == 32) HC_UM_CASE(32, true);  else HC_UM_CASE(64, true); }
+    else         { if (rt == 32) HC_UM_CASE(32, false); else HC_UM_CASE(64, false); }
+#undef HC_UM_MID2
+#undef HC_UM_MID
 #undef HC_UM_CASE
 #undef HC_UM_CASE3
 #undef HC_UM_K
@@ -4462,9 +4484,27 @@ static inline long hc_down_kchunk(long long lr, long long HN, long long nrt) {
  *
  * Strictly greater than 64: at exactly 64 rows a 128-row tile re-reads the weight just as often
  * (once) but wastes half its LDS traffic and WMMA slots on clamped duplicate rows, and its 26112 B
- * of LDS fits two workgroups per WGP instead of three. Do not change to `>=`. */
+ * of LDS fits two workgroups per WGP instead of three. Do not change to `>=`.
+ *
+ * 33 to kMidRows rows (eight sequences at depth 3 to 5) take a 48-row tile of kMidNT = 32 columns
+ * a workgroup. What a read of 33 rows pays for at the 64-row tile is not its rows but its wave
+ * map: 4 m-tiles x 4 n-tiles over eight waves are two 16 x 16 WMMA tiles a wave, so every staged
+ * K pass is a chain of eight multiplies and their fragment reads where the 32-row tile's (2 x 4,
+ * one a wave) is four, and a block's passes run one after the other. A 48-row tile at kTNT
+ * columns keeps the two tiles a wave and gains nothing (55 to 59 us a read at 33 to 48 rows
+ * against 57 to 61; its smaller LDS, 28 KiB against 34, does not show). At 32 columns the
+ * 48-row tile is 3 x 2 tiles, one a wave again, on twice the workgroups: 50 to 54 us against 57
+ * to 61 (32 rows: 37.5; r4d_selftest --perfhc). Its K loops are the plain ones: pipelined as the
+ * 32-row tile's are (the A tile is 384 vectors over 256 threads, so half the threads would stage
+ * a second one) they measured 54 to 58 us.
+ * One row tile either way, so hc_down_kchunk's K split (counted at kTNT) is the 64-row tile's and
+ * every element is summed in the same order: the bytes are the same (r4d_selftest compares the
+ * two; r4d_hc_read_pin_decode(2) keeps the 64-row tile, (3) the 48-row tile at kTNT columns). */
+constexpr long kMidRows = 48;
 static inline int hc_down_rt(long long rows) {
-    return (rows > kTileMinRows) ? 128 : (rows > 32 ? 64 : 32);
+    if (rows > kTileMinRows) return 128;
+    if (rows <= 32) return 32;
+    return (rows <= kMidRows && (g_hc_decode_form == 0 || g_hc_decode_form == 3)) ? (int)kMidRows : 64;
 }
 
 /* The partial buffer for any row count up to the band's M, in bytes.
@@ -4500,9 +4540,9 @@ static inline void hc_down_tiled_launch(int rt, bool f8, const unsigned short* h
                                         unsigned short* dbuf, unsigned short* inj, float* part,
                                         long rows, long n, int hc, long lr, long ncol, long hrow,
                                         long irow, long kc, float wadd, RadStream s,
-                                        unsigned int* ctr = nullptr) {
+                                        unsigned int* ctr = nullptr, int nt = kTNT) {
     const long HN = (long)hc * n;
-    const dim3 gd((unsigned)((ncol + kTNT - 1) / kTNT), (unsigned)((rows + rt - 1) / rt),
+    const dim3 gd((unsigned)((ncol + nt - 1) / nt), (unsigned)((rows + rt - 1) / rt),
                   (unsigned)((HN + kc - 1) / kc));
 #define HC_DOWN_CASE(RT_, F8_)                                                                   \
     hipLaunchKernelGGL((hc_down_tiled_kernel<RT_, kTNT, F8_>), gd, dim3(kThreads), 0,             \
@@ -4510,6 +4550,16 @@ static inline void hc_down_tiled_launch(int rt, bool f8, const unsigned short* h
                        hc, lr, ncol, hrow, irow, kc, wadd, ctr)
     switch (rt) {
         case 32:  if (f8) HC_DOWN_CASE(32, true);  else HC_DOWN_CASE(32, false);  break;
+        case 48:
+            if (nt == kMidNT) {
+                if (f8) hipLaunchKernelGGL((hc_down_tiled_kernel<48, kMidNT, true>), gd, dim3(kThreads), 0,
+                                           (hipStream_t)s, h, w, down, dld, scale, injw, dbuf, inj, part,
+                                           rows, n, hc, lr, ncol, hrow, irow, kc, wadd, ctr);
+                else    hipLaunchKernelGGL((hc_down_tiled_kernel<48, kMidNT, false>), gd, dim3(kThreads), 0,
+                                           (hipStream_t)s, h, w, down, dld, scale, injw, dbuf, inj, part,
+                                           rows, n, hc, lr, ncol, hrow, irow, kc, wadd, ctr);
+            } else if (f8) HC_DOWN_CASE(48, true); else HC_DOWN_CASE(48, false);
+            break;
         case 64:  if (f8) HC_DOWN_CASE(64, true);  else HC_DOWN_CASE(64, false);  break;
         default:  if (f8) HC_DOWN_CASE(128, true); else HC_DOWN_CASE(128, false); break;
     }
@@ -4524,12 +4574,13 @@ static inline void hc_norm_down_tiled_launch(int rt, bool f8, const unsigned sho
                                              float* part, long rows, long n, int hc, long lr,
                                              long ncol, long hrow, long irow, long kc, float wadd,
                                              float eps, RadStream s, unsigned int* ctr,
-                                             unsigned int* sync, bool chain) {
+                                             unsigned int* sync, bool chain, int nt = kTNT) {
     const long HN = (long)hc * n;
-    const unsigned gdx = (unsigned)((ncol + kTNT - 1) / kTNT), gdy = (unsigned)((rows + rt - 1) / rt);
+    const unsigned gdx = (unsigned)((ncol + nt - 1) / nt), gdy = (unsigned)((rows + rt - 1) / rt);
     const unsigned gdz = (unsigned)((HN + kc - 1) / kc), nn = (unsigned)hc * (unsigned)rows;
-#define HC_ND_E(RT_, F8_, CH_)                                                                   \
-    hipLaunchKernelGGL((hc_norm_down_tiled_kernel<RT_, kTNT, F8_, CH_>),                         \
+#define HC_ND_E(RT_, F8_, CH_) HC_ND_EN(RT_, kTNT, F8_, CH_)
+#define HC_ND_EN(RT_, NT_, F8_, CH_)                                                             \
+    hipLaunchKernelGGL((hc_norm_down_tiled_kernel<RT_, NT_, F8_, CH_>),                          \
                        dim3(nn + gdx * gdy * gdz),                                               \
                        dim3(kThreads), 0, (hipStream_t)s, h, w, down, dld, scale, injw, dbuf,   \
                        inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd, ctr, sync, eps,  \
@@ -4538,9 +4589,16 @@ static inline void hc_norm_down_tiled_launch(int rt, bool f8, const unsigned sho
     do { if (chain) HC_ND_E(RT_, F8_, r4dchain); else HC_ND_E(RT_, F8_, R4dUnchained); } while (0)
     switch (rt) {
         case 32:  if (f8) HC_ND_CASE(32, true);  else HC_ND_CASE(32, false);  break;
+        case 48:
+            if (nt == kMidNT) {
+                if (f8) { if (chain) HC_ND_EN(48, kMidNT, true, r4dchain);  else HC_ND_EN(48, kMidNT, true, R4dUnchained); }
+                else    { if (chain) HC_ND_EN(48, kMidNT, false, r4dchain); else HC_ND_EN(48, kMidNT, false, R4dUnchained); }
+            } else if (f8) HC_ND_CASE(48, true); else HC_ND_CASE(48, false);
+            break;
         default:  if (f8) HC_ND_CASE(64, true);  else HC_ND_CASE(64, false);  break;
     }
 #undef HC_ND_CASE
+#undef HC_ND_EN
 #undef HC_ND_E
 }
 
@@ -4570,6 +4628,7 @@ static inline void hc_up_tiled_launch(int rt, bool f8, const void* up, long uld,
                        (hipStream_t)s, up, uld, dbuf, ubuf, rows, hn, lr)
     switch (rt) {
         case 32:  if (f8) HC_UP_CASE(32, true);  else HC_UP_CASE(32, false);  break;
+        case 48:  if (f8) HC_UP_CASE(48, true);  else HC_UP_CASE(48, false);  break;
         case 64:  if (f8) HC_UP_CASE(64, true);  else HC_UP_CASE(64, false);  break;
         default:  if (f8) HC_UP_CASE(128, true); else HC_UP_CASE(128, false); break;
     }
@@ -5050,8 +5109,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     /* The row count picks the form. The per-row kernels read both mixing matrices once per row:
      * four rows is hidden by an issue-bound kernel, but 32 (eight sequences at depth 3) is 210 MB
      * per connection. So from kDecMinRows the products run tiled, 128 rows when there are enough
-     * (prefill), else 32 or 64 with a K-split down product. Below kDecMinRows the per-row kernels
-     * win. */
+     * (prefill), else 32, 48 or 64 (hc_down_rt) with a K-split down product. Below kDecMinRows the
+     * per-row kernels win. */
     bool fused = false;
     /* The shape the fused kernel is built for keeps its rows per-row to kFusedMaxRows, under the
      * two-grid pin too: the pinned pair is then the same bodies as the fused grid. */
@@ -5102,9 +5161,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
          * launches -> two: 8 rows 31.8 -> 31.3, 16 rows 34.3 -> 33.8, 32 rows 37.0 -> 37.9,
          * 48 rows 57.6 -> 62.2, 64 rows 68.0 -> 68.0); in a step each launch saved is about 3 us of
          * dispatch ordering besides. */
+        /* The columns a workgroup of the decode tiles owns: kTNT, and kMidNT at the 48-row tile
+         * (r4d_hc_read_pin_decode(3) keeps kTNT there). Only the grids change with it: the K split
+         * stays hc_down_kchunk's, counted at kTNT. */
+        const int tnt = (rt == 48 && g_hc_decode_form != 3) ? kMidNT : kTNT;
         unsigned int* dctr = nullptr;
-        if (rows <= kNdFuseRows && ks > 1 && !wdown && (rt == 32 || rt == 64) &&
-            ((ncol + kTNT - 1) / kTNT) * nrt <= (long)kMaxMixCtr)
+        if (rows <= kNdFuseRows && ks > 1 && !wdown && (rt == 32 || rt == 48 || rt == 64) &&
+            ((ncol + tnt - 1) / tnt) * nrt <= (long)kMaxMixCtr)
             dctr = hc_mix_ctr(s);
         const bool ndfuse = dctr != nullptr;
 
@@ -5122,7 +5185,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                       fold ? (const unsigned short*)injw->data : nullptr,
                                       dbuf, fold ? (unsigned short*)inj->data : nullptr, part,
                                       (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow,
-                                      (long)irow, kc, wadd, eps, s, dctr, dctr + kMaxMixCtr, chain);
+                                      (long)irow, kc, wadd, eps, s, dctr, dctr + kMaxMixCtr, chain, tnt);
         else if (wdown)
             hc_down_wide_launch(f8, (const unsigned short*)h->data, (const float*)w->data,
                                 down->data, (long)dld, scale,
@@ -5136,7 +5199,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                  fold ? (const unsigned short*)injw->data : nullptr,
                                  dbuf, fold ? (unsigned short*)inj->data : nullptr, part,
                                  (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow,
-                                 (long)irow, kc, wadd, s, dctr);
+                                 (long)irow, kc, wadd, s, dctr, tnt);
         if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
 
         if (ks > 1 && !dctr) {
@@ -5153,7 +5216,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
          * the finisher's counters fit: hc_up_mix_tiled_kernel at 32- and 64-row tiles,
          * hc_up_mix_wide_kernel at the prefill tile (registers instead of the 58 KiB of LDS staging
          * planes). */
-        const int ipb = (hc > 0 && (kTNT % hc) == 0) ? kTNT / hc : 0;
+        const int ipb = (hc > 0 && (tnt % hc) == 0) ? tnt / hc : 0;
         const long ntile = (long)(n / kUpTB) * ((rows + rt - 1) / rt);
         unsigned int* mctr = nullptr;
         const bool wide = rt == kWideRT && hc == 4 && g_hc_prefill_form != 1;
@@ -5180,7 +5243,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                    rq ? (float*)rqs->data : nullptr, mctr,
                                    (long)rows, (long)n, (int)hc, (long)lr, (long)hrow,
                                    (long)xrow, (long)qrow, (long)srow, (long)rqrow, (long)rsrow,
-                                   wadd, s, chain);
+                                   wadd, s, chain, tnt);
         else
             hc_up_tiled_launch(rt, f8, up->data, (long)uld, dbuf, ubuf,
                                (long)rows, (long)HN, (long)lr, s);
@@ -5314,4 +5377,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 }
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
+/* 0 the launcher's rule; 1 the two-grid form (and the 64-row tile from 33 rows); 2 the rule with the
+ * 64-row tile from 33 rows, as it was before the 48-row tile; 3 the rule with the 48-row tile at
+ * kTNT columns a workgroup. */
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }

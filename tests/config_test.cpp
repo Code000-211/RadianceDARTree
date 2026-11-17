@@ -577,6 +577,12 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-depth", { "adaptive" } }, { "--draft-depth-max", { "5" } },
         { "--draft-depth-min", { "2" } }, { "--draft-depth-stop", { "0.7" } },
         { "--draft-depth-lag", { "0" } }, { "--draft-depth-stat", { "path" } },
+        { "--draft-depth-load", { "on", "--draft-depth", "adaptive" } },
+        { "--draft-depth-load-from", { "4" } }, { "--draft-depth-load-min", { "1" } },
+        { "--draft-depth-load-late", { "off" } }, { "--draft-depth-load-calib", { "static" } },
+        { "--draft-depth-load-tok-ms", { "0.23,0.36,0.43,0.51" } },
+        { "--draft-depth-load-row-ms", { "1.2,0.8" } }, { "--draft-depth-load-round-ms", { "0.5" } },
+        { "--draft-depth-load-jump-ms", { "1.3,1.4,2.3,0" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
@@ -1191,6 +1197,48 @@ TEST(draft_depth_adaptive_parses_and_needs_a_coupled_chain) {
     CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "block" }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-min", "4", "--draft-depth-max", "3" }),
              RAD_E_INVAL);
+}
+
+/* --draft-depth-load is off unless asked for: the load-aware rule of the adaptive chain. It needs
+ * that chain and its `top` statistic, and takes its tables as comma lists. */
+TEST(draft_depth_load_parses_and_needs_the_adaptive_chain) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK(!c.draft_depth_load);
+    CHECK_EQ(c.draft_depth_load_from, 5);
+    CHECK_EQ(c.draft_depth_load_min, 2);
+    CHECK(c.draft_depth_load_late);
+    CHECK(c.draft_depth_load_online);
+    CHECK(c.draft_depth_load_tok_ms.empty() && c.draft_depth_load_jump_ms.empty());
+    Config a;
+    CHECK_EQ(parse({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-depth-load-from", "3",
+                     "--draft-depth-load-min", "1", "--draft-depth-load-late", "off",
+                     "--draft-depth-load-calib", "static", "--draft-depth-load-row-ms", "1.1,0.8,0.7",
+                     "--draft-depth-load-jump-ms", "1.3,0,2" }, &a), RAD_OK);
+    CHECK(a.draft_depth_load && a.draft_depth_adaptive && a.draft_coupling);
+    CHECK_EQ(a.draft_depth_load_from, 3);
+    CHECK_EQ(a.draft_depth_load_min, 1);
+    CHECK(!a.draft_depth_load_late);
+    CHECK(!a.draft_depth_load_online);
+    CHECK_EQ(a.draft_depth_load_row_ms, std::string("1.1,0.8,0.7"));
+    CHECK_EQ(a.draft_depth_load_jump_ms, std::string("1.3,0,2"));
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-verify", "traversal" }), RAD_OK);
+    /* not without the adaptive chain, and not with the drawn token's own mass as the statistic */
+    CHECK_EQ(parse_fresh({ "--draft-depth-load", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "fixed", "--draft-depth-load", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-depth-stat", "path" }),
+             RAD_E_INVAL);
+    /* the knobs alone change nothing and are taken */
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-from", "8" }), RAD_OK);
+    for (const char* bad : { "auto", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-depth-load", bad }), RAD_E_INVAL);
+    for (const char* bad : { "1", "65", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-from", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "17" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-min", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-calib", "auto" }), RAD_E_INVAL);
+    for (const char* bad : { "a", "1,", "1;2", "-1", "0", "1,2,3,4,5,6,7,8,9" })
+        CHECK_EQ(parse_fresh({ "--draft-depth-load-row-ms", bad }), RAD_E_INVAL);
+    for (const char* bad : { "1,2,3,4,5", "-0.5", "x" })
+        CHECK_EQ(parse_fresh({ "--draft-depth-load-jump-ms", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-jump-ms", "0,0,0,0" }), RAD_OK);
 }
 
 /* --draft-verify is token (alias rowwise) unless asked for; block and traversal parse, block

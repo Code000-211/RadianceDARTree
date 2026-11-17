@@ -4,6 +4,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "sched/draft_depth.h"   /* the --draft-depth-load lists */
 #include "kld.h"
 #include "rad_mtp_adapt.h"
 #include "format/rope_override.h"
@@ -297,6 +298,28 @@ static const Flag g_flags[] = {
                                         "0 or 1 (default 1: the host decides while the next round runs)" },
     { "--draft-depth-stat",   "S",      "--draft-depth adaptive: top (default, each round's largest\n"
                                         "probability) | path (the probability of the token it drew)" },
+    { "--draft-depth-load",   "MODE",   "off (default) | on -- --draft-depth adaptive with several sequences\n"
+    "                                    in a step: draft round j only for the rows whose expected accepted\n"
+    "                                    drafts pay their verify\n"
+    "                                    rows, the kernel tile they open and the round, at the measured\n"
+    "                                    throughput; fewer sequences than --draft-depth-load-from keep the\n"
+    "                                    stop rule. Same output law" },
+    { "--draft-depth-load-from", "N",   "--draft-depth-load: the fewest drafting sequences of a step the\n"
+                                        "load-aware rule decides (default 5)" },
+    { "--draft-depth-load-min", "N",    "--draft-depth-load: rounds a load-aware step always runs (default 2)" },
+    { "--draft-depth-load-late", "MODE", "on (default) | off -- --draft-depth-load: choose each row's verified\n"
+                                        "drafts again when the next verify is issued, from the laws read by then" },
+    { "--draft-depth-load-calib", "MODE", "--draft-depth-load: online (default; acceptance by confidence,\n"
+    "                                    throughput and row/round/tile prices follow the running server) |\n"
+    "                                    static (the built-in or given tables only)" },
+    { "--draft-depth-load-tok-ms", "LIST", "--draft-depth-load: tokens a millisecond by drafting sequences\n"
+                                        "1..8, comma-separated (a short list repeats its last; default built in)" },
+    { "--draft-depth-load-row-ms", "LIST", "--draft-depth-load: a verify row's milliseconds, by drafting\n"
+                                        "sequences 1..8" },
+    { "--draft-depth-load-round-ms", "LIST", "--draft-depth-load: a draft round's milliseconds, by drafting\n"
+                                        "sequences 1..8" },
+    { "--draft-depth-load-jump-ms", "LIST", "--draft-depth-load: what a verify of more than 16, 32, 48, 64\n"
+                                        "rows costs on top, in milliseconds (four numbers)" },
     { "--draft-ngram-leaves", "N",      "a serial head's tree: graft up to N prompt-lookup nodes (a\n"
                                         "branch off the root or a chain extension) onto a host-built\n"
                                         "tree verify when the lookup's match is long enough; lossless,\n"
@@ -1107,6 +1130,42 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-depth-load") || S("--draft-depth-load-late")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            bool b = false;
+            if      (!std::strcmp(v, "off")) b = false;
+            else if (!std::strcmp(v, "on"))  b = true;
+            else { RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v); return RAD_E_INVAL; }
+            (S("--draft-depth-load") ? c->draft_depth_load : c->draft_depth_load_late) = b;
+        }
+        else if (S("--draft-depth-load-from")) { if (!num(2, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-min"))  { if (!num(1, 16, &c->draft_depth_load_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-calib")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "online")) c->draft_depth_load_online = true;
+            else if (!std::strcmp(v, "static")) c->draft_depth_load_online = false;
+            else {
+                RAD_ERR("--draft-depth-load-calib takes online or static, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-load-tok-ms") || S("--draft-depth-load-row-ms") ||
+                 S("--draft-depth-load-round-ms") || S("--draft-depth-load-jump-ms")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const bool jump = S("--draft-depth-load-jump-ms");
+            double probe[DraftDepthCfg::kLoadSeqs];
+            const int cap = jump ? (int)DraftDepthCfg::kJumps : (int)DraftDepthCfg::kLoadSeqs;
+            /* a price may be zero (a tile that costs nothing); a rate may not */
+            if (*v && draft_depth_parse_list(v, probe, cap, jump ? 0.0 : 1e-6, 1000.0) < 1) {
+                RAD_ERR("%s takes 1..%d comma-separated %s numbers, not '%s'", a.c_str(), cap,
+                        jump ? "non-negative" : "positive", v);
+                return RAD_E_INVAL;
+            }
+            (S("--draft-depth-load-tok-ms") ? c->draft_depth_load_tok_ms
+             : S("--draft-depth-load-row-ms") ? c->draft_depth_load_row_ms
+             : S("--draft-depth-load-round-ms") ? c->draft_depth_load_round_ms
+             : c->draft_depth_load_jump_ms) = v;
+        }
         else if (S("--draft-ngram-leaves"))    { if (!num(0, 16, &c->draft_ngram_leaves)) return RAD_E_INVAL; }
         else if (S("--draft-ngram-min-match")) { if (!num(1, 64, &c->draft_ngram_min_match)) return RAD_E_INVAL; }
         else if (S("--draft-suffix")) {
@@ -1680,6 +1739,20 @@ int config_parse(int argc, char** argv, Config* c) {
         c->draft_coupling = true;
         c->draft_tree = 0;
     }
+    /* --draft-depth-load weighs the adaptive chain's rounds; its late choice reads each round's
+     * largest probability, the one statistic that is not the drawn token's own. */
+    if (c->draft_depth_load) {
+        if (!c->draft_depth_adaptive) {
+            RAD_ERR("--draft-depth-load on needs --draft-depth adaptive: it decides the adaptive "
+                    "chain's rounds for a step of several sequences");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_depth_stat != 0) {
+            RAD_ERR("--draft-depth-load on needs --draft-depth-stat top: its tables and the late "
+                    "choice of the verify's rows read each round's largest probability");
+            return RAD_E_INVAL;
+        }
+    }
     /* --draft-verify block verifies a linear chain with the coupled drafting's states. */
     if (c->draft_verify_block) {
         if (c->given.count("--draft-coupling") && !c->draft_coupling) {
@@ -1857,6 +1930,16 @@ const ShowRow kShow[] = {
     { "--draft-depth-stop",   [](const Config& c) { return fnum(c.draft_depth_stop); } },
     { "--draft-depth-lag",    [](const Config& c) { return num(c.draft_depth_lag); } },
     { "--draft-depth-stat",   [](const Config& c) { return std::string(c.draft_depth_stat == 1 ? "path" : "top"); } },
+    { "--draft-depth-load",   [](const Config& c) { return onoff(c.draft_depth_load); } },
+    { "--draft-depth-load-from", [](const Config& c) { return num(c.draft_depth_load_from); } },
+    { "--draft-depth-load-min", [](const Config& c) { return num(c.draft_depth_load_min); } },
+    { "--draft-depth-load-late", [](const Config& c) { return onoff(c.draft_depth_load_late); } },
+    { "--draft-depth-load-calib", [](const Config& c) {
+          return std::string(c.draft_depth_load_online ? "online" : "static"); } },
+    { "--draft-depth-load-tok-ms", [](const Config& c) { return or_none(c.draft_depth_load_tok_ms, "builtin"); } },
+    { "--draft-depth-load-row-ms", [](const Config& c) { return or_none(c.draft_depth_load_row_ms, "builtin"); } },
+    { "--draft-depth-load-round-ms", [](const Config& c) { return or_none(c.draft_depth_load_round_ms, "builtin"); } },
+    { "--draft-depth-load-jump-ms", [](const Config& c) { return or_none(c.draft_depth_load_jump_ms, "builtin"); } },
     { "--draft-ngram-leaves", [](const Config& c) {
           return c.draft_ngram_leaves > 0 ? num(c.draft_ngram_leaves) : std::string("off"); } },
     { "--draft-ngram-min-match", [](const Config& c) { return num(c.draft_ngram_min_match); } },

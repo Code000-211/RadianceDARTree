@@ -1665,6 +1665,62 @@ at the same mean of 3.0 drafts and a step 0.7% longer: +3.0% tokens a second (95
 +5.0%) over temperatures 0.7 and 1.0; a cap of 7 gained no more, a deep verify row costing more than a
 shallow one. The stop is not sensitive between 0.80 and 0.90.
 
+A draft round is one pass of the head, and it covers only the sequences whose chain is still going: the
+drafting sequences are ordered by the depth of their last chain (deepest first) and a round's pass takes
+the rows up to the last one that goes on, so the round of a step where most chains have ended is a pass
+over a few rows instead of all of them. Nothing a row computes depends on its place in the pass.
+
+**Several sequences in one step: `draft-depth-load: on`.** The stop rule prices a draft as one stream pays
+for it: its verify row and the head round that makes it. With several sequences drafting in one step the
+prices part. A round is one pass for every row, a verify row is each row's own, the row that takes the
+verify past a kernel tile (more than 16, 32, 48 or 64 query rows) pays for the tile, and a millisecond is
+worth more tokens. From `draft-depth-load-from` drafting sequences on (default 5) the load-aware rule
+decides the chain instead: round j runs for the rows of largest p that maximise
+
+    sum of p  -  rate x (what their verify rows and the tiles they open cost + the round)
+
+with p the chance that the row's draft j is accepted, read off the chain's confidence so far, and the rate
+the tokens a millisecond the engine makes at that many sequences: a draft is made when it yields more than
+the same time does on average. `draft-depth-load-min` rounds (default 2) always run. When the next verify is
+issued the host has read one more law of every chain than the rule had, and `draft-depth-load-late: on` (the
+default) chooses each row's verified drafts again from those -- draft j by the laws up to its own, never
+the one after it -- so a chain that turned unsure after its round was issued costs the round but no verify
+row, and the rows are cut back to a tile where the tile costs more than the drafts past it yield. A step
+with fewer sequences is decided by the stop rule exactly as without the key, so a single stream is served
+bit for bit as before.
+
+```yaml
+    max-num-seqs: 8
+    draft-depth: adaptive
+    draft-depth-load: on           # the stop rule up to 4 drafting sequences, the load-aware rule from 5
+```
+
+The tables the rule reads -- each draft's acceptance by confidence, the tokens a millisecond, and a verify
+row's, a round's and a tile's milliseconds by drafting sequences -- start from ones measured on
+Qwen3.8-Flash-Next (IQR-V4, two R9700, temperature 1.0), or from the `draft-depth-load-*-ms` lists, and with
+`draft-depth-load-calib: online` (the default) follow the running server. Every verified chain is counted,
+for each draft it carried, at the confidence its decisions read (on top of 48 pseudo-observations of the
+built-in table a knot, the estimate kept monotone in the confidence, the counts halving every 4000 steps or
+so); the rate is a moving average of the pure decode steps' tokens and milliseconds; and the prices are
+those steps' milliseconds regressed on verify rows, rounds and tiles, with the built-in prices as the
+prior, so a price the steps do not tell apart (a round from the rows that come with it) stays near the
+table and one they do (a row, a tile) follows them. A lower temperature, which accepts more at the same
+confidence, another card or another model therefore needs no table of its own; `static` serves the tables
+as given. The output law is the target's either way: within a step the rule reads draft-side laws only (its
+own chain's up to the draft it admits, and the other sequences'), and the tables move between steps, from
+verifies and step times that are over -- draws at coordinates the step in hand never reads again
+(`core/sched/draft_depth.h` has the argument, `tests/mtp_rrs_test.cpp` the chi-square with tables that
+follow the run, and the two controls that fail it: a choice that reads the law after the draft, and tables
+made from the step's own verify). Requests that share a seed share those coordinates, as under
+`draft-calib: online`. Shutdown logs what was measured (`draft depth load-aware (final)`), and
+`RADIANCE_CONC_LOG=<file>` writes one line a decode step (rows, rounds, each chain's depth and confidences,
+the accepted counts) for study; nothing reads it back. On Qwen3.8-Flash-Next (2x R9700, traversal
+verify, `max-num-seqs: 8`, BetterBench's concurrency sweep, 48 requests a run) eight streams in one server
+session, the rule switched between runs, made 565 tokens a second against the stop rule's 557 at
+temperature 1.0 (+1.5%, two runs each) and 572 against 556 at 0.7 (+2.9%); one, two and four streams are
+the stop rule's and unchanged. The gain is what is left once the 33-row tile costs about a millisecond
+(the 48-row tile of `hc_read`); with a dearer tile the rule has more to avoid.
+
 **Adaptive depth and the suffix selector together.** `draft-depth: adaptive` and `draft-suffix: on` combine, with
 `draft-verify: traversal` or token by token. Per step and per sequence the selector goes first: if the sequence's own
 history recurs (`draft-suffix-min-match`, `draft-suffix-min-score`) the step verifies the suffix chain (up to
@@ -2625,6 +2681,15 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `draft-depth-stop: P` | 0.85 | `draft-depth: adaptive`: the chain goes on while its confidence is at least P |
 | `draft-depth-lag: K` | 1 | `draft-depth: adaptive`: rounds the decision trails the chain (0 or 1); 1 hides the host's decision behind a running round |
 | `draft-depth-stat: S` | top | `draft-depth: adaptive`: `top` multiplies each round's largest probability, `path` the probability of the token it drew |
+| `draft-depth-load: MODE` | off | `on`: a step that drafts for `draft-depth-load-from` sequences or more runs draft round j only for the rows whose expected accepted drafts pay their verify rows, the kernel tile they open and the round, at the measured throughput (§4.6). Needs `draft-depth: adaptive` with `draft-depth-stat: top`. Same output law; fewer sequences keep the stop rule |
+| `draft-depth-load-from: N` | 5 | `draft-depth-load: on`: the fewest drafting sequences of a step the load-aware rule decides (2..64) |
+| `draft-depth-load-min: N` | 2 | `draft-depth-load: on`: rounds a load-aware step always runs, and drafts its late choice never cuts |
+| `draft-depth-load-late: MODE` | on | `draft-depth-load: on`: choose each row's verified drafts again when the next verify is issued, from the laws read by then |
+| `draft-depth-load-calib: MODE` | online | `draft-depth-load: on`: `online` keeps the rule's tables (acceptance by confidence, tokens a millisecond, row / round / tile prices) on the running server's own verifies and step times; `static` serves the built-in or given tables |
+| `draft-depth-load-tok-ms: LIST` | built in | `draft-depth-load: on`: tokens a millisecond by drafting sequences 1..8, comma-separated (a short list repeats its last number); where the online calibration starts |
+| `draft-depth-load-row-ms: LIST` | built in | `draft-depth-load: on`: a verify row's milliseconds by drafting sequences 1..8 |
+| `draft-depth-load-round-ms: LIST` | built in | `draft-depth-load: on`: a draft round's milliseconds by drafting sequences 1..8 |
+| `draft-depth-load-jump-ms: LIST` | built in | `draft-depth-load: on`: what a verify of more than 16, 32, 48, 64 query rows costs on top, in milliseconds (up to four numbers) |
 | `draft-coupling: MODE` | off | `on`: an MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. With a draft tree (`draft-tree on`, stage 1 or 2) the siblings of a node are sampled without replacement from the head's law and verified by recursive rejection sampling (`DESIGN-coupling.md`): the same lossless guarantee. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `draft-model: PATH` | | not implemented: merge the drafter at convert time |
 

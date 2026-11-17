@@ -3179,6 +3179,533 @@ TEST(adaptive_chain_depth_keeps_the_target_law) {
     g_sharp = 1.0;
 }
 
+/* ---- the load-aware rule (DraftDepthCfg::load): several sequences drafted in one step, each chain's
+ * depth decided from its own and the OTHER rows' draft laws (draft_depth_go_load). Every sequence
+ * must keep the target's law: its depth now depends on its neighbours' drafts, which are
+ * independent of its own draws. `n_seq` generations of three tokens run side by side, a step for
+ * all that are still short; with one left the stop rule decides, as in the engine. */
+namespace {
+
+struct LoadRun { double z3[4], z1[4], mean_acc, mean_depth, rounds, share[8]; long mismatch; };
+
+/* The late choice with a deliberate mistake, for the control: draft j chosen by conf(min(j + peek,
+ * seen)); peek 0 is draft_depth_select's own arithmetic (checked against it), peek 1 reads the law
+ * that FOLLOWS x_j, which is conditioned on x_j. Rows and rounds priced as the rule prices them. */
+void select_peek(const DraftDepthCfg& c, DraftDepthRow* r, int n, int rounds, int other_rows, int peek) {
+    const double lam = c.load_lam[n < 1 ? 1 : (n > 8 ? 8 : n)];
+    int R = other_rows;
+    for (int i = 0; i < n; ++i) { r[i].depth = 1; r[i].done = false; R += 2; }
+    for (int j = 2; j <= rounds && j <= c.max; ++j) {
+        int cand[8], nc = 0;
+        double p[8];
+        for (int i = 0; i < n; ++i) {
+            if (r[i].done || r[i].depth != j - 1) continue;
+            const int m = std::min(j + peek, r[i].seen);
+            p[i] = draft_depth_cal(c, j, draft_depth_conf(r[i], m), std::min(2, std::max(0, m - (j - 2))));
+            cand[nc++] = i;
+        }
+        std::stable_sort(cand, cand + nc, [&](int a, int b) { return p[a] > p[b]; });
+        const double base = draft_depth_load_cost(c, n, R);
+        double sum = 0, best = 0;
+        int take = 0;
+        for (int m = 1; m <= nc; ++m) {
+            sum += p[cand[m - 1]];
+            const double v = sum - lam * (draft_depth_load_cost(c, n, R + m) - base);
+            if (v > best) { best = v; take = m; }
+        }
+        for (int m = 0; m < nc; ++m) { if (m < take) r[cand[m]].depth = j; else r[cand[m]].done = true; }
+        R += take;
+        if (!take) break;
+    }
+    for (int i = 0; i < n; ++i) r[i].done = true;
+}
+
+/* `late`: 0 the rule alone; 1 the late choice behind it (cfg.late_lag rounds not waited for);
+ * 2 the control that reads one round too far. */
+LoadRun run_depth_load(const DraftDepthCfg& cfg0, int n_seq, bool trav, int trials, double noise,
+                       int other_rows = 0, int late = 0, int online = 0) {
+    /* `online`: 1 the tables follow the run (DraftDepthOnline, fed by every verified chain,
+     * refreshed every 16 steps); 2 the control whose tables are made from the verify of the very
+     * step they then decide. */
+    DraftDepthCfg cfg = cfg0;
+    DraftDepthOnline on;
+    if (online) draft_depth_online_begin(cfg, &on);
+    long fed = 0;
+    std::vector<std::vector<double>> cnt3((size_t)n_seq, std::vector<double>((size_t)V * V * V, 0)),
+                                     cnt1((size_t)n_seq, std::vector<double>((size_t)V, 0));
+    LoadRun R{};
+    double rows = 0, steps = 0;
+    for (int s = 0; s < trials; ++s) {
+        uint64_t seed[4], h[4];
+        int out[4][16], len[4];
+        for (int q = 0; q < n_seq; ++q) {
+            seed[q] = 0x2f6b1ull + (uint64_t)s * 104729ull + (uint64_t)q * 0x9e3779b97f4a7c15ull;
+            h[q] = 1; len[q] = 0;
+        }
+        for (;;) {
+            int act[4], n = 0;
+            for (int q = 0; q < n_seq; ++q) if (len[q] < 3) act[n++] = q;
+            if (n == 0) break;
+            std::vector<Tree> t((size_t)n);
+            DraftDepthRow row[4];
+            for (int i = 0; i < n; ++i) {
+                draft_chain(&t[(size_t)i], seed[act[i]], (uint64_t)len[act[i]], cfg.max, 0, noise, h[act[i]]);
+                draft_depth_begin(cfg, &row[i], false);
+            }
+            if (online == 2) {
+                /* the control: what the target accepts of each whole chain, into the tables first */
+                draft_depth_online_begin(cfg0, &on);
+                on.prior_w = 1e-3;
+                for (int i = 0; i < n; ++i) {
+                    Tree tc = t[(size_t)i];
+                    tc.n = cfg.max;
+                    float sv[8];
+                    int ns = 0, so_[64], acc = 0;
+                    for (; ns < cfg.max && ns < 8; ++ns) sv[ns] = (float)draft_depth_stat(tc.st[ns], ns + 1, DRAFT_DEPTH_TOP);
+                    if (trav) walk_trav(tc, seed[act[i]], (uint64_t)len[act[i]], noise, 0, so_, &acc, RadMtpTravOpt{});
+                    else      walk(tc, seed[act[i]], (uint64_t)len[act[i]], noise, 0, so_, &acc);
+                    draft_depth_online_chain(cfg, &on, cfg.max, 0, acc, sv, ns);
+                }
+                cfg = cfg0;
+                draft_depth_online_refresh(&cfg, &on);
+            }
+            /* the engine's driver: rounds in order, every row observed up to the round a decision reads */
+            int ran = 1;
+            for (int j = 2; j <= cfg.max; ++j) {
+                const int need = draft_depth_need(cfg, j);
+                for (int i = 0; i < n; ++i)
+                    while (row[i].seen < need)
+                        draft_depth_observe(&row[i], row[i].seen + 1,
+                                            draft_depth_stat(t[(size_t)i].st[row[i].seen], row[i].seen + 1, cfg.stat));
+                bool any = false;
+                if (cfg.load && n > 1) any = draft_depth_go_load(cfg, row, n, j, other_rows);
+                else for (int i = 0; i < n; ++i) any = draft_depth_go(cfg, &row[i], j) || any;
+                if (!any) break;
+                ran = j;
+            }
+            if (late && n > 1 && ran >= 2) {
+                /* the driver's wait: every row observed up to the rounds the choice may read */
+                const int upto = late == 2 ? ran : std::max(1, ran - cfg.late_lag);
+                for (int i = 0; i < n; ++i)
+                    while (row[i].seen < upto)
+                        draft_depth_observe(&row[i], row[i].seen + 1,
+                                            draft_depth_stat(t[(size_t)i].st[row[i].seen], row[i].seen + 1, cfg.stat));
+                if (late == 1) {
+                    DraftDepthRow chk[4];
+                    for (int i = 0; i < n; ++i) chk[i] = row[i];
+                    draft_depth_select(cfg, row, n, ran, other_rows);
+                    select_peek(cfg, chk, n, ran, other_rows, 0);
+                    for (int i = 0; i < n; ++i) R.mismatch += chk[i].depth != row[i].depth;
+                } else {
+                    select_peek(cfg, row, n, ran, other_rows, 1);
+                }
+            }
+            R.rounds += ran; ++steps;
+            for (int i = 0; i < n; ++i) {
+                const int q = act[i];
+                const int D = row[i].depth < 1 ? 1 : row[i].depth;
+                Tree& tr = t[(size_t)i];
+                float sv[8];
+                int   ns = 0;
+                for (; ns < ran && ns < 8; ++ns) {
+                    const double x = draft_depth_stat(tr.st[ns], ns + 1, DRAFT_DEPTH_TOP);
+                    if (x < 0) break;
+                    sv[ns] = (float)x;
+                }
+                for (int j = D; j < 64; ++j) tr.st[j] = RadMtpCoupleState{};
+                tr.n = D;
+                R.mean_depth += D; ++R.share[D < 8 ? D : 7]; ++rows;
+                int step_out[64], accepted = 0;
+                const int m = trav ? walk_trav(tr, seed[q], (uint64_t)len[q], noise, 0, step_out, &accepted, RadMtpTravOpt{})
+                                   : walk(tr, seed[q], (uint64_t)len[q], noise, 0, step_out, &accepted);
+                R.mean_acc += accepted;
+                for (int k = 0; k < m && len[q] < 16; ++k) { out[q][len[q]++] = step_out[k]; h[q] = child_hash(h[q], step_out[k]); }
+                /* the chain is settled: the engine feeds it when its verify is committed */
+                if (online == 1)
+                    draft_depth_online_chain(cfg, &on, D, cfg.load && n > 1 ? row[i].rule : 0, accepted, sv, ns);
+            }
+            if (online == 1 && (++fed & 15) == 0) draft_depth_online_refresh(&cfg, &on);
+        }
+        for (int q = 0; q < n_seq; ++q) {
+            ++cnt1[(size_t)q][(size_t)out[q][0]];
+            ++cnt3[(size_t)q][(size_t)((out[q][0] * V + out[q][1]) * V + out[q][2])];
+        }
+    }
+    std::vector<double> e1((size_t)V, 0), e3((size_t)V * V * V, 0);
+    const Law l0 = law_at(1, noise);
+    for (int a = 0; a < V; ++a) {
+        e1[(size_t)a] = l0.p[a];
+        const uint64_t ha = child_hash(1, a);
+        const Law l1 = law_at(ha, noise);
+        for (int b = 0; b < V; ++b) {
+            const Law l2 = law_at(child_hash(ha, b), noise);
+            for (int c = 0; c < V; ++c) e3[(size_t)((a * V + b) * V + c)] = l0.p[a] * l1.p[b] * l2.p[c];
+        }
+    }
+    for (int q = 0; q < n_seq; ++q) {
+        R.z3[q] = zscore(cnt3[(size_t)q], e3, trials);
+        R.z1[q] = zscore(cnt1[(size_t)q], e1, trials);
+    }
+    R.mean_acc /= rows; R.mean_depth /= rows; R.rounds /= steps;
+    for (double& x : R.share) x /= rows;
+    return R;
+}
+
+/* p = conf (cal_x 0..1), one price for a row and one for a round at every row count. */
+DraftDepthCfg depth_cfg_load(int max, int lag, double stop, double trow, double tround) {
+    DraftDepthCfg c = depth_cfg(max, lag, DRAFT_DEPTH_TOP, stop);
+    c.load = true;
+    c.load_min = 1;           /* the tests weigh round 2 too wherever the rule has read a law for it */
+    /* one token a millisecond, so the prices in milliseconds are prices in drafts */
+    for (int n = 0; n <= DraftDepthCfg::kLoadSeqs; ++n) {
+        c.load_lam[n] = 1.0; c.load_row_ms[n] = trow; c.load_round_ms[n] = tround;
+    }
+    c.cal_x[0] = 0.0; c.cal_x[1] = 1.0;
+    for (int f = 0; f < 3; ++f)
+        for (int j = 0; j <= DraftDepthCfg::kCalRounds; ++j) { c.cal_p[f][j][0] = 0.0; c.cal_p[f][j][1] = 1.0; }
+    return c;
+}
+
+}  /* namespace */
+
+TEST(load_aware_depth_rule_prices_rows_and_rounds_apart) {
+    DraftDepthCfg c = depth_cfg_load(5, 1, 0.85, 0.5, 0.6);
+    CHECK(draft_depth_cal(c, 3, 0.25) == 0.25);
+    CHECK(draft_depth_cal(c, 3, 2.0) == 1.0);
+    /* three rows at conf .9, .8, .4 deciding round 3: two want it (gain .4 + .3 = .7 >= .6) */
+    DraftDepthRow r[3];
+    const double s1[3] = { 0.9, 0.8, 0.4 };
+    for (int i = 0; i < 3; ++i) { draft_depth_begin(c, &r[i], false); }
+    CHECK(draft_depth_go_load(c, r, 3, 2));                 /* round 2 reads nothing: conf 1, gain 1.5 */
+    for (int i = 0; i < 3; ++i) draft_depth_observe(&r[i], 1, s1[i]);
+    CHECK(draft_depth_go_load(c, r, 3, 3));
+    CHECK_EQ(r[0].depth, 3); CHECK_EQ(r[1].depth, 3); CHECK_EQ(r[2].depth, 2);
+    CHECK(r[2].done); CHECK(!r[0].done);
+    /* round 4: only row 0 still wants (.9 * .9 = .81, gain .31 < .6): the round does not run for one row */
+    const double s2[3] = { 0.9, 0.6, 0.9 };
+    for (int i = 0; i < 3; ++i) draft_depth_observe(&r[i], 2, s2[i]);
+    CHECK(!draft_depth_go_load(c, r, 3, 4));
+    CHECK_EQ(r[0].depth, 3); CHECK(r[0].done); CHECK(r[1].done);
+    /* a cheap round lets the one row go on; a greedy row (no law) keeps its fixed depth and forces its rounds */
+    c.load_round_ms[3] = 0.2;
+    DraftDepthRow g[3];
+    for (int i = 0; i < 3; ++i) draft_depth_begin(c, &g[i], i == 2);
+    CHECK(draft_depth_go_load(c, g, 3, 2));
+    for (int i = 0; i < 3; ++i) draft_depth_observe(&g[i], 1, s1[i]);
+    for (int i = 0; i < 2; ++i) g[i].conf = 0.1;            /* neither sampled row wants round 3 */
+    CHECK(draft_depth_go_load(c, g, 3, 3));                 /* the lawless row's third round runs */
+    CHECK_EQ(g[0].depth, 2); CHECK_EQ(g[1].depth, 2); CHECK_EQ(g[2].depth, 3);
+    CHECK(!draft_depth_go_load(c, g, 3, 4));
+    /* a tile's price: six rows at conf .8 beside a step of 30 rows, the tile past 32 rows at 1.5 drafts --
+     * two fill the tile (gain 2 x .3), the other four would open the next one (4 x .3 < 1.5) and stay out */
+    DraftDepthCfg t = depth_cfg_load(5, 1, 0.85, 0.5, 0.1);
+    for (auto& jm : t.load_jump_ms) jm[1] = 1.5;          /* past 32 rows */
+    DraftDepthRow q[6];
+    for (int i = 0; i < 6; ++i) { draft_depth_begin(t, &q[i], false); q[i].depth = 2; draft_depth_observe(&q[i], 1, 0.8); }
+    CHECK_EQ(draft_depth_load_cost(t, 6, 32) + 1.5 + 0.5, draft_depth_load_cost(t, 6, 33));
+    CHECK(draft_depth_go_load(t, q, 6, 3, 30 - 6 * 3));      /* R = 30: the six rows' 18 and 12 others */
+    int went = 0;
+    for (int i = 0; i < 6; ++i) went += q[i].depth == 3;
+    CHECK_EQ(went, 2);
+    CHECK_EQ(q[0].depth, 3); CHECK_EQ(q[1].depth, 3); CHECK(q[5].done);
+    /* without the tile's price all six go */
+    for (auto& jm : t.load_jump_ms) jm[1] = 0.0;
+    for (int i = 0; i < 6; ++i) { draft_depth_begin(t, &q[i], false); q[i].depth = 2; draft_depth_observe(&q[i], 1, 0.8); }
+    CHECK(draft_depth_go_load(t, q, 6, 3, 12));
+    went = 0;
+    for (int i = 0; i < 6; ++i) went += q[i].depth == 3;
+    CHECK_EQ(went, 6);
+}
+
+TEST(load_aware_chain_depth_keeps_the_target_law) {
+    const int trials = 200000;
+    g_sharp = 2.0;
+    /* `tile`: a 16-row tile's price with seven other rows in the step, so the third round's rows
+     * open a tile and the rule picks which of them by their p. */
+    struct C { int n, lag; double trow, tround, tile; const char* name; };
+    const C cs[] = { { 2, 1, 0.30, 0.25, 0.0, "2 rows lag1" }, { 3, 1, 0.35, 0.40, 0.0, "3 rows lag1" },
+                     { 3, 0, 0.30, 0.30, 0.0, "3 rows lag0" }, { 3, 1, 0.20, 0.05, 0.45, "3 rows tile" } };
+    for (const C& c : cs) {
+        DraftDepthCfg cfg = depth_cfg_load(4, c.lag, 0.40, c.trow, c.tround);
+        for (auto& jm : cfg.load_jump_ms) jm[0] = c.tile;     /* past 16 rows */
+        for (int trav = 1; trav >= 0; --trav) {
+            const LoadRun r = run_depth_load(cfg, c.n, trav != 0, trials, 0.6, c.tile > 0 ? 7 : 0);
+            double z3 = 0, z1 = 0;
+            for (int q = 0; q < c.n; ++q) { z3 = std::max(z3, r.z3[q]); z1 = std::max(z1, r.z1[q]); }
+            std::printf("  load %-11s %s: worst z3=%.2f z1=%.2f acc=%.3f depth %.2f rounds %.2f shares %.2f %.2f %.2f %.2f\n",
+                        c.name, trav ? "trav   " : "rowwise", z3, z1, r.mean_acc, r.mean_depth, r.rounds,
+                        r.share[1], r.share[2], r.share[3], r.share[4]);
+            CHECK(z3 < 4.5); CHECK(z1 < 4.5);
+            /* the rule cuts chains at several depths, and stops the pass before the deepest chain's wish */
+            int used = 0;
+            for (int d = 1; d <= 4; ++d) used += r.share[d] > 0.05;
+            CHECK(used >= 2);
+        }
+    }
+    g_sharp = 1.0;
+}
+
+TEST(late_choice_of_the_verify_rows_reads_each_draft_by_the_laws_up_to_its_own) {
+    DraftDepthCfg c = depth_cfg_load(5, 1, 0.85, 0.3, 0.0);
+    /* a different table for each confidence read, so the test sees which one was taken */
+    for (int j = 0; j <= DraftDepthCfg::kCalRounds; ++j) {
+        c.cal_p[0][j][1] = 0.25;      /* conf(j - 2): never enough */
+        c.cal_p[1][j][1] = 0.50;      /* conf(j - 1) */
+        c.cal_p[2][j][1] = 1.00;      /* conf(j) */
+    }
+    DraftDepthRow r[2];
+    const double s[2][4] = { { 0.9, 0.9, 0.9, 0.9 }, { 0.9, 0.5, 0.9, 0.9 } };
+    for (int i = 0; i < 2; ++i) {
+        draft_depth_begin(c, &r[i], false);
+        for (int k = 0; k < 3; ++k) draft_depth_observe(&r[i], k + 1, s[i][k]);   /* rounds 1..3 read, 4 ran unread */
+    }
+    CHECK(draft_depth_conf(r[1], 2) > 0.449 && draft_depth_conf(r[1], 2) < 0.451);
+    draft_depth_select(c, r, 2, 4);
+    /* row 0: drafts 2 and 3 by conf(2) = .81 and conf(3) = .729 (full table), draft 4 by conf(3) through
+     * the conf(j - 1) table: .36 >= .3 -- depth 4. Row 1: draft 2 by conf(2) = .45 >= .3, draft 3 by
+     * conf(3) = .405 >= .3, draft 4 by .5 x .405 = .2 < .3 -- depth 3. */
+    CHECK_EQ(r[0].depth, 4); CHECK_EQ(r[1].depth, 3);
+    CHECK(r[0].done && r[1].done);
+    /* nothing read past round 1: draft 2 by conf(1) (the conf(j - 1) table), draft 3 by conf(1) through the
+     * conf(j - 2) table, which admits nothing */
+    for (int i = 0; i < 2; ++i) { draft_depth_begin(c, &r[i], false); draft_depth_observe(&r[i], 1, s[i][0]); }
+    draft_depth_select(c, r, 2, 4);
+    CHECK_EQ(r[0].depth, 2); CHECK_EQ(r[1].depth, 2);
+    /* a greedy row keeps the rule's depth, capped by the rounds that ran */
+    DraftDepthRow g[2];
+    draft_depth_begin(c, &g[0], true); g[0].depth = 3;
+    draft_depth_begin(c, &g[1], false); draft_depth_observe(&g[1], 1, 0.9);
+    draft_depth_select(c, g, 2, 2);
+    CHECK_EQ(g[0].depth, 2); CHECK_EQ(g[1].depth, 2);
+}
+
+TEST(late_choice_keeps_the_target_law_and_reading_a_round_too_far_does_not) {
+    const int trials = 200000;
+    g_sharp = 2.0;
+    struct C { int n, late_lag; double stop, trow, tile; int other; const char* name; };
+    const C cs[] = { { 2, 1, 0.20, 0.10, 0.0, 0, "2 rows, last round unread" },
+                     { 3, 0, 0.20, 0.14, 0.0, 0, "3 rows, every round read" },
+                     { 3, 1, 0.20, 0.06, 0.25, 7, "3 rows, a tile" },
+                     { 3, 2, 0.30, 0.10, 0.0, 0, "3 rows, no wait" } };
+    for (const C& c : cs) {
+        DraftDepthCfg cfg = depth_cfg_load(4, 1, c.stop, c.trow, 0.0);
+        cfg.load = false;                 /* the rounds by the stop rule, the rows by the late choice */
+        cfg.late = true; cfg.late_lag = c.late_lag;
+        for (auto& jm : cfg.load_jump_ms) jm[0] = c.tile;     /* past 16 rows */
+        for (int trav = 1; trav >= 0; --trav) {
+            const LoadRun r = run_depth_load(cfg, c.n, trav != 0, trials, 0.6, c.other, 1);
+            double z3 = 0, z1 = 0;
+            for (int q = 0; q < c.n; ++q) { z3 = std::max(z3, r.z3[q]); z1 = std::max(z1, r.z1[q]); }
+            std::printf("  late %-26s %s: worst z3=%.2f z1=%.2f acc=%.3f depth %.2f rounds %.2f shares %.2f %.2f %.2f %.2f\n",
+                        c.name, trav ? "trav   " : "rowwise", z3, z1, r.mean_acc, r.mean_depth, r.rounds,
+                        r.share[1], r.share[2], r.share[3], r.share[4]);
+            CHECK(z3 < 4.5); CHECK(z1 < 4.5);
+            CHECK_EQ(r.mismatch, 0L);
+            int used = 0;
+            for (int d = 1; d <= 4; ++d) used += r.share[d] > 0.05;
+            CHECK(used >= 2);
+        }
+    }
+    /* the control: the same choice reading conf(j + 1) for draft j */
+    DraftDepthCfg bad = depth_cfg_load(4, 1, 0.20, 0.14, 0.0);
+    bad.load = false; bad.late = true; bad.late_lag = 0;
+    for (int trav = 1; trav >= 0; --trav) {
+        const LoadRun r = run_depth_load(bad, 3, trav != 0, 100000, 0.6, 0, 2);
+        double z3 = 0, z1 = 0;
+        for (int q = 0; q < 3; ++q) { z3 = std::max(z3, r.z3[q]); z1 = std::max(z1, r.z1[q]); }
+        std::printf("  late control (reads the round after the draft, %s): worst z3=%.1f z1=%.1f depth %.2f\n",
+                    trav ? "traversal" : "rowwise", z3, z1, r.mean_depth);
+        CHECK(z3 > 8.0 || z1 > 8.0);
+    }
+    g_sharp = 1.0;
+}
+
+TEST(late_choice_keeps_a_row_to_the_rounds_that_ran_for_it) {
+    /* A round's pass covers the rows up to the last one still going, so a row behind it holds no
+     * draft of that round: the choice may cut it shorter, never take it further. */
+    DraftDepthCfg c = depth_cfg_load(5, 1, 0.85, 0.05, 0.0);
+    DraftDepthRow r[3];
+    for (int i = 0; i < 3; ++i) {
+        draft_depth_begin(c, &r[i], false);
+        for (int k = 0; k < 3; ++k) draft_depth_observe(&r[i], k + 1, 0.95);
+    }
+    r[1].ran = 2;                 /* dropped out before round 3 */
+    r[2].ran = 4;
+    draft_depth_select(c, r, 3, 4);
+    CHECK_EQ(r[0].depth, 4); CHECK_EQ(r[1].depth, 2); CHECK_EQ(r[2].depth, 4);
+    /* a row with no law keeps the rule's depth, within the rounds that ran for it */
+    DraftDepthRow g[2];
+    draft_depth_begin(c, &g[0], true); g[0].depth = 3; g[0].ran = 2;
+    draft_depth_begin(c, &g[1], false); draft_depth_observe(&g[1], 1, 0.9);
+    draft_depth_select(c, g, 2, 3);
+    CHECK_EQ(g[0].depth, 2);
+}
+
+TEST(load_aware_tables_start_from_the_measured_ones_and_lists_parse) {
+    DraftDepthCfg c = depth_cfg(5, 1, DRAFT_DEPTH_TOP, 0.85);
+    draft_depth_load_defaults(&c);
+    CHECK_EQ(draft_depth_knots(c), 8);
+    CHECK_NEAR(draft_depth_cal(c, 3, 1.0, 2), 0.971, 1e-12);
+    CHECK_NEAR(draft_depth_cal(c, 3, 0.90, 2), 0.5 * (0.661 + 0.824), 1e-12);
+    CHECK_NEAR(draft_depth_cal(c, 2, 0.123, 0), 0.575, 1e-12);       /* round 2 is read with nothing */
+    CHECK_NEAR(draft_depth_cal(c, 7, 0.99, 1), 0.823, 1e-12);        /* past the measured rounds: the last */
+    CHECK(c.load_lam[1] < c.load_lam[8] && c.load_row_ms[1] > c.load_row_ms[8]);
+    /* a verify's price: rows, and each tile the rows are past, once */
+    const double j0 = c.load_jump_ms[8][0], j1 = c.load_jump_ms[8][1], j2 = c.load_jump_ms[8][2];
+    CHECK_NEAR(draft_depth_load_cost(c, 8, 16), 16 * c.load_row_ms[8], 1e-12);
+    CHECK_NEAR(draft_depth_load_cost(c, 8, 17), 17 * c.load_row_ms[8] + j0, 1e-12);
+    CHECK_NEAR(draft_depth_load_cost(c, 8, 33), 33 * c.load_row_ms[8] + j0 + j1, 1e-12);
+    CHECK_NEAR(draft_depth_load_cost(c, 8, 49), 49 * c.load_row_ms[8] + j0 + j1 + j2, 1e-12);
+    CHECK_NEAR(draft_depth_load_cost(c, 20, 8), draft_depth_load_cost(c, 8, 8), 1e-12);   /* past 8 sequences: the last */
+    double v[8];
+    CHECK_EQ(draft_depth_parse_list("0.5,0.25,2", v, 8, 0.0, 10.0), 3);
+    CHECK(v[0] == 0.5 && v[1] == 0.25 && v[2] == 2.0);
+    CHECK_EQ(draft_depth_parse_list("1", v, 8, 0.0, 10.0), 1);
+    for (const char* bad : { "", "1,", ",1", "a", "1;2", "1,2,3,4,5", "-1", "11" })
+        CHECK_EQ(draft_depth_parse_list(bad, v, 4, 0.0, 10.0), -1);
+}
+
+TEST(online_calibration_counts_each_verified_draft_at_the_confidence_its_decision_read) {
+    DraftDepthCfg c = depth_cfg(5, 1, DRAFT_DEPTH_TOP, 0.85);
+    draft_depth_load_defaults(&c);
+    c.load = true; c.late = true;
+    DraftDepthOnline o;
+    draft_depth_online_begin(c, &o);
+    auto sum = [&](const double (*a)[DraftDepthOnline::kK], int j) {
+        double x = 0;
+        for (int k = 0; k < DraftDepthOnline::kK; ++k) x += a[j][k];
+        return x;
+    };
+    /* a chain of three drafts, two accepted; conf(1) = .9 lies half way between the knots .85 and .95 */
+    const float s[3] = { 0.9f, 1.0f, 1.0f };
+    draft_depth_online_chain(c, &o, 3, 3, 2, s, 3);
+    for (int t = 0; t < 3; ++t) {
+        CHECK_NEAR(sum(o.cn[t], 2), 1.0, 1e-9); CHECK_NEAR(sum(o.ca[t], 2), 1.0, 1e-9);   /* draft 2: accepted */
+        CHECK_NEAR(sum(o.cn[t], 3), 1.0, 1e-9); CHECK_NEAR(sum(o.ca[t], 3), 0.0, 1e-9);   /* draft 3: not */
+        CHECK_NEAR(sum(o.cn[t], 4), 0.0, 1e-9);                                           /* never made */
+    }
+    CHECK_NEAR(o.cn[0][2][7], 1.0, 1e-9);                    /* table 0 of draft 2 reads conf(0) = 1 */
+    CHECK_NEAR(o.cn[0][3][4], 0.5, 1e-6); CHECK_NEAR(o.cn[0][3][5], 0.5, 1e-6);   /* draft 3 by conf(1) */
+    CHECK_NEAR(o.cn[1][2][4], 0.5, 1e-6); CHECK_NEAR(o.cn[2][2][5], 0.5, 1e-6);
+    /* the rule sent a chain to round 4 and the late choice cut it to 2: the rule's table (0) counts
+     * drafts 3 and 4 as not accepted, the late choice's tables count nothing for them */
+    draft_depth_online_begin(c, &o);
+    draft_depth_online_chain(c, &o, 2, 4, 2, s, 3);
+    CHECK_NEAR(sum(o.cn[0], 3), 1.0, 1e-9); CHECK_NEAR(sum(o.ca[0], 3), 0.0, 1e-9);
+    CHECK_NEAR(sum(o.cn[0], 4), 1.0, 1e-9); CHECK_NEAR(sum(o.ca[0], 4), 0.0, 1e-9);
+    CHECK_NEAR(sum(o.cn[1], 3), 0.0, 1e-9); CHECK_NEAR(sum(o.cn[2], 4), 0.0, 1e-9);
+    CHECK_NEAR(sum(o.cn[2], 2), 1.0, 1e-9); CHECK_NEAR(sum(o.ca[2], 2), 1.0, 1e-9);
+    /* a step the stop rule decided (rule 0): only what was verified */
+    draft_depth_online_begin(c, &o);
+    draft_depth_online_chain(c, &o, 2, 0, 0, s, 3);
+    CHECK_NEAR(sum(o.cn[0], 2), 1.0, 1e-9); CHECK_NEAR(sum(o.cn[0], 3), 0.0, 1e-9);
+
+    /* the estimate: the counts on top of the static table's pseudo-observations, monotone in conf */
+    draft_depth_online_begin(c, &o);
+    const float one[5] = { 1, 1, 1, 1, 1 };
+    for (int i = 0; i < 4000; ++i) draft_depth_online_chain(c, &o, 3, 0, i % 2 ? 3 : 2, one, 3);
+    const double before = c.cal_p[2][4][7];
+    draft_depth_online_refresh(&c, &o);
+    CHECK(c.cal_p[2][3][7] > 0.49 && c.cal_p[2][3][7] < 0.53);          /* half of draft 3 were accepted */
+    for (int k = 1; k < 8; ++k) CHECK(c.cal_p[2][3][k] >= c.cal_p[2][3][k - 1]);
+    CHECK(c.cal_p[2][3][6] <= c.cal_p[2][3][7]);                        /* the knots below were pooled down to it */
+    CHECK(c.cal_p[2][2][7] > 0.99);                                     /* every draft 2 was */
+    CHECK_NEAR(c.cal_p[2][4][7], before, 1e-12);                        /* a draft nobody made keeps the table */
+    CHECK_EQ(o.chains, 4000L);
+    /* counts fade: a refresh keeps cal_keep of them */
+    const double n0 = o.cn[2][3][7];
+    draft_depth_online_refresh(&c, &o);
+    CHECK_NEAR(o.cn[2][3][7], n0 * o.cal_keep, 1e-6);
+}
+
+TEST(online_calibration_prices_rows_and_tiles_from_step_times) {
+    DraftDepthCfg c = depth_cfg(5, 1, DRAFT_DEPTH_TOP, 0.85);
+    draft_depth_load_defaults(&c);
+    DraftDepthOnline o;
+    draft_depth_online_begin(c, &o);
+    const double row4 = c.load_row_ms[4];
+    /* steps of 8 sequences: 14 + 0.5 R + 0.9 D + 2.0 past 32 rows + 0.7 past 48, a little noise */
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    auto rnd = [&]() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return (double)(x >> 11) / 9007199254740992.0; };
+    double tok = 0, ms_sum = 0;
+    for (int i = 0; i < 8000; ++i) {
+        const int R = 17 + (int)(rnd() * 35.0);                          /* 17 .. 51 */
+        const int D = std::min(5, std::max(2, 2 + (R - 17) / 9 + (rnd() < 0.3 ? 1 : 0)));
+        const double ms = 14.0 + 0.5 * R + 0.9 * D + (R > 32 ? 2.0 : 0.0) + (R > 48 ? 0.7 : 0.0) + (rnd() - 0.5) * 0.6;
+        const int tk = 8 + R / 3;
+        draft_depth_online_step(c, &o, 8, R, D, ms, tk);
+        tok += tk; ms_sum += ms;
+    }
+    draft_depth_online_step(c, &o, 8, 30, 3, 300.0, 18);                  /* a stall: left out */
+    CHECK_EQ(o.outliers, 1L);
+    draft_depth_online_refresh(&c, &o);
+    std::printf("  fitted at 8 sequences: row %.3f (0.5), round %.3f (0.9; prior %.3f), tiles %.2f %.2f %.2f %.2f "
+                "(-, 2.0, 0.7, -), %.4f tok/ms\n", c.load_row_ms[8], c.load_round_ms[8], o.theta0[8][2],
+                c.load_jump_ms[8][0], c.load_jump_ms[8][1], c.load_jump_ms[8][2], c.load_jump_ms[8][3], c.load_lam[8]);
+    /* a price the steps tell apart lands on it, or at least most of the way from the table's */
+    auto near = [](double est, double truth, double prior) {
+        return std::fabs(est - truth) < 0.30 || std::fabs(est - truth) < 0.4 * std::fabs(prior - truth);
+    };
+    CHECK(std::fabs(c.load_row_ms[8] - 0.5) < 0.05);
+    CHECK(near(c.load_jump_ms[8][1], 2.0, o.theta0[8][4]));
+    CHECK(near(c.load_jump_ms[8][2], 0.7, o.theta0[8][5]));
+    CHECK_NEAR(c.load_jump_ms[8][3], o.theta0[8][6], 1e-6);              /* no step was past 64 rows: the table's */
+    CHECK(c.load_round_ms[8] > 0.5 && c.load_round_ms[8] < 1.3);          /* between the prior and the data */
+    CHECK(std::fabs(c.load_lam[8] / (tok / ms_sum) - 1.0) < 0.08);        /* the last steps' rate */
+    CHECK_NEAR(c.load_row_ms[4], row4, 1e-12);                            /* a row count nobody ran keeps the table */
+    /* too few steps: the table stays */
+    DraftDepthCfg d = depth_cfg(5, 1, DRAFT_DEPTH_TOP, 0.85);
+    draft_depth_load_defaults(&d);
+    DraftDepthOnline o2;
+    draft_depth_online_begin(d, &o2);
+    for (int i = 0; i < 20; ++i) draft_depth_online_step(d, &o2, 2, 6, 3, 50.0, 4);
+    draft_depth_online_refresh(&d, &o2);
+    CHECK_NEAR(d.load_row_ms[2], 0.824, 1e-12); CHECK_NEAR(d.load_lam[2], 0.3558, 1e-12);
+}
+
+TEST(online_calibration_keeps_the_target_law_and_tables_made_from_the_steps_own_verify_do_not) {
+    const int trials = 120000;
+    g_sharp = 2.0;
+    /* The rule and the late choice with tables that follow the run: every chain a verify settled
+     * is counted, the tables are remade every 16 steps, and each later step is decided by them.
+     * They are functions of steps that are over, so every sequence keeps the target's law. */
+    struct C { int n, late; double trow, tround, tile; int other; const char* name; };
+    const C cs[] = { { 2, 0, 0.30, 0.25, 0.0, 0, "2 rows, the rule" }, { 3, 1, 0.14, 0.10, 0.0, 0, "3 rows, rule + late" },
+                     { 3, 1, 0.08, 0.05, 0.30, 7, "3 rows, late, a tile" } };
+    for (const C& c : cs) {
+        DraftDepthCfg cfg = depth_cfg_load(4, 1, 0.40, c.trow, c.tround);
+        for (auto& jm : cfg.load_jump_ms) jm[0] = c.tile;
+        cfg.late = c.late != 0;
+        /* start the tables well off (p = conf / 2), so the calibration has something to move */
+        for (int t = 0; t < 3; ++t)
+            for (int j = 0; j <= DraftDepthCfg::kCalRounds; ++j) cfg.cal_p[t][j][1] = 0.5;
+        for (int trav = 1; trav >= 0; --trav) {
+            const LoadRun r = run_depth_load(cfg, c.n, trav != 0, trials, 0.6, c.other, c.late, 1);
+            double z3 = 0, z1 = 0;
+            for (int q = 0; q < c.n; ++q) { z3 = std::max(z3, r.z3[q]); z1 = std::max(z1, r.z1[q]); }
+            std::printf("  online %-21s %s: worst z3=%.2f z1=%.2f acc=%.3f depth %.2f rounds %.2f shares %.2f %.2f %.2f %.2f\n",
+                        c.name, trav ? "trav   " : "rowwise", z3, z1, r.mean_acc, r.mean_depth, r.rounds,
+                        r.share[1], r.share[2], r.share[3], r.share[4]);
+            CHECK(z3 < 4.5); CHECK(z1 < 4.5);
+            int used = 0;
+            for (int d = 1; d <= 4; ++d) used += r.share[d] > 0.05;
+            CHECK(used >= 2);
+        }
+    }
+    /* the control: the tables made from what the target accepts of the step's own chains */
+    DraftDepthCfg bad = depth_cfg_load(4, 1, 0.20, 0.45, 0.0);
+    bad.load = false; bad.late = true; bad.late_lag = 0;
+    for (int trav = 1; trav >= 0; --trav) {
+        const LoadRun r = run_depth_load(bad, 2, trav != 0, 40000, 0.6, 0, 1, 2);
+        double z3 = 0, z1 = 0;
+        for (int q = 0; q < 2; ++q) { z3 = std::max(z3, r.z3[q]); z1 = std::max(z1, r.z1[q]); }
+        std::printf("  online control (tables from the step's own verify, %s): worst z3=%.1f z1=%.1f depth %.2f\n",
+                    trav ? "traversal" : "rowwise", z3, z1, r.mean_depth);
+        CHECK(z3 > 8.0 || z1 > 8.0);
+    }
+    g_sharp = 1.0;
+}
+
 TEST(a_depth_rule_that_reads_the_admitted_draft_or_the_target_is_not_exact) {
     const int trials = 100000;
     g_sharp = 2.0;

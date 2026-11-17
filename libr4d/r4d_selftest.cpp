@@ -21423,10 +21423,11 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
  * form, pinned through r4d_hc_read_pin_decode(1). E4M3 or int8 codes, on a real stream (the
  * one-grid form keys its counters on it). The two forms must dispatch different kernels, so a pin
  * that is ignored cannot pass by comparing a form with itself. */
-static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
+static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8, int other = 1) {
+    /* `other` 2: the rule with the 64-row tile from 33 rows (33 to 48 rows are a 48-row tile). */
+    const char* const what = other == 2 ? "the 64-row tile" : "the two-grid form";
     const std::string nm = fmt("hc_read_e4m3 decode kernels at M=%lld, %s codes: the rule "
-                               "byte-identical to the two-grid form", (long long)M,
-                               i8 ? "int8" : "E4M3");
+                               "byte-identical to %s", (long long)M, i8 ? "int8" : "E4M3", what);
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
     if (!pl.pin_hc_dec || !pl.record) { skip(nm.c_str(), "no r4d_hc_read_pin_decode"); return; }
@@ -21502,7 +21503,7 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; };
     Out out[2];
     for (int form = 0; form < 2; ++form) {
-        pl.pin_hc_dec(form);
+        pl.pin_hc_dec(form ? other : 0);
         st_memset(d_x, 0, xb); st_memset(d_q, 0, qb); st_memset(d_qs, 0, sb);
         st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb); st_memset(d_inj, 0, ib);
         const void* fns[16] = {};
@@ -21510,7 +21511,7 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
         const int rc = r->launch(&a, (RadStream)hs);
         const int nd = pl.record(nullptr, 0);
         if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
-            ok(nm.c_str(), false, fmt("%s rc=%d", form ? "the two-grid form" : "the rule", rc));
+            ok(nm.c_str(), false, fmt("%s rc=%d", form ? what : "the rule", rc));
             pl.pin_hc_dec(0);
             (void)hipStreamDestroy(hs);
             return;
@@ -21900,6 +21901,12 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
             if (pl.pin_hc) pl.pin_hc(0);
             pl.pin_hc_dec(1);
             time_now("the two-grid decode form");
+            if (M > 32 && M <= 48) {
+                pl.pin_hc_dec(2);
+                time_now("the 64-row tile");
+                pl.pin_hc_dec(3);
+                time_now("the 48-row tile at 64 columns a workgroup");
+            }
             pl.pin_hc_dec(0);
             time_now("the launcher's rule");
         }
@@ -36244,6 +36251,9 @@ static void device_phase(const Plugin& pl) {
          * 8 rows) and the tiled up-mix at both of its row tiles. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
+        /* The 48-row tile (33 to 48 rows) against the 64-row tile it replaced. */
+        for (int64_t m : { 33, 40, 47, 48 })
+            for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8, 2);
     }
     if (sel("hc_read_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "

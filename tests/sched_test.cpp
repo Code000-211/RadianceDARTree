@@ -4004,6 +4004,72 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
     }
 }
 
+/* --draft-depth adaptive (Engine::issue_serial_drafter): a round's pass covers the drafting rows up
+ * to the last one whose chain goes on, and serial_order_by_depth puts the sequences that drafted
+ * deepest last step first, so that those rows are a short prefix. */
+TEST(a_draft_round_covers_the_first_drafting_rows_and_the_deepest_sequences_come_first) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+
+    const uint64_t a = f.submit(160, 2000);
+    const uint64_t b = f.submit(160, 2000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    /* `a`'s drafts are never taken and `b`'s always are: `a` verifies one draft a step, `b` four. */
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    for (int t = 0; t < 64; ++t) {
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        CHECK_OK(f.sch.set_draft(b, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return e.seq == b ? e.n_spec : 0; }));
+    }
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_OK(f.sch.set_draft(b, draft, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, e.seq == a ? 1 : 4);
+
+    /* the plan's order unless asked: `a` was submitted first */
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rows[0].seq, a); CHECK_EQ(rows[1].seq, b);
+    const RadBatch* h0 = f.sch.serial_batch(0, 1);
+    REQUIRE(h0 != nullptr);
+    const int64_t hist_tok = h0->n_tok;
+    const int32_t a_id = h0->seq_ids[0];
+
+    /* by the drafts the last chain made: `b` (four) ahead of `a` (one) */
+    f.sch.serial_order_by_depth(true);
+    rounds = 4;
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
+    CHECK_EQ(rounds, 4);
+    CHECK_EQ(rows[0].seq, b); CHECK_EQ(rows[1].seq, a);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK_EQ(hb->n_seq, 2);
+    CHECK_EQ(hb->n_tok, hist_tok);                   /* the same history, the other order */
+    CHECK_EQ(hb->seq_ids[1], a_id);
+    const int32_t b_id = hb->seq_ids[0];
+    CHECK(b_id != a_id);
+    /* round 2 for both, round 3 for the first row alone, and a round nobody is in has no pass */
+    const RadBatch* r2 = f.sch.serial_batch(2, 1, 2);
+    REQUIRE(r2 != nullptr);
+    CHECK_EQ(r2->n_seq, 2); CHECK_EQ(r2->n_tok, 2);
+    CHECK_EQ(r2->seq_ids[0], b_id); CHECK_EQ(r2->seq_ids[1], a_id);
+    const RadBatch* r3 = f.sch.serial_batch(3, 1, 1);
+    REQUIRE(r3 != nullptr);
+    CHECK_EQ(r3->n_seq, 1); CHECK_EQ(r3->n_tok, 1);
+    CHECK_EQ(r3->seq_ids[0], b_id);
+    CHECK(f.sch.serial_batch(4, 1, 0) == nullptr);
+    /* without a row count every drafting row, as before */
+    const RadBatch* r4 = f.sch.serial_batch(4, 1);
+    REQUIRE(r4 != nullptr);
+    CHECK_EQ(r4->n_seq, 2);
+    f.sch.serial_end(rounds);
+}
+
 /* Each sequence has its own stop, and the rounds follow the deepest. The step issued ahead of a
  * commit verifies, per sequence, the first rounds up to its own window, and the drafter's longer
  * proposal is cut to that count rather than refused as a mismatch. */

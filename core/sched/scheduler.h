@@ -464,7 +464,11 @@ public:
      * whose leaves the card fixes in round 1, so the engine can tell expect_draft the next tree's
      * real nodes before it issues the step that verifies them (Config::draft_tree_exact). */
     bool exact_rows() const { return exact_rows_; }
-    const RadBatch* serial_batch(int round, int step);
+    const RadBatch* serial_batch(int round, int step, int rows = -1);
+    /* --draft-depth adaptive: serial_begin puts the drafting sequences in the order of the drafts
+     * their last chain made, deepest first (stable), so that a round over the rows still going
+     * (serial_batch's `rows`) is a short prefix of them. Off: the plan's order. */
+    void serial_order_by_depth(bool on) { serial_by_depth_ = on; }
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
      * round 0 carries it. Call serial_end() once the step has committed. */
     void serial_end(int rounds_done);
@@ -663,6 +667,7 @@ private:
      * serial_begin gives it one row per drafting sequence and none otherwise, and its rounds stay
      * at the committed position (advance.h). False and 0 for every other drafter. */
     bool          serial_shared_ = false;
+    bool          serial_by_depth_ = false;   /* serial_order_by_depth() */
     int32_t       serial_rot_shift_ = 0;
     /* A tree drafter (rad_drafter_tree): every trunk plan is StepPlan::spec_is_tree. */
     bool          tree_ = false;
@@ -830,6 +835,7 @@ private:
         /* Its index among the drafting rows, or -1 for a row that only owes history (e.g. a
          * sequence mid-prompt, with hidden states but no token to draft from). */
         int32_t        draft_idx = -1;
+        int32_t        order = 0;       /* the drafts its last chain made (serial_order_by_depth) */
         /* No Request* here, as for BlockSeq: serial_batch reads serial_ after the lock was
          * released and retaken. */
         /* The furthest position round 1 can write at: the verify step's last position, reached
