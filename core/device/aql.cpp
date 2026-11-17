@@ -1238,9 +1238,13 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced, bool* asked) {
     if (*asked) {
         s->last_sys_acq = (int64_t)idx;
         s->epoch = ep;
-        /* The prefetch stream reads nothing the host writes; a system acquire there would only
-         * invalidate the L2 under the compute stream. */
-        if (s->agent_only && !forced) return HSA_FENCE_SCOPE_AGENT;
+        /* The prefetch stream reads no data the host writes, so a host write or epoch does not
+         * make it acquire at system scope (that would only invalidate the L2 under the compute
+         * stream). Its own kernel arguments are host-written into its ring like any stream's,
+         * though: after the ring laps, an agent-scope acquire leaves the slot's old line in the
+         * L2 and a launch could run with the previous lap's arguments. The half lap keeps the
+         * system acquire: one in 2048 prefetch launches. */
+        if (s->agent_only && !forced && !lap) return HSA_FENCE_SCOPE_AGENT;
         return HSA_FENCE_SCOPE_SYSTEM;
     }
     return HSA_FENCE_SCOPE_AGENT;

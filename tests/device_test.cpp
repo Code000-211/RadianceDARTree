@@ -191,6 +191,32 @@ TEST(a_chained_kernel_sees_a_shared_value_the_launch_in_front_wrote) {
  * with no host wait between them: without that acquire every launch past the first lap stores
  * where the launch a lap before did (as they do on a prefetch stream, which never takes one and
  * counts on the pass beside it to have turned the L2 over). */
+/* The prefetch stream (rad_xp_stream_create, agent-scope acquires) also reads its own arguments
+ * from a host-written ring: across three laps every launch must see its own slot. */
+TEST(a_prefetch_stream_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the prefetch stream is an AQL stream");
+    const unsigned n = 3 * 4096 + 517;
+    RadStream xs = nullptr;
+    if (rad_xp_stream_create(&xs) != RAD_OK || !xs) SKIP("no prefetch stream on this device");
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad::aql::chain_marks(xs, seen, n));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+    rad_stream_destroy(xs);
+}
+
 TEST(a_chained_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
     if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
     const unsigned n = 3 * 4096 + 517;
