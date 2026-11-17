@@ -38,7 +38,7 @@ __global__ __launch_bounds__(256) void prefetch_kernel(const int4* __restrict__ 
  * between a GEMM and the collective after it (where launches chain), it starts reading as the
  * GEMM's last block ends, with no event between the queues and no barrier bit on the GEMM. */
 __global__ __launch_bounds__(256) void r4dchain_prefetch(const int4* __restrict__ p, size_t n16) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     r4d_chain_done();
     const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t nt  = (size_t)gridDim.x * blockDim.x;

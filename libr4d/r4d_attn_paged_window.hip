@@ -1124,7 +1124,7 @@ __global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
 }
 template <int HD, int GQA, int KV8, bool TREE = false>
 __global__ __launch_bounds__(kThreads) void r4dchain_attn_window(AttnArgs A) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     attn_body<HD, GQA, KV8, TREE>(A);
     r4d_chain_done();
 }
@@ -1132,7 +1132,7 @@ template <int HD, int GQA>
 __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) { merge_body<HD, GQA>(A); }
 template <int HD, int GQA>
 __global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     merge_body<HD, GQA>(A);
     r4d_chain_done();
 }

@@ -468,6 +468,20 @@ if(RAD_HIP_FOUND AND TARGET r4d_selftest)
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
 endif()
 
+# ================================================================== the chained waits' scalar-cache flush
+#
+# A chained kernel whose wait is r4d_chain_wait_vec skips `s_dcache_inv` (libr4d/r4d_chain.h). This
+# compiles every unit with a chained kernel to gfx1201 assembly with the build's own flags and fails
+# on a kernel that skips it and has a scalar load, from anything but its argument segment, behind
+# its acquire. No card needed; it recompiles the kernels (minutes), hence `slow`.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(RAD_HIP_FOUND AND Python3_FOUND AND CMAKE_EXPORT_COMPILE_COMMANDS)
+  add_test(NAME chain_scalar_audit
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/chain_scalar_audit.py
+                   ${CMAKE_BINARY_DIR} ${CMAKE_BINARY_DIR}/chain_scalar_audit --check)
+  set_tests_properties(chain_scalar_audit PROPERTIES LABELS "slow" TIMEOUT 1800)
+endif()
+
 # ================================================================== libhalo's interface parity
 #
 # libhalo serves gfx1151 behind libr4d's exact interface (libhalo/halo_parity.cpp): the same op
