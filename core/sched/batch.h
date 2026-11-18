@@ -155,6 +155,9 @@ public:
 
     /* The last build's batch for one rank: build()'s result with that rank's slab pointers. */
     const RadBatch* batch_for(int rank) const;
+    /* Whether a checkpoint inside a lone prefill's chunk is handed to the plugin as
+     * RadBatch::ckpt_cut (Scheduler::set_ckpt_inside). Off: ckpt_cut is always 0. */
+    void set_ckpt_cut(bool on) { ckpt_cut_on_ = on; }
 
     /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
      * round, slot state and inputs (advance.h). */
@@ -224,6 +227,7 @@ private:
         int32_t *h_q = nullptr, *h_ctx = nullptr, *h_acc = nullptr, *h_parent = nullptr;
         int32_t *h_path = nullptr, *d_path = nullptr;   /* [max_seqs][path_pitch_] */
         int32_t *h_cktok = nullptr, *h_ckslot = nullptr;
+        int32_t *h_ckcu = nullptr, *d_ckcu = nullptr;   /* [3] RadBatch::ckpt_cu */
         int32_t *h_out = nullptr;      /* [n_out] which of this step's tokens want logits */
         int32_t *h_dout = nullptr;     /* [n_draft_out] a history pass's round-1 rows */
         int32_t *d_tok = nullptr, *d_pos = nullptr, *d_cu = nullptr, *d_sid = nullptr;
@@ -377,6 +381,7 @@ private:
      * (`mm_ev_`). */
     bool                   mm_on_ = false;
     bool                   bidi_on_ = false;   /* RadEncoderDecl::bidirectional */
+    bool                   ckpt_cut_on_ = false;   /* set_ckpt_cut */
     /* The engine serves runtime LoRA adapters (Config::lora): the batch carries each row's slot. */
     bool                   lora_on_ = false;
     /* Program::plugin_words: the words a sequence may carry, 0 for none. */

@@ -59,7 +59,7 @@ std::vector<Row> cpp_rows() {
 }
 
 /* The layout at RAD_ABI_VERSION 39 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 40, kTableFormat = 2;
+constexpr uint32_t kTableAbi = 41, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -226,7 +226,10 @@ TEST(rad_yarn_is_the_same_function_in_c_and_cpp) {
 TEST(the_serial_tree_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadBatch, spec_path), (size_t)480);
     CHECK_EQ(offsetof(RadBatch, spec_path_pitch), (size_t)488);
-    CHECK_EQ(sizeof(RadBatch), (size_t)496);
+    /* ABI 41: a checkpoint inside the step, past the pitch. */
+    CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)492);
+    CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)496);
+    CHECK_EQ(sizeof(RadBatch), (size_t)504);
     CHECK_EQ(offsetof(RadDrafterDecl, tree_nodes), (size_t)56);
     CHECK_EQ(offsetof(RadDrafterDecl, tree_leaves), (size_t)60);
     CHECK_EQ(offsetof(RadDrafterDecl, tree_width), (size_t)64);
@@ -235,7 +238,8 @@ TEST(the_serial_tree_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadArchProbe, tree_linear_ok), (size_t)128);
     CHECK_EQ(offsetof(RadArchProbe, tree_nodes), (size_t)136);
     CHECK_EQ(offsetof(RadArchProbe, tree_nodes_max), (size_t)140);
-    CHECK_EQ(sizeof(RadArchProbe), (size_t)144);
+    CHECK_EQ(offsetof(RadArchProbe, ckpt_snap_ok), (size_t)144);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)152);
     CHECK_EQ(offsetof(RadBuildCtx, draft_rounds), (size_t)200);
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_leaves), (size_t)204);
     CHECK_EQ(offsetof(RadBuildCtx, draft_tree_width), (size_t)208);

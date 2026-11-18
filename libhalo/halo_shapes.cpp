@@ -1602,6 +1602,7 @@ extern "C" int halo_shape_moe_gemm_q(const RadParam* p, int n_p, int operand, Ra
         opd((uint32_t)RAD_F8E4M3, ne1, N1, K1),           /* w_odd -- the odd experts */
         opd((uint32_t)RAD_BF16, ne1, (N1 + g - 1) / g, (K1 + g - 1) / g),   /* w_odd_scale */
         opd(D, M * k, N),                                 /* y, in sorted order */
+        opd_none(),                                       /* split -- optional, none here */
     };
     HALO_PICK(l);
 }
@@ -1645,6 +1646,7 @@ extern "C" int halo_shape_moe_gemm_q_mod4(const RadParam* p, int n_p, int operan
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
         wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
         opd(D, M * k, N),                                 /* y -- in SORTED order */
+        opd_none(),                                       /* split -- optional, none here */
     };
     HALO_PICK(l);
 }

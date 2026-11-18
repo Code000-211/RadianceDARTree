@@ -9350,6 +9350,71 @@ static void moe_iqr_pack_case(const Plugin& pl, int64_t Mtok, bool down) {
                       std::to_string(first / N) + " column " + std::to_string(first % N)
                 : "the run map's bytes");
     }
+    /* `split` (a checkpoint inside the step): with each expert's slots ascending, as the router's
+     * stable sort leaves them, the rows of tokens before the split are a run of their own, so they
+     * hold the bytes a pass of those tokens alone gives them -- whatever the rows after them. The
+     * head pass is the same routing cut to those rows. */
+    if (!down) {
+        const int64_t cut = Mtok * 3 / 4 + 1;    /* not on a tile, so the runs' remainders move */
+        std::vector<int32_t> so2 = sorted, oh((size_t)E + 1, 0), soh;
+        for (int64_t e = 0; e < E; ++e) {
+            auto b = so2.begin() + off[(size_t)e], en = so2.begin() + off[(size_t)e + 1];
+            /* live slots ascending, dropped ones (-1) last within the run */
+            std::sort(b, en, [](int32_t x, int32_t y2) {
+                return (x < 0) != (y2 < 0) ? y2 < 0 : x < y2; });
+            oh[(size_t)e] = (int32_t)soh.size();
+            for (auto it = b; it != en; ++it)
+                if (*it >= 0 && *it < cut * top_k) soh.push_back(*it);
+        }
+        oh[(size_t)E] = (int32_t)soh.size();
+        /* the dropped slots inside runs are not part of this check: drop them from the split run */
+        std::vector<int32_t> so3, o3((size_t)E + 1, 0);
+        for (int64_t e = 0; e < E; ++e) {
+            o3[(size_t)e] = (int32_t)so3.size();
+            for (int32_t i = off[(size_t)e]; i < off[(size_t)e + 1]; ++i)
+                if (so2[(size_t)i] >= 0) so3.push_back(so2[(size_t)i]);
+        }
+        o3[(size_t)E] = (int32_t)so3.size();
+        const int64_t live = (int64_t)so3.size();
+        so3.resize((size_t)Tr, -1);
+        soh.resize((size_t)Tr, -1);
+        const int32_t cut32 = (int32_t)cut;
+        void* d_cut = dalloc(4);
+        st_memcpy(d_cut, &cut32, 4, hipMemcpyHostToDevice);
+        auto launch = [&](const std::vector<int32_t>& so, const std::vector<int32_t>& of, bool sp,
+                          std::vector<uint16_t>& out) {
+            st_memcpy(d_so, so.data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_of, of.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+            std::vector<RadTensor> t2 = ts;
+            if (sp) t2.push_back(T(d_cut, RAD_I32, { 1 }));
+            RadArgs a2 = a;
+            a2.t = t2.data(); a2.n_t = (int)t2.size();
+            const int rc = r->launch(&a2, (RadStream) nullptr);
+            const bool fine = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+            if (fine) st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+            return fine;
+        };
+        std::vector<uint16_t> ys((size_t)(Tr * N)), yh((size_t)(Tr * N));
+        const std::string what = std::string(nm) + ": split at token " + std::to_string(cut) +
+                                 ", the rows before it are a pass of those tokens alone";
+        if (!launch(so3, o3, true, ys) || !launch(soh, oh, false, yh)) {
+            ok(what.c_str(), false, "launch failed");
+        } else {
+            int64_t diff = 0, rows = 0;
+            for (int64_t e = 0; e < E; ++e)
+                for (int32_t j = 0; j < oh[(size_t)e + 1] - oh[(size_t)e]; ++j) {
+                    const int64_t rs = o3[(size_t)e] + j, rh = oh[(size_t)e] + j;
+                    ++rows;
+                    if (std::memcmp(&ys[(size_t)(rs * N)], &yh[(size_t)(rh * N)], (size_t)N * 2))
+                        ++diff;
+                }
+            ok(what.c_str(), diff == 0 && rows > 0 && live > rows,
+               std::to_string(diff) + " of " + std::to_string(rows) + " rows differ");
+        }
+        st_memcpy(d_so, sorted.data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_of, off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+    }
     dfree_all();
 }
 
@@ -23271,6 +23336,77 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
     };
     for (size_t f = 1; f < outs.size(); ++f) same(f, kForm[ran[f]]);
 
+    /* `fold` (hc_read's fold_y / fold_inj): a write left undone by the reduction before it
+     * (ar_hc_write at `hwrite` 0), applied by the read in its own pass over the streams. Against
+     * hc_write_bf16 then the plain read, under the launcher's rule, byte for byte in the streams
+     * and in every output. */
+    if (const RadKernelInfo* wrow = find(pl, "hc_write_bf16"); wrow && !timed) {
+        if (pl.pin_hc) pl.pin_hc(0);
+        std::vector<uint16_t> yv((size_t)(M * n)), gv((size_t)(M * hc));
+        for (auto& v : yv) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 300.0f);
+        for (auto& v : gv) v = h_to_bf16((float)(rnd() % 2000) / 1000.0f);
+        void* d_y = dalloc(yv.size() * 2);
+        void* d_g = dalloc(gv.size() * 2);
+        st_memcpy(d_y, yv.data(), yv.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_g, gv.data(), gv.size() * 2, hipMemcpyHostToDevice);
+        struct FOut { std::vector<uint8_t> h, x, inj, q, qs, rq, rs; };
+        auto run = [&](bool fold, FOut* o) -> int {
+            st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+            st_memset(d_x, 0, xb); st_memset(d_inj, 0, ib); st_memset(d_q, 0, qb);
+            st_memset(d_qs, 0, sb); st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb);
+            int rc = RAD_OK;
+            if (!fold) {
+                std::vector<RadTensor> wt = { T(d_y, RAD_BF16, { M, n }), T(d_g, RAD_BF16, { M, hc }),
+                                              T(d_h, RAD_BF16, { M, HN }) };
+                std::vector<RadParam> wp = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16") };
+                RadArgs wa;
+                std::memset(&wa, 0, sizeof(wa));
+                wa.t = wt.data(); wa.n_t = (int)wt.size(); wa.p = wp.data(); wa.n_p = (int)wp.size();
+                rc = wrow->launch(&wa, rst);
+                if (rc == RAD_OK) rc = r->launch(&a, rst);
+            } else {
+                std::vector<RadTensor> ft = ts;
+                ft.push_back(T(d_y, RAD_BF16, { M, n }));
+                ft.push_back(T(d_g, RAD_BF16, { M, hc }));
+                std::vector<RadParam> fp = ps;
+                fp.push_back(PI("fold", 1));
+                RadArgs fa = a;
+                fa.t = ft.data(); fa.n_t = (int)ft.size(); fa.p = fp.data(); fa.n_p = (int)fp.size();
+                rc = r->launch(&fa, rst);
+            }
+            if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) return rc != RAD_OK ? rc : -1;
+            auto get = [&](std::vector<uint8_t>& v, void* d, size_t b) {
+                v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+            };
+            get(o->h, d_h, hh.size() * 2);
+            get(o->x, d_x, xb); get(o->inj, d_inj, ib); get(o->q, d_q, qb);
+            get(o->qs, d_qs, sb); get(o->rq, d_rq, qb); get(o->rs, d_rs, sb);
+            return RAD_OK;
+        };
+        FOut p0, p1;
+        const int rc0 = run(false, &p0), rc1 = run(true, &p1);
+        std::string bad;
+        if (rc0 != RAD_OK || rc1 != RAD_OK) bad = fmt(" (rc %d / %d)", rc0, rc1);
+        else {
+            if (p0.h != p1.h)     bad += " h";
+            if (p0.x != p1.x)     bad += " x";
+            if (p0.inj != p1.inj) bad += " inj";
+            if (p0.q != p1.q)     bad += " q";
+            if (p0.qs != p1.qs)   bad += " qs";
+            if (p0.rq != p1.rq)   bad += " rq";
+            if (p0.rs != p1.rs)   bad += " rs";
+        }
+        size_t moved = 0;
+        for (size_t i = 0; rc0 == RAD_OK && i < p0.h.size(); i += 2)
+            moved += std::memcmp(&p0.h[i], (const uint8_t*)hh.data() + i, 2) != 0;
+        ok(fmt("%s at M=%lld with the write folded in (fold): byte-identical to hc_write then the "
+               "read, streams and outputs", rn, (long long)M).c_str(),
+           bad.empty() && moved > hh.size() / 2,
+           bad.empty() ? fmt("%zu of %zu stream values written", moved, hh.size())
+                       : "differs in" + bad);
+        st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    }
+
     if (timed) {
         auto time_now = [&](const char* label) {
             hipEvent_t w0, w1;
@@ -32902,6 +33038,7 @@ struct ArHc {
     int64_t M = 0, n = 0, hc = 2, top_k = 0;   /* top_k 0: the plain fused write */
     const char* act = nullptr;                 /* gather's shared arm: null operand, "none", "sigmoid" */
     bool use_scratch = false;                  /* hand the inverse table's scratch to the gather */
+    bool hwrite0 = false;                      /* `hwrite` 0: the reduction alone */
     void* inst = nullptr;
     int rounds = 1;                            /* launches on the one instance, y handed in again */
     std::vector<int> coded_seq;                /* launch r's `coded` is [r % size]; empty: none */
@@ -32920,6 +33057,7 @@ static void ar_hc_worker(ArHc* t) {
                                  PI("hc", t->hc), PS("dtype", "bf16"), PI("wire", 0) };
     if (gather) ps.push_back(PI("top_k", t->top_k));
     if (t->act) ps.push_back(PS("act", t->act));
+    if (t->hwrite0) ps.push_back(PI("hwrite", 0));
     t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
 
@@ -33032,6 +33170,9 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
                    { 200, 2048, 2, 10, "sigmoid", true } };
     }
     const std::string nm(name);
+    /* Every shape with the stream write, then (two ranks) at `hwrite` 0: the same y and the
+     * streams untouched. */
+    for (int hw = 1; hw >= (world == 2 ? 0 : 1); --hw)
     for (const Shape& sh : shapes) {
         const int64_t M = sh.M, n = sh.n, hc = sh.hc, k = sh.top_k, T = M * k;
         const bool gather = k > 0;
@@ -33042,7 +33183,8 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
                                  (sh.act ? std::string(", shared ") + sh.act
                                          : std::string(", no shared arm"))
                                        : std::string()) +
-                               (gather && sh.scratch ? ", inverse table" : "");
+                               (gather && sh.scratch ? ", inverse table" : "") +
+                               (hw ? "" : ", hwrite 0");
 
         /* The routing is replicated across ranks -- every rank sorts the same slots -- while the
          * routed rows, the weights and the streams are each rank's own. `sorted` is the stable
@@ -33077,7 +33219,7 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
         for (int r = 0; r < world; ++r) {
             ArHc& x = t[(size_t)r];
             x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = world;
-            x.M = M; x.n = n; x.hc = hc; x.top_k = k; x.act = sh.act; x.use_scratch = sh.scratch;
+            x.M = M; x.n = n; x.hc = hc; x.top_k = k; x.act = sh.act; x.use_scratch = sh.scratch; x.hwrite0 = hw == 0;
             x.y_in.resize((size_t)(M * n));
             x.inj.resize((size_t)(M * hc));
             x.h0.resize((size_t)(M * hc * n));
@@ -33164,7 +33306,7 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
                     const int64_t o = (tok * hc + c) * n + e;
                     const float wantf = h_bf16(x.h0[(size_t)o]) +
                                         h_bf16(x.inj[(size_t)(tok * hc + c)]) * h_bf16(want_y);
-                    const uint16_t want = h_bf16_away(wantf);
+                    const uint16_t want = hw ? h_bf16_away(wantf) : x.h0[(size_t)o];
                     const uint16_t g = x.h_out[(size_t)o];
                     if (g != want) {
                         const double rel = std::fabs((double)h_bf16(g) - (double)wantf) /
@@ -37649,7 +37791,7 @@ static void device_phase(const Plugin& pl) {
                                  "against the decode tiles'\n");
         /* 700 and 1000 put PF2's K chunks across a stream boundary and row tiles past the last
          * row; 4096 is the one-chunk epilogue. */
-        for (int64_t m : { 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
+        for (int64_t m : { 8, 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
         /* The PF2 up product's reciprocal rule (hc_up_mix_pf3_kernel) over every float it can
          * meet: 1 + e^-v lies in [1, inf], and a NaN stays the division's. */
         if (pl.hc_rcp_check) {

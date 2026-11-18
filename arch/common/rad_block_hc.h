@@ -97,6 +97,9 @@ struct HyperConn {
         int     overlap = 0;
         /* The rows of such a piece, the real declare's (read_rows can be a sizing level's). */
         int64_t overlap_rows = 0;
+        /* Declare the reducing writes' y-only forms (op_ar_write_y, op_ar_gather_write_y), for an
+         * architecture that folds a write's stream update into the next read (declare_fold). */
+        int     fold = 0;
     };
 
     struct Wire {
@@ -155,6 +158,17 @@ struct HyperConn {
     rad_op     op_ar_write_ov = 0;
     rad_op     op_ar_gather_write_ov[kOvPieces] = {};
     int        n_gather_ov = 0;
+    /* The write's stream update moved into the next read (two ranks, exact wire, a prefill-sized
+     * step): `op_ar_write_y` / `op_ar_gather_write_y` reduce and write y alone (`hwrite` 0), and
+     * the reading connection's `op_read_fold` (declare_fold) applies h[s] += inj[s] * y in its
+     * own pass over the streams, which it makes anyway. The pair is the bytes of the write and
+     * the read, and the streams are read and written once less a reduction. Decode and verify
+     * steps keep the fused write. */
+    static constexpr int64_t kFoldRows = 512;
+    rad_op     op_ar_write_y = 0, op_ar_gather_write_y = 0;
+    rad_op     op_read_fold = 0;
+    rad_buf    fold_y = 0, fold_inj = 0;     /* the folded write's y and gains (declare_fold) */
+    int64_t    fold_hc = 0;
 
     int64_t hn() const { return c.hc * g.n_embd; }
     /* The reducing write for this step's wire, or 0 when that wire has no fused form (then the
@@ -178,6 +192,20 @@ struct HyperConn {
                 const Config& cfg, const Wire& wire, const Src& src);
 
     int  declare_gather(RadBuilder* b, const GatherSrc& src);
+    /* The read with `src`'s write folded in front (op_read_fold). No op where not served. */
+    int  declare_fold(RadBuilder* b, const HyperConn& src);
+    /* Whether a T-row step's write may leave its stream update to `next`'s read: the y-only form
+     * of the write the step would issue exists, and `next` folds this connection's write. */
+    bool defers(int64_t T, const HyperConn& next) const {
+        if (T < kFoldRows || g.world != 2 || !ar_exact_write_takes(g, T)) return false;
+        if (!next.op_read_fold || next.fold_y != w.x.x || next.fold_inj != w.inj) return false;
+        if (takes_gather(T)) return op_ar_gather_write_y != 0;
+        return takes_ar(T) && op_ar_write_y != 0;
+    }
+    /* write() at `hwrite` 0, for a step defers() accepts. */
+    void write_y(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
+    /* read() with the folded write folded in (op_read_fold). */
+    void read_fold(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
 
     void read (RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
     void write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
@@ -197,10 +225,25 @@ struct HyperConn {
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
      * two reads over half of them; reading a wide step in pieces computes what the narrower steps
      * did. */
-    void read_pieces(RadCtx* c_, int64_t T) const {
+    void read_pieces(RadCtx* c_, int64_t T) const { read_span(c_, T, 0, T); }
+    /* The same with a boundary at `cut` (a checkpoint inside the step, RadBatch::ckpt_cut): rows
+     * [0, cut) are read as a chunk of `cut` rows reads them, then [cut, T) on their own; 0 is
+     * none. */
+    void read_pieces(RadCtx* c_, int64_t T, int64_t cut, bool fold = false) const {
+        if (cut <= 0 || cut >= T) { read_span(c_, T, 0, T, fold); return; }
+        read_span(c_, T, 0, cut, fold);
+        read_span(c_, T, cut, T, fold);
+    }
+    /* Rows [a, b) in pieces of Config::read_rows from `a`; one read where they fit in one. With
+     * `fold`, each piece folds the folded write of its rows (read_fold). */
+    void read_span(RadCtx* c_, int64_t T, int64_t a, int64_t b, bool fold = false) const {
         const int64_t piece = c.read_rows;
-        if (piece <= 0 || T <= piece) { read(c_, T, 0, T); return; }
-        for (int64_t r0 = 0; r0 < T; r0 += piece) read(c_, T, r0, T - r0 < piece ? T - r0 : piece);
+        auto one = [&](int64_t r0, int64_t n) {
+            if (fold) read_fold(c_, T, r0, n);
+            else      read(c_, T, r0, n);
+        };
+        if (piece <= 0 || b - a <= piece) { one(a, b - a); return; }
+        for (int64_t r0 = a; r0 < b; r0 += piece) one(r0, b - r0 < piece ? b - r0 : piece);
     }
 };
 
@@ -347,6 +390,14 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                                               RAD_INT("overlap", 1)),
                                    RAD_NOWEIGHTS),
                                 {w.x.x, w.inj, w.h}, {w.x.x, w.h});
+        if (op_ar_write && c.fold && g.world == 2)
+            op_ar_write_y = rw(b, RAD_OP(b, "ar_hc_write_y",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, ar_rows), RAD_INT("n", g.n_embd),
+                                             RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
+                                             RAD_STR("dtype", g.dtype), RAD_INT("wire", 0),
+                                             RAD_INT("hwrite", 0)),
+                                  RAD_NOWEIGHTS),
+                               {w.x.x, w.inj, w.h}, {w.x.x, w.h});
         /* The rotated form at two ranks only: there is no four-rank form on that wire
          * (docs/OPS.md), and an unresolvable op would be reported at startup as an unservable
          * band. */
@@ -418,6 +469,20 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
         }
         if (n_gather_ov < np) n_gather_ov = 0;
     }
+    if (op_ar_gather_write && c.fold && g.world == 2) {
+        op_ar_gather_write_y = RAD_OP(b, "ar_gather_hc_write_y",
+                                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
+                                                 RAD_INT("hc", c.hc), RAD_INT("top_k", src.top_k),
+                                                 RAD_INT("world_size", g.world),
+                                                 RAD_STR("dtype", g.dtype),
+                                                 RAD_STR("act", shared ? "sigmoid" : "none"),
+                                                 RAD_INT("wire", 0), RAD_INT("hwrite", 0)),
+                                      RAD_NOWEIGHTS);
+        if (op_ar_gather_write_y) {
+            RAD_ARCH_TRY(rad_op_reads (b, op_ar_gather_write_y, rd, shared ? 8 : 6));
+            RAD_ARCH_TRY(rad_op_writes(b, op_ar_gather_write_y, wr, 2));
+        }
+    }
     if (op_ar_write6) {
         op_ar_gather_write6 = RAD_OP(b, "ar_gather_hc_write",
                                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
@@ -452,6 +517,66 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                                    : RAD_NONE,
                 (c.rotate || xrot) ? brow_slice(xrot ? w.x.s8 : w.rs, r0, rows,
                                                 fp8_blocks(g.n_embd)) : RAD_NONE);
+}
+
+inline int HyperConn::declare_fold(RadBuilder* b, const HyperConn& src) {
+    if (!op_read || !src.op_write || !src.c.inject || g.world != 2 || src.c.hc != c.hc ||
+        (!src.op_ar_write_y && !src.op_ar_gather_write_y))
+        return RAD_OK;
+    const rad_weight wts[4] = { w_norm, w_down, w_up, w_inj };
+    const int n_wts = c.inject ? 4 : 3;
+    op_read_fold = RAD_OP(b, "hc_read_fold",
+                       RAD_PARAMS(RAD_RANGE("M", 1, c.read_rows > 0 && c.read_rows < g.max_tok
+                                                        ? c.read_rows : g.max_tok),
+                                  RAD_INT("n", g.n_embd),
+                                  RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                                  RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                                  RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
+                                  RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                                  RAD_INT("rotate", (c.rotate || xrot) ? 1 : 0),
+                                  RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16"),
+                                  RAD_INT("fold", 1)),
+                       wts, n_wts);
+    if (!op_read_fold) return RAD_OK;
+    /* The read's own outputs and the streams it now writes; the folded write's y and gains. */
+    rad_buf wr[8] = { w.x.x, 0, 0, 0, 0, 0, 0, 0 };
+    int n_wr = 1;
+    if (c.inject) wr[n_wr++] = w.inj;
+    if (xrot) {
+        wr[n_wr++] = pq;     wr[n_wr++] = ps;
+        wr[n_wr++] = w.x.q8; wr[n_wr++] = w.x.s8;
+    } else {
+        if (c.quant)  { wr[n_wr++] = c.codes_i8 ? w.x.q8 : w.x.q; wr[n_wr++] = c.codes_i8 ? w.x.s8 : w.x.s; }
+        if (c.rotate) { wr[n_wr++] = w.rq;  wr[n_wr++] = w.rs; }
+    }
+    wr[n_wr++] = w.h;
+    const rad_buf rd[3] = { w.h, src.w.x.x, src.w.inj };
+    RAD_ARCH_TRY(rad_op_reads (b, op_read_fold, rd, 3));
+    RAD_ARCH_TRY(rad_op_writes(b, op_read_fold, wr, n_wr));
+    fold_y = src.w.x.x;
+    fold_inj = src.w.inj;
+    fold_hc = src.c.hc;
+    return RAD_OK;
+}
+
+inline void HyperConn::read_fold(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+    (void)T;
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_read_fold, rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                c.inject ? RAD_W(w_inj) : RAD_NONE,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
+                c.quant  ? brow_slice(xrot ? pq : c.codes_i8 ? w.x.q8 : w.x.q, r0, rows,
+                                      g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(xrot ? ps : c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                (c.rotate || xrot) ? brow_slice(xrot ? w.x.q8 : w.rq, r0, rows, g.n_embd)
+                                   : RAD_NONE,
+                (c.rotate || xrot) ? brow_slice(xrot ? w.x.s8 : w.rs, r0, rows,
+                                                fp8_blocks(g.n_embd)) : RAD_NONE,
+                brow_slice(fold_y, r0, rows, g.n_embd),
+                brow_slice(fold_inj, r0, rows, fold_hc));
 }
 
 /* ================================================================== the control-vector projection
@@ -565,6 +690,26 @@ inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) co
         return;
     }
     RAD_ISSUE_N(c_, takes_ar(T) ? ar_write(T) : op_write, rows,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                brow_slice(w.inj, r0, rows, c.hc),
+                brow_slice(w.h, r0, rows, hn()));
+}
+
+inline void HyperConn::write_y(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+    if (takes_gather(T)) {
+        const int64_t k = gsrc.top_k;
+        const bool shared = gsrc.sh && gsrc.sg;
+        RAD_ISSUE_N(c_, op_ar_gather_write_y, rows,
+                    brows(gsrc.ye, rows * k), brow_slice(gsrc.ew, r0, rows, k),
+                    brows(gsrc.sorted, rows * k),
+                    shared ? brow_slice(gsrc.sh, r0, rows, g.n_embd) : RAD_NONE,
+                    shared ? brow_slice(gsrc.sg, r0, rows, 1) : RAD_NONE,
+                    brow_slice(w.x.x, r0, rows, g.n_embd),
+                    brow_slice(w.inj, r0, rows, c.hc),
+                    brow_slice(w.h, r0, rows, hn()));
+        return;
+    }
+    RAD_ISSUE_N(c_, op_ar_write_y, rows,
                 brow_slice(w.x.x, r0, rows, g.n_embd),
                 brow_slice(w.inj, r0, rows, c.hc),
                 brow_slice(w.h, r0, rows, hn()));

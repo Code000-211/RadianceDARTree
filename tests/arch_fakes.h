@@ -159,6 +159,11 @@ struct RadBuilder {
     const RecOp* op_of(rad_op h) const { return h ? &ops[h - 1] : nullptr; }
 };
 
+struct SnapRec {
+    size_t at;      /* issues before the call */
+    int    group;
+    int    layer;
+};
 struct StageRec {
     size_t issue = 0;   /* the issue count when the stage copy was issued */
     int    layer = -1;
@@ -182,6 +187,7 @@ struct RadCtx {
     bool                  stage_on = false;
     int                   stage_last = -1;
     std::vector<StageRec> stages;
+    std::vector<SnapRec>  snaps;     /* rad_ckpt_snap calls */
     /* kv_stage_next: after which issue index the next layer's copy was handed over. */
     std::vector<StageRec> stages_next;
 };
@@ -508,6 +514,13 @@ extern "C" int rad_lane(RadCtx* c, int lane) {
 extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     c->joins.push_back({ c->issues.size(), from, to });
+    return RAD_OK;
+}
+/* A checkpoint inside the step (RadBatch::ckpt_cut): recorded at its place in the issue stream,
+ * so a test can find the snapshot between the recurrence's two pieces. */
+extern "C" int rad_ckpt_snap(RadCtx* c, rad_kvgroup g, int layer) {
+    if (!c) return RAD_E_INVAL;
+    c->snaps.push_back(SnapRec{ c->issues.size(), (int)g, layer });
     return RAD_OK;
 }
 /* No pool binding here, so a layer is at the index it names: the arch test uses layer 0 where it

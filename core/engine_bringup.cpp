@@ -1316,6 +1316,12 @@ int Engine::declare() {
         draft_tree_ = cfg_.n_spec > 0 && cfg_.draft_tree != 0 &&
                       (cfg_.draft_tree > 0 || pb.tree_pays != 0);
         tree_linear_ok_ = pb.tree_linear_ok != 0;
+        ckpt_snap_ok_ = pb.ckpt_snap_ok != 0;
+        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made. */
+        {
+            const char* e = std::getenv("RADIANCE_CKPT_STAGE");
+            cfg_.ckpt_stage = !(e && e[0] == '0');
+        }
         if (draft_tree_) {
             const char* why = cfg_.draft_tree > 0 ? "--draft-tree on"
                                                   : "the model's plugin measured a gain with them";

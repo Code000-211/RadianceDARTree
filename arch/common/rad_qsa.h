@@ -524,7 +524,21 @@ inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch, bool scrat
                     kv_cache(c.kv_tail, layer),
                     praw2(tlb->state_index, RAD_I32, S, tw),
                     praw(batch->spec_parent, RAD_I32, T));
-    else
+    else if (S == 1 && batch->ckpt_cut > 0 && batch->ckpt_cut < T && batch->ckpt_cu) {
+        /* A checkpoint inside the step (RadBatch::ckpt_cut): the ring over the rows before it,
+         * the snapshot, then the rest -- the ring a chunk ending there leaves, and after both
+         * the ring the whole step leaves (a row writes its own position's slot). */
+        const int64_t ck = batch->ckpt_cut;
+        for (int64_t p = 0; p < 2; ++p) {
+            RAD_ISSUE_N(c_, op_tail, p == 0 ? ck : T - ck,
+                        bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
+                        praw(batch->positions, RAD_I32, T),
+                        praw(batch->ckpt_cu + p, RAD_I32, 2),
+                        kv_cache(c.kv_tail, layer),
+                        praw2(tlb->state_index, RAD_I32, S, tw));
+            if (p == 0) rad_ckpt_snap(c_, c.kv_tail, layer);
+        }
+    } else
         RAD_ISSUE_N(c_, op_tail, T,
                     bcol_at(w.qk, 0, nw, koff, c.head_dim, T),
                     praw(batch->positions, RAD_I32, T),

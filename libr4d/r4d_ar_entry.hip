@@ -1810,10 +1810,14 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
     const RadTensor* const y = g.y;
     const RadTensor* const inj = g.inj;
     const RadTensor* const h = g.h;
-    const long long M = g.M, n = g.n, hc = g.hc, top_k = g.top_k, irow = g.irow, hrow = g.hrow;
+    const long long M = g.M, n = g.n, top_k = g.top_k, irow = g.irow, hrow = g.hrow;
     const long long ye_ld = g.ye_ld, ew_ld = g.ew_ld, sh_ld = g.sh_ld, sg_ld = g.sg_ld;
     const int sig = g.sig, wire = g.wire;
     const bool has_inv = g.has_inv;
+    /* `hwrite` 0, as ar_hc_write's. */
+    const bool hwrite = r4d_geti_or(a, "hwrite", 1) != 0;
+    if (!hwrite && wire == 6) return RAD_E_UNSUPPORTED;
+    const long long hc = hwrite ? g.hc : 0;
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
@@ -1877,6 +1881,7 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
  * is the write's rule, widened by the launcher until a block's slot table fits in LDS, or, when
  * that needs more blocks and scratch is present, kept and served from the inverse table. */
 extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
+    if (r4d_geti_or(a, "hwrite", 1) == 0) return RAD_E_UNSUPPORTED;   /* two ranks only */
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
     if (in->world != 4) return RAD_E_SHAPE;
@@ -1967,8 +1972,13 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
     const RadTensor* const y = w.y;
     const RadTensor* const inj = w.inj;
     const RadTensor* const h = w.h;
-    const long long M = w.M, n = w.n, hc = w.hc, irow = w.irow, hrow = w.hrow;
+    const long long M = w.M, n = w.n, irow = w.irow, hrow = w.hrow;
     const int wire = w.wire;
+    /* `hwrite` 0: the reduction alone, the streams left for the reading connection to write
+     * (hc_read's `fold`); every form then runs its write over no stream. */
+    const bool hwrite = r4d_geti_or(a, "hwrite", 1) != 0;
+    if (!hwrite && wire == 6) return RAD_E_UNSUPPORTED;
+    const long long hc = hwrite ? w.hc : 0;
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
@@ -2014,6 +2024,7 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
  * Block count follows the plain one-shot's rule (nb_for over the whole message under nb_cap);
  * words, flags and slot match the one-shot's, so the two can share an instance. */
 extern "C" int r4d_rad_ar_hc_write_4rank(const RadArgs* a, RadStream s) {
+    if (r4d_geti_or(a, "hwrite", 1) == 0) return RAD_E_UNSUPPORTED;   /* two ranks only */
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
     if (in->world != 4) return RAD_E_SHAPE;

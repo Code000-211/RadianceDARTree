@@ -273,6 +273,9 @@ struct Model {
     bool          df_tree = false;
     enum { MAX_TAPS = 8 };
     int           n_taps = 0;
+    /* RADIANCE_Q4_HCFOLD=1 (opt-in, measured slower): declare the folded reads
+     * (HyperConn::declare_fold). */
+    bool          hc_fold = false;
     int           tap_layer[MAX_TAPS] = {};
     rad_buf       b_dfsrc = 0;                 /* [max_tok, n_taps * n_embd] */
     rad_op        op_tap = 0;
@@ -1673,6 +1676,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, g.n_layer, std::max(q_dim, v_dim) * g.world,
                                std::max<int64_t>(g.n_embd, std::max(q_dim, v_dim) * g.world)));
+    {
+        const char* e = std::getenv("RADIANCE_Q4_HCFOLD");
+        m.hc_fold = e && e[0] == '1';
+        m.hccfg.fold = m.hc_fold ? 1 : 0;
+    }
     for (int64_t l = 0; l < g.n_layer; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.full = is_full_attention(l, interval) ? 1 : 0;
@@ -1736,6 +1744,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 pre, (long long)l);
         RAD_ARCH_TRY(lay.hc_mix.declare(b, nm, g, nm.f("blk.%lld.attn_hc", (long long)l),
                                         m.hccfg, hw, mixs));
+        /* Each write's stream update folded into the read behind it (HyperConn::declare_fold): the
+         * previous layer's feed-forward write into this read, the mixer's write into the
+         * feed-forward's read, the last layer's into the final connection's. A prefill step's
+         * reduction then writes y alone and the read, which walks the streams anyway, applies the
+         * update (step_serial). Declared beside the read they extend, so no buffer lives longer.
+         * MEASURED, NEGATIVE, hence opt-in (RADIANCE_Q4_HCFOLD=1): on 2x R9700 (IQR-V4, span 4
+         * at 8192) prefill is ~1% slower (filler prompts, 6-24K: 760 -> 767 ms, 1554 -> 1572,
+         * 3009 -> 3032; output identical): the staged coded write's stream update runs under
+         * its link time, so taking it out of the reduction saves little, while the read's
+         * prologue, one wave a (row, stream) that only summed squares, now reads y and writes
+         * the streams too. */
+        if (m.hc_fold && l > 0) RAD_ARCH_TRY(lay.hc_mix.declare_fold(b, m.layers[(size_t)l - 1].hc_ffn));
 
         /* `Src::norm = nullptr` is the blocks' "input already normed and quantised" mode, and
          * `add_out = false` stops them adding into the stream; the connection's write half does
@@ -1841,6 +1861,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         RAD_ARCH_TRY(lay.hc_ffn.declare(b, nm, g, nm.f("blk.%lld.ffn_hc", (long long)l),
                                         fcfg, fw, ffns));
+        if (m.hc_fold) RAD_ARCH_TRY(lay.hc_ffn.declare_fold(b, lay.hc_mix));
 
         MoeFP8::Src ms{};
         ms.cfg              = m.moecfg;
@@ -1918,6 +1939,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "input_mix_weight_up.weight");
         RAD_ARCH_TRY(m.mixer.declare(b, nm, g, nm.f("output_hc"), mc, mixw, mixs));
     }
+
+    /* The final connection folds the last layer's feed-forward write (hc_fold, above). */
+    if (m.hc_fold && !m.layers.empty())
+        RAD_ARCH_TRY(m.mixer.declare_fold(b, m.layers.back().hc_ffn));
 
     /* ---- the issue order of a decode step's small launches (AttnGatedFP8::kv_first_rows,
      * MoeFP8::sh_down_first_lo): at decode and verify heights the k and v projections go in
@@ -2469,7 +2494,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 
     /* The delta net runs a piece at a time over the bounds (ArPieces::cu) in a step of one
      * prefill sequence in two pieces. */
-    const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL
+    const int32_t* gcu = pcu && K == 2 && batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
+                         batch->ckpt_cut <= 0
                        ? pcu : nullptr;
 
     const int64_t n = (int64_t)m.layers.size();
@@ -2587,6 +2613,9 @@ static bool arover(const Model& m, const RadBatch* batch, int64_t T) {
     const int64_t R = m.piece_rows;
     if (!m.arover || R <= 0 || T <= R) return false;
     if (batch->phase != RAD_PHASE_PREFILL || batch->n_seq != 1) return false;
+    /* Its reads are a piece tall from the step's first row; a checkpoint inside the step cuts them
+     * (step_serial). */
+    if (batch->ckpt_cut > 0) return false;
     if (m.moecfg.calib || m.calib.on || dbg_resid_on() || m.n_taps > 0) return false;
     for (const Layer& l : m.layers) {
         if (!l.hc_mix.overlap_serves(T, false) || !l.hc_ffn.overlap_serves(T, true)) return false;
@@ -2667,8 +2696,9 @@ static void step_arover(RadCtx* c, const RadBatch* batch, Model& m, const int32_
 }
 
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
- * other where step_pipelined's conditions do not hold. */
-static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+ * other where step_pipelined's conditions do not hold. Returns whether the last write left its
+ * stream update to the final connection's read (HyperConn::defers). */
+static bool step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
     RAD_ISSUE(c, m.op_embed,
@@ -2689,11 +2719,18 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     /* The pass's first full-attention layer makes what every such layer shares of the indexer's
      * step (QsaIndexer::step, `first`). */
     bool qsa_first = true;
-    for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
+    /* A prefill-sized step's writes leave their stream update to the next read
+     * (HyperConn::defers): not where something reads or changes the stream between the two -- the
+     * calibration and DFlash2 taps, the residual dump, a steered layer's projection, the PLE add
+     * in front of its layer's read. `fold_in`: the read about to run folds the last write. */
+    const bool hcf = m.n_taps == 0 && !m.calib.on && !dbg_resid_on();
+    bool fold_in = false;
+    const int64_t nl = (int64_t)m.layers.size();
+    for (int64_t li = 0; li < nl; ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) m.ple.step(c, batch);
-        l.hc_mix.read_pieces(c, T);
+        l.hc_mix.read_pieces(c, T, batch->ckpt_cut, fold_in);
         /* The calibration taps read the codes the mixer's GEMMs read: its input before it runs,
          * its output projection's input before the feed-forward's connection reuses the pair. */
         if (l.cs_in >= 0) m.calib.tap(c, (size_t)l.cs_in, T);
@@ -2726,11 +2763,20 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
             prefetch_beside(c, l.op_pf_router_v && T >= kVerifyRows ? l.op_pf_router_v
                                                                     : l.op_pf_router,
                             l.mlp.w_router, T);
-        l.hc_mix.write(c, T, 0, T);
+        const bool dm = hcf && l.hc_mix.defers(T, l.hc_ffn);
+        if (dm) l.hc_mix.write_y(c, T, 0, T);
+        else    l.hc_mix.write(c, T, 0, T);
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T);
+        l.hc_ffn.read_pieces(c, T, batch->ckpt_cut, dm);
         l.mlp.step(c, batch);
-        l.hc_ffn.write(c, T, 0, T);
+        const Layer* nx = li + 1 < nl ? &m.layers[(size_t)li + 1] : nullptr;
+        const bool steered = l.proj.op && batch->control_vector;
+        const bool df = hcf && !steered &&
+                        (nx ? li + 1 != m.ple_layer && l.hc_ffn.defers(T, nx->hc_mix)
+                            : l.hc_ffn.defers(T, m.mixer));
+        if (df) l.hc_ffn.write_y(c, T, 0, T);
+        else    l.hc_ffn.write(c, T, 0, T);
+        fold_in = df;
         /* The request's control vector, on the stream the write just finished. */
         l.proj.step(c, batch, 0, T);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
@@ -2743,6 +2789,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         }
     }
     m.calib.after_step(c, T);
+    return fold_in;
 }
 
 /* Stage 2: after a head pass (the history pass is round 1, then rounds 2..R of W rows a sequence)
@@ -2835,11 +2882,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     const int32_t* pcu = pipe_bounds(c, batch, m);
+    bool mfold = false;     /* the last write's stream update is the final read's (step_serial) */
     if (pipelined(m, T))         step_pipelined(c, batch, m, pcu);
     else if (arover(m, batch, T)) step_arover(c, batch, m, pcu);
-    else                         step_serial(c, batch, m, pcu);
+    else                         mfold = step_serial(c, batch, m, pcu);
 
-    m.mixer.read_pieces(c, T);
+    m.mixer.read_pieces(c, T, 0, mfold);
 
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
@@ -2959,6 +3007,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * have chained forms: on two R9700 a full pass under the draft head went from 13.9 to 12.5 ms
      * and the step without the head from 9.98 to 9.17 ms at one sequence. */
     out->chain_pays = RAD_CHAIN_ALWAYS;
+    /* A step of one prefill sequence with its checkpoint inside it (RadBatch::ckpt_cut): the delta
+     * net runs its recurrence in two pieces and snapshots between them (rad_block_gdn_fp8.h), and
+     * the connection reads cut their pieces at the checkpoint (HyperConn::read_pieces), so the
+     * rows before it read what a chunk ending there reads. */
+    out->ckpt_snap_ok = 1;
     return RAD_OK;
 }
 

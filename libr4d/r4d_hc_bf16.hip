@@ -3716,13 +3716,15 @@ constexpr long kPf2MinRows = 512;                // the rule's floor, and where 
  *
  * Every decoded element is f2bf(code * scale) as in the wide form's staging. */
 __global__ __launch_bounds__(kThreads)
-void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout,
+void hc_pf2_prep_kernel(unsigned short* h, float* __restrict__ scaleout,
                         long rows, long n, int hc, long hrow, float eps, long nnb,
                         const void* __restrict__ downv, long dld, bool f8,
                         const unsigned short* __restrict__ injw,
                         const unsigned char* __restrict__ up8, long uld,
                         uint4* __restrict__ plane, unsigned short* __restrict__ udec,
-                        long lr, long ncol, long ntt) {
+                        long lr, long ncol, long ntt,
+                        const unsigned short* __restrict__ fy,
+                        const unsigned short* __restrict__ finj, long fyrow, long firow) {
     __shared__ float s_t[kWaves][kThreads];
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long HN = (long)hc * n;
@@ -3731,13 +3733,33 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
         if (p >= rows * hc) return;
         const long r = p / hc;
         const int  c = (int)(p - r * hc);
-        const unsigned short* hp = h + r * hrow + (long)c * n;
-        /* Five chunks' loads in flight before the first is summed; summation order is unchanged. */
-        constexpr int kU = 5;
+        unsigned short* const hp = h + r * hrow + (long)c * n;
         float acc[8];
 #pragma unroll
         for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
         long j0 = 0;
+        if (fy) {
+            /* The folded write (hc_read `fold`): h[c] += inj[c] * y in hc_write_kernel's arithmetic,
+             * stored, and the stream's sum of squares over the written values -- the same sum,
+             * in the same order, that the plain path takes over the stream hc_write leaves. */
+            const float g = bf2f(finj[r * firow + c]);
+            const unsigned short* yp = fy + r * fyrow;
+            for (; j0 < n; j0 += kThreads) {
+                uint4 v = *(const uint4*)(hp + j0 + lane * 8);
+                const uint4 yv = *(const uint4*)(yp + j0 + lane * 8);
+                unsigned short* he = reinterpret_cast<unsigned short*>(&v);
+                const unsigned short* ye = reinterpret_cast<const unsigned short*>(&yv);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) he[e] = f2bf(bf2f(he[e]) + g * bf2f(ye[e]));
+                *(uint4*)(hp + j0 + lane * 8) = v;
+                float f[8];
+                bf16x8(v, f);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[e] += f[e] * f[e];
+            }
+        }
+        /* Five chunks' loads in flight before the first is summed; summation order is unchanged. */
+        constexpr int kU = 5;
         for (; j0 + kU * kThreads <= n; j0 += kU * kThreads) {
             uint4 v[kU];
 #pragma unroll
@@ -4873,7 +4895,9 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                          unsigned short* inj, unsigned char* q, float* qs, unsigned char* rq,
                          float* rqs, long rows, long n, int hc, long lr, long ncol, long hrow,
                          long irow, long xrow, long qrow, long srow, long rqrow, long rsrow,
-                         long kc, int ks, float eps, float wadd, RadStream s, bool pf3) {
+                         long kc, int ks, float eps, float wadd, RadStream s, bool pf3,
+                         const unsigned short* fy, const unsigned short* finj, long fyrow,
+                         long firow) {
     const long HN  = (long)hc * n;
     const long ntt = (ncol + 15) / 16;                        /* plane n-tiles */
     uint4* const          plane = (uint4*)wsp;
@@ -4885,8 +4909,9 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
     long ndec = (work + kThreads - 1) / kThreads;
     if (ndec > 512) ndec = 512;
     hipLaunchKernelGGL(hc_pf2_prep_kernel, dim3((unsigned)(nnb + ndec)), dim3(kThreads), 0,
-                       (hipStream_t)s, h, scale, rows, n, hc, hrow, eps, nnb, down, dld, f8, injw,
-                       (const unsigned char*)up, uld, plane, udec, lr, ncol, ntt);
+                       (hipStream_t)s, const_cast<unsigned short*>(h), scale, rows, n, hc, hrow,
+                       eps, nnb, down, dld, f8, injw, (const unsigned char*)up, uld, plane, udec,
+                       lr, ncol, ntt, fy, finj, fyrow, firow);
     if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
 
     float* const kpart = ks > 1 ? part : nullptr;
@@ -4929,7 +4954,8 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
 
 enum { HCE_X = 0, HCE_H };
 enum { HCW_Y = 0, HCW_INJ, HCW_H };
-enum { HCR_H = 0, HCR_W, HCR_DOWN, HCR_UP, HCR_INJW, HCR_X, HCR_INJ, HCR_Q, HCR_S, HCR_RQ, HCR_RS };
+enum { HCR_H = 0, HCR_W, HCR_DOWN, HCR_UP, HCR_INJW, HCR_X, HCR_INJ, HCR_Q, HCR_S, HCR_RQ, HCR_RS,
+       HCR_FY, HCR_FINJ };
 
 /* LDS for kernel A's bf16 N beside its static planes: gfx1201 gives a workgroup 64 KiB, so N gets
  * 64 KiB less kHcReadAStaticLds (30576 elements). The row table claims `n <= 7552` and `hc <= 4`
@@ -5302,6 +5328,33 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     const float eps  = (float)r4d_getf(a, "eps", 1e-6);
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
 
+    /* `fold` (the operands fold_y, fold_inj): the preceding write's stream update, which the
+     * reduction left undone (ar_hc_write at `hwrite` 0). The PF2 prologue writes it in its pass
+     * over the streams; every other form runs hc_write_kernel over the rows first. Either way the
+     * streams and everything read from them are the bytes of the write then the read. */
+    const RadTensor* fy   = r4d_opt(a, HCR_FY);
+    const RadTensor* finj = r4d_opt(a, HCR_FINJ);
+    if ((fy != nullptr) != (finj != nullptr)) return R4D_NO(RAD_E_INVAL);
+    long long fyrow = 0, firow = 0;
+    if (fy) {
+        R4D_DT(fy, RAD_BF16); R4D_DT(finj, RAD_BF16);
+        long long fr = 0, ir = 0;
+        fyrow = r4d_rows_pitch(fy, n, &fr);
+        firow = r4d_rows_pitch(finj, hc, &ir);
+        if (fyrow < 0 || firow < 0 || fr < rows || ir < rows) return R4D_NO(RAD_E_STRIDE);
+        if ((((uintptr_t)fy->data | (uintptr_t)(fyrow * 2)) & 15u) != 0u) return R4D_NO(RAD_E_ALIGN);
+    }
+    auto fold_write = [&]() -> int {
+        if (!fy) return RAD_OK;
+        const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
+        const int frc = R4D_EMIT(s, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
+                                 (const unsigned short*)fy->data, (const unsigned short*)finj->data,
+                                 (unsigned short*)h->data, (long)rows, (long)n, (int)hc,
+                                 (long)fyrow, (long)firow, (long)hrow);
+        if (frc != RAD_OK || hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+        return RAD_OK;
+    };
+
     /* Check what this launch touches, not the scratch hook's total: the hook walks the band, which
      * is too slow per launch. `d`, the scales and `u` sit at offsets fixed by the band's M; the
      * split-K partials are checked in the tiled branch, where the split is known. */
@@ -5370,10 +5423,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
                 (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow, (long)irow, (long)xrow,
                 (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, s,
-                g_hc_prefill_form == 4 || (g_hc_prefill_form != 3 && g_hc_pf3));
+                g_hc_prefill_form == 4 || (g_hc_prefill_form != 3 && g_hc_pf3),
+                fy ? (const unsigned short*)fy->data : nullptr,
+                fy ? (const unsigned short*)finj->data : nullptr, (long)fyrow, (long)firow);
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
+        if (const int frc = fold_write(); frc != RAD_OK) return frc;
         /* On the decode tiles the norm scales share the down product's grid and its split reduces
          * itself (hc_norm_down_tiled_kernel): two launches a read where there were four. The
          * counters are the mix finisher's block, one per (column tile, row tile), which the up-mix
@@ -5469,6 +5525,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                (long)rows, (long)HN, (long)lr, s);
         if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     } else {
+    if (const int frc = fold_write(); frc != RAD_OK) return frc;
     long long ta = kDownTAMax;
     /* Target two workgroups per WGP, i.e. one per CU, since want_wg() returns WGPs (see its note).
      * A one-WGP target would accept 44 blocks at a depth-3 verify (four rows, ta = 32); the one-CU

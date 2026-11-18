@@ -1301,7 +1301,18 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
              * (under a quantum) runs as the next step's chunk (tail_checkpoint decides when that
              * is worth it). A window's tail snapshot is taken above, inside its chunk. */
             const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target);
-            if (!cfg_.prefill_tail_snapshot) {
+            /* A prefill alone in its spanned step whose plugin snapshots inside the step
+             * (set_ckpt_inside) takes either snapshot below inside its last chunk, at the same
+             * position, and runs to the prompt's end: the rows past it would otherwise be a step
+             * of their own, which on a routed model reads nearly every expert for a few dozen
+             * rows. */
+            const bool inside = ckpt_inside_ && cfg_.prefill_tail_snapshot && geo_.span > 1 &&
+                                span_now_ && cfg_.prefill_span > 1 && !geo_.window_ckpt;
+            if (inside && tail > n_computed) {
+                if (checkpoint_pos) *checkpoint_pos = tail;
+            } else if (inside && n_computed + want > next) {
+                if (checkpoint_pos) *checkpoint_pos = (n_computed + want) / I * I;
+            } else if (!cfg_.prefill_tail_snapshot) {
                 /* --prefill-tail-snapshot off: neither cut below, so the last chunk runs to the
                  * prompt's end; its snapshot is kept where that end is the tail (no cut). */
                 if (tail == n_target && tail > n_computed && checkpoint_pos) *checkpoint_pos = tail;

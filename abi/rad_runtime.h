@@ -375,6 +375,18 @@ typedef struct RadBatch {
      * key heal, a rolling token window. */
     const int32_t* spec_path;
     int32_t        spec_path_pitch;   /* >= max_spec + 1 */
+    /* ---- appended in ABI 41 (a checkpoint inside the step) */
+    /* A step of one prefill sequence (n_seq 1, no decode rows) whose linear-state checkpoint lies
+     * inside it rather than at its end: host, the rows before the checkpoint (its position less
+     * the sequence's context), 0 on every other step. Set only for a plugin that asked
+     * (RadArchProbe::ckpt_snap_ok). Such a plugin runs its recurrence over [0, ckpt_cut) and
+     * [ckpt_cut, n_tok) as two pieces -- each what a chunk of those rows computes -- and calls
+     * rad_ckpt_snap for each stateful layer between them, so the snapshot is the state a chunk
+     * ending at the checkpoint leaves, without a step of its own for the rows past it.
+     * `ckpt_cu` is [3] device: {0, ckpt_cut, n_tok}, a piece's cu_seqlens at +0 and +1; null when
+     * ckpt_cut is 0. */
+    int32_t        ckpt_cut;
+    const int32_t* ckpt_cu;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -932,6 +944,13 @@ int rad_lane_join(RadCtx* c, int from, int to);
  * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns
  * the status it set, so a helper can `return rad_step_fail(...)`. */
 int rad_step_fail(RadCtx* c, const char* what);
+
+/* A step with a checkpoint inside it (RadBatch::ckpt_cut): copy layer `layer`'s state of the
+ * stateful KV group `group` -- the sequence's committed slot as the issue stands -- into the
+ * engine's checkpoint stage, on the current lane's stream. Called between the two pieces of the
+ * recurrence, once for every stateful group and layer the plugin holds. A no-op returning RAD_OK
+ * on a step with no checkpoint inside it, so a caller need not test. */
+int rad_ckpt_snap(RadCtx* c, rad_kvgroup group, int layer);
 
 /* ================================================================== run-phase queries */
 const RadBatch* rad_batch(RadCtx* c);

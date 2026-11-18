@@ -566,13 +566,20 @@ void moe_iqr_kernel(R4D_MOEIQR_PARAMS) {
  * rows. Offsets are clamped to T, where the kernel clamps a run's end. */
 __global__ __launch_bounds__(256) void moe_iqr_packmap_kernel(
     const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t CAP,
-    uint32_t cap, uint32_t* __restrict__ map) {
+    uint32_t cap, uint32_t* __restrict__ map, const int32_t* __restrict__ sorted,
+    const int32_t* __restrict__ split, uint32_t top_k) {
     constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
     __shared__ uint32_t s_cnt[kMaxExpert + 1];
     __shared__ int32_t  s_wt[kTiles][NW];
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
-    /* a thread's experts (tid, tid + NT, ..): first row, rows, and the dot path's remainder */
-    uint32_t lo[kTiles], n[kTiles], dr[kTiles];
+    /* `split` (a checkpoint inside the step): the rows of tokens below *split, which lead each
+     * expert's run in the stable sort, are a run of their own and the rest another, each cut as a
+     * whole run is -- so those rows take the entries, and the paths, a pass of them alone gives
+     * them. Null: one run an expert. */
+    const uint32_t cslot = split ? (uint32_t)split[0] * top_k : 0u;
+    /* a thread's experts (tid, tid + NT, ..): first row, the first run's rows and the dot path's
+     * remainder, then the second run's (none without a split) */
+    uint32_t lo[kTiles], n[kTiles], dr[kTiles], n2[kTiles], dr2[kTiles];
 #pragma unroll
     for (uint32_t i = 0; i < kTiles; ++i) {
         const uint32_t e = tid + i * NT;
@@ -581,15 +588,31 @@ __global__ __launch_bounds__(256) void moe_iqr_packmap_kernel(
         lo[i] = a < T ? a : T;
         const uint32_t hi = b < T ? b : T;
         n[i] = hi > lo[i] ? hi - lo[i] : 0u;
+        n2[i] = 0u;
+        if (split && n[i] > 0u) {
+            /* the first row at or past the split: rows hold slots, ascending within a run */
+            uint32_t l = lo[i], h = lo[i] + n[i];
+            while (l < h) {
+                const uint32_t m = (l + h) >> 1;
+                if ((uint32_t)sorted[m] < cslot) l = m + 1u;
+                else h = m;
+            }
+            n2[i] = lo[i] + n[i] - l;
+            n[i] = l - lo[i];
+        }
         const uint32_t rem = n[i] % FM;
         dr[i] = rem >= 1u && rem <= kDotRows ? rem : 0u;
+        const uint32_t rem2 = n2[i] % FM;
+        dr2[i] = rem2 >= 1u && rem2 <= kDotRows ? rem2 : 0u;
     }
     const uint32_t live0 = (uint32_t)off[n_expert];
     const uint32_t live = live0 < T ? live0 : T;
 #pragma unroll
     for (uint32_t i = 0; i < kTiles; ++i) {
         const uint32_t e = tid + i * NT;
-        if (e < n_expert) s_cnt[e] = (n[i] - dr[i] + CAP - 1) / CAP + (dr[i] ? 1u : 0u);
+        if (e < n_expert)
+            s_cnt[e] = (n[i] - dr[i] + CAP - 1) / CAP + (dr[i] ? 1u : 0u) +
+                       (n2[i] - dr2[i] + CAP - 1) / CAP + (dr2[i] ? 1u : 0u);
     }
     /* the tail of dropped slots, carried as one more "expert" so the scan places it too */
     if (tid == 0) s_cnt[n_expert] = T > live ? (T - live + CAP - 1) / CAP : 0u;
@@ -628,6 +651,18 @@ __global__ __launch_bounds__(256) void moe_iqr_packmap_kernel(
         if (dr[i] && o < cap) {
             map[1 + 2 * o + 0] = e | dr[i] << 16;
             map[1 + 2 * o + 1] = lo[i] + m;
+            ++o;
+        }
+        /* the second run, after the first */
+        const uint32_t lo2 = lo[i] + n[i], m2 = n2[i] - dr2[i];
+        for (uint32_t r = 0; r < m2; r += CAP, ++o) {
+            if (o >= cap) break;
+            map[1 + 2 * o + 0] = e | (m2 - r < CAP ? m2 - r : CAP) << 16;
+            map[1 + 2 * o + 1] = lo2 + r;
+        }
+        if (dr2[i] && o < cap) {
+            map[1 + 2 * o + 0] = e | dr2[i] << 16;
+            map[1 + 2 * o + 1] = lo2 + m2;
         }
     }
     if (tid == 0) {
@@ -714,6 +749,11 @@ struct Launch {
 static inline long long pack_cap(long long T, long long n_expert) {
     return 2 * n_expert + T / (long long)(kRows * kPackTiles) + 2;
 }
+/* ...and with a split (moe_iqr_packmap_kernel): two runs an expert, one more partial entry and
+ * dot remainder each. */
+static inline long long pack_cap_split(long long T, long long n_expert) {
+    return 4 * n_expert + T / (long long)(kRows * kPackTiles) + 2;
+}
 
 template <class F>
 int launch_form(const Launch& g, RadStream stream) {
@@ -769,6 +809,9 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
                                 ncls == 4 ? r4d_opt(a, 9) : nullptr,
                                 ncls == 4 ? r4d_opt(a, 11) : nullptr };
     const RadTensor* Y      = r4d_opt(a, ncls == 4 ? 12 : 8);
+    /* `split` (optional, after y): a checkpoint inside the step -- the token at which each expert's
+     * run is cut in two for the map (moe_iqr_packmap_kernel). */
+    const RadTensor* split  = r4d_opt(a, ncls == 4 ? 13 : 9);
     if (!Aq || !As || !sorted || !off || !Y) return R4D_NO(RAD_E_INVAL);
     if (!Aq->data || !As->data || !sorted->data || !off->data || !Y->data)
         return R4D_NO(RAD_E_INVAL);
@@ -886,9 +929,12 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
          * all of the activation and the scratch holds its entries (an expert at most one per
          * 128 rows begun and one for its dot remainder, and the tail). */
         const uint32_t pin = map_tiles_pin();
-        const long long capp = pack_cap(T, n_expert);
+        /* A split takes the packed map whatever the rows: its entries carry their row counts, and
+         * its bytes are the run map's. */
+        const bool split_on = split && split->data && split->dtype == RAD_I32;
+        const long long capp = split_on ? pack_cap_split(T, n_expert) : pack_cap(T, n_expert);
         g.packed = fm.bits == 4 && fm.L == 16 &&
-                   (pin ? pin == kPackTiles : T >= kPackMinRowsPerExpert * n_expert) &&
+                   (split_on || (pin ? pin == kPackTiles : T >= kPackMinRowsPerExpert * n_expert)) &&
                    (unsigned long long)M * (unsigned long long)a_ld + (unsigned long long)K <
                        (1ull << 32) &&
                    (unsigned long long)Ms * (unsigned long long)as_ld < (1ull << 32) &&
@@ -897,7 +943,8 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
         if (g.packed) {
             cap = capp;
             rc = R4D_EMIT(stream, moe_iqr_packmap_kernel, dim3(1), dim3(256), 0, g.off, g.n_expert,
-                          g.T, kRows * kMapTiles, kRows * kPackTiles, (uint32_t)cap, g.map);
+                          g.T, kRows * kMapTiles, kRows * kPackTiles, (uint32_t)cap, g.map, g.sorted,
+                          split_on ? (const int32_t*)split->data : nullptr, (uint32_t)top_k);
         } else {
             rc = r4d_moe_blockmap_emit(stream, g.off, g.n_expert, g.T, kRows * kMapTiles,
                                        (uint32_t)cap, g.map);
@@ -926,7 +973,7 @@ int64_t moe_iqr_scratch(const RadArgs* a) {
     if (r4d_moe_in_decode_band(T, n_expert)) return 0;
     /* the run map's entries or the packed map's, whichever are more */
     return r4d_moe_blockmap_bytes(std::max(r4d_moe_blockmap_cap(T, n_expert, kRows * kMapTiles),
-                                           pack_cap(T, n_expert)));
+                                           pack_cap_split(T, n_expert)));
 }
 
 }  // namespace

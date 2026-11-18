@@ -795,6 +795,7 @@ Engine::~Engine() {
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
      * landing in a freed arena is a GPU memory fault. */
+    ckpt_stage_close();
     for (auto& r : ranks_) {
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
         r->tierx.quiesce();
@@ -1224,7 +1225,8 @@ int Engine::prepare_release(const RadBatch* b) {
      * parked, so no allocation races the read. */
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
-    return RAD_OK;
+    /* A checkpoint inside the step: every rank's Ctx copies into its stage (Ctx::set_ckpt_snap). */
+    return ckpt_stage_arm(b);
 }
 
 bool Engine::exact_jit() const {
@@ -1547,6 +1549,8 @@ int Engine::step_loop() {
         bool any_restore = false;
         for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
         if (any_restore) {
+            /* A slot being restored may be the one a stage copy is still writing. */
+            if (const int w = ckpt_wait_copies(); w < 0) return fail_loop(w);
             const int rs = sched_.locked([&]() -> int {
                 for (const StepEntry& e : plan.e) {
                     if (e.ckpt_restore < 0) continue;
@@ -2005,6 +2009,103 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the checkpoint stage */
+/* After the KV carve, the snapshot store and Scheduler::init. Every rank carved a stage or none
+ * did (KVManager::plan_groups decides on the same config and plans). */
+int Engine::ckpt_stage_open() {
+    bool staged = !ranks_.empty() && ck_store_.enabled();
+    for (auto& rk : ranks_) staged = staged && rk->kv.ckpt_stage() != nullptr;
+    if (!staged) return RAD_OK;
+    ranks_[0]->kv.ckpt_stage_layout(&ck_stage_off_, &ck_stage_lb_);
+    auto env_off = [](const char* k) {
+        const char* e = std::getenv(k);
+        return e && e[0] == '0';
+    };
+    ckpt_inside_ = ckpt_snap_ok_ && !env_off("RADIANCE_CKPT_INSIDE");
+    /* Off by default, measured slower (Engine::ckpt_async_): RADIANCE_CKPT_ASYNC=1 the DMA
+     * engine, 2 a copy kernel, each on a stream of its own. */
+    {
+        const char* e = std::getenv("RADIANCE_CKPT_ASYNC");
+        ckpt_async_ = e && (e[0] == '1' || e[0] == '2');
+        ckpt_async_blit_ = e && e[0] == '2';
+    }
+    if (ckpt_async_) {
+        const size_t n = ranks_.size();
+        ck_stream_.assign(n, nullptr);
+        ck_ready_.assign(n, nullptr);
+        ck_done_.assign(n, nullptr);
+        ck_pending_.assign(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            RAD_TRY(rad_dev_set(ranks_[i]->device));
+            RAD_TRY(rad_stream_create(&ck_stream_[i], /*high_priority=*/0));
+            RAD_TRY(rad_event_create(&ck_ready_[i]));
+            RAD_TRY(rad_event_create(&ck_done_[i]));
+            /* The card's DMA queue, readied here rather than on the first snapshot. */
+            RAD_TRY(rad_memcpy_list_async(nullptr, 0, 0, ck_stream_[i]));
+        }
+        if (n > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    }
+    sched_.set_ckpt_inside(ckpt_inside_);
+    RAD_INFO("checkpoint stage: %s a rank on the card; %s; %s",
+             humanb(ranks_[0]->kv.ckpt_stage_bytes()).c_str(),
+             ckpt_inside_ ? "a prompt's tail snapshot is taken inside its last chunk"
+                          : "every snapshot at a chunk's end",
+             ckpt_async_ ? "snapshots go to the host off the compute stream"
+                         : "snapshots go to the host on the compute stream");
+    return RAD_OK;
+}
+
+void Engine::ckpt_stage_close() {
+    for (size_t i = 0; i < ck_stream_.size(); ++i) {
+        if (!ck_stream_[i]) continue;
+        (void)rad_dev_set(ranks_[i]->device);
+        (void)rad_stream_sync(ck_stream_[i]);
+        if (ck_ready_[i]) rad_event_destroy(ck_ready_[i]);
+        if (ck_done_[i]) rad_event_destroy(ck_done_[i]);
+        rad_stream_destroy(ck_stream_[i]);
+    }
+    ck_stream_.clear();
+    ck_ready_.clear();
+    ck_done_.clear();
+    ck_pending_.clear();
+}
+
+/* Each rank's compute stream behind its stage copy in flight: before the stage is written again
+ * or a host slot is read back. */
+int Engine::ckpt_wait_copies() {
+    for (size_t i = 0; i < ck_pending_.size(); ++i) {
+        if (!ck_pending_[i]) continue;
+        if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[i]->device));
+        RAD_TRY(rad_event_wait(ranks_[i]->ctx.stream(), ck_done_[i]));
+        ck_pending_[i] = 0;
+    }
+    if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    return RAD_OK;
+}
+
+int Engine::ckpt_stage_arm(const RadBatch* b) {
+    if (ck_stage_off_.empty()) return RAD_OK;
+    const StepEntry* in = nullptr;
+    if (b && b->ckpt_cut > 0)
+        for (const StepEntry& e : sched_.plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && e.ckpt_tok + 1 < e.n_tokens) in = &e;
+    if (!in) {
+        for (auto& rk : ranks_) rk->ctx.set_ckpt_snap(nullptr, ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+        return RAD_OK;
+    }
+    if (in->ckpt_tok + 1 != b->ckpt_cut || !state_slots_of(in->seq, &ckpt_slots_)) {
+        RAD_ERR("step %d: sequence %llu's checkpoint inside the step (row %d) is not the batch's "
+                "(%d), or its state slots are gone", b->step, (unsigned long long)in->seq,
+                (int)in->ckpt_tok, (int)b->ckpt_cut);
+        return RAD_E_STATE;
+    }
+    /* The step writes the stage, so the last snapshot must have left it. */
+    RAD_TRY(ckpt_wait_copies());
+    for (auto& rk : ranks_)
+        rk->ctx.set_ckpt_snap(rk->kv.ckpt_stage(), ckpt_slots_, ck_stage_off_, ck_stage_lb_);
+    return RAD_OK;
+}
+
 /* Snapshot after the step that produced the state. Linear state is what the chunk's last token
  * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
  * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
@@ -2033,12 +2134,53 @@ int Engine::save_checkpoints() {
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
                 }
-                for (auto& rk : ranks_) {
+                /* A checkpoint inside the step is in the stage already (rad_ckpt_snap); one at
+                 * the chunk's end is gathered there on the card when the copy to the host runs
+                 * off the compute stream (ckpt_async_), else copied from the live slots as
+                 * before. */
+                const bool inside = e.ckpt_tok + 1 < e.n_tokens && !ck_stage_off_.empty();
+                const bool staged = inside || ckpt_async_;
+                if (staged && !inside) {
+                    const int w = ckpt_wait_copies();
+                    if (w < 0) return w;
+                }
+                for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                    auto& rk = ranks_[ri];
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                    const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
-                                                         (int)ckpt_slots_.size(),
-                                                         e.ckpt_slot, rk->ctx.stream(),
-                                                         &ckpt_win_);
+                    int s = RAD_OK;
+                    if (!staged) {
+                        s = rk->kv.checkpoint_save(ckpt_slots_.data(), (int)ckpt_slots_.size(),
+                                                   e.ckpt_slot, rk->ctx.stream(), &ckpt_win_);
+                    } else {
+                        if (!inside)
+                            s = rk->kv.checkpoint_stage_in(ckpt_slots_.data(),
+                                                           (int)ckpt_slots_.size(),
+                                                           rk->ctx.stream());
+                        else
+                            /* The layers the step did not snapshot (rad_ckpt_snap) are the ones
+                             * it did not change: a drafter head's state, which moves only in
+                             * the drafter's passes behind this copy. */
+                            s = rk->kv.checkpoint_stage_rest(
+                                ckpt_slots_.data(), (int)ckpt_slots_.size(), rk->ctx.stream(),
+                                [&](size_t g, int64_t li) { return rk->ctx.ckpt_snapped(g, li); });
+                        if (s >= 0 && !ckpt_async_) {
+                            s = rk->kv.checkpoint_stage_out(e.ckpt_slot, rk->ctx.stream());
+                        } else if (s >= 0) {
+                            /* The stage to the host slot on the card's DMA engine, on a stream of
+                             * its own behind the step; the next writer of the stage and every
+                             * restore wait for ck_done_ (ckpt_wait_copies). */
+                            RadCopySeg seg{};
+                            s = rk->kv.checkpoint_stage_out(e.ckpt_slot, nullptr, &seg);
+                            if (s >= 0) s = rad_event_record(ck_ready_[ri], rk->ctx.stream());
+                            if (s >= 0) s = rad_event_wait(ck_stream_[ri], ck_ready_[ri]);
+                            if (s >= 0)
+                                s = ckpt_async_blit_
+                                        ? rad_memcpy_async(seg.dst, seg.src, seg.bytes, ck_stream_[ri])
+                                        : rad_memcpy_list_async(&seg, 1, 0, ck_stream_[ri]);
+                            if (s >= 0) s = rad_event_record(ck_done_[ri], ck_stream_[ri]);
+                            if (s >= 0) ck_pending_[ri] = 1;
+                        }
+                    }
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
                                 "%d: %s", rk->index, (unsigned long long)e.seq,
@@ -2048,6 +2190,31 @@ int Engine::save_checkpoints() {
                     }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                /* RADIANCE_CKPT_HASH=1: wait for the snapshot and log a digest of each rank's
+                 * shard, to compare two builds' snapshots byte for byte. A debugging aid: it
+                 * drains the streams. */
+                static const bool hash_on = [] {
+                    const char* h = std::getenv("RADIANCE_CKPT_HASH");
+                    return h && h[0] == '1';
+                }();
+                if (hash_on) {
+                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                        auto& rk = ranks_[ri];
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        (void)rad_stream_sync(rk->ctx.stream());
+                        if (ri < ck_stream_.size() && ck_stream_[ri]) (void)rad_stream_sync(ck_stream_[ri]);
+                        const unsigned char* p = (const unsigned char*)rk->kv.checkpoint_ptr(e.ckpt_slot);
+                        uint64_t h = 0xcbf29ce484222325ull;
+                        const int64_t nb = rk->kv.checkpoint_bytes();
+                        for (int64_t j = 0; p && j < nb; ++j) { h ^= p[j]; h *= 0x100000001b3ull; }
+                        RAD_INFO("ckpt-hash seq=%llu pos=%lld rank=%zu inside=%d bytes=%lld %016llx",
+                                 (unsigned long long)e.seq,
+                                 (long long)(e.ctx_len + e.ckpt_tok + 1), ri,
+                                 (int)(e.ckpt_tok + 1 < e.n_tokens), (long long)nb,
+                                 (unsigned long long)h);
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                }
             }
             return RAD_OK;
         });
@@ -2922,6 +3089,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * spanned step (--prefill-span-pass step) the span pays from the second interval on. */
         sched_.set_span_min(cfg_.prefill_span_min >= 0 ? cfg_.prefill_span_min : span_auto);
     }
+    RAD_TRY(ckpt_stage_open());
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

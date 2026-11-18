@@ -759,6 +759,13 @@ static const RadParamSpec pArHcWrite[] = {
 static const RadOperandSpec oArHcWrite[] = {
     { "y", RAD_OPD_INOUT, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
 };
+/* ar_hc_write_y: ar_hc_write's operands and parameters with `hwrite`: 0 is the reduction alone --
+ * y is written, the streams are not (the reading connection behind it folds the write into its own
+ * pass over them: hc_read_fold). 1 is ar_hc_write. */
+static const RadParamSpec pArHcWriteY[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("world_size"), P_STR("dtype"),
+    P_INTO("wire"), P_INTO("overlap"), P_INTO("hwrite"),
+};
 /* moe_gather's parameters and operands, then ar_hc_write's. The gather's output is the
  * reduction's message, one operand written by the gather and reduced in place. */
 static const RadParamSpec pArGatherHcWrite[] = {
@@ -770,6 +777,11 @@ static const RadParamSpec pArGatherHcWrite[] = {
      * are the whole pass's (every slot of the pass, `sorted_tok` holding token * top_k + slot of
      * the pass's tokens), the other operands the launch's rows. Two ranks, coded wire. */
     P_INTO("row0"),
+};
+/* ar_gather_hc_write_y: ar_gather_hc_write's with `hwrite`, as ar_hc_write_y's. */
+static const RadParamSpec pArGatherHcWriteY[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("top_k"), P_INT("world_size"), P_STR("dtype"),
+    P_STRO("act"), P_INTO("wire"), P_INTO("overlap"), P_INTO("row0"), P_INTO("hwrite"),
 };
 static const RadOperandSpec oArGatherHcWrite[] = {
     { "y_expert", RAD_OPD_IN, 0 }, { "expert_w", RAD_OPD_IN, 0 }, { "sorted_tok", RAD_OPD_IN, 0 },
@@ -794,6 +806,14 @@ static const RadParamSpec pHcRead[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
     P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"),
 };
+/* hc_read_fold: hc_read with the preceding write folded in front (ar_hc_write_y at `hwrite` 0
+ * left the streams unwritten): h[s] += fold_inj[s] * fold_y in hc_write's arithmetic, stored, then
+ * the read over the written streams. `fold` 1 states the two trailing operands. */
+static const RadParamSpec pHcReadFold[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
+    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"),
+    P_INTO("fold"),
+};
 static const RadOperandSpec oHcRead[] = {
     { "h",        RAD_OPD_IN,     0 },
     { "w",        RAD_OPD_WEIGHT, 0 },
@@ -806,6 +826,21 @@ static const RadOperandSpec oHcRead[] = {
     { "scale",    RAD_OPD_OUT,    1 },
     { "rq",       RAD_OPD_OUT,    1 },
     { "rscale",   RAD_OPD_OUT,    1 },
+};
+static const RadOperandSpec oHcReadFold[] = {
+    { "h",        RAD_OPD_INOUT,  0 },
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "mix_down", RAD_OPD_WEIGHT, 0 },
+    { "mix_up",   RAD_OPD_WEIGHT, 0 },
+    { "inject_w", RAD_OPD_WEIGHT, 1 },
+    { "x",        RAD_OPD_OUT,    0 },
+    { "inj",      RAD_OPD_OUT,    1 },
+    { "q",        RAD_OPD_OUT,    1 },
+    { "scale",    RAD_OPD_OUT,    1 },
+    { "rq",       RAD_OPD_OUT,    1 },
+    { "rscale",   RAD_OPD_OUT,    1 },
+    { "fold_y",   RAD_OPD_IN,     0 },
+    { "fold_inj", RAD_OPD_IN,     0 },
 };
 
 static const RadParamSpec pGdnGatedRmsNorm[] = {
@@ -1273,6 +1308,7 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "w_odd",         RAD_OPD_WTAB, 0 },
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 /* The same GEMM over four classes by expert number mod 4: `w`/`w_scale` hold class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4. Four ranks
@@ -1299,6 +1335,7 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3",           RAD_OPD_WTAB, 0 },
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
@@ -3772,6 +3809,9 @@ static const RadOpSchema kSchemas[] = {
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
+    SCHEMA("hc_read_fold", pHcReadFold, oHcReadFold,
+           "hc_write, then hc_read over the streams it wrote, in the read's own pass: the "
+           "preceding all-reduce left the write undone (ar_hc_write_y at hwrite 0)."),
     SCHEMA("hc_project", pHcProject, oHcProject,
            "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
            "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
@@ -4114,6 +4154,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),
+    SCHEMA("ar_hc_write_y", pArHcWriteY, oArHcWrite,
+           "ar_hc_write whose stream write can be left out (hwrite 0): the reduction alone, y "
+           "written, for a reading connection that folds the write (hc_read_fold)."),
+    SCHEMA("ar_gather_hc_write_y", pArGatherHcWriteY, oArGatherHcWrite,
+           "ar_gather_hc_write whose stream write can be left out, as ar_hc_write_y."),
     SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
            "moe_gather, then ar_hc_write, in one kernel: the routed experts' rows summed back to "
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
@@ -8519,6 +8564,26 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
   r4d_shape_hc_read, r4d_rad_unrelayout_hc_e4m3 },
 
+{ "hc_read_fold_bf16", "hc_read_fold", "norm",
+  "hc_read_bf16 with the preceding write folded in: the PF2 prologue applies it in its pass over "
+  "the streams, every other form runs hc_write first",
+  "as hc_read_bf16",
+  "the bytes of hc_write_bf16 then hc_read_bf16, in the streams and every output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcRead), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_read, r4d_rad_hc_read_scratch, nullptr, nullptr,
+  r4d_shape_hc_read },
+
+{ "hc_read_fold_e4m3", "hc_read_fold", "norm",
+  "hc_read_e4m3 with the preceding write folded in, as hc_read_fold_bf16",
+  "as hc_read_e4m3",
+  "the bytes of hc_write_bf16 then hc_read_e4m3, in the streams and every output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcReadE4m3), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_read, r4d_rad_hc_read_scratch,
+  r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
+  r4d_shape_hc_read, r4d_rad_unrelayout_hc_e4m3 },
+
 { "gdn_gated_rmsnorm_h128_bf16", "gdn_gated_rmsnorm", "gdn",
   "gated rms norm over a row: out = rms(x) . w . act(z), for the prefill path only",
   "128 channels per row, one wave per row; silu or sigmoid gate",
@@ -9990,6 +10055,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write, nullptr, nullptr, nullptr,
   r4d_shape_ar_hc_write },
 
+{ "ar_hc_write_y", "ar_hc_write_y", "norm",
+  "ar_hc_write with the stream write optional (hwrite): at 0 the reduction alone, for a reading "
+  "connection that folds the write in (hc_read_fold)",
+  "as ar_hc_write; hwrite 0 on the exact wire only",
+  "as ar_hc_write; at hwrite 0 y is ar_hc_write's y byte for byte and the streams are untouched",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArHcWrite), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write, nullptr, nullptr, nullptr,
+  r4d_shape_ar_hc_write },
+
 { "ar_hc_write_4rank", "ar_hc_write", "norm",
   "the four-rank exact all-reduce and the gated residual's write that follows it, in one kernel: "
   "h[s] += inj[s] * y over the reduced y",
@@ -10022,6 +10097,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_gather_hc_write,
   r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
   r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
+
+{ "ar_gather_hc_write_y", "ar_gather_hc_write_y", "norm",
+  "ar_gather_hc_write with the stream write optional (hwrite), as ar_hc_write_y",
+  "as ar_gather_hc_write; hwrite 0 on the exact wire only",
+  "as ar_gather_hc_write; at hwrite 0 y is its y byte for byte and the streams are untouched",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArGatherHcWrite), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_gather_hc_write,
+  r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
+  r4d_shape_ar_gather_hc_write, nullptr, nullptr },
 
 { "ar_gather_hc_write_4rank", "ar_gather_hc_write", "norm",
   "moe_gather folded in front of the four-rank ar_hc_write: each block sums its words' tokens "

@@ -576,6 +576,10 @@ public:
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
      * saves (Engine::serve). */
     void    set_span_min(int64_t tokens);
+    /* Whether a checkpoint may lie inside a chunk (RadBatch::ckpt_cut): the plugin snapshots
+     * inside the step (RadArchProbe::ckpt_snap_ok) and the engine holds a stage for it. Set once
+     * by the engine after init; false keeps every checkpoint at a chunk's end. */
+    void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
@@ -616,6 +620,8 @@ private:
     int64_t       stage_rows_ = 0;
     /* set_span_min: the shortest prefill a span is taken for, 0 for any. */
     int64_t       span_min_ = 0;
+    /* set_ckpt_inside */
+    bool          ckpt_inside_ = false;
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */

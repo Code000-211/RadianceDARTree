@@ -1006,6 +1006,10 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* Engine-internal, not a flag: plan a checkpoint stage on the card (KVManager::ckpt_stage).
+     * The engine sets it at startup unless RADIANCE_CKPT_STAGE=0; a KVManager planned without it
+     * (a test, a tool) carves none. */
+    bool    ckpt_stage = false;
     /* --prefix-resume exact|nearest.
      * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
      *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken

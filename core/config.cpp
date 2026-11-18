@@ -187,9 +187,11 @@ static const Flag g_flags[] = {
     "                                    piece passes at tie level. Needs --prefill-span above 1" },
     { "--prefill-tail-snapshot", "MODE", "on (default): a prompt's last chunk ends where the\n"
     "                                    next turn's linear-state snapshot goes (prefix resume\n"
-    "                                    nearest), leaving its last tokens a step of their own; off:\n"
-    "                                    the last chunk runs to the prompt's end, one step fewer, and\n"
-    "                                    a next turn resumes up to an interval earlier" },
+    "                                    nearest), leaving its last tokens a step of their own (a\n"
+    "                                    lone spanned prefill on a model that snapshots inside a step\n"
+    "                                    takes it inside the chunk, no step more); off: the last chunk\n"
+    "                                    runs to the prompt's end, one step fewer, and a next turn\n"
+    "                                    resumes up to an interval earlier" },
     { "--prefill-span-first", "MODE",   "off (default) | on -- whether a lone prefill may span from\n"
     "                                    its first token; on: the first interval rides the span (its\n"
     "                                    rows read QSA's selection, the same keys as the dense pass\n"

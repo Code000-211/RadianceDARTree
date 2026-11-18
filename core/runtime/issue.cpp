@@ -1462,6 +1462,42 @@ int64_t rad::Ctx::kv_layer_index(rad_kvgroup g, int layer) const {
     return ls[(size_t)layer];
 }
 
+/* rad_ckpt_snap: one layer of a stateful group, the sequence's slot to the stage's row for that
+ * layer, on the current lane. The stage is laid out as KVManager::checkpoint_copy lays a slot out
+ * (group by group in plan order, a layer's state after another), so the engine moves it to the
+ * host slot in one copy (Engine::save_checkpoints). */
+int rad::Ctx::ckpt_snap(rad_kvgroup g, int layer) {
+    if (!snap_stage_ || !batch_ || batch_->ckpt_cut <= 0) return RAD_OK;
+    if (g >= kv_.size() || g >= snap_slot_.size() || snap_slot_[g] < 0 || snap_off_[g] < 0 ||
+        !kv_[g].base) {
+        step_fail_ = fmt("rank %d: rad_ckpt_snap names KV group %u, which holds no state the "
+                         "checkpoint stage carries", rank_, (unsigned)g);
+        step_status_ = RAD_E_STATE;
+        return RAD_E_STATE;
+    }
+    const KVPoolBinding& b = kv_[g];
+    const int64_t li = kv_layer_index(g, layer);
+    const int64_t lb = snap_lb_[g];
+    if (li < 0 || lb <= 0) {
+        step_fail_ = fmt("rank %d: rad_ckpt_snap: KV group %u holds no layer %d", rank_,
+                         (unsigned)g, layer);
+        step_status_ = RAD_E_STATE;
+        return RAD_E_STATE;
+    }
+    const char* src = static_cast<const char*>(b.base) + kv_binding_offset(b, li) +
+                      (int64_t)snap_slot_[g] * lb;
+    char* dst = static_cast<char*>(snap_stage_) + snap_off_[g] + li * lb;
+    const int rc = rad_memcpy_async(dst, src, lb, cur_stream());
+    if (rc < 0 && step_status_ >= 0) step_status_ = rc;
+    if (rc >= 0 && g < snap_done_.size() && (size_t)layer < snap_done_[g].size())
+        snap_done_[g][(size_t)layer] = 1;
+    return rc;
+}
+
+int rad_ckpt_snap(RadCtx* c, rad_kvgroup group, int layer) {
+    return c ? static_cast<rad::Ctx*>(c)->ckpt_snap(group, layer) : RAD_E_INVAL;
+}
+
 int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
     return c ? (int)static_cast<rad::Ctx*>(c)->kv_layer_index(group, layer) : -1;
 }

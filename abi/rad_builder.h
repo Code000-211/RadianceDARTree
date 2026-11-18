@@ -1807,6 +1807,13 @@ typedef struct RadArchProbe {
      * core's). The core derives the default budget as max(tree_nodes, rounds + leaves) and clamps
      * it to this, and refuses an explicit --draft-tree-nodes or a round count above it, naming it. */
     int32_t tree_nodes_max;
+    /* ---- appended in ABI 41 (a checkpoint inside the step) */
+    /* Nonzero when the plugin serves RadBatch::ckpt_cut: a step of one prefill sequence whose
+     * checkpoint lies inside it runs its recurrence in two pieces and snapshots between them
+     * (rad_ckpt_snap). The scheduler then takes a prompt's tail snapshot inside its last chunk
+     * rather than ending the chunk there and running the rows past it as a step of their own.
+     * Zero keeps that step. */
+    int64_t ckpt_snap_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

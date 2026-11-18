@@ -1009,7 +1009,7 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
                      long coded) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8) throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
-  if (hc < 1 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
+  if (hc < 0 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
   if (M * n * 2 / 16 > slot_stride16) throw std::runtime_error("ar_hc_write: message larger than a slot");
   const int n16 = (int)(M * n * 2 / 16);
   int nb = (int)nblocks;
@@ -1079,7 +1079,7 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
                            long drain, long acq, long inv, long gate, long gate_ctr, long stage,
                            long chain, long coded) {
   hipStream_t st = (hipStream_t)stream_i;
-  if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
+  if (n <= 0 || M <= 0 || n % 8 || hc < 0 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
   if (ye_ld % 8 || (sh && sh_ld < n)) return -3;
   if (M * n * 2 / 16 > slot_stride16) return -5;      /* larger than a slot */
@@ -1210,7 +1210,7 @@ int r4d_ar_gather_hc_write_rows(long peer_scratch, long my_scratch, long peer_fl
                                 long inv, long gate, long gate_ctr, long coded, long row0,
                                 long t_full) {
   hipStream_t st = (hipStream_t)stream_i;
-  if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
+  if (n <= 0 || M <= 0 || n % 8 || hc < 0 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
   if (ye_ld % 8 || (sh && sh_ld < n)) return -3;
   if (!inv || !sorted || row0 < 0 || (row0 + M) * top_k > t_full) return -3;

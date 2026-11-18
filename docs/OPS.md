@@ -202,6 +202,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_post` | `M`(range) `n` `hc` `dtype` | `x`, `h`, `post`, `comb` → `out` |
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
+| `hc_read_fold` | as `hc_read`, `fold`/opt | as `hc_read`, `h`:inout; then `fold_y`, `fold_inj` |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
@@ -2738,6 +2739,8 @@ device code.
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
+| `ar_hc_write_y` | as `ar_hc_write`, `overlap`/opt `hwrite`/opt | as `ar_hc_write` |
+| `ar_gather_hc_write_y` | as `ar_gather_hc_write`, `overlap`/opt `row0`/opt `hwrite`/opt | as `ar_gather_hc_write` |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
 
@@ -2776,6 +2779,11 @@ of whole 256-value waves and leaves the others, and the host-mailbox twins, plai
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`
 mean what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On either wire it is byte-identical
 to the three kernels it replaces.
+
+`ar_hc_write_y` and `ar_gather_hc_write_y` are the two fused writes with `hwrite`: 1 (the
+default) is the op without the suffix; 0 is the reduction alone -- `y` holds the bytes the fused
+write leaves there and `h` is not touched -- for a caller whose next read of the streams applies the
+write itself (`hc_read_fold`). Two ranks, exact wire; `hwrite` 0 on the rotated wire is refused.
 
 `ar_rmsnorm_quant_i8` is the exact `all_reduce` of `x` followed by `rmsnorm_quant_i8`'s junction
 over the reduced sum, at two ranks and at four. At four it is the exact one-shot's transport with

@@ -120,6 +120,7 @@ void BatchBuilder::carve(Set& s, char* h) {
     pair(&s.h_path,   &s.d_path,   path_pitch_ * S);
     pair(&s.h_cktok,  &s.d_cktok,  S);
     pair(&s.h_ckslot, &s.d_ckslot, S);
+    pair(&s.h_ckcu,   &s.d_ckcu,   4);
     pair(&s.h_out,    &s.d_out,    O);
     pair(&s.h_dout,   &s.d_dout,   S);
     pair(&s.h_rows,   &s.d_rows,   4 * S);
@@ -978,6 +979,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
      * band for separately issued decode rows. */
     int32_t max_q_dec = 0, max_q_pf = 0;
     int n_ck = 0;
+    int32_t ck_cut = 0;      /* RadBatch::ckpt_cut */
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
@@ -1093,6 +1095,13 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 ++n_bidi;
             }
         }
+        if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0 && e.ckpt_tok + 1 < e.n_tokens &&
+            plan.draft_pass == 0) {
+            /* A checkpoint inside the chunk (RadBatch::ckpt_cut), where the step is the one shape
+             * a plugin snapshots inside: one prefill alone (the scheduler plans a linear-state
+             * one nowhere else). A window snapshot inside a chunk needs no cut. */
+            if (ckpt_cut_on_ && n_seq == 1 && e.is_prefill) ck_cut = e.ckpt_tok + 1;
+        }
         if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0) {
             /* checkpoint_tok indexes this step's tokens: the sequence's base plus the offset the
              * scheduler chose, the last token of a checkpoint interval (§7.3). */
@@ -1163,6 +1172,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 (long long)n_tok, (long long)k);
         return nullptr;
     }
+    /* The two pieces' bounds of a checkpoint inside the step. */
+    s.h_ckcu[0] = 0;
+    s.h_ckcu[1] = ck_cut;
+    s.h_ckcu[2] = (int32_t)n_tok;
+    s.h_ckcu[3] = 0;
 
     /* Scored rows (Request::score): one per token of a scoring entry's prefill chunk, in entry
      * order (the order Engine::score_rows maps back). Appended after the sampled rows so the
@@ -1347,6 +1361,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_checkpoints = n_ck;
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
+        B.ckpt_cut = ck_cut;
+        B.ckpt_cu = ck_cut > 0 ? on_rank(base, b0, s.d_ckcu) : nullptr;
         B.n_ahead = n_ahead;
     }
     /* Record the flight behind everything reading this span: the upload and the derivation

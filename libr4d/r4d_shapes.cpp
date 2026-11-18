@@ -546,6 +546,7 @@ extern "C" int r4d_shape_hc_read(const RadParam* p, int n_p, int operand, RadOpd
     const int64_t inject = pi(p, n_p, "inject", 1);
     const int64_t group  = pi(p, n_p, "group", 0);
     const int64_t rotate = pi(p, n_p, "rotate", 0);
+    const int64_t fold   = pi(p, n_p, "fold", 0);
     const uint32_t D = dt_act(p, n_p, "dtype");
     const int64_t HN = hc * n;
     const RadOpdDesc l[] = {
@@ -560,6 +561,8 @@ extern "C" int r4d_shape_hc_read(const RadParam* p, int n_p, int operand, RadOpd
         group > 0 ? opd((uint32_t)RAD_F32, M, n / (group > 0 ? group : 1)) : opd_none(),
         group > 0 && rotate ? opd((uint32_t)RAD_F8E4M3, M, n) : opd_none(),           /* rq */
         group > 0 && rotate ? opd((uint32_t)RAD_F32, M, n / group) : opd_none(),      /* rscale */
+        fold ? opd(D, M, n) : opd_none(),                                              /* fold_y */
+        fold ? opd(D, M, hc) : opd_none(),                                             /* fold_inj */
     };
     R4D_PICK(l);
 }
@@ -1643,6 +1646,7 @@ static int moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
         opd(C, ne1, N1, K1),           /* w_odd -- the odd experts */
         opd((uint32_t)RAD_BF16, ne1, srows(N1), (K1 + g - 1) / g),   /* w_odd_scale */
         opd(D, M * k, N),                                 /* y, in sorted order */
+        opd_none(),                                       /* split -- optional */
     };
     R4D_PICK(l);
 }
@@ -1693,6 +1697,7 @@ static int moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpd
         opd_idx(ne + 1, 0, M * k + 1, -1),                /* expert_offset */
         wq(1), sq(1), wq(2), sq(2), wq(3), sq(3),         /* classes 1, 2, 3 */
         opd(D, M * k, N),                                 /* y -- in SORTED order */
+        opd_none(),                                       /* split -- optional */
     };
     R4D_PICK(l);
 }

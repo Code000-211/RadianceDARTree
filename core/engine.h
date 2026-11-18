@@ -820,6 +820,34 @@ private:
      * the checkpoint save waits for its context pass (save_checkpoints). */
     bool drafter_snap_ = false;
     int  save_checkpoints();
+    /* Checkpoints through the stage (KVManager::ckpt_stage).
+     *
+     * ckpt_snap_ok_: the plugin snapshots inside a step (RadArchProbe::ckpt_snap_ok); with a
+     * stage on every rank the scheduler then takes a prompt's tail snapshot inside its last chunk
+     * (Scheduler::set_ckpt_inside; RADIANCE_CKPT_INSIDE=0 keeps the chunk's own step).
+     *
+     * ckpt_async_ (RADIANCE_CKPT_ASYNC=1, the DMA engine; 2, a copy kernel; off by default): a
+     * snapshot goes stage -> host slot on a stream of its own, off the compute stream, every
+     * snapshot gathered into the stage first. ck_pending_[rank]: such a copy is in flight; its end
+     * event ck_done_ is waited for on the compute stream before anything writes the stage again or
+     * restores a slot. MEASURED, NEGATIVE: on 2x R9700 (Flash-Next IQR-V4, span 4 at 8192) a 6K
+     * prompt took 912 ms against 756 on the compute stream, either way: the copy stream's wait on
+     * the step's end holds the scheduler thread, which then issues the next step late. Without it a
+     * snapshot is still the stage's one contiguous copy rather than a pitched copy a group. */
+    bool ckpt_snap_ok_ = false;
+    bool ckpt_inside_ = false;
+    bool ckpt_async_ = false;
+    bool ckpt_async_blit_ = false;   /* RADIANCE_CKPT_ASYNC=2: a copy kernel, not the DMA engine */
+    std::vector<RadStream> ck_stream_;
+    std::vector<RadEvent>  ck_ready_, ck_done_;
+    std::vector<uint8_t>   ck_pending_;
+    std::vector<int64_t>   ck_stage_off_, ck_stage_lb_;
+    int  ckpt_stage_open();
+    void ckpt_stage_close();
+    /* Before a step: the compute streams wait for a stage copy in flight; a step with a checkpoint
+     * inside it arms every rank's Ctx (Ctx::set_ckpt_snap). */
+    int  ckpt_stage_arm(const RadBatch* b);
+    int  ckpt_wait_copies();
     /* A tree drafter (rad_drafter_tree), driven on the card only: ADV_BTAKE takes its parents,
      * ADV_COMPACT moves the accepted path's K and V after the acceptance, and ADV_CTXTREE stages
      * the context pass by that path. */

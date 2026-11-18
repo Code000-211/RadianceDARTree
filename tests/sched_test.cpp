@@ -638,6 +638,64 @@ TEST(prefill_chunks_span_intervals_on_the_same_pieces) {
     CHECK_EQ(ck, -1);
 }
 
+/* A plugin that snapshots inside a step (Scheduler::set_ckpt_inside): a lone spanned prefill's
+ * last chunk runs to the prompt's end and carries the tail snapshot -- or, with none, the last
+ * boundary it crosses -- inside it, at the position the cut would have put it. Not for a step
+ * planned at the shared budget, and not under --prefill-tail-snapshot off. */
+TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512, quantum 64 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_ckpt_inside(true);
+    int64_t ck = -1;
+    /* The tail: [512, 1000) with the snapshot at 960, where the cut ended the chunk. */
+    CHECK_EQ(f.sch.plan_chunk(512, 1000, 512, &ck), 488);
+    CHECK_EQ(ck, 960);
+    /* No tail snapshot: the last boundary crossed, 768, inside [512, 830). */
+    CHECK_EQ(f.sch.plan_chunk(512, 830, 512, &ck), 318);
+    CHECK_EQ(ck, 768);
+    /* Mid-prompt chunks and a prompt ending on its tail are as before. */
+    CHECK_EQ(f.sch.plan_chunk(256, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 768);
+    CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
+    CHECK_EQ(ck, 960);
+    /* Every position matches the cut schedule's. */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    int bad = 0;
+    for (int64_t target = 300; target <= 2600; target += 7) {
+        std::vector<int64_t> a, b;
+        for (int64_t n = 0; n < target; ) {
+            int64_t c1 = -1;
+            const int64_t w = g.sch.plan_chunk(n, target, 512, &c1);
+            if (w <= 0) break;
+            n += w;
+            if (c1 >= 0) a.push_back(c1);
+        }
+        for (int64_t n = 0; n < target; ) {
+            int64_t c1 = -1;
+            const int64_t w = f.sch.plan_chunk(n, target, 512, &c1);
+            if (w <= 0) break;
+            n += w;
+            if (c1 >= 0) b.push_back(c1);
+        }
+        bad += a != b;
+    }
+    CHECK_EQ(bad, 0);
+
+    Fixture o;
+    o.build();
+    o.cfg.prefill_span = 2;
+    o.cfg.prefill_tail_snapshot = false;
+    CHECK_OK(o.start());
+    o.sch.set_ckpt_inside(true);
+    CHECK_EQ(o.sch.plan_chunk(512, 1000, 512, &ck), 488);
+    CHECK_EQ(ck, -1);
+}
+
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
  * resumes from: every chunk end and checkpoint it makes is one a span of 1 makes, and the deepest
  * checkpoint (where the next turn resumes) is the same. */

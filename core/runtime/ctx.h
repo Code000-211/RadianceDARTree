@@ -290,6 +290,32 @@ public:
         return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
     }
 
+    /* ---------------------------------------------------------- a checkpoint inside the step
+     * (RadBatch::ckpt_cut, rad_ckpt_snap). The engine arms the rank before it releases such a
+     * step: `stage` is this rank's checkpoint stage (KVManager::ckpt_stage), laid out as a
+     * checkpoint slot; per KV group, the sequence's committed state slot (-1: not stateful), the
+     * group's offset in the stage and its bytes a layer. Disarmed (stage null) for every other
+     * step. */
+    void set_ckpt_snap(void* stage, const std::vector<int32_t>& slot,
+                       const std::vector<int64_t>& off, const std::vector<int64_t>& lb) {
+        snap_stage_ = stage;
+        snap_slot_ = slot;
+        snap_off_ = off;
+        snap_lb_ = lb;
+        snap_done_.resize(kv_.size());
+        for (size_t g = 0; g < kv_.size(); ++g) snap_done_[g].assign(kv_[g].layer_slot.size(), 0);
+    }
+    int ckpt_snap(rad_kvgroup g, int layer);
+    /* Whether the armed step snapshotted group `g`'s pool layer `li` (a group-local index, as the
+     * stage lays it out); a layer the step left alone holds the snapshot's state at the step's end
+     * and the engine copies it in (Engine::save_checkpoints). */
+    bool ckpt_snapped(size_t g, int64_t li) const {
+        if (g >= snap_done_.size()) return false;
+        for (size_t i = 0; i < kv_[g].layer_slot.size(); ++i)
+            if (kv_[g].layer_slot[i] == li && snap_done_[g][i]) return true;
+        return false;
+    }
+
     /* ---------------------------------------------------------- routing (spec §5.5) */
     int route_report(int layer, const RadRouting* r);
     /* Layer `layer`'s row of the card-side histogram, when it holds `n_expert` counts; null
@@ -691,6 +717,11 @@ private:
     Program*        program_   = nullptr;
     Registry*       registry_  = nullptr;   /* CtxDesc::registry */
     std::vector<KVPoolBinding> kv_;   /* by rad_kvgroup; RAD_OPK_KV resolves through it */
+    /* set_ckpt_snap */
+    void*                snap_stage_ = nullptr;
+    std::vector<int32_t> snap_slot_;
+    std::vector<int64_t> snap_off_, snap_lb_;
+    std::vector<std::vector<uint8_t>> snap_done_;   /* [group][model layer] snapshotted */
     ResidencyTable* residency_ = nullptr;
     OpStager*       stager_ = nullptr;
     bool            staging_ = false;     /* the stager armed for the pass being issued */

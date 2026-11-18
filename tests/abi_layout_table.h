@@ -1,8 +1,8 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 40 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 41 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
-{ "RadArchProbe", "", 0, 144 },
+{ "RadArchProbe", "", 0, 152 },
 { "RadArchProbe", "draft_depth", 0, 4 },
 { "RadArchProbe", "draft_depth_fixed", 4, 4 },
 { "RadArchProbe", "shape_probe_ok", 8, 4 },
@@ -26,6 +26,7 @@
 { "RadArchProbe", "tree_linear_ok", 128, 8 },
 { "RadArchProbe", "tree_nodes", 136, 4 },
 { "RadArchProbe", "tree_nodes_max", 140, 4 },
+{ "RadArchProbe", "ckpt_snap_ok", 144, 8 },
 { "RadArgs", "", 0, 72 },
 { "RadArgs", "t", 0, 8 },
 { "RadArgs", "n_t", 8, 4 },
@@ -38,7 +39,7 @@
 { "RadArgs", "world_size", 60, 4 },
 { "RadArgs", "kv_used_max_h", 64, 4 },
 { "RadArgs", "wgp_count", 68, 4 },
-{ "RadBatch", "", 0, 496 },
+{ "RadBatch", "", 0, 504 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -106,6 +107,8 @@
 { "RadBatch", "anchor_rows", 472, 8 },
 { "RadBatch", "spec_path", 480, 8 },
 { "RadBatch", "spec_path_pitch", 488, 4 },
+{ "RadBatch", "ckpt_cut", 492, 4 },
+{ "RadBatch", "ckpt_cu", 496, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },
@@ -114,7 +117,7 @@
 { "RadBufDecl", "domain", 60, 4 },
 { "RadBufDecl", "derive", 64, 8 },
 { "RadBufDecl", "kv", 72, 4 },
-{ "RadBuildCtx", "", 0, 224 },
+{ "RadBuildCtx", "", 0, 240 },
 { "RadBuildCtx", "rank", 0, 4 },
 { "RadBuildCtx", "world_size", 4, 4 },
 { "RadBuildCtx", "max_tok", 8, 8 },
@@ -152,6 +155,9 @@
 { "RadBuildCtx", "draft_tree_width", 208, 4 },
 { "RadBuildCtx", "draft_tree_prune_abs", 212, 4 },
 { "RadBuildCtx", "draft_tree_prune_rel", 216, 4 },
+{ "RadBuildCtx", "draft_adapt", 224, 8 },
+{ "RadBuildCtx", "draft_rheo", 232, 4 },
+{ "RadBuildCtx", "span_pass_step", 236, 4 },
 { "RadAudioGenBatch", "", 0, 344 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },

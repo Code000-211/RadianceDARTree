@@ -1042,6 +1042,7 @@ static const RadOperandSpec oMoeGemmQ[] = {
     { "w_odd",         RAD_OPD_WTAB, 0 },
     { "w_odd_scale",   RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 /* The same GEMM over four classes by expert number mod 4: `w`/`w_scale` hold class 0 at [N, K],
  * `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry e / 4 of class e % 4. Four ranks
@@ -1068,6 +1069,7 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3",           RAD_OPD_WTAB, 0 },
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
+    { "split",         RAD_OPD_IN,   1 },
 };
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
