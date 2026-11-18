@@ -185,7 +185,16 @@ static const Flag g_flags[] = {
     "                                    then read once for all the step's rows; the arena grows by\n"
     "                                    the expert planes' extra rows and the output differs from\n"
     "                                    piece passes at tie level. Needs --prefill-span above 1" },
-    { "--prefill-span-min",   "N",      "the shortest prompt, in tokens, a prefill spans for: auto\n"
+    { "--prefill-tail-snapshot", "MODE", "on (default): a prompt's last chunk ends where the\n"
+    "                                    next turn's linear-state snapshot goes (prefix resume\n"
+    "                                    nearest), leaving its last tokens a step of their own; off:\n"
+    "                                    the last chunk runs to the prompt's end, one step fewer, and\n"
+    "                                    a next turn resumes up to an interval earlier" },
+    { "--prefill-span-first", "MODE",   "off (default) | on -- whether a lone prefill may span from\n"
+    "                                    its first token; on: the first interval rides the span (its\n"
+    "                                    rows read QSA's selection, the same keys as the dense pass\n"
+    "                                    below the exactness bound, summed in another order)" },
+    { "--prefill-span-min",   "N",     "the shortest prompt, in tokens, a prefill spans for: auto\n"
     "                                    (default) is 8 intervals where routed experts are read from\n"
     "                                    host memory and 0 elsewhere; 0 spans every lone prefill" },
     /* A total, not per sequence: the snapshot store is one pool of N slots
@@ -953,6 +962,24 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "step"))  c->prefill_span_step = true;
             else {
                 RAD_ERR("--prefill-span-pass takes piece or step, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-tail-snapshot")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->prefill_tail_snapshot = true;
+            else if (!std::strcmp(v, "off")) c->prefill_tail_snapshot = false;
+            else {
+                RAD_ERR("--prefill-tail-snapshot takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-span-first")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->prefill_span_first = true;
+            else if (!std::strcmp(v, "off")) c->prefill_span_first = false;
+            else {
+                RAD_ERR("--prefill-span-first takes on or off, not '%s'", v);
                 return RAD_E_INVAL;
             }
         }
@@ -1911,6 +1938,8 @@ const ShowRow kShow[] = {
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },
     { "--prefill-span-pass",  [](const Config& c) { return std::string(c.prefill_span_step ? "step" : "piece"); } },
+    { "--prefill-tail-snapshot", [](const Config& c) { return onoff(c.prefill_tail_snapshot); } },
+    { "--prefill-span-first", [](const Config& c) { return onoff(c.prefill_span_first); } },
     { "--prefill-span-min",   [](const Config& c) {
           return c.prefill_span_min < 0 ? std::string("auto") : num(c.prefill_span_min); } },
     { "--checkpoint-slots",   [](const Config& c) {

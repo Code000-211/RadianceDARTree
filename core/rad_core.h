@@ -983,6 +983,22 @@ struct Config {
      * the expert slab nothing), 0 elsewhere. 0 spans every lone prefill from its second interval
      * on. */
     int64_t prefill_span_min = -1;
+    /* --prefill-tail-snapshot on|off: whether a prompt's last chunk is cut where the linear state
+     * is snapshotted for the next turn under --prefix-resume nearest (Scheduler::plan_chunk): at
+     * the last quantum boundary (Scheduler::tail_checkpoint), or, a spanned last chunk, at the last
+     * interval boundary it crosses. The cut leaves the prompt's last few tokens (up to a quantum,
+     * or a quarter interval) a step of their own, which on a routed model reads most of the
+     * experts once more (some 60 ms a prompt on Flash-Next at two ranks). Off ends the last chunk
+     * at the prompt's end: the next turn resumes from the deepest snapshot a chunk end left (the
+     * last interval or span boundary) and recomputes up to an interval more. On (the default) is
+     * the schedule as it was. Output of a cold prompt differs only as another chunking does. */
+    bool    prefill_tail_snapshot = true;
+    /* --prefill-span-first on|off: whether a span may start at a prompt's first token (off, the
+     * default: from its second interval on, Scheduler::plan_chunk). On, the first interval is no
+     * step of its own: its rows read the indexer's selection where the dense pass served them,
+     * the same keys below QSA's exactness bound summed in another order, and on routed models the
+     * first interval's experts are read once with the span's rows. */
+    bool    prefill_span_first = false;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap

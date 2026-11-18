@@ -456,6 +456,15 @@ TEST(the_span_pass_and_the_span_minimum_need_a_span) {
     /* piece without a span is the default said aloud. */
     CHECK_EQ(parse_fresh({ "--prefill-span-pass", "piece" }), RAD_OK);
 
+    /* --prefill-tail-snapshot: on by default, off and on parse, nothing else does. */
+    CHECK(d.prefill_tail_snapshot);
+    Config t;
+    CHECK_EQ(parse({ "--prefill-tail-snapshot", "off" }, &t), RAD_OK);
+    CHECK(!t.prefill_tail_snapshot);
+    CHECK_EQ(parse({ "--prefill-tail-snapshot", "on" }, &t), RAD_OK);
+    CHECK(t.prefill_tail_snapshot);
+    CHECK_EQ(parse_fresh({ "--prefill-tail-snapshot", "maybe" }), RAD_E_INVAL);
+
     Config m;
     CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "0" }, &m), RAD_OK);
     CHECK_EQ(m.prefill_span_min, 0);
@@ -586,6 +595,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--prefill-span-pass", { "step", "--prefill-span", "2" } },
+        { "--prefill-tail-snapshot", { "off" } },
+        { "--prefill-span-first", { "on" } },
         { "--prefill-span-min", { "4096", "--prefill-span", "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--prefix-resume", { "nearest" } },

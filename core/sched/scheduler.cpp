@@ -1269,9 +1269,13 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
          * makes a chunk of its own. Not from a prompt's start: the first interval may be served on
          * another path (QSA's dense attention below its exactness bound). Not from a tail
          * checkpoint: the pieces after it would no longer start on the interval. A chunk the
-         * budget cuts short of the span's end steps back to the last boundary it crosses. */
+         * budget cuts short of the span's end steps back to the last boundary it crosses.
+         * --prefill-span-first on spans from the prompt's start too: the first interval's rows
+         * then read QSA's selection, which below the exactness bound holds the same keys as the
+         * dense pass (summed in another order). */
         int64_t far = next;
-        if (geo_.span > 1 && span_now_ && n_computed >= I && n_computed % I == 0)
+        if (geo_.span > 1 && span_now_ && n_computed % I == 0 &&
+            (n_computed >= I || cfg_.prefill_span_first))
             far = n_computed + geo_.span * I;
         if (n_computed + want > far)
             want = far - n_computed;
@@ -1297,7 +1301,11 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
              * (under a quantum) runs as the next step's chunk (tail_checkpoint decides when that
              * is worth it). A window's tail snapshot is taken above, inside its chunk. */
             const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target);
-            if (tail > n_computed) {
+            if (!cfg_.prefill_tail_snapshot) {
+                /* --prefill-tail-snapshot off: neither cut below, so the last chunk runs to the
+                 * prompt's end; its snapshot is kept where that end is the tail (no cut). */
+                if (tail == n_target && tail > n_computed && checkpoint_pos) *checkpoint_pos = tail;
+            } else if (tail > n_computed) {
                 want = tail - n_computed;
                 if (checkpoint_pos) *checkpoint_pos = tail;
             } else if (n_computed + want > next) {

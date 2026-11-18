@@ -1407,6 +1407,15 @@ rows (2048 tokens and the decode headroom) is one pass too, where it was a pass 
 below (eight intervals where routed experts are staged from host memory, every prompt elsewhere);
 with step-tall passes the span pays from the second interval on, hence `0`.
 
+`prefill-span-first: on` lets the span start at the prompt's first token as well (default `off`:
+the first interval is a step of its own). Its rows then read QSA's selection where the dense pass
+served them -- below the indexer's exactness bound the same keys, summed in another order -- and
+the first interval's experts are read once with the rest of the span. The output differs from
+`off` as another chunking does (greedy text can flip at a near-tie). On Flash-Next at TP2 with
+`max-num-batched-tokens: 8192, prefill-span: 4`, cold prompts of documentation text (whose routing
+spreads over most experts) 6.7K tokens 1002 -> 857 ms, 14K 2137 -> 1905 ms, 24K 3160 -> 3074 ms;
+BetterBench's filler text, whose routing is narrow, gains 0-4%.
+
 On Qwen3.8-Flash-Next IQR-V4 (2x R9700 at 210 W, TP2, `expert_tiered`, 12 GiB host pool, MTP 5 with
 adaptive depth), prefill of one cold prompt with the four keys above against
 `max-num-batched-tokens: 2048`, in tokens a second (prompt tokens over the time to the first token,
@@ -1489,6 +1498,16 @@ its tail in other chunks than a cold prefill can flip a near-tie in greedy text.
   the turn added.
 - `nearest`: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is at
   its last quantum boundary. A turn re-prefills up to one chunk less than under `exact`.
+
+Under `nearest` the tail snapshot cuts the prompt's last chunk there (linear state is what a
+chunk's last token leaves), and the last tokens -- under a quantum, or under a quarter interval
+where a spanned last chunk is cut at the last interval boundary it crosses -- are a step of their
+own. On a routed model that small step reads most of the experts once more: some 60 ms a prompt on
+Flash-Next at two ranks, whatever the prompt's length. `prefill-tail-snapshot: off` leaves the
+last chunk whole (one step fewer; a prompt that ends on its tail keeps the snapshot, which cuts
+nothing); a next turn then resumes from the deepest snapshot a chunk end left, the last interval or
+span boundary, and re-prefills up to an interval more. For single-shot prompts (benchmarks, one
+question per document) off is the faster schedule; for conversations that come back, on.
 
 Under `exact` an interval larger than the chunk must be a multiple of it; otherwise it is rounded
 up, and startup says so:
@@ -2695,8 +2714,10 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
 | `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
+| `prefill-span-first: MODE` | off | `on`: a lone prefill may span from its first token, the first interval no step of its own (its rows read QSA's selection, the dense pass's keys below the exactness bound, summed in another order); `off`: from its second interval on (§4.5) |
 | `checkpoint-slots: N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `tp: 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB, and with its DFlash2 drafter that drafter's 2048-token window too, 487 MiB). `auto` gives each of `max-num-seqs` what `checkpoint-policy` keeps for a `max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; a floor of 8 (or what the policy wants, if fewer) outranks `memory.host-headroom-mib`, which gives back exactly the shortfall down to 1 GiB rather than take the store to none, and the startup line says so. The startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `checkpoint-policy: NAME` | geometric-backoff | also `tip-only`, `keep-all` |
+| `prefill-tail-snapshot: MODE` | on | `on`: under `prefix-resume: nearest` a prompt's last chunk is cut at its tail snapshot (last quantum boundary, or a spanned chunk's last interval boundary), its last tokens a step of their own; `off`: the last chunk runs to the prompt's end, one step fewer, and a next turn resumes up to an interval earlier (§4.5) |
 | `prefix-resume: MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |
 | `no-prefix-cache: true` | prefix cache on | disable prefix caching |
 

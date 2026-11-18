@@ -533,6 +533,20 @@ TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
     CHECK_EQ(ck, 960);
 
+    /* --prefill-tail-snapshot off: the last chunk runs to the prompt's end and writes no tail
+     * snapshot where that would cut it; the interval splits before it are the same, and a prompt
+     * ending on its tail keeps the snapshot, which costs no cut. */
+    Fixture o;
+    o.build();
+    o.cfg.prefill_tail_snapshot = false;
+    CHECK_OK(o.start());
+    CHECK_EQ(o.sch.plan_chunk(0, 1000, 512, &ck), 256);
+    CHECK_EQ(ck, 256);
+    CHECK_EQ(o.sch.plan_chunk(768, 1000, 512, &ck), 232);
+    CHECK_EQ(ck, -1);
+    CHECK_EQ(o.sch.plan_chunk(768, 960, 512, &ck), 192);
+    CHECK_EQ(ck, 960);
+
     /* A budget short of the interval still ends on a quantum, never in the middle of a tile. */
     CHECK_EQ(f.sch.plan_chunk(0, 1000, 100, &ck), 64);
     CHECK_EQ(ck, -1);
@@ -609,6 +623,19 @@ TEST(prefill_chunks_span_intervals_on_the_same_pieces) {
     /* Off the interval (a resume from a tail checkpoint) the chunk ends at the next boundary. */
     CHECK_EQ(f.sch.plan_chunk(960, 3000, 512, &ck), 64);
     CHECK_EQ(ck, 1024);
+
+    /* --prefill-span-first on: the first interval is spanned too; the rest is as above. */
+    Fixture s;
+    s.build();
+    s.cfg.prefill_span = 2;
+    s.cfg.prefill_span_first = true;
+    CHECK_OK(s.start());
+    CHECK_EQ(s.sch.plan_chunk(0, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 512);
+    CHECK_EQ(s.sch.plan_chunk(512, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 1024);
+    CHECK_EQ(s.sch.plan_chunk(0, 200, 512, &ck), 200);
+    CHECK_EQ(ck, -1);
 }
 
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
