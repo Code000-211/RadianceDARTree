@@ -358,6 +358,23 @@ int  r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags,
                             long top_k, long sig, long stream, long nblocks, long nthreads,
                             long drain, long acq, long inv, long gate, long gate_ctr,
                             long stage = 0, long chain = 0, long coded = 0);
+// r4d_ar_gather_hc_write over rows [row0, row0 + M) of a routed pass of t_full / top_k tokens:
+// `ye` and `sorted` [t_full] are the pass's, `ew`, `sh`, `sg`, `y`, `inj` and `h` the launch's
+// rows. Coded wire on a P2P instance only (`coded` as r4d_ar_hc_write's); `inv` is M*top_k int32
+// device scratch for the launch's part of the inverse slot table. The bytes of each row are those
+// a launch over the whole pass makes for it. Returns 0, or a negative code for a shape it does not
+// serve.
+int  r4d_ar_gather_hc_write_rows(long peer_scratch, long my_scratch, long peer_flags,
+                                 long my_flags, long seq_ctrs, long slot_stride16, long y,
+                                 long inj, long h, long M, long n, long hc, long irow, long hrow,
+                                 long ye, long ew, long sorted, long sh, long sg, long ye_ld,
+                                 long ew_ld, long sh_ld, long sg_ld, long top_k, long sig,
+                                 long stream, long nblocks, long nthreads, long drain, long acq,
+                                 long inv, long gate, long gate_ctr, long coded, long row0,
+                                 long t_full);
+// Test hook: the parts of the staged coded form (r4d_ar_hc_write_coded_staged_kernel) every fused
+// write that takes the coded push uses, 0 for the single-phase kernel; -1 restores the rule.
+void r4d_ar_coded_stages_pin(int stages);
 // r4d_ar_hc_write and r4d_ar_gather_hc_write on the rotated 6-bit wire (r4d_ar_oneshot_2rank_wht6's
 // format, loc_pack and scratch split): byte-identical to all_reduce on that wire then hc_write,
 // with `ye` non-zero preceded by moe_gather. Gather operands as r4d_ar_gather_hc_write; its slot

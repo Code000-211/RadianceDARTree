@@ -998,6 +998,41 @@ static long ar_coded(const RadArgs* a, const ArInst* in, long words16) {
     return (long long)words16 * 16 >= ar_coded_min_bytes();
 }
 
+/* A two-rank fused write issued on the second lane beside compute (`overlap` 1): a narrow staged
+ * launch, so the blocks that wait on the link hold few of the card's wave slots. A block of 1024
+ * threads fills a CU's slots for the whole reduction; the coded rule's 48 such blocks leave a
+ * concurrent read 16 CUs. R4D_AR_OV_NB blocks (default 16) of 1024 threads, each cutting its
+ * share in R4D_AR_OV_STAGES parts (default 4, r4d_ar_hc_write_coded_staged_kernel). Measured
+ * alone on 2x R9700, 2048 rows of 2560: 16 x 1024 in 4 parts 454 us (write), 525 us (gather),
+ * against 433 and 482 at the coded rule's 48 blocks. A message the coded form does not take
+ * keeps its grid, at most R4D_AR_OV_NB blocks. */
+static void ar_overlap_grid(const ArInst* in, long words16, long* coded, int* nblocks,
+                            int* nthreads) {
+    static int nb_ov = -1, st_ov = -1;
+    if (nb_ov < 0) {
+        const char* e = std::getenv("R4D_AR_OV_NB");
+        nb_ov = e && *e ? std::atoi(e) : 16;
+        if (nb_ov < 1) nb_ov = 1;
+        const char* s = std::getenv("R4D_AR_OV_STAGES");
+        st_ov = s && *s ? std::atoi(s) : 4;
+        if (st_ov < 1) st_ov = 1;
+        if (st_ov > 16) st_ov = 16;
+    }
+    static int nt_ov = -1;
+    if (nt_ov < 0) {
+        const char* t = std::getenv("R4D_AR_OV_NT");
+        nt_ov = t && *t ? std::atoi(t) : R4D_AR_CODED_THREADS;
+        if (nt_ov < 64) nt_ov = 64;
+        if (nt_ov > 1024) nt_ov = 1024;
+    }
+    (void)in; (void)words16;
+    if (*nblocks > nb_ov || *coded) *nblocks = nb_ov;
+    if (*coded) {
+        *nthreads = nt_ov;
+        *coded = st_ov >= 2 ? st_ov : 1;
+    }
+}
+
 extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0);
@@ -1799,10 +1834,29 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
-    const long coded = ar_coded(a, in, words16);
+    long coded = ar_coded(a, in, words16);
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
                                    : nb_for(words16, coded ? R4D_AR_CODED_NB_CAP : in->nb_cap);
+    int nthreads = coded ? R4D_AR_CODED_THREADS : cfgv.nthreads;
+    if (r4d_geti_or(a, "overlap", 0) == 1) ar_overlap_grid(in, words16, &coded, &nblocks, &nthreads);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    /* `row0`: rows [row0, row0 + M) of a longer pass, whose whole sort is `sorted_tok`. */
+    const long long row0 = r4d_geti_or(a, "row0", -1);
+    if (row0 >= 0) {
+        const long long t_full = r4d_numel(so);
+        if (in->host || !coded || !has_inv || (row0 + M) * top_k > t_full) return RAD_E_UNSUPPORTED;
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        const int rc = r4d_ar_gather_hc_write_rows(
+            in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
+            in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h), (long)M, (long)n, (long)hc,
+            (long)irow, (long)hrow, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
+            sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld,
+            (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks,
+            nthreads, cfgv.drain, cfgv.acq, (long)(uintptr_t)a->scratch, early,
+            early ? in->gate_ctr : 0L, coded, (long)row0, (long)t_full);
+        if (rc != 0) return RAD_E_SHAPE;
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
 
     const long gate = link_gate(a), early = in->host ? 0L : gate;
     const int rc = r4d_ar_gather_hc_write(
@@ -1810,8 +1864,7 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h), (long)M, (long)n, (long)hc,
         (long)irow, (long)hrow, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
-        (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks,
-        coded ? R4D_AR_CODED_THREADS : cfgv.nthreads,
+        (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
         early ? in->gate_ctr : 0L, in->my_stage, (long)r4d_geti_or(a, "chain", 0), coded);
     if (rc != 0) return RAD_E_SHAPE;
@@ -1828,6 +1881,7 @@ extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
     if (!in) return RAD_E_STATE;
     if (in->world != 4) return RAD_E_SHAPE;
     if (in->dtype != 0) return RAD_E_DTYPE;
+    if (r4d_geti_or(a, "row0", -1) >= 0) return RAD_E_UNSUPPORTED;   /* two ranks only */
 
     GatherHcWriteArgs g;
     const int arc = ar_gather_hc_write_args(a, in, &g);
@@ -1933,9 +1987,11 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
-    const long coded = ar_coded(a, in, words16);
+    long coded = ar_coded(a, in, words16);
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
                                    : nb_for(words16, coded ? R4D_AR_CODED_NB_CAP : in->nb_cap);
+    int nthreads = coded ? R4D_AR_CODED_THREADS : cfgv.nthreads;
+    if (r4d_geti_or(a, "overlap", 0) == 1) ar_overlap_grid(in, words16, &coded, &nblocks, &nthreads);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1943,7 +1999,7 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         r4d_ar_hc_write(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
-                        nblocks, coded ? R4D_AR_CODED_THREADS : cfgv.nthreads, cfgv.drain,
+                        nblocks, nthreads, cfgv.drain,
                         cfgv.acq, early, early ? in->gate_ctr : 0L, in->my_stage,
                         (long)r4d_geti_or(a, "chain", 0), coded));
     return early ? RAD_LINK_ENDED : RAD_OK;

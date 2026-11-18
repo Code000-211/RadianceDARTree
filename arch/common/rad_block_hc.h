@@ -90,6 +90,13 @@ struct HyperConn {
          * Flash-Next's shape, on every lane with a scratch region), so a model that reads a wider
          * step in pieces anyway declares the band no wider than a piece. */
         int64_t read_rows = 0;
+        /* Pieces (of read_rows) of the widest step whose reducing writes are also declared at
+         * `overlap` 1 (op_ar_write_ov, op_ar_gather_write_ov), for an architecture that issues a
+         * wide step's writes a piece at a time on the second lane (write_overlap); 0 for none. The
+         * real declare's count, also at a sizing declare. Two ranks, exact wire. */
+        int     overlap = 0;
+        /* The rows of such a piece, the real declare's (read_rows can be a sizing level's). */
+        int64_t overlap_rows = 0;
     };
 
     struct Wire {
@@ -139,6 +146,15 @@ struct HyperConn {
     GatherSrc  gsrc{};
     rad_op     op_ar_gather_write = 0, op_ar_gather_write6 = 0;
     int64_t    gather_rows = 0, gather_rows6 = 0;
+    /* The exact fused writes at `overlap` 1, for a write issued a piece (Config::read_rows) at a
+     * time on the second lane beside the reads of other pieces (write_overlap): a narrow launch.
+     * The gather takes one op a piece of its pass, declared at that piece's first row (`row0`),
+     * since it finds a row's slots in the whole pass's sort. Two ranks; 0 where not asked for
+     * (Config::overlap) or not served. */
+    static constexpr int kOvPieces = 16;
+    rad_op     op_ar_write_ov = 0;
+    rad_op     op_ar_gather_write_ov[kOvPieces] = {};
+    int        n_gather_ov = 0;
 
     int64_t hn() const { return c.hc * g.n_embd; }
     /* The reducing write for this step's wire, or 0 when that wire has no fused form (then the
@@ -165,6 +181,17 @@ struct HyperConn {
 
     void read (RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
     void write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
+    /* Whether write_overlap serves a step of T rows: the step's write reduces (and, with `gather`,
+     * takes the gather) on the exact wire, and the overlap ops were declared. */
+    bool overlap_serves(int64_t T, bool gather) const {
+        if (!takes_ar(T) || !ar_exact_write_takes(g, T) || !op_ar_write_ov) return false;
+        const int64_t R = c.overlap_rows;
+        return !gather || (takes_gather(T) && R > 0 && (T + R - 1) / R <= n_gather_ov);
+    }
+    /* Rows [r0, r0 + rows) of a T-row step's reducing write, at `overlap` 1: the bytes write()
+     * makes for those rows (the reduction and the stream update are per element). With `gather`
+     * the block's pass is the whole step, read by its inverse slot table. */
+    void write_overlap(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool gather) const;
     /* The read over rows [0, T), in pieces of Config::read_rows where it is set; one read
      * otherwise. The read's down product splits K by how many row tiles it is handed
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
@@ -312,6 +339,14 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                                            RAD_STR("dtype", g.dtype), RAD_INT("wire", 0)),
                                 RAD_NOWEIGHTS),
                              {w.x.x, w.inj, w.h}, {w.x.x, w.h});
+        if (op_ar_write && c.overlap && g.world == 2)
+            op_ar_write_ov = rw(b, RAD_OP(b, "ar_hc_write",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, ar_rows), RAD_INT("n", g.n_embd),
+                                              RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
+                                              RAD_STR("dtype", g.dtype), RAD_INT("wire", 0),
+                                              RAD_INT("overlap", 1)),
+                                   RAD_NOWEIGHTS),
+                                {w.x.x, w.inj, w.h}, {w.x.x, w.h});
         /* The rotated form at two ranks only: there is no four-rank form on that wire
          * (docs/OPS.md), and an unresolvable op would be reported at startup as an unservable
          * band. */
@@ -356,6 +391,32 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
         RAD_ARCH_TRY(rad_op_reads (b, op_ar_gather_write, rd, shared ? 8 : 6));
         RAD_ARCH_TRY(rad_op_writes(b, op_ar_gather_write, wr, 2));
         gather_rows = rows;
+    }
+    /* One op a piece of the pass (write_overlap), each over at most a piece's rows. */
+    const int64_t R = c.overlap_rows;
+    if (op_ar_gather_write && op_ar_write_ov && R > 0 && c.overlap > 1 && g.world == 2) {
+        /* The real declare's count at every max_tok: a sizing declare declares the same graph. */
+        const int64_t np = c.overlap;
+        for (int64_t p = 0; p < np && p < kOvPieces; ++p) {
+            const rad_op op = RAD_OP(b, "ar_gather_hc_write",
+                                     RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", g.n_embd),
+                                                RAD_INT("hc", c.hc), RAD_INT("top_k", src.top_k),
+                                                RAD_INT("world_size", g.world),
+                                                RAD_STR("dtype", g.dtype),
+                                                RAD_STR("act", shared ? "sigmoid" : "none"),
+                                                RAD_INT("wire", 0),
+                                                /* The first piece's write has nothing beside
+                                                 * it (the reads wait for it): the wide rule. */
+                                                RAD_INT("overlap", p > 0 ? 1 : 0),
+                                                RAD_INT("row0", p * R)),
+                                     RAD_NOWEIGHTS);
+            if (!op) break;
+            RAD_ARCH_TRY(rad_op_reads (b, op, rd, shared ? 8 : 6));
+            RAD_ARCH_TRY(rad_op_writes(b, op, wr, 2));
+            op_ar_gather_write_ov[p] = op;
+            n_gather_ov = (int)p + 1;
+        }
+        if (n_gather_ov < np) n_gather_ov = 0;
     }
     if (op_ar_write6) {
         op_ar_gather_write6 = RAD_OP(b, "ar_gather_hc_write",
@@ -504,6 +565,29 @@ inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) co
         return;
     }
     RAD_ISSUE_N(c_, takes_ar(T) ? ar_write(T) : op_write, rows,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                brow_slice(w.inj, r0, rows, c.hc),
+                brow_slice(w.h, r0, rows, hn()));
+}
+
+inline void HyperConn::write_overlap(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
+                                     bool gather) const {
+    if (gather) {
+        const int64_t k = gsrc.top_k;
+        const bool shared = gsrc.sh && gsrc.sg;
+        /* The piece's op: declared at its first row (declare_gather), so r0 is a piece edge. */
+        RAD_ISSUE_N(c_, op_ar_gather_write_ov[r0 / c.overlap_rows], rows,
+                    brows(gsrc.ye, T * k), brow_slice(gsrc.ew, r0, rows, k),
+                    brows(gsrc.sorted, T * k),
+                    shared ? brow_slice(gsrc.sh, r0, rows, g.n_embd) : RAD_NONE,
+                    shared ? brow_slice(gsrc.sg, r0, rows, 1) : RAD_NONE,
+                    brow_slice(w.x.x, r0, rows, g.n_embd),
+                    brow_slice(w.inj, r0, rows, c.hc),
+                    brow_slice(w.h, r0, rows, hn()));
+        return;
+    }
+    /* The first piece at the wide rule (ar_write), as the gather's first piece op. */
+    RAD_ISSUE_N(c_, r0 == 0 ? ar_write(T) : op_ar_write_ov, rows,
                 brow_slice(w.x.x, r0, rows, g.n_embd),
                 brow_slice(w.inj, r0, rows, c.hc),
                 brow_slice(w.h, r0, rows, hn()));

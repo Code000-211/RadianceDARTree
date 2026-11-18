@@ -752,6 +752,9 @@ static const RadOperandSpec oHcWrite[] = {
 static const RadParamSpec pArHcWrite[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("world_size"), P_STR("dtype"),
     P_INTO("wire"),   /* 0 = exact bf16, 6 = rotated 6-bit */
+    /* 1 when issued on the caller's second lane beside compute: a narrow staged launch at two
+     * ranks (r4d_ar_entry.hip, ar_overlap_grid); the bytes are unchanged. */
+    P_INTO("overlap"),
 };
 static const RadOperandSpec oArHcWrite[] = {
     { "y", RAD_OPD_INOUT, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
@@ -761,6 +764,12 @@ static const RadOperandSpec oArHcWrite[] = {
 static const RadParamSpec pArGatherHcWrite[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("top_k"), P_INT("world_size"), P_STR("dtype"),
     P_STRO("act"), P_INTO("wire"),
+    /* As ar_hc_write's. */
+    P_INTO("overlap"),
+    /* A launch over rows [row0, row0 + M) of a longer routed pass: `y_expert` and `sorted_tok`
+     * are the whole pass's (every slot of the pass, `sorted_tok` holding token * top_k + slot of
+     * the pass's tokens), the other operands the launch's rows. Two ranks, coded wire. */
+    P_INTO("row0"),
 };
 static const RadOperandSpec oArGatherHcWrite[] = {
     { "y_expert", RAD_OPD_IN, 0 }, { "expert_w", RAD_OPD_IN, 0 }, { "sorted_tok", RAD_OPD_IN, 0 },

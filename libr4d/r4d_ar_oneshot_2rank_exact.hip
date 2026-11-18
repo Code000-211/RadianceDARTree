@@ -26,6 +26,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -695,6 +696,193 @@ __global__ void r4d_ar_hc_write_coded_kernel(
   if (CH::on) r4d_chain_done();
 }
 
+// ---- The staged coded form: r4d_ar_hc_write_coded_kernel with its block's chunks cut into `S`
+// parts, each with its own handshake, so the link and the card's memory work at the same time.
+//
+// The coded kernel runs in two phases: every block codes and pushes its part of the message (the
+// link's time: 31.5 MB of an 8192-row chunk at ~25 GB/s, 1.3 ms), then decodes the peer's, adds it
+// and writes the four streams (the card memory's time: 0.42 GB read and written, ~0.8 ms). All
+// blocks do the same at once, so a reduction takes the sum of the two. Here a block pushes part j,
+// then folds part j - 1 while part j crosses the link, then publishes part j: the reduction takes
+// about the longer of the two.
+//
+// Each part is a handshake unit of its own: virtual block v = b * S + j owns the part's flag, its
+// handshake counter, its check word (r4d_ar_seq.h) and the part's chunks, as block v of a grid of
+// nb * S blocks would, so the units need nb * S <= nbw. The slot parity is the block's, taken as
+// every kernel of the family takes it. The arithmetic, the coded words and the fold order of every
+// value are the coded kernel's: y and h are its bytes, and so the plain kernels'.
+#define R4D_ARC_STAGES_MAX 16
+template <int MODE, class CH>
+__global__ void r4d_ar_hc_write_coded_staged_kernel(
+    int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
+    unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
+    unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
+    int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
+    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr, int S) {
+  if (CH::on) r4d_chain_wait();
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seqv[R4D_ARC_STAGES_MAX], s_slot;
+  __shared__ int   s_i[R4D_ARG_ROWS * R4D_ARG_SLOTS];
+  __shared__ float s_w[R4D_ARG_ROWS * R4D_ARG_SLOTS];
+  __shared__ float s_g[R4D_ARG_ROWS];
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  {
+    /* r4d_ar_seq_take over the block's S units: one handshake counter each, the parity once. */
+    unsigned int* const par = seq_ctrs + nbw;
+    const unsigned int pt = nt > 32 ? 32u : 0u;
+    if (tid < S) s_seqv[tid] = atomicAdd(&seq_ctrs[b * S + tid], 1u) + 1u;
+    if ((unsigned)tid == pt) s_slot = (atomicAdd(&par[b], 1u) + 1u) & 1u;
+    for (unsigned int j = b + (tid + 1u) * nb; j < nbw; j += nt * nb) atomicAdd(&par[j], 1u);
+    r4d_lds_barrier();
+  }
+  const int slot = (int)s_slot;
+  const R4dArc2 ps = r4d_arc2_at(peer_base + (size_t)slot * slot_stride16, n16);
+  const R4dArc2 ms = r4d_arc2_at(my_base + (size_t)slot * slot_stride16, n16);
+
+  const int w = ((n16 + nb - 1) / nb + 31) & ~31;   // 16B words per block, whole waves
+  int start = b * w; if (start > n16) start = n16;
+  int end = start + w; if (end > n16) end = n16;
+  const int ws = ((w + S - 1) / S + 31) & ~31;      // a part's words, whole waves
+  const int lane = tid & 31;
+  const int wpr = n >> 3;                 // 16B words a row
+  const int row_lo = start / wpr;
+  const int nrow = end > start ? (end - 1) / wpr - row_lo + 1 : 0;
+
+  if (MODE == 1) {
+    const int K = G.top_k;
+    for (int x = tid; x < nrow * K; x += nt) s_i[x] = -1;
+    __syncthreads();
+    {
+      const int lo = row_lo * K, hi = (row_lo + nrow) * K;
+      for (int i = tid; i < G.T; i += nt) {
+        const int f = G.sorted[i];
+        if (f >= lo && f < hi) s_i[f - lo] = i;
+      }
+    }
+    for (int x = tid; x < nrow * K; x += nt)
+      s_w[x] = bf2f(G.ew[(long)(row_lo + x / K) * G.ew_ld + x % K]);
+    if (G.sh)
+      for (int r = tid; r < nrow; r += nt) {
+        const float v0 = bf2f(G.sg[(long)(row_lo + r) * G.sg_ld]);
+        s_g[r] = G.sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
+      }
+    __syncthreads();
+  }
+  auto lo_of = [&](int j) { const int x = start + j * ws; return x < end ? x : end; };
+
+  /* Code and push part j, then its check word and, once the stores are out, its flag. The fold of
+   * the part before runs between the stores and the flag (below), beside the transfer. */
+  auto push = [&](int j) -> unsigned int {
+    unsigned int hck = 0u;
+    const int e = lo_of(j + 1);
+    for (int k = lo_of(j) + tid; k < e; k += nt) {
+      int4 v;
+      if (MODE == 0) {
+        v = y4[k];
+      } else {
+        const int row = k / wpr, i0 = (k - row * wpr) * 8;
+        v = r4d_ar_gather_word<MODE == 2>(G, inv, s_i, s_w, s_g, row, row - row_lo, i0);
+        y4[k] = v;
+      }
+      hck += r4d_arc2_put(ps, k - lane, v);
+    }
+    return hck;
+  };
+  auto publish = [&](int j, unsigned int hck) {
+    const unsigned int v = (unsigned)(b * S + j);
+    r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, v, s_seqv[j]);
+    if (drain == 1) __threadfence_system();
+    else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+    __syncthreads();
+    if (tid == 0) {
+      if (drain == 2) __threadfence_system();
+      store_sys_rel(&peer_flags[v], s_seqv[j]);
+    }
+  };
+  auto fold = [&](int j) {
+    const unsigned int v = (unsigned)(b * S + j);
+    const unsigned int sq = s_seqv[j];
+    const int s0 = lo_of(j), e = lo_of(j + 1);
+    /* A relaxed poll, as the register form's (r4d_ar_seq.h): an acquire load is followed by a
+     * system-scope cache invalidate on every poll, which also drops what the kernels running
+     * beside this one (the second lane's reads) have cached. The slot is fine-grained memory read
+     * past the caches, and the push check re-reads behind an acquire whenever the bytes do not
+     * agree. */
+    if (tid == 0) {
+      unsigned long long z = 0;
+      while (r4d_ar_seq_behind(__hip_atomic_load(&my_flags[v], __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_SYSTEM), sq)) {
+        if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    if (acq) __threadfence_system();
+    r4d_archk_wait(my_flags, nbw, (unsigned)slot, v, sq, [&](unsigned int& hh) {
+      for (int k = s0 + tid; k < e; k += nt) hh += r4d_arc2_sum(ms, k - lane);
+    });
+    if (j == S - 1)
+      r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+    for (int k = s0 + tid; k < e; k += nt) {
+      const int4 r = vadd<__hip_bfloat16, 8>(y4[k], r4d_arc2_get(ms, k - lane));
+      y4[k] = r;
+      const int row = k / wpr, i0 = (k - row * wpr) * 8;
+      r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
+                           reinterpret_cast<const unsigned short*>(&r));
+    }
+  };
+
+  publish(0, push(0));
+  for (int j = 1; j < S; ++j) {
+    const unsigned int hck = push(j);
+    fold(j - 1);
+    publish(j, hck);
+  }
+  fold(S - 1);
+  if (CH::on) r4d_chain_done();
+}
+
+/* Parts a block of the staged coded form takes, 0 for the single-phase coded kernel. `req` is the
+ * launch's `coded`: 2 to R4D_ARC_STAGES_MAX asks for that many parts (the second lane's narrow
+ * launch, r4d_ar_entry.hip); 1 takes the rule: the write R4D_AR_CODED_STAGES parts (default 8)
+ * from R4D_AR_CODED_STAGES_MIN_KB (default 4096 KiB), the gather form R4D_AR_CODED_STAGES_G
+ * (default 6) from R4D_AR_CODED_STAGES_G_MIN_KB (default 6144 KiB); 0 or 1 parts is the
+ * single-phase kernel. Both ranks decide from the same launch, message and grid. On 2x R9700, rows
+ * of 2560, 48 blocks of 1024, coded -> staged, us: write 1024 rows 203 -> 190, 2048 433 -> 378,
+ * 4096 1023 -> 821, 8192 2015 -> 1639; gather 1536 rows 336 -> 326 (S4), 2048 482 -> 445,
+ * 4096 1077 -> ~1005, 8192 2235 -> 2015. A gather below ~1.5K rows is slower staged. */
+static int g_ar_stages_pin = -1;
+extern "C" void r4d_ar_coded_stages_pin(int stages) { g_ar_stages_pin = stages; }
+static int ar_coded_stages(long req, int n16, int nb, unsigned nbw, bool gather = false) {
+  static int s_env = -1, s_env_g = -1;
+  static long min16 = 0, min16_g = 0;
+  if (s_env < 0) {
+    auto parts = [](const char* key, int dflt) {
+      const char* e = std::getenv(key);
+      int s = e && *e ? std::atoi(e) : dflt;
+      if (s < 0) s = 0;
+      return s > R4D_ARC_STAGES_MAX ? R4D_ARC_STAGES_MAX : s;
+    };
+    auto floor16 = [](const char* key, long dflt_kb) {
+      const char* m = std::getenv(key);
+      return (m && *m ? std::atol(m) : dflt_kb) * 1024L / 16L;
+    };
+    min16   = floor16("R4D_AR_CODED_STAGES_MIN_KB", 4096L);
+    min16_g = floor16("R4D_AR_CODED_STAGES_G_MIN_KB", 6144L);
+    s_env_g = parts("R4D_AR_CODED_STAGES_G", 6);
+    s_env   = parts("R4D_AR_CODED_STAGES", 8);
+  }
+  int s;
+  if (req >= 2) s = req > R4D_ARC_STAGES_MAX ? R4D_ARC_STAGES_MAX : (int)req;
+  else if (g_ar_stages_pin >= 0) s = g_ar_stages_pin > R4D_ARC_STAGES_MAX ? R4D_ARC_STAGES_MAX
+                                                                           : g_ar_stages_pin;
+  else if (gather) s = n16 >= min16_g ? s_env_g : 0;
+  else s = n16 >= min16 ? s_env : 0;
+  int S = s;
+  while (S > 1 && (long)nb * S > (long)nbw) --S;
+  return S >= 2 ? S : 0;
+}
+
 /* Whether a message of n16 chunks fits the coded form in a slot of `slot_stride16` words on a P2P
  * instance (`stage` 0): whole waves' chunks, and the coded image within the slot. */
 int r4d_ar_coded2_ok(long n16, long slot_stride16, long stage) {
@@ -839,6 +1027,17 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
     if (g_ar_late_push) drain = 4;      /* tests only: every push lands after its flag */
     R4dArGather G;
     std::memset(&G, 0, sizeof G);
+    if (const int S = drain == 4 ? 0 : ar_coded_stages(coded, n16, nb, nbw)) {
+#define R4D_ARHWS(CH_)                                                                          \
+  r4d_ar_hc_write_coded_staged_kernel<0, CH_><<<nb, nt, 0, st>>>(                               \
+      (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,           \
+      (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
+      n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,      \
+      nullptr, (long long*)gate, (unsigned int*)gate_ctr, S)
+      if (chain) R4D_ARHWS(r4dchain); else R4D_ARHWS(R4dUnchained);
+#undef R4D_ARHWS
+      return;
+    }
 #define R4D_ARHWC(CH_)                                                                          \
   r4d_ar_hc_write_coded_kernel<0, CH_><<<nb, nt, 0, st>>>(                                      \
       (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,           \
@@ -933,7 +1132,24 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,    \
         inv_, (long long*)gate, (unsigned int*)gate_ctr, stage)
-  if (cod) {
+  const int stg = cod && !g_ar_late_push ? ar_coded_stages(coded, n16, nb, nbw, true) : 0;
+  if (stg) {
+#define R4D_ARGHWS(MODE_, CH_, inv_)                                                            \
+    r4d_ar_hc_write_coded_staged_kernel<MODE_, CH_><<<nb, nt, 0, st>>>(                         \
+        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,         \
+        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, \
+        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,    \
+        inv_, (long long*)gate, (unsigned int*)gate_ctr, stg)
+    if (by_inv) {
+      r4d_ar_gather_inv_kernel<<<1, 1024, 0, st>>>((int*)inv, (const int*)sorted, G.T);
+      R4D_ARGHWS(2, R4dUnchained, (const int*)inv);
+    } else if (chain) {
+      R4D_ARGHWS(1, r4dchain, nullptr);
+    } else {
+      R4D_ARGHWS(1, R4dUnchained, nullptr);
+    }
+#undef R4D_ARGHWS
+  } else if (cod) {
     if (g_ar_late_push) drain = 4;      /* tests only: every push lands after its flag */
 #define R4D_ARGHWC(MODE_, CH_, inv_)                                                            \
     r4d_ar_hc_write_coded_kernel<MODE_, CH_><<<nb, nt, 0, st>>>(                                \
@@ -970,6 +1186,72 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
     R4D_ARGHW(false, R4dUnchained, nullptr);
   }
 #undef R4D_ARGHW
+  return (int)hipGetLastError();
+}
+
+/* The part of a pass's inverse slot table a launch over some of its rows reads: inv[f - lo] for the
+ * slots f in [lo, lo + cnt), from the pass's whole sort of t_full rows. */
+__global__ void r4d_ar_gather_inv_rows_kernel(int* __restrict__ inv, const int* __restrict__ sorted,
+                                              int t_full, int lo, int cnt) {
+  for (int x = threadIdx.x; x < cnt; x += blockDim.x) inv[x] = -1;
+  __syncthreads();
+  for (int i = threadIdx.x; i < t_full; i += blockDim.x) {
+    const int f = sorted[i];
+    if (f >= lo && f - lo < cnt) inv[f - lo] = i;
+  }
+}
+
+int r4d_ar_gather_hc_write_rows(long peer_scratch, long my_scratch, long peer_flags,
+                                long my_flags, long seq_ctrs, long slot_stride16, long y,
+                                long inj, long h, long M, long n, long hc, long irow, long hrow,
+                                long ye, long ew, long sorted, long sh, long sg, long ye_ld,
+                                long ew_ld, long sh_ld, long sg_ld, long top_k, long sig,
+                                long stream_i, long nblocks, long nthreads, long drain, long acq,
+                                long inv, long gate, long gate_ctr, long coded, long row0,
+                                long t_full) {
+  hipStream_t st = (hipStream_t)stream_i;
+  if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
+  if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
+  if (ye_ld % 8 || (sh && sh_ld < n)) return -3;
+  if (!inv || !sorted || row0 < 0 || (row0 + M) * top_k > t_full) return -3;
+  if (M * n * 2 / 16 > slot_stride16) return -5;
+  const int n16 = (int)(M * n * 2 / 16);
+  if (!coded || !r4d_ar_coded2_ok(n16, slot_stride16, 0)) return -6;
+  const unsigned nbw = (unsigned)r4d_ar_max_blocks();
+  int nb = (int)nblocks;
+  if (nb < 1) nb = 1;
+  if (nb > n16 / 32) nb = n16 / 32;
+  if (nb > R4D_AR_MAX_BLOCKS || (unsigned)nb > nbw) return -4;
+  int nt = (int)nthreads;
+  if (nt < 64) nt = 64;
+  if (nt > 1024) nt = 1024;
+  nt &= ~31;
+  R4dArGather G;
+  std::memset(&G, 0, sizeof G);
+  G.ye = (const unsigned short*)ye;
+  G.ew = (const unsigned short*)ew;
+  G.sorted = (const int*)sorted;
+  G.sh = (const unsigned short*)sh;
+  G.sg = (const unsigned short*)sg;
+  G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
+  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
+  r4d_ar_gather_inv_rows_kernel<<<1, 1024, 0, st>>>((int*)inv, (const int*)sorted, (int)t_full,
+                                                    (int)(row0 * top_k), (int)(M * top_k));
+  const int stg = g_ar_late_push ? 0 : ar_coded_stages(coded, n16, nb, nbw, true);
+  if (stg) {
+    r4d_ar_hc_write_coded_staged_kernel<2, R4dUnchained><<<nb, nt, 0, st>>>(
+        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
+        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
+        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
+        (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr, stg);
+  } else {
+    if (g_ar_late_push) drain = 4;
+    r4d_ar_hc_write_coded_kernel<2, R4dUnchained><<<nb, nt, 0, st>>>(
+        (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
+        (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
+        n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
+        (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr);
+  }
   return (int)hipGetLastError();
 }
 

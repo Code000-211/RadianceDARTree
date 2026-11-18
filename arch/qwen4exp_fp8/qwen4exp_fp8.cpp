@@ -300,6 +300,14 @@ struct Model {
      * spanned step sorts its slots once and each expert's run is the step's. A sizing declare
      * takes it from the real one, as span_on. */
     bool      pass_step = false;
+    /* A spanned step whose routed pass is the step (pass_step) at two ranks: its fused writes go
+     * out a piece at a time on the second lane beside the connection reads of the pieces before
+     * (step_arover). Opt-in, RADIANCE_Q4_AROVER=1: measured slower (see step_arover). A sizing declare takes it from
+     * the real one, as span_on. */
+    bool      arover = false;
+    bool      arover_noted = false;
+    int       arover_np = 0;      /* pieces of the widest step (the real declare's max_tok) */
+    int64_t   arover_rows = 0;    /* their rows (the real declare's piece) */
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -1240,6 +1248,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.span_on   = g_model[rad_build_slot(ctx)].span_on;
         m.pipe_on   = g_model[rad_build_slot(ctx)].pipe_on;
         m.pass_step = g_model[rad_build_slot(ctx)].pass_step;
+        m.arover    = g_model[rad_build_slot(ctx)].arover;
+        m.arover_np = g_model[rad_build_slot(ctx)].arover_np;
+        m.arover_rows = g_model[rad_build_slot(ctx)].arover_rows;
     } else {
         m.span_on = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < g.max_tok &&
                     g.max_tok > m.piece_rows;
@@ -1260,6 +1271,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                              "beside the other piece's all-reduce"
                                            : "a calibration run takes its statistics a pass at a "
                                              "time");
+        /* The step's own all-reduces beside the connection reads (step_arover). */
+        {
+            const char* e = std::getenv("RADIANCE_Q4_AROVER");
+            m.arover = m.pass_step && g.world == 2 && g.wire_exact && !dmode_df &&
+                       e && *e && std::atoi(e) > 0;
+            m.arover_np = m.arover && m.piece_rows > 0
+                              ? (int)((g.max_tok + m.piece_rows - 1) / m.piece_rows) : 0;
+            if (m.arover_np < 2 || m.arover_np > HyperConn::kOvPieces) m.arover = false;
+            m.arover_rows = m.piece_rows;
+        }
     }
     /* Every op of a pass is per row, but the grouped trellis GEMM takes a run of one or two rows
      * through its dot path and a longer one through its tiles, which agree only within f32
@@ -1282,6 +1303,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * (HyperConn::read_pieces, and the pipelined step's own reads), so the reads are declared no
      * wider than a pass and their scratch is sized for that band. */
     if (m.span_on) m.hccfg.read_rows = m.piece_rows;
+    /* step_arover's writes run on lane 1 beside lane 0's reads: the connections declare their
+     * narrow writes, and every buffer those writes touch is out of the sharing pool (the stream,
+     * the message and the gains here; the MoE's planes below). */
+    if (m.arover) {
+        m.hccfg.overlap = m.arover_np;
+        m.hccfg.overlap_rows = m.arover_rows;
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_x.x));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
+    }
     RAD_ARCH_TRY(m.a_x.declare_qs(b, nm, g, "x", g.n_embd, 0, m.trunk_i8));
     /* The connections write int8 codes themselves when every reader of their codes is an int8
      * linear: the trunk's are, and the routed experts then read the rotated copy or the bf16
@@ -1500,6 +1530,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.a_sff.q8_rot = m.trunk_rot;
         m.b_sout  = decl_b(b, nm.f("moe_sout"),  g.act_dtype, {T, g.n_embd});
         m.b_sgate = decl_b(b, nm.f("moe_sgate"), g.act_dtype, {T, 1});
+    }
+    /* What step_arover's piece gathers read on lane 1 (the stream, message and gains are marked
+     * above). */
+    if (m.arover) {
+        for (rad_buf x : {m.b_inj, m.b_edn, m.b_ew, m.b_sorted, m.b_sout, m.b_sgate})
+            if (x) RAD_ARCH_TRY(rad_buf_concurrent(b, x));
     }
 
     m.b_hout   = decl_b(b, nm.f("hout"),   g.act_dtype, {g.max_logit_rows, g.n_embd});
@@ -2513,6 +2549,123 @@ struct QsaSide {
     static void at(void* u, int) { ((QsaSide*)u)->one(); }
 };
 
+/* ============================ A spanned step's reductions beside its reads ============================
+ *
+ * At two ranks a spanned step with its routed pass over the whole step (pass_step) runs serially,
+ * and its 96 fused writes -- the mixer's reduction with the stream update (ar_hc_write) and the
+ * MoE's gather, reduction and update (ar_gather_hc_write) -- are about a fifth of it: an 8192-row
+ * message takes ~2.1 ms, ~1.3 of them the link's. Each connection read behind a write already
+ * runs a piece (one checkpoint interval) at a time (HyperConn::read_pieces), and every byte a
+ * write makes depends only on its own row. So each write goes out a piece at a time on the
+ * second lane, and lane 0 reads piece p as soon as piece p is written, beside the write of piece
+ * p + 1:
+ *
+ *   lane 0   mixer |      read 0 | read 1 | read 2 | read 3 | MoE pass |      read 0 | ...
+ *   lane 1         | write 0 | write 1 | write 2 | write 3 |           | write 0 | write 1 | ...
+ *
+ * Only the first piece's write of each reduction is on the step's path. The mixer, the routed
+ * pass and every read are the serial step's launches, and a piece's write makes the whole
+ * write's bytes for its rows, so the step's output is the serial step's byte for byte. The
+ * writes are declared at `overlap` 1 (HyperConn::write_overlap): a narrow launch that leaves the
+ * CUs to the reads beside it; the gather reads the pass's inverse slot table (moe_scatter_inv)
+ * by its rows.
+ *
+ * The second lane's requirements (Ctx::lane1_): every collective of a layer goes out on lane 1,
+ * and lane 0 has joined lane 1 before it issues the next collective of its own (the embedding's
+ * at the next step, the head's), so the two ranks see the same order; no write carries an arrival
+ * counter; the buffers lane 1 touches are out of the sharing pool (declare).
+ *
+ * MEASURED, NEGATIVE, hence opt-in (RADIANCE_Q4_AROVER=1): on 2x R9700 (PCIe 4.0 x16, IQR-V4,
+ * expert_tiered, span 4 at 8192) an 8192-row step takes 1248 ms against 1122 serially (output
+ * identical). The reads and the writes beside them slow each other about as much as they overlap:
+ * hc_down_pf2 165 -> 345 us a piece, hc_pf2_prep 113 -> 190, hc_up_mix 201 -> 265, a narrow piece
+ * write 454 -> 690 us (gather 525 -> 800) -- both are bound by the card's memory, not by the
+ * CUs (16 x 1024, 32 x 512 and 64 x 256 blocks and relaxed flag polls all measured the same). On
+ * top, every lane join holds lane 0 30-60 us and its launches lose their chaining beside lane 1
+ * (~20 us between kernels against ~4). */
+static bool arover(const Model& m, const RadBatch* batch, int64_t T) {
+    const int64_t R = m.piece_rows;
+    if (!m.arover || R <= 0 || T <= R) return false;
+    if (batch->phase != RAD_PHASE_PREFILL || batch->n_seq != 1) return false;
+    if (m.moecfg.calib || m.calib.on || dbg_resid_on() || m.n_taps > 0) return false;
+    for (const Layer& l : m.layers) {
+        if (!l.hc_mix.overlap_serves(T, false) || !l.hc_ffn.overlap_serves(T, true)) return false;
+        if (l.mlp.c.rows < T) return false;    /* the routed pass is the whole step */
+    }
+    return true;
+}
+
+static void step_arover(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok, R = m.piece_rows;
+    const int64_t K = (T + R - 1) / R;
+    auto r0 = [&](int64_t p) { return p * R; };
+    auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };
+    if (!m.arover_noted) {
+        m.arover_noted = true;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen4exp: a spanned step's fused all-reduce writes go out a "
+                            "piece at a time on the second lane, beside the connection reads: "
+                            "%lld rows in %lld pieces of %lld\n",
+                    (long long)T, (long long)K, (long long)R);
+    }
+    RAD_ISSUE(c, m.op_embed,
+              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
+    m.mrows.step(c, batch, m.a_x.x, T);
+    if (m.op_embed_ar)
+        RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE);
+    if (m.ple_layer >= 0) m.ple.ids(c, batch);
+    m.enter.step(c, T);
+    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
+
+    const int64_t n = (int64_t)m.layers.size();
+    if (n > 0) {
+        if (m.ple_layer == 0) m.ple.step(c, batch);
+        m.layers[0].hc_mix.read_pieces(c, T);
+    }
+    bool qsa_first = true;
+    for (int64_t li = 0; li < n; ++li) {
+        const Layer& l = m.layers[(size_t)li];
+        if (l.full) {
+            l.qsa.step(c, l.attn.w.h, batch, pcu, l.attn.qsa_use(batch), qsa_first);
+            qsa_first = false;
+            l.attn.step(c, batch);
+        }
+        else        l.gdn.step(c, batch);
+        /* The mixer's reduction a piece at a time on lane 1, behind the whole mixer; the feed-
+         * forward connection reads piece p behind its write. */
+        rad_lane_join(c, 0, 1);
+        for (int64_t p = 0; p < K; ++p) {
+            rad_lane(c, 1);
+            l.hc_mix.write_overlap(c, T, r0(p), rn(p), false);
+            rad_lane(c, 0);
+            rad_lane_join(c, 1, 0);
+            l.hc_ffn.read(c, T, r0(p), rn(p));
+        }
+        l.mlp.step(c, batch);
+        /* The MoE's gather and reduction a piece at a time, behind the whole pass; the next
+         * layer's connection reads piece p behind its write. PLE adds into every row of the
+         * stream before the next layer reads it, so there the reads wait for every piece. */
+        const Layer* nx = li + 1 < n ? &m.layers[(size_t)li + 1] : nullptr;
+        const bool ple_next = nx && li + 1 == m.ple_layer;
+        rad_lane_join(c, 0, 1);
+        for (int64_t p = 0; p < K; ++p) {
+            rad_lane(c, 1);
+            l.hc_ffn.write_overlap(c, T, r0(p), rn(p), true);
+            rad_lane(c, 0);
+            rad_lane_join(c, 1, 0);
+            l.proj.step(c, batch, r0(p), rn(p));
+            if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p));
+        }
+        if (ple_next) {
+            m.ple.step(c, batch);
+            nx->hc_mix.read_pieces(c, T);
+        }
+    }
+    rad_lane_join(c, 1, 0);
+}
+
 /* The trunk one stream at a time over the whole step: every step a span of 1 makes, and every
  * other where step_pipelined's conditions do not hold. */
 static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
@@ -2682,8 +2835,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     const int32_t* pcu = pipe_bounds(c, batch, m);
-    if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
-    else                 step_serial(c, batch, m, pcu);
+    if (pipelined(m, T))         step_pipelined(c, batch, m, pcu);
+    else if (arover(m, batch, T)) step_arover(c, batch, m, pcu);
+    else                         step_serial(c, batch, m, pcu);
 
     m.mixer.read_pieces(c, T);
 
