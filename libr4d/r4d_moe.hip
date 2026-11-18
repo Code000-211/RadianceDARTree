@@ -2775,6 +2775,38 @@ static int g_moe_prefill_form = 0;
  * projection's 256-column tile (use 128 or 64), 2 the 256-column tile (refused where the shape
  * cannot take it or the launch is not aligned). r4d_selftest compares them byte for byte. */
 static int g_moe_down_tile_pin = 0;
+/* The 256-column down tile's rows a block: 32 over sixteen waves of one 16-row M tile and two column
+ * tiles each, or 64 over the same sixteen waves of two M tiles each (MT 4, WGM 2). The 64-row block
+ * stages its run's weight tile once for twice the rows and runs twice the WMMA steps between two
+ * barriers, with half the blocks; each element is the 32-row block's sum, a wave's second M tile
+ * being what another block's wave computed. Built for the form measured, the int8 activation under
+ * w4nl64's scales.
+ *
+ * Flash-Next's down (2560 x 384:256 at a rank of two, 512 experts, top 10), us a layer in the
+ * engine's prefill (stamped, card 0), 32 -> 64 rows: a pass of 20480 rows 693 -> 633, 40960 rows
+ * 1288 -> 1097, 81920 rows 2441 -> 1971. r4d_selftest --perfmoe over a measured routing, us a
+ * launch: 1024 tokens 527 -> 533, 1536 667 -> 652, 2048 807 -> 764, 4096 1407 -> 1258, 8192
+ * 2673 -> 2297.
+ *
+ * Not the bandwidth it looks like at 32 rows (843 MB of weight and output in 1.37 ms at 4096
+ * tokens): a block that takes several row tiles in turn, and so reads its weight tile from cache
+ * after the first, was no faster than the 64-row block (1255-1320 us at 4096), and 128-row blocks
+ * over thirty-two waves, or of four M tiles a wave, slower (1390-2170).
+ *
+ * The rule takes 64 rows from a mean of 32 routed rows an expert (kMoeDownMtRowsPerExpert: 16384
+ * rows at 512 experts). Pinnable for tests: -1 the rule (RADIANCE_MOE_DOWN_MT gives the pin its
+ * first value), 2 or 4 the M tiles a block. r4d_selftest compares them byte for byte. */
+constexpr long long kMoeDownMtRowsPerExpert = 32;
+static int g_moe_down_mt_pin = -2;
+static inline int r4d_moe_down_mt(long long T, long long n_expert) {
+    if (g_moe_down_mt_pin == -2) {
+        const char* e = std::getenv("RADIANCE_MOE_DOWN_MT");
+        const int v = e ? std::atoi(e) : -1;
+        g_moe_down_mt_pin = (v == 2 || v == 4) ? v : -1;
+    }
+    if (g_moe_down_mt_pin > 0) return g_moe_down_mt_pin;
+    return T >= kMoeDownMtRowsPerExpert * n_expert ? 4 : 2;
+}
 
 /* One body for the fp8 and w4 launchers, which differ only in the weight dtype and its two
  * pitches, so their shape checks cannot drift apart.
@@ -3041,14 +3073,30 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         if (tpin < 0 || tpin > 2) return R4D_NO(RAD_E_INVAL);
         if (tpin == 2 && (!map || !dn_wide)) return R4D_NO(RAD_E_UNSUPPORTED);
         if (tpin == 1) dn_wide = false;
+        /* The 256-column tile's M tiles a block (r4d_moe_down_mt); the 64-row block's map has fewer
+         * entries than the scratch holds. */
+        int dmt = 2;
+        if constexpr (W4 == 2 && I8) { if (map && dn_wide) dmt = r4d_moe_down_mt(T, n_expert); }
+        const long long dfm = dmt * 16;
+        const long long dcap = dmt == 2 ? cap : r4d_blockmap_cap(T, n_expert, dfm);
         if (map) {
             emit_rc = R4D_EMIT(stream, moe_blockmap_kernel<R4dUnchained>, dim3(1), dim3(256), 0,
                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
-                               (uint32_t)kPrefillRows, (uint32_t)cap, map);
+                               (uint32_t)dfm, (uint32_t)dcap, map);
             if (emit_rc != RAD_OK) return emit_rc;
             /* Every aligned instantiation uses UW and issues its first pass at the map read (see
              * the early-weight note at the kernel). */
-            if (dn_wide) {
+            if (dn_wide && dmt == 4) {
+                if constexpr (W4 == 2 && I8)
+                    emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<4, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true, false, I8, R4dUnchained>),
+                               dim3((unsigned)dcap, (unsigned)(N / (2 * kPrefillCols))),
+                               dim3(16 * kWave), 0,
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                               (const int32_t*)sorted->data, (const int32_t*)off->data,
+                               (uint16_t*)Y->data, (const uint32_t*)map,
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+            } else if (dn_wide) {
                 /* Only a weight with a scale per row takes it (dn_wide is false otherwise); the
                  * block-fp8 instantiation would not compile, its scale being per 128x128 tile. */
                 if constexpr (W4 != 0 || I8)
@@ -3140,6 +3188,9 @@ extern "C" int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs* a) { return moe_
 extern "C" void r4d_moe_gemm_pin_prefill(int form) { g_moe_prefill_form = form; }
 extern "C" void r4d_moe_gemm_pin_fk(int pin) { g_moe_fk_pin = pin; }
 extern "C" void r4d_moe_gemm_pin_down_tile(int pin) { g_moe_down_tile_pin = pin; }
+extern "C" void r4d_moe_gemm_pin_down_mt(int pin) {
+    g_moe_down_mt_pin = (pin == 2 || pin == 4) ? pin : -1;
+}
 extern "C" void r4d_moe_gemm_pin_down_dec(int pin) {
     g_moe_down_dec_pin = pin < (int)kMoeDownDecMaxG ? pin : (int)kMoeDownDecMaxG;
 }

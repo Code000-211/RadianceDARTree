@@ -29,6 +29,8 @@
 //   map      above it (a prefill chunk). x is an entry of the run map moe_blockmap_kernel builds in
 //            the op's scratch, (expert, first row) at 64 rows an entry: a block decodes its
 //            expert's tiles once for up to four token tiles, a wave a weight tile down all of K.
+//            A large pass takes the packed map (moe_iqr_packmap_kernel) at 128 rows an entry and
+//            eight token tiles a decode, the same bytes.
 //
 // The forms built are the computed trellis under one f32 scale a row (TrellisMad, kRowF32), IQR-V4's
 // form for a feed-forward weight: the fold is the block's factor times the activation's scale, one
@@ -45,6 +47,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 /* r4d_moe.hip: the run map of a grouped GEMM at `fm` rows a block, built in `scratch` by one
@@ -206,14 +210,15 @@ __device__ __forceinline__ void dot_run(const Ctx& c, uint32_t rt, uint32_t kph,
 
 /* KW waves across a tile's K, RTB tiles a block: a wide-K projection (gate_up) takes four waves a
  * tile, a narrow one (down, two or three 128-K blocks a rank) one wave a tile and four tiles a
- * block. MAP: the run-map grid, whose block serves NT token tiles of its run. */
+ * block. MAP: the run-map grid, whose block serves NT token tiles of its run; PK: its entries are
+ * packed ones, (expert | rows << 16, first row), from moe_iqr_packmap_kernel. */
 #define R4D_MOEIQR_PARAMS                                                                         \
     const int8_t* __restrict__ X, const float* __restrict__ XS, const IqrCls c_0,                 \
     const IqrCls c_1, const IqrCls c_2, const IqrCls c_3, const int32_t* __restrict__ sorted,     \
     const int32_t* __restrict__ off, uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,  \
     uint32_t T, uint32_t fy, uint32_t n_expert, uint32_t inv_k, uint32_t x_ld, uint32_t xs_ld,    \
     uint32_t y_ld, uint32_t mode, uint32_t run_tiles, uint32_t inv_ft
-template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW>
+template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, bool PK = false>
 __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     using D = Dec<F>;
     static_assert(D::MAD && F::SC == kRowF32 && F::LRB == 0,
@@ -221,6 +226,7 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     static_assert(NT == 1u || (MAP && KW == 1u),
                   "several token tiles a block: the run map's grid, a wave a weight tile");
     static_assert(TPW == 1u || KW == 1u, "several weight tiles a wave: a wave a tile's whole K");
+    static_assert(!PK || MAP, "packed entries: the run map's grid");
     constexpr uint32_t NW = KW * RTB, NTHR = NW * kWave, kCols = RTB * TPW * 16u;
     /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift, bit 3 the activation's scale per 256 of
      * K, bits 8+ `parts` (r4d_moe.hip's). */
@@ -250,9 +256,15 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             zero_rows(rs, rs + kRows * NT < T ? rs + kRows * NT : T);
             return;
         }
-        const uint32_t oe = (uint32_t)off[e + 1];
-        re = oe < T ? oe : T;
-        if (re > rs + kRows * NT) re = rs + kRows * NT;
+        if constexpr (PK) {
+            /* a packed entry: the expert, and the entry's rows above it */
+            re = rs + (e >> 16);
+            e &= 0xFFFFu;
+        } else {
+            const uint32_t oe = (uint32_t)off[e + 1];
+            re = oe < T ? oe : T;
+            if (re > rs + kRows * NT) re = rs + kRows * NT;
+        }
     } else {
         /* The (tile, run) grid. The block's first wave finds the run and the others take it from
          * LDS after one barrier: each of its lanes holds kMaxExpert / 32 consecutive experts'
@@ -344,6 +356,11 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
     const int8_t* xrow[NT];
     const float* xsr[NT];
     bool okr[NT];
+    /* Past four token tiles a block the rows' addresses are 32-bit offsets off the launch's uniform
+     * bases and their live flags one mask, a register a tile instead of two and a half (eight tiles
+     * at pointers spill sixteen registers). The same loads and values. */
+    constexpr bool XO = NT > 4u;
+    uint32_t xo[NT], xso[NT], okm = 0u;
     if (dot) {
 #pragma unroll
         for (uint32_t m = 0; m < kDotRows; ++m) {
@@ -361,9 +378,15 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
             const uint32_t srow = rs + (rj < nrows ? rj : nrows - 1u);
             const int32_t f = sorted[srow];
             const uint32_t tok = a_sorted ? srow : (f < 0 ? 0u : slot_token((uint32_t)f, inv_k));
-            xrow[j] = X + (size_t)tok * x_ld + frag_k0(lane);
-            xsr[j] = XS + (size_t)tok * xs_ld;
-            okr[j] = a_sorted || f >= 0;
+            if constexpr (XO) {
+                xo[j] = tok * x_ld + frag_k0(lane);
+                xso[j] = tok * xs_ld;
+                okm |= ((a_sorted || f >= 0) ? 1u : 0u) << j;
+            } else {
+                xrow[j] = X + (size_t)tok * x_ld + frag_k0(lane);
+                xsr[j] = XS + (size_t)tok * xs_ld;
+                okr[j] = a_sorted || f >= 0;
+            }
         }
     }
 
@@ -414,7 +437,9 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         auto bload = [&](uint32_t j, uint32_t kb, i2v (&b)[8]) {
 #pragma unroll
             for (uint32_t ks = 0; ks < 8; ++ks) {
-                const uint2 v = *(const uint2*)(xrow[j] + kb * kBlock + ks * kK);
+                uint2 v;
+                if constexpr (XO) v = *(const uint2*)(X + (size_t)(xo[j] + kb * kBlock + ks * kK));
+                else              v = *(const uint2*)(xrow[j] + kb * kBlock + ks * kK);
                 b[ks][0] = (int)v.x;
                 b[ks][1] = (int)v.y;
             }
@@ -443,7 +468,10 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
 #pragma unroll
                     for (uint32_t ks = 0; ks < kBlock / kK; ++ks)
                         raw = mma8<true>(frag_of(a8[ks / 4u], ks % 4u), bq[j & 1u][ks], raw);
-                    const float sb = fb * xsr[j][kb >> ash];
+                    float xsv;
+                    if constexpr (XO) xsv = XS[(size_t)(xso[j] + (kb >> ash))];
+                    else              xsv = xsr[j][kb >> ash];
+                    const float sb = fb * xsv;
                     corr[j] += sb;
 #pragma unroll
                     for (uint32_t t = 0; t < 8; ++t)
@@ -494,8 +522,11 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         const uint32_t rj = j * kRows + col;
         if (rj < nrows) {
             float v[8];
+            bool okj;
+            if constexpr (XO) okj = ((okm >> j) & 1u) != 0u;
+            else              okj = okr[j];
 #pragma unroll
-            for (uint32_t t = 0; t < 8; ++t) v[t] = okr[j] ? out[j][t] * rsc[t] : 0.0f;
+            for (uint32_t t = 0; t < 8; ++t) v[t] = okj ? out[j][t] * rsc[t] : 0.0f;
             *(uint4*)(Y + (size_t)(rs + rj) * y_ld + part * fy + tin * 16u + a0) =
                 make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
                            bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
@@ -510,20 +541,145 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
 
 /* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
  * chained form (r4d_chain.h), every block waiting before its first read and adding once after
- * its last write. */
-template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH>
-__global__ __launch_bounds__(KW * RTB * kWave) R4D_WAVES(8)
+ * its last write. Eight token tiles a block hold 237 registers: six waves a SIMD. */
+template <class F, uint32_t KW, uint32_t RTB, bool MAP, uint32_t NT, uint32_t TPW, class CH,
+          bool PK = false>
+__global__ __launch_bounds__(KW * RTB * kWave) R4D_WAVES(NT > 4u ? 6 : 8)
 void moe_iqr_kernel(R4D_MOEIQR_PARAMS) {
     if (CH::on) r4d_chain_wait();
-    moe_iqr_body<F, KW, RTB, MAP, NT, TPW>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
+    moe_iqr_body<F, KW, RTB, MAP, NT, TPW, PK>(X, XS, c_0, c_1, c_2, c_3, sorted, off, Y, map, T, fy,
                                            n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles,
                                            inv_ft);
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_MOEIQR_PARAMS
 
+/* The packed map: the run map at CAP rows an entry for a block of CAP / 16 token tiles, built by
+ * one workgroup as r4d_moe.hip's moe_blockmap_kernel builds the run map. An entry is
+ * (expert | rows << 16, first row).
+ *
+ * The run map's grid at FM rows (64) gives a run's remainder of one or two rows an entry of its
+ * own, which takes the dot path, and the dot path's sums are not the tile path's to the last bit.
+ * So that a pass's bytes do not depend on the grid, the same rows keep an entry of their own here:
+ * a run is its rows less that remainder, CAP an entry, then the remainder. CAP is a multiple of
+ * FM, so no other entry is one or two rows. The dropped slots' tail is an entry (kTail) every CAP
+ * rows. Offsets are clamped to T, where the kernel clamps a run's end. */
+__global__ __launch_bounds__(256) void moe_iqr_packmap_kernel(
+    const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t CAP,
+    uint32_t cap, uint32_t* __restrict__ map) {
+    constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
+    __shared__ uint32_t s_cnt[kMaxExpert + 1];
+    __shared__ int32_t  s_wt[kTiles][NW];
+    const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
+    /* a thread's experts (tid, tid + NT, ..): first row, rows, and the dot path's remainder */
+    uint32_t lo[kTiles], n[kTiles], dr[kTiles];
+#pragma unroll
+    for (uint32_t i = 0; i < kTiles; ++i) {
+        const uint32_t e = tid + i * NT;
+        const uint32_t a = (uint32_t)off[e < n_expert ? e : n_expert];
+        const uint32_t b = (uint32_t)off[e + 1 < n_expert ? e + 1 : n_expert];
+        lo[i] = a < T ? a : T;
+        const uint32_t hi = b < T ? b : T;
+        n[i] = hi > lo[i] ? hi - lo[i] : 0u;
+        const uint32_t rem = n[i] % FM;
+        dr[i] = rem >= 1u && rem <= kDotRows ? rem : 0u;
+    }
+    const uint32_t live0 = (uint32_t)off[n_expert];
+    const uint32_t live = live0 < T ? live0 : T;
+#pragma unroll
+    for (uint32_t i = 0; i < kTiles; ++i) {
+        const uint32_t e = tid + i * NT;
+        if (e < n_expert) s_cnt[e] = (n[i] - dr[i] + CAP - 1) / CAP + (dr[i] ? 1u : 0u);
+    }
+    /* the tail of dropped slots, carried as one more "expert" so the scan places it too */
+    if (tid == 0) s_cnt[n_expert] = T > live ? (T - live + CAP - 1) / CAP : 0u;
+    __syncthreads();
+    /* the exclusive scan over the n_expert + 1 counts, NT at a time */
+    uint32_t carry = 0;
+    for (uint32_t b = 0, tl = 0; b <= n_expert; b += NT, ++tl) {
+        const uint32_t e = b + tid;
+        const int32_t  v = e <= n_expert ? (int32_t)s_cnt[e] : 0;
+        const int32_t  x = wave_incl_scan_i32(v, lane);
+        if (lane == kWave - 1) s_wt[tl][wave] = x;
+        lds_barrier();
+        int32_t below = 0, tot = 0;
+#pragma unroll
+        for (uint32_t k = 0; k < NW; ++k) {
+            const int32_t cc = s_wt[tl][k];
+            below += (k < wave) ? cc : 0;
+            tot   += cc;
+        }
+        if (e <= n_expert) s_cnt[e] = carry + (uint32_t)(below + x - v);
+        carry += (uint32_t)tot;
+    }
+    if (tid == 0) map[0] = carry < cap ? carry : cap;    /* the count, clamped to the grid */
+    __syncthreads();
+#pragma unroll
+    for (uint32_t i = 0; i < kTiles; ++i) {
+        const uint32_t e = tid + i * NT;
+        if (e >= n_expert) continue;
+        uint32_t o = s_cnt[e];
+        const uint32_t m = n[i] - dr[i];
+        for (uint32_t r = 0; r < m; r += CAP, ++o) {
+            if (o >= cap) break;
+            map[1 + 2 * o + 0] = e | (m - r < CAP ? m - r : CAP) << 16;
+            map[1 + 2 * o + 1] = lo[i] + r;
+        }
+        if (dr[i] && o < cap) {
+            map[1 + 2 * o + 0] = e | dr[i] << 16;
+            map[1 + 2 * o + 1] = lo[i] + m;
+        }
+    }
+    if (tid == 0) {
+        uint32_t o = s_cnt[n_expert];
+        for (uint32_t r = live; r < T; r += CAP, ++o) {
+            if (o >= cap) break;
+            map[1 + 2 * o + 0] = kTail;
+            map[1 + 2 * o + 1] = r;
+        }
+    }
+}
+
 /* Token tiles a block of the run map's grid: a run of up to 64 rows decodes its expert once. */
 constexpr uint32_t kMapTiles = 4;
+/* ...and of the packed map's, a large pass's: a run of up to 128 rows decodes its expert once. The
+ * run map's entry costs a decode of its expert (Flash-Next's gate_up on an R9700: ~1.1 us an entry
+ * against ~0.26 us a 16-row token tile), and under a measured routing a pass has 1.3 entries an
+ * expert at 2048 tokens, 1.9 at 4096 and 3.1 at 8192; at 128 rows 1.05, 1.3 and 1.9. Eight tiles'
+ * accumulators cost the kernel two of its eight waves a SIMD (237 registers), sixteen spill 248
+ * and are 2.3x slower. The bytes are the run map's (see moe_iqr_packmap_kernel).
+ *
+ * Flash-Next's gate_up (768:512 x 2560, 512 experts, top 10), us a layer in the engine's prefill at
+ * two ranks (stamped, card 0), four tiles -> eight: a pass of 17920 rows 812 -> 763, 20480 rows
+ * 1034 -> 965, 40960 rows 1779 -> 1623. r4d_selftest --perfmoeiqr, launches with the card idle
+ * between them: 2048 tokens 1368 -> 1360, 4096 2057 -> 1945, 8192 3423 -> 3118; back to back
+ * (R4D_PERF_IQR_GAP_MS unset) 2490 -> 2213 at 4096.
+ *
+ * What was tried beside it and is not here: a block of one decoding wave a weight tile and three
+ * helper waves that multiply the decoded unit from LDS against six or seven token tiles each (one
+ * decode for up to 336 rows, four weight tiles a block so the helpers share activation rows) is
+ * 13-19 % faster than four tiles back to back at 4096 and 8192 tokens, but level with them where
+ * the card is idle between launches and in the engine (40960 rows 1779 -> 1762, 20480 rows 4 %
+ * slower): its helpers wait on each row gather with no decode of their own to hide it behind. */
+constexpr uint32_t kPackTiles = 8;
+/* The mean routed rows an expert from which a pass takes the packed map: 32, half a run-map entry
+ * (16384 rows at 512 experts, a pass of 1639 tokens at top 10). A constant, so recorded and live
+ * passes take the same kernels. */
+constexpr long long kPackMinRowsPerExpert = 32;
+/* The map's token tiles, pinnable for tests: 0 the rule (RADIANCE_MOE_IQR_MAP_TILES gives the pin
+ * its first value), 4 the run map, 8 the packed map wherever the form has it. r4d_selftest compares
+ * them byte for byte. */
+static std::atomic<int> g_moe_iqr_map_tiles{-1};
+static uint32_t map_tiles_pin() {
+    int v = g_moe_iqr_map_tiles.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_MOE_IQR_MAP_TILES");
+        v = e ? std::atoi(e) : 0;
+        if (v != (int)kMapTiles && v != (int)kPackTiles) v = 0;
+        g_moe_iqr_map_tiles.store(v, std::memory_order_relaxed);
+    }
+    return (uint32_t)v;
+}
 /* The routed rows between which a narrow-K wave takes two weight tiles. Flash-Next's down
  * projection (2560 x 384:256, 512 experts, top 10), us a launch at one tile -> two: 10 rows 11.1 ->
  * 11.9 (too few waves to fill the card), 20 rows level, 30 rows 21.1 -> 20.3, 80 rows 48.0 -> 44.1,
@@ -549,8 +705,15 @@ struct Launch {
     uint32_t* map;
     uint32_t T, N, n_expert, inv_k, x_ld, xs_ld, y_ld, mode, run_tiles, inv_ft;
     uint32_t gx, nkb;
+    bool packed;  /* the map is the packed one, at kPackTiles token tiles a block */
     bool chain;   /* the chained form (r4d_chain.h) */
 };
+
+/* The packed map's entry bound: an expert one entry per 128 rows begun and one for its dot
+ * remainder, and the dropped slots' tail. */
+static inline long long pack_cap(long long T, long long n_expert) {
+    return 2 * n_expert + T / (long long)(kRows * kPackTiles) + 2;
+}
 
 template <class F>
 int launch_form(const Launch& g, RadStream stream) {
@@ -572,7 +735,17 @@ int launch_form(const Launch& g, RadStream stream) {
     const bool wide_k = g.nkb >= 8u && (g.T < kOneWaveMinRows || (g.N / 16u) % 4u);
     const bool two = !wide_k && g.nkb < 8u && g.N % (16u * 8u) == 0u &&
                      g.T >= kTwoTileMinRows && g.T <= kTwoTileMaxRows;
-    if (g.map)                     R4D_MOEIQR_GO(1u, 4u, true, kMapTiles, 1u);
+    if (g.map && g.packed) {
+        /* the packed map's grid, the one form built with it (see moe_iqr_launch) */
+        rc = R4D_NO(RAD_E_UNSUPPORTED);
+        if constexpr (F::B == 4 && F::L == 16)
+            rc = R4D_EMIT(stream, (moe_iqr_kernel<F, 1u, 4u, true, kPackTiles, 1u, R4dUnchained, true>),
+                          dim3(g.gx, g.N / 64u), dim3(4u * kWave), 0, g.x, g.xs, g.c[0], g.c[1],
+                          g.c[2], g.c[3], g.sorted, g.off, g.y, (const uint32_t*)g.map, g.T,
+                          g.N / (g.mode >> 8), g.n_expert, g.inv_k, g.x_ld, g.xs_ld, g.y_ld, g.mode,
+                          g.run_tiles, g.inv_ft);
+    }
+    else if (g.map)                R4D_MOEIQR_GO(1u, 4u, true, kMapTiles, 1u);
     else if (wide_k)               R4D_MOEIQR_GO(4u, 1u, false, 1u, 1u);
     else if (!two)                 R4D_MOEIQR_GO(1u, 4u, false, 1u, 1u);
     else                           R4D_MOEIQR_GO(1u, 4u, false, 1u, 2u);
@@ -704,12 +877,31 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = r4d_geti_or(a, "chain", 0) != 0;
     } else {
-        const long long cap = r4d_moe_blockmap_cap(T, n_expert, kRows * kMapTiles);
+        long long cap = r4d_moe_blockmap_cap(T, n_expert, kRows * kMapTiles);
         if (!a->scratch || a->scratch_bytes < r4d_moe_blockmap_bytes(cap))
             return R4D_NO(RAD_E_SCRATCH);
         g.map = (uint32_t*)a->scratch;
-        const int rc = r4d_moe_blockmap_emit(stream, g.off, g.n_expert, g.T, kRows * kMapTiles,
-                                             (uint32_t)cap, g.map);
+        /* The packed map: the one form built with it (the 4-bit, 2^16-state one, Flash-Next's), from
+         * kPackMinRowsPerExpert rows an expert or as pinned, where the rows' 32-bit offsets reach
+         * all of the activation and the scratch holds its entries (an expert at most one per
+         * 128 rows begun and one for its dot remainder, and the tail). */
+        const uint32_t pin = map_tiles_pin();
+        const long long capp = pack_cap(T, n_expert);
+        g.packed = fm.bits == 4 && fm.L == 16 &&
+                   (pin ? pin == kPackTiles : T >= kPackMinRowsPerExpert * n_expert) &&
+                   (unsigned long long)M * (unsigned long long)a_ld + (unsigned long long)K <
+                       (1ull << 32) &&
+                   (unsigned long long)Ms * (unsigned long long)as_ld < (1ull << 32) &&
+                   a->scratch_bytes >= r4d_moe_blockmap_bytes(capp);
+        int rc;
+        if (g.packed) {
+            cap = capp;
+            rc = R4D_EMIT(stream, moe_iqr_packmap_kernel, dim3(1), dim3(256), 0, g.off, g.n_expert,
+                          g.T, kRows * kMapTiles, kRows * kPackTiles, (uint32_t)cap, g.map);
+        } else {
+            rc = r4d_moe_blockmap_emit(stream, g.off, g.n_expert, g.T, kRows * kMapTiles,
+                                       (uint32_t)cap, g.map);
+        }
         if (rc != RAD_OK) return rc;
         g.gx = (uint32_t)cap;
     }
@@ -732,7 +924,9 @@ int64_t moe_iqr_scratch(const RadArgs* a) {
     if (n_expert <= 0 || n_expert > (long long)kMaxExpert || top_k <= 0 || M <= 0) return 0;
     const long long T = M * top_k;
     if (r4d_moe_in_decode_band(T, n_expert)) return 0;
-    return r4d_moe_blockmap_bytes(r4d_moe_blockmap_cap(T, n_expert, kRows * kMapTiles));
+    /* the run map's entries or the packed map's, whichever are more */
+    return r4d_moe_blockmap_bytes(std::max(r4d_moe_blockmap_cap(T, n_expert, kRows * kMapTiles),
+                                           pack_cap(T, n_expert)));
 }
 
 }  // namespace
@@ -744,3 +938,9 @@ extern "C" int r4d_rad_moe_gemm_iqr_mod4(const RadArgs* a, RadStream s) {
     return moe_iqr_launch(a, s, 4);
 }
 extern "C" int64_t r4d_rad_moe_gemm_iqr_scratch(const RadArgs* a) { return moe_iqr_scratch(a); }
+/* Pins the prefill map's token tiles of moe_gemm_iqr for tests: 4 the run map, 8 the packed map,
+ * anything else the rule (see g_moe_iqr_map_tiles). */
+extern "C" void r4d_moe_iqr_pin_map_tiles(int nt) {
+    g_moe_iqr_map_tiles.store(nt == (int)kMapTiles || nt == (int)kPackTiles ? nt : 0,
+                              std::memory_order_relaxed);
+}

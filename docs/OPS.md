@@ -2335,7 +2335,11 @@ one or two rows, which is nearly every run of a decode step, dots each decoded v
 activation byte and uses no WMMA tile; a longer run transposes each decoded unit once and
 multiplies it against every 16-row token tile it reaches. Inside the decode band the grid is
 (tile, run) over at most sixteen rows a block; above it a run map in the op's scratch gives a
-block up to 64 rows of one expert, so a prefill chunk decodes each expert's tiles about once. A
+block up to 64 rows of one expert, so a prefill chunk decodes each expert's tiles about once. From
+a mean of 32 routed rows an expert (a pass of 1639 tokens at 512 experts and top 10) the 4-bit
+form's map is packed at 128 rows an entry and a block multiplies eight token tiles a decode; a
+run's remainder of one or two rows past whole 64s keeps its own entry, so the bytes are the run
+map's. A
 class's rows are whole trellis runs in each part, so a gate_up split in 128-row blocks between
 ranks takes `tcq_rows=128`. The output is the product within f32 rounding.
 
