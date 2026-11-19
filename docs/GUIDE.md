@@ -1344,9 +1344,14 @@ models:
 ```
 
 a prefill that is alone in its step carries up to N intervals a step, from the prompt's second
-interval on (the first is never spanned). Every other step -- one with decode rows, another prefill,
-or a request waiting to be admitted -- is planned at the shared budget, `max-num-batched-tokens`
-less the extra intervals (here 2048), as without the span, `busy-prefill-chunk` included. The
+interval on (the first is never spanned). Several prompts prefilling at once with nothing decoding
+and no request to admit take such steps one at a time: the one with the fewest prompt tokens left
+has the step to itself and the others wait for it, so the first of them answers first and none
+runs at the shared budget's lower rate. Every other step -- one with decode rows, a request
+waiting to be admitted, or the one step after a request finished while others still prefill (its
+client's next turn, sent at once, then waits for that step and not for a span) -- is planned at
+the shared budget, `max-num-batched-tokens` less the extra
+intervals (here 2048), as without the span, `busy-prefill-chunk` included. The
 checkpoints at a span's end and at a prompt's tail are written where a span of 1 writes them, so a
 follow-up turn resumes where it did. Startup states both budgets:
 
@@ -2726,7 +2731,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `placement: MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens |
-| `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
+| `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on (several prompts prefilling with nothing decoding take such steps one at a time, the fewest tokens left first); needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
 | `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
 | `prefill-span-first: MODE` | off | `on`: a lone prefill may span from its first token, the first interval no step of its own (its rows read QSA's selection, the dense pass's keys below the exactness bound, summed in another order); `off`: from its second interval on (§4.5) |

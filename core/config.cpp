@@ -174,7 +174,9 @@ static const Flag g_flags[] = {
     { "--checkpoint-interval","N",      "linear-attention state checkpoint interval, in tokens" },
     { "--prefill-span",       "N",      "checkpoint intervals one step may carry of a prefill alone\n"
     "                                    in its step, from the prompt's second interval on (default\n"
-    "                                    1); needs --max-num-batched-tokens of N intervals. Every\n"
+    "                                    1); needs --max-num-batched-tokens of N intervals. Prompts\n"
+    "                                    prefilling side by side with nothing decoding take such\n"
+    "                                    steps one at a time, the fewest tokens left first. Every\n"
     "                                    other step is planned at the budget less the extra\n"
     "                                    intervals, and the checkpoints inside a span are not\n"
     "                                    written" },

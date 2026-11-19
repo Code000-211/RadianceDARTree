@@ -629,6 +629,10 @@ private:
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* A request finished while others still run: the next step is planned at the shared budget,
+     * not a span (step()), so that the finished conversation's next turn, which a client sends at
+     * once, waits for a shared step rather than a spanned one. Consumed by that step. */
+    bool          finished_beside_ = false;
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;

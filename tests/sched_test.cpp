@@ -824,9 +824,10 @@ TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
     CHECK(last_pf > 0);
 }
 
-/* A shared step under a span is planned as a deployment without one plans it: with two requests
- * from the start, every step they share is the same, entry for entry, at budget 512 with a span of
- * two as at budget 256 with none, --busy-prefill-chunk's shares included. */
+/* A shared step under a span is planned as a deployment without one plans it: with one request
+ * decoding (b, its prompt a step of its own) and a long prompt beside it, every step they share is
+ * the same, entry for entry, at budget 512 with a span of two as at budget 256 with none,
+ * --busy-prefill-chunk's shares included. */
 TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     std::vector<std::vector<std::pair<uint64_t, int32_t>>> plans[2];
     for (int m = 0; m < 2; ++m) {
@@ -834,8 +835,12 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
         f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/m == 0 ? 512 : 256);
         if (m == 0) f.cfg.prefill_span = 2;
         CHECK_OK(f.start());
+        const uint64_t b = f.submit(100, 12);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int64_t)f.sch.plan().e.size(), 1ll);
+        CHECK_EQ(f.sch.plan().e[0].n_tokens, 100);
+        f.commit_plain();
         const uint64_t a = f.submit(3000, 4);
-        const uint64_t b = f.submit(300, 6);
         (void)a;
         for (int k = 0; k < 40; ++k) {
             if (!f.sch.step()) break;
@@ -852,6 +857,110 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     }
     CHECK(plans[0].size() >= 4);
     CHECK(plans[0] == plans[1]);
+}
+
+/* Prompts prefilling side by side with nothing decoding and no one to admit: each step is spanned
+ * and holds one of them, the one with the fewest prompt tokens left, and the others wait for it
+ * (they take no share of it). As soon as one decodes, the steps are shared again. */
+TEST(concurrent_prefills_with_nothing_decoding_span_one_at_a_time_shortest_first) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512, shared 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(3000, 3);
+    const uint64_t b = f.submit(1300, 3);
+    /* Both admitted in the first step, at the shared budget. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
+    CHECK(f.sch.plan().n_tok <= 256);
+    f.commit_plain();
+    /* Then b, the shorter, alone in spanned steps up to its first token; a takes nothing. */
+    std::vector<int32_t> b_chunks;
+    int b_first = -1;
+    for (int k = 0; k < 20 && b_first < 0; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        CHECK_EQ((int64_t)p.e.size(), 1ll);
+        CHECK_EQ(p.e[0].seq, b);
+        CHECK(p.e[0].is_prefill);
+        b_chunks.push_back(p.e[0].n_tokens);
+        if (p.e[0].produces_token) b_first = k;
+        f.commit_plain();
+    }
+    CHECK(b_first >= 0);
+    int wide = 0;
+    for (int32_t n : b_chunks) wide += n > 256;
+    CHECK(wide >= 1);
+    /* With b decoding, every step is shared: no entry and no step past 256 tokens, a's chunk beside
+     * b's row. */
+    int shared = 0, a_beside_b = 0;
+    for (int k = 0; k < 6; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        bool has_a = false, has_b = false;
+        for (const StepEntry& e : p.e) {
+            has_a = has_a || e.seq == a;
+            has_b = has_b || (e.seq == b && !e.is_prefill);
+        }
+        if (!has_b) break;
+        ++shared;
+        CHECK(p.n_tok <= 256);
+        a_beside_b += has_a;
+        f.commit_plain();
+    }
+    CHECK(shared >= 2);
+    CHECK_EQ(a_beside_b, shared);
+
+    /* A step wider than the shared budget never holds more than one sequence, over a run of three
+     * prompts arriving together (RadBuildCtx::max_mixed_tok). */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    g.submit(2500, 2);
+    g.submit(900, 2);
+    g.submit(1700, 2);
+    int bad = 0, spans = 0, done = 0;
+    for (int k = 0; k < 200; ++k) {
+        if (!g.sch.step()) break;
+        const StepPlan& p = g.sch.plan();
+        if (p.n_tok > 256) { ++spans; bad += p.e.size() != 1; }
+        g.commit_plain();
+        ++done;
+    }
+    CHECK(done < 200);
+    CHECK(spans >= 3);
+    CHECK_EQ(bad, 0);
+
+    /* The step after a request finishes beside a prefill is shared: a follow-up turn its client
+     * sends at once waits for that step, not for a span. Then the prefill spans again. */
+    Fixture h;
+    h.build();
+    h.cfg.prefill_span = 2;
+    CHECK_OK(h.start());
+    const uint64_t d = h.submit(100, 3);
+    CHECK(h.sch.step() != nullptr);
+    h.commit_plain();
+    const uint64_t p = h.submit(3000, 2);
+    std::vector<int64_t> after;           /* p's chunks from the step after d finished */
+    bool d_gone = false;
+    for (int k = 0; k < 40 && after.size() < 3; ++k) {
+        if (!h.sch.step()) break;
+        bool has_d = false;
+        int64_t p_tok = 0;
+        for (const StepEntry& e : h.sch.plan().e) {
+            has_d = has_d || e.seq == d;
+            if (e.seq == p) p_tok = e.n_tokens;
+        }
+        if (!has_d) { d_gone = true; after.push_back(p_tok); }
+        h.commit_plain();
+    }
+    CHECK(d_gone);
+    CHECK_EQ((int64_t)after.size(), 3ll);
+    if (after.size() == 3) {
+        CHECK(after[0] > 0 && after[0] <= 256);
+        CHECK(after[1] > 256 || after[2] > 256);
+    }
 }
 
 /* Window snapshots do not support spans, and a model without checkpoints has no interval.

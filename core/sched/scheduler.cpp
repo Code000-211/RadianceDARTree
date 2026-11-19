@@ -867,6 +867,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (s.req->finish_reason.empty() && reason) s.req->finish_reason = reason;
     queue_erase(running_, s.slot);
     queue_erase(waiting_, s.slot);
+    if (st == ReqState::Finished && !s.req->embed && !running_.empty()) finished_beside_ = true;
     s.n_draft = 0;
 
     /* Terminal. The sink keeps the first finish, so a cancel racing a natural stop yields one
@@ -2074,13 +2075,21 @@ const RadBatch* Scheduler::step() {
 
     /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
      * long as the intervals it carries, so a decode row riding along would wait that long for its
-     * token. The span is taken only when the step can hold nothing but the one prefill (a single
-     * running request with prompt left and no admission possible, or a single request in an empty
-     * engine); every other step is planned at ChunkGeometry::shared_tok as a deployment without a
-     * span plans it, --busy-prefill-chunk included. Both kinds of chunk end on the same interval
+     * token. The span is taken only when the step can hold nothing but one prefill: a single
+     * request in an empty engine, or running requests that all have prompt left with no admission
+     * possible. Of several, the one with the fewest prompt tokens left takes the step alone and the
+     * others wait for it (shortest remaining first): a step of shared_tok split between them runs
+     * well under a spanned step's rate, and the first token of the shortest comes first. Every
+     * other step -- one with a decode row, or a request to admit -- is planned at
+     * ChunkGeometry::shared_tok as a deployment without a span plans it, --busy-prefill-chunk
+     * included. So is the one step after a request finished beside them (finished_beside_): a
+     * follow-up turn its client sends at once arrives while that step runs, and waits for it
+     * rather than for a span several times as long. Both kinds of chunk end on the same interval
      * grid, so a prompt may switch between them at any step. */
     span_now_ = true;
     struct SpanReset { bool& f; ~SpanReset() { f = true; } } span_reset{span_now_};
+    /* The running request a spanned step holds, or -1: every other running request sits it out. */
+    int32_t span_slot = -1;
     /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
      * plugin that a step wider than shared_tok is one sequence (RadBuildCtx::max_mixed_tok),
      * whatever the geometry turned out to be. */
@@ -2088,14 +2097,28 @@ const RadBatch* Scheduler::step() {
         bool lone = false;
         const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
                                     (int64_t)running_.size() < cfg_.max_seqs;
-        if (running_.size() == 1 && !admit_possible) {
-            const SchedReq& s0 = *reqs_[(size_t)running_[0]];
-            lone = s0.req->n_computed < (int64_t)s0.req->prompt.size() ||
-                   s0.req->n_computed + 1 < s0.seq_len();
+        const bool after_finish = finished_beside_;
+        finished_beside_ = false;
+        if (!running_.empty() && !admit_possible && !after_finish) {
+            int64_t fewest = INT64_MAX;
+            for (int32_t slot : running_) {
+                const SchedReq& sr = *reqs_[(size_t)slot];
+                const Request& rr = *sr.req;
+                const int64_t tg = sr.seq_len();
+                if (rr.n_computed >= (int64_t)rr.prompt.size() && rr.n_computed + 1 >= tg) {
+                    span_slot = -1;           /* a decode row: a shared step */
+                    break;
+                }
+                if (tg - rr.n_computed < fewest) { fewest = tg - rr.n_computed; span_slot = slot; }
+            }
+            lone = span_slot >= 0;
             /* By the whole prefill, not what is left of it, so a prompt keeps spanning through
              * its last intervals (set_span_min). */
-            if (lone && span_min_ > 0)
+            if (lone && span_min_ > 0) {
+                const SchedReq& s0 = *reqs_[(size_t)span_slot];
                 lone = std::max<int64_t>((int64_t)s0.req->prompt.size(), s0.seq_len()) >= span_min_;
+            }
+            if (!lone) span_slot = -1;
         } else if (running_.empty() && waiting_.size() == 1) {
             const SchedReq& w = *reqs_[(size_t)waiting_[0]];
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
@@ -2128,6 +2151,8 @@ const RadBatch* Scheduler::step() {
     int64_t behind_dec = 0, behind_pf = 0;
     if (share_step) {
         for (int32_t slot : running_) {
+            /* Those a spanned step leaves out take no share of it. */
+            if (span_slot >= 0 && slot != span_slot) continue;
             const Request& rr = *reqs_[(size_t)slot]->req;
             const int64_t tg = reqs_[(size_t)slot]->seq_len();
             const bool pf = (rr.n_computed < (int64_t)rr.prompt.size()) || (rr.n_computed + 1 < tg);
@@ -2159,6 +2184,9 @@ const RadBatch* Scheduler::step() {
      * admitted, so new work never preempts work half done. */
     for (size_t i = 0; i < running_.size(); ) {
         if ((int64_t)plan_.e.size() >= cfg_.max_seqs || (budget <= 0 && headroom <= 0)) break;
+        /* A spanned step holds one sequence (RadBuildCtx::max_mixed_tok): the one chosen above. */
+        if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+        if (span_slot >= 0 && running_[i] != span_slot) { ++i; continue; }
 
         int32_t slot = running_[i];
         SchedReq& s = *reqs_[(size_t)slot];
