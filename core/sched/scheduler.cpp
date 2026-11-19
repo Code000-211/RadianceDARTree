@@ -1301,14 +1301,15 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
              * leaves, so the final chunk splits at the last quantum boundary and the remainder
              * (under a quantum) runs as the next step's chunk (tail_checkpoint decides when that
              * is worth it). A window's tail snapshot is taken above, inside its chunk. */
-            const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target);
             /* A prefill alone in its spanned step whose plugin snapshots inside the step
              * (set_ckpt_inside) takes either snapshot below inside its last chunk, at the same
              * position, and runs to the prompt's end: the rows past it would otherwise be a step
              * of their own, which on a routed model reads nearly every expert for a few dozen
-             * rows. */
+             * rows. Its tail snapshot splits nothing, so it is taken however few rows it lies
+             * past the interval boundary below it (tail_checkpoint's in_step). */
             const bool inside = ckpt_inside_ && cfg_.prefill_tail_snapshot && geo_.span > 1 &&
                                 span_now_ && cfg_.prefill_span > 1 && !geo_.window_ckpt;
+            const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target, inside);
             if (inside && tail > n_computed) {
                 if (checkpoint_pos) *checkpoint_pos = tail;
             } else if (inside && n_computed + want > next) {
@@ -1403,8 +1404,9 @@ int64_t Scheduler::bidi_fit(const Request& r, int64_t n_computed, int64_t n_targ
  * last chunk starts (below). Under nearest, its last quantum boundary, only past the first
  * interval (a shorter prompt is cheap to redo) and only where it gains at least a quarter
  * interval over the interval checkpoint below it, which pays for the extra step; a window
- * snapshot follows its own rule (below). */
-int64_t Scheduler::tail_checkpoint(int64_t target) const {
+ * snapshot follows its own rule (below). A snapshot taken inside the last chunk (`in_step`)
+ * costs no step, only its copy, and is taken wherever it lies past the interval below it. */
+int64_t Scheduler::tail_checkpoint(int64_t target, bool in_step) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
     if (geo_.exact) {
@@ -1431,6 +1433,7 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
         const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
         return t >= std::min<int64_t>(I, kWindowSnapshotMin) ? t : -1;
     }
+    if (in_step) return tail > I && tail % I != 0 ? tail : -1;
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 

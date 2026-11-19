@@ -660,7 +660,8 @@ TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
     CHECK_EQ(ck, 768);
     CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
     CHECK_EQ(ck, 960);
-    /* Every position matches the cut schedule's. */
+    /* Every position matches the cut schedule's (at this interval a quarter interval is one
+     * quantum, so the cut's tail floor takes the same positions; see the next case). */
     Fixture g;
     g.build();
     g.cfg.prefill_span = 2;
@@ -694,6 +695,74 @@ TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
     o.sch.set_ckpt_inside(true);
     CHECK_EQ(o.sch.plan_chunk(512, 1000, 512, &ck), 488);
     CHECK_EQ(ck, -1);
+}
+
+/* The quarter-interval floor of nearest's tail snapshot (tail_checkpoint) is for a cut, which costs
+ * the last tokens a step of their own. A snapshot taken inside the last chunk cuts nothing: it is at
+ * the prompt's last quantum boundary however few rows that is past the interval below it, so the
+ * next turn resumes there and not at the interval. */
+TEST(a_tail_snapshot_inside_the_last_chunk_has_no_quarter_interval_floor) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048);
+    f.cfg.checkpoint_interval = 1024;     /* quantum 64; a quarter interval is 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_ckpt_inside(true);
+    int64_t ck = -1;
+    /* 2176 is 128 past the boundary at 2048: the cut schedule keeps 2048 and runs [2048, 2200) as
+     * a step of its own; inside, one chunk to the end with the snapshot at 2176. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 2200, 2048, &ck), 1176);
+    CHECK_EQ(ck, 2176);
+    /* A last chunk that crosses no boundary, 3136 (64 past 3072), as well. */
+    CHECK_EQ(f.sch.plan_chunk(3072, 3150, 2048, &ck), 78);
+    CHECK_EQ(ck, 3136);
+    /* A tail on the boundary itself is that boundary's snapshot, as before; one past a quarter
+     * interval as before too. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 2090, 2048, &ck), 1066);
+    CHECK_EQ(ck, 2048);
+    CHECK_EQ(f.sch.plan_chunk(1024, 2400, 2048, &ck), 1376);
+    CHECK_EQ(ck, 2368);
+    /* The first interval keeps none (a shorter prompt is cheap to redo). */
+    CHECK_EQ(f.sch.plan_chunk(0, 1000, 2048, &ck), 1000);
+    CHECK_EQ(ck, -1);
+
+    /* The step sequence: the first interval, then the rest of the prompt in one spanned step with
+     * the snapshot inside it, 128 rows past the interval. */
+    const uint64_t a = f.submit(2200, 2);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].seq, a);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1024);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_tok, 1023);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1176);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_tok, 2176 - 1024 - 1);
+    CHECK(f.sch.plan().e[0].produces_token);
+    f.commit_plain();
+
+    /* Where the snapshot cuts the chunk, the floor stays: 2048 and the rest a step of its own. */
+    Fixture g;
+    g.build(4096, 64, 2048);
+    g.cfg.checkpoint_interval = 1024;
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    CHECK_EQ(g.sch.plan_chunk(1024, 2200, 2048, &ck), 1024);
+    CHECK_EQ(ck, 2048);
+    CHECK_EQ(g.sch.plan_chunk(2048, 2200, 2048, &ck), 152);
+    CHECK_EQ(ck, -1);
+    /* And so it does inside a shared step, which a span does not hold. */
+    g.sch.set_ckpt_inside(true);
+    const uint64_t b = g.submit(2200, 2);
+    const uint64_t c = g.submit(100, 40);
+    (void)c;
+    int64_t b_ck = -1;
+    for (int k = 0; k < 30; ++k) {
+        if (!g.sch.step()) break;
+        for (const StepEntry& e : g.sch.plan().e)
+            if (e.seq == b && e.is_prefill && e.ckpt_tok >= 0) b_ck = e.ctx_len + e.ckpt_tok + 1;
+        g.commit_plain();
+    }
+    CHECK_EQ(b_ck, 2048);
 }
 
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn

@@ -1522,7 +1522,11 @@ windows -- runs over the rows before it and the rows after it as two pieces, eac
 those rows computes, and copies its slot to a stage on the card between them; the connection reads
 are cut there too, and the routed GEMMs give each expert's rows before it a run of their own. The
 snapshot holds the bytes the cut schedule's step leaves (a next turn resumes and answers exactly as
-before), and the step of the last tokens is gone. The stage is one snapshot a rank on the card
+before), and the step of the last tokens is gone. Cutting nothing, it also needs no quarter
+interval past the boundary below it: a prompt whose last quantum boundary lies less far past it,
+which the cut schedule leaves at that boundary, takes its tail snapshot at that last quantum
+boundary all the same, and a next turn re-prefills under a quantum rather than up to a quarter
+interval. The stage is one snapshot a rank on the card
 (57.9 MiB a rank on Flash-Next at TP2), taken from the KV pool; every snapshot then goes to its host
 slot from there in one copy. `RADIANCE_CKPT_INSIDE=0` keeps the cut, `RADIANCE_CKPT_STAGE=0` the
 stage and the cut. A step shared with other work keeps the cut. Prompts of documentation text (whose

@@ -544,8 +544,10 @@ public:
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
 
-    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition). */
-    int64_t tail_checkpoint(int64_t target) const;
+    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition).
+     * `in_step`: the snapshot is taken inside the last chunk (set_ckpt_inside), which it does not
+     * split, so nearest's quarter-interval floor does not apply. */
+    int64_t tail_checkpoint(int64_t target, bool in_step = false) const;
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
