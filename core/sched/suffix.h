@@ -27,6 +27,7 @@
 #pragma once
 #include "ngram.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -91,6 +92,36 @@ public:
         r.score = m > 0 ? d : 0.0f;
         r.expect = sum;
         return r;
+    }
+
+    /* Index the sequence as propose() would for its first `upto` tokens, with no proposal: a
+     * prefill chunk's commit (Scheduler::commit), so the index grows a chunk at a time instead
+     * of all at once at the first token, under the scheduler's lock. Exactly the contents
+     * propose() builds; never shrinks. */
+    void advance(const TokenSeq& seq, uint64_t owner, int min_match, int64_t upto) {
+        if (min_match < 1 || min_match > kMaxK || upto <= min_match || upto > seq.size()) return;
+        if (ix_.owner() != owner || k_ != min_match) { reset(owner); k_ = min_match; }
+        if (upto <= filled_) return;
+        index_to(seq, upto);
+        ix_.index_only(seq, min_match, min_match + kExtra, upto - 1);
+    }
+    /* A copy built over one request's prompt, taken over by another whose sequence starts with
+     * the same tokens (Scheduler's suffix stash). */
+    void set_owner(uint64_t owner) { ix_.set_owner(owner); }
+    int  k() const { return k_; }
+    /* Tests: the index's contents, independent of its tables' shapes. */
+    std::vector<uint64_t> contents() const {
+        std::vector<uint64_t> v = ix_.contents();
+        v.push_back(0xffffffffffffffffull);
+        for (const Table* t : { &followed_, &follow_ }) {
+            std::vector<uint64_t> w;
+            for (uint64_t e : t->t) if (e) w.push_back(e);
+            std::sort(w.begin(), w.end());
+            v.insert(v.end(), w.begin(), w.end());
+            v.push_back(0xfffffffffffffffeull);
+        }
+        v.push_back((uint64_t)filled_);
+        return v;
     }
 
     int64_t indexed() const { return filled_; }

@@ -111,6 +111,8 @@ struct SchedReq {
     bool        draft_suffix = false;
     bool        suffix_hot = false;
     SuffixIndex suffix_ix;
+    /* The prompt's index has been copied to the scheduler's suffix stash (suffix_advance). */
+    bool        suffix_stashed = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -730,6 +732,29 @@ private:
     /* --draft-suffix: the suffix proposal for `s`'s next step, over its committed history, into
      * `out` (RAD_SCHED_MAX_SPEC entries). Returns its length, 0 for none. */
     int suffix_propose(SchedReq& s, int32_t* out, int* match = nullptr);
+    /* --draft-suffix's index is built a prefill chunk at a time (suffix_advance, at each prefill
+     * commit) rather than all at the first token. A long prompt's finished index is copied into
+     * the stash; the next request whose prompt starts with those tokens (the conversation's next
+     * turn) takes it over at admission (suffix_adopt) and indexes only what it adds. Either way the
+     * index holds exactly what a build from nothing would. */
+    void suffix_advance(SchedReq& s);
+    void suffix_adopt(SchedReq& s);
+    struct SuffixStash {
+        std::vector<int32_t> tokens;
+        SuffixIndex ix;
+        uint64_t used = 0;
+    };
+    std::vector<SuffixStash> suffix_stash_;
+    uint64_t suffix_stash_clock_ = 0;
+    /* Prompts shorter than this are cheap to index again; the stash holds at most this many
+     * copies and bytes. */
+    static constexpr int64_t kSuffixStashMin = 4096;
+    static constexpr size_t  kSuffixStashMax = 16;
+    static constexpr int64_t kSuffixStashBytes = (int64_t)512 << 20;
+public:
+    /* Tests: the stash's size, and a sequence's index contents. */
+    size_t suffix_stash_size() const { return suffix_stash_.size(); }
+private:
     /* --draft-ngram-leaves: graft the lookup's proposal onto the host-built tree in s.draft. */
     void graft_ngram(SchedReq& s, int cap, const int32_t* parents);
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its

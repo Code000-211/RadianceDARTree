@@ -84,6 +84,26 @@ int64_t NgramIndex::find_suffix(const TokenSeq& s, int n) const {
     }
 }
 
+void NgramIndex::index_only(const TokenSeq& seq, int nmin, int nmax, int64_t upto) {
+    nmin = std::max(1, std::min(nmin, (int)kMaxN));
+    nmax = std::max(nmin, std::min(nmax, (int)kMaxN));
+    upto = std::min(upto, kMaxLen);
+    if (nmin != nmin_ || nmax != nmax_ || filled_ > upto) {
+        const uint64_t own = owner_;
+        reset(own);
+        nmin_ = nmin;
+        nmax_ = nmax;
+    }
+    index_to(seq, upto);
+}
+
+std::vector<uint64_t> NgramIndex::contents() const {
+    std::vector<uint64_t> v;
+    for (const uint32_t t : tab_) if (t) v.push_back(t);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
 int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
                         int* match, int match_cap) {
     const int64_t len = seq.size();

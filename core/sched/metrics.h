@@ -180,6 +180,8 @@ struct SchedMetrics {
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
     int64_t suffix_held_ahead = 0;
+    /* Requests whose suffix index was taken over from an earlier turn's prompt (suffix stash). */
+    int64_t suffix_adopted = 0;
     int64_t tree_active_cut = 0;
     int64_t tree_active_hist [RAD_METRICS_MAX_SPEC + 1] = {};
     int64_t tree_accdepth_hist[RAD_METRICS_MAX_SPEC + 1] = {};
