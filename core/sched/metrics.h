@@ -182,6 +182,10 @@ struct SchedMetrics {
     int64_t suffix_held_ahead = 0;
     /* Requests whose suffix index was taken over from an earlier turn's prompt (suffix stash). */
     int64_t suffix_adopted = 0;
+    /* Suffix proposals the global cache won (--draft-suffix-global-mib), and lookups that found it
+     * mid-insert and skipped it. */
+    int64_t suffix_global = 0;
+    int64_t suffix_global_busy = 0;
     int64_t tree_active_cut = 0;
     int64_t tree_active_hist [RAD_METRICS_MAX_SPEC + 1] = {};
     int64_t tree_accdepth_hist[RAD_METRICS_MAX_SPEC + 1] = {};

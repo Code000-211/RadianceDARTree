@@ -122,6 +122,7 @@ struct SchedMetrics {
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
     int64_t suffix_held_ahead = 0;
+    int64_t suffix_global = 0, suffix_global_busy = 0, suffix_adopted = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */

@@ -18,6 +18,7 @@
 #include "metrics.h"
 #include "ngram.h"
 #include "suffix.h"
+#include "gsuffix.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -745,6 +746,8 @@ private:
         uint64_t used = 0;
     };
     std::vector<SuffixStash> suffix_stash_;
+    /* --draft-suffix-global-mib: earlier responses across requests (gsuffix.h). */
+    GlobalSuffix gsuffix_;
     uint64_t suffix_stash_clock_ = 0;
     /* Prompts shorter than this are cheap to index again; the stash holds at most this many
      * copies and bytes. */
@@ -754,6 +757,8 @@ private:
 public:
     /* Tests: the stash's size, and a sequence's index contents. */
     size_t suffix_stash_size() const { return suffix_stash_.size(); }
+    /* The engine loads and saves it (--draft-suffix-dir). */
+    GlobalSuffix& global_suffix() { return gsuffix_; }
 private:
     /* --draft-ngram-leaves: graft the lookup's proposal onto the host-built tree in s.draft. */
     void graft_ngram(SchedReq& s, int cap, const int32_t* parents);

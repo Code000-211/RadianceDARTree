@@ -371,6 +371,11 @@ static const Flag g_flags[] = {
     { "--draft-suffix-min-score", "D",  "cut the suffix chain where its path score (the product of the\n"
                                         "follower frequencies along it, SuffixDecoding's D) falls under D\n"
                                         "(default 0.3)" },
+    { "--draft-suffix-global-mib", "N", "also propose from a cache of earlier responses across requests\n"
+                                        "(SuffixDecoding's global tree), up to N MiB; the step verifies\n"
+                                        "whichever chain expects more accepted tokens. 0 is off (default)" },
+    { "--draft-suffix-dir", "DIR",      "keep the global suffix cache across restarts in DIR (default:\n"
+                                        "--prefix-cache-dir when set)" },
     { "--draft-coupling-temp", "T",     "the temperature of the coupled draft law Q (the head's top-8\n"
     "                                    scores / T, softmax): a number (default 1 = the legacy law), or\n"
     "                                    request / auto = each request's own temperature (times\n"
@@ -1248,6 +1253,8 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--draft-suffix-min-match")) { if (!num(1, 12, &c->draft_suffix_min_match)) return RAD_E_INVAL; }
         else if (S("--draft-suffix-max"))       { if (!num(1, 32, &c->draft_suffix_max)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-global-mib")) { if (!num(0, INT32_MAX, &c->draft_suffix_global_mib)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-dir"))       { if (!(v = need(i))) return RAD_E_INVAL; c->draft_suffix_dir = v; }
         else if (S("--draft-suffix-min-score")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             char* end = nullptr;
@@ -2037,6 +2044,10 @@ const ShowRow kShow[] = {
     { "--draft-suffix-min-match", [](const Config& c) { return num(c.draft_suffix_min_match); } },
     { "--draft-suffix-max",   [](const Config& c) { return num(c.draft_suffix_max); } },
     { "--draft-suffix-min-score", [](const Config& c) { return fnum(c.draft_suffix_min_score); } },
+    { "--draft-suffix-global-mib", [](const Config& c) {
+          return c.draft_suffix_global_mib ? num(c.draft_suffix_global_mib) : std::string("0 (off)"); } },
+    { "--draft-suffix-dir", [](const Config& c) {
+          return or_none(c.draft_suffix_dir, c.prefix_cache_dir.empty() ? "none" : "--prefix-cache-dir"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-verify",       [](const Config& c) {
           return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },

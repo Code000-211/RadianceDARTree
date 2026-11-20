@@ -210,6 +210,9 @@ void Metrics::sample(const SchedMetrics& m) {
     c_suffix_steps_.advance_to(m.suffix_steps);
     c_suffix_rows_.advance_to(m.suffix_rows);
     c_suffix_accepted_.advance_to(m.suffix_accepted);
+    c_suffix_global_.advance_to(m.suffix_global);
+    c_suffix_global_busy_.advance_to(m.suffix_global_busy);
+    c_suffix_adopted_.advance_to(m.suffix_adopted);
     c_suffix_held_ahead_.advance_to(m.suffix_held_ahead);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
@@ -497,6 +500,16 @@ std::string Metrics::render() const {
               "Draft rows those suffix steps verified.", L, c_suffix_rows_.get());
     w.counter("radiance:suffix_accepted_total",
               "Of those rows, the drafts accepted.", L, c_suffix_accepted_.get());
+    w.counter("radiance:suffix_global_total",
+              "Suffix lookups whose chain came from the global cache of earlier responses "
+              "(--draft-suffix-global-mib), which expected more accepted tokens.", L,
+              c_suffix_global_.get());
+    w.counter("radiance:suffix_global_busy_total",
+              "Suffix lookups that found the global cache mid-insert and skipped it.", L,
+              c_suffix_global_busy_.get());
+    w.counter("radiance:suffix_adopted_total",
+              "Requests whose suffix index was taken over from an earlier turn's prompt.", L,
+              c_suffix_adopted_.get());
     w.counter("radiance:suffix_held_ahead_total",
               "Decode steps not issued ahead of the previous commit because the sequence's "
               "history ended in a recurring pattern (--draft-suffix).", L, c_suffix_held_ahead_.get());
